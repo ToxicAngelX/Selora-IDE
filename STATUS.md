@@ -25,8 +25,25 @@ Notes:
   belongs to the owner.)
 
 ## Next
-Phase 1 — Risk spike (1a editor pane, 1b selora-ai client, 1c spike app)
-Briefs: 1c brief is verbatim in ROADMAP.md §Phase 1; 1a/1b briefs derived from
-the Phase 1 task list + ARCHITECTURE.md §9/§10 (selora-editor, selora-ai).
+Phase 1 — Risk spike: 1a and 1b MERGED and gated (commits 3c2d5f7, 6d5cbb2).
+1c (spike app) launching next. Then: full gate + human smoke test.
 Blockers: none. Owner action pending: a real `sk-gw-…` key for the Phase 1
 acceptance test (the human-run SSE verification).
+
+## Phase 1 merge notes (for Phase 2 briefs)
+- selora-editor ships `Editor::new(Arc<RwLock<Buffer>>)`, `set_text`, `text`,
+  `cursor()`, added via `ui.add(&mut editor)` (Widget on `&mut Editor`).
+  Editor font is 14px (ROADMAP 1a brief override of the 13px token); Phase 2
+  settings make font_size user-driven.
+- KNOWN DEBT (Phase 2 must resolve): selora-editor mirrors theme tokens in
+  `crates/selora-editor/src/theme.rs` because PLAN §5's graph (selora-ui →
+  selora-editor) makes importing selora-ui a cargo cycle. Options: dev-dep
+  equality test, or hoist tokens to a leaf both import. Mirror is value-exact
+  and documented.
+- selora-ai: `SeloraClient::new(base_url, api_key)`, `list_models`,
+  `stream_chat(req, tx)` → ChatReceipt; SSE parser is `sse::parse_sse_event`
+  (12+ mandatory RISKS §3 fixtures covered). `selora-settings` dep was removed
+  from selora-ai for the spike (constructor-arg config); Phase 4 re-adds it
+  for the model-price cache. Mid-stream failures are NOT retried (avoids
+  duplicated deltas) — only request establishment retries (ARCHITECTURE §6.5).
+- Cost: `compute_cost_usd(model, prompt, completion)` is exported for Phase 4.
