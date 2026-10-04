@@ -1,64 +1,103 @@
-# Status — 2026-10-04
+# Status — 2026-10-04 (session end)
 
-## Last completed
-Phase 1 — Risk spike — COMPLETE (code + gate + live acceptance)
-Branch: main (1a: 3c2d5f7, 1b: 6d5cbb2, 1c: e362aeb, close-out: f934fe6)
-Merged: 2026-10-04
-Acceptance: PASSED — live gateway test with a real key (headless, via
-`cargo run -p selora-ai --example smoke`, key passed by env var only):
-  connected (16 models), "say hi" → real SSE stream "Hi! How's it going?"
-  (claude-fable-5), receipt 49 completion tokens, app window ran and exited
-  cleanly (exit 0). Workspace gate: build/77 tests/fmt/clippy green.
-Notes: gateway returns completion_tokens but no prompt usage/cost — the
-Phase 4 cost meter owns the price table and the estimate fallback.
-Owner should rotate the sk-gw- key used for testing (it passed through chat).
+> This is the restart point. Read this file, then AGENT_ORCHESTRATION.md §10.
+> Do not re-plan, do not re-read the whole history. RESUME_PROMPT.md at the
+> repo root has the copy-paste prompt for a fresh orchestrator session.
 
-## Next
-Phase 2 — Editor core (2a tabs/splits, 2b file tree, 2c fuzzy, 2d syntax HL,
-2e command palette, 2f settings) — six parallel subagents per
-AGENT_ORCHESTRATION.md §10. Orchestrator pre-steps: hoist design tokens to
-a leaf crate (fixes the selora-editor/selora-ui cycle), pre-create module
-skeletons so no subagent touches a shared lib.rs, AppState spine in
-selora-app (subagents propose diffs; orchestrator applies).
-Blockers: none.
-- Workspace: all 9 crates wired per PLAN.md §5 dependency graph.
-- `crates/selora-ui/src/theme.rs` = DESIGN_TOKENS.md §11 contract, verified value-by-value.
-- egui is **0.36.2**: `eframe::App::ui(&mut self, ui, frame)` replaces `update`;
-  panels are `egui::Panel::top/left/right(...)`; theming via `set_theme` /
-  `set_visuals_of` / `set_style_of`. ARCHITECTURE.md's 0.29-era snippets are
-  design contracts, not copy-paste code. Phase 1+ briefs must assume 0.36 idioms.
-- Fonts: 5 real OFL TTFs bundled (Space Grotesk R/M/SB, JetBrains Mono R/M) with
-  license texts. Icons: `selora-ide-mono.svg` only; .ico/.png generation documented
-  in `assets/icons/NOTE.md` (needed for the Phase 5 installer).
-- Toolchain installed fresh this session: rustup + stable 1.99.0 MSVC + VS Build
-  Tools (C++ workload). cargo at `C:\Users\Toxic\.cargo\bin` — export PATH in bash.
-- cargo-deny.toml + CI deny step added by orchestrator (RELEASE.md §7.1 gap the
-  Phase 0 brief missed). Local `cargo deny check licenses` still to be run once
-  cargo-deny finishes installing (CI will enforce it regardless).
-- `cargo run -p selora-app` smoke: boots, stays alive, dark canvas, title strip
-  with brand mark. (Window verified by subagent smoke test; visual sign-off
-  belongs to the owner.)
+## Where we are
 
-## Next
-Phase 1 — Risk spike: 1a and 1b MERGED and gated (commits 3c2d5f7, 6d5cbb2).
-1c (spike app) launching next. Then: full gate + human smoke test.
-Blockers: none. Owner action pending: a real `sk-gw-…` key for the Phase 1
-acceptance test (the human-run SSE verification).
+**Phase 0 (Foundation) — DONE.** Commit 7c0f5f8 + close-outs.
+**Phase 1 (Risk spike) — DONE, including live acceptance.** Commits
+3c2d5f7 (1a editor), 6d5cbb2 (1b selora-ai), e362aeb (1c spike app).
+Live gateway test with a real key PASSED (16 models, real SSE stream
+"Hi! How's it going?" from claude-fable-5, receipt, clean window exit) —
+run via `SELORA_KEY=... cargo run -p selora-ai --example smoke`.
+**Phase 2 (Editor core) — PRE-STEPS DONE, SUBAGENTS NOT YET LAUNCHED.**
+Commits d520a77 + 6dc6a04.
 
-## Phase 1 merge notes (for Phase 2 briefs)
-- selora-editor ships `Editor::new(Arc<RwLock<Buffer>>)`, `set_text`, `text`,
-  `cursor()`, added via `ui.add(&mut editor)` (Widget on `&mut Editor`).
-  Editor font is 14px (ROADMAP 1a brief override of the 13px token); Phase 2
-  settings make font_size user-driven.
-- KNOWN DEBT (Phase 2 must resolve): selora-editor mirrors theme tokens in
-  `crates/selora-editor/src/theme.rs` because PLAN §5's graph (selora-ui →
-  selora-editor) makes importing selora-ui a cargo cycle. Options: dev-dep
-  equality test, or hoist tokens to a leaf both import. Mirror is value-exact
-  and documented.
-- selora-ai: `SeloraClient::new(base_url, api_key)`, `list_models`,
-  `stream_chat(req, tx)` → ChatReceipt; SSE parser is `sse::parse_sse_event`
-  (12+ mandatory RISKS §3 fixtures covered). `selora-settings` dep was removed
-  from selora-ai for the spike (constructor-arg config); Phase 4 re-adds it
-  for the model-price cache. Mid-stream failures are NOT retried (avoids
-  duplicated deltas) — only request establishment retries (ARCHITECTURE §6.5).
-- Cost: `compute_cost_usd(model, prompt, completion)` is exported for Phase 4.
+## Last completed (this session's Phase 2 pre-steps)
+
+1. **Design tokens hoisted to leaf crate `selora-tokens`** (d520a77) —
+   fixes the selora-editor ↔ selora-ui cargo cycle that forced a token
+   mirror in Phase 1. `selora-ui::theme` re-exports + keeps
+   `set_fonts`/`set_visuals`; `selora-editor::theme` is now a re-export.
+2. **Module skeletons + mod declarations pre-created** (6dc6a04) in
+   selora-ui (editor/tabs.rs, sidebar/file_tree.rs, palette/command.rs,
+   palette/fuzzy.rs, dialogs/settings.rs), selora-fs (tree.rs, fuzzy.rs),
+   selora-editor (syntax.rs) — all stubs. **No subagent may edit any
+   lib.rs or Cargo.toml** (only its own stub .rs file + new files in its
+   owned dirs).
+3. **Phase 2 deps pre-registered and verified compiling**: selora-fs
+   (ignore 0.4.33, nucleo-matcher 0.3.1), selora-ui (nucleo-matcher),
+   selora-editor (tree-sitter 0.27 + tree-sitter-highlight + 9 grammars
+   0.20–0.25 — heterogeneous versions, verified to build together).
+4. **selora-core::Workspace** (focus-order open/close semantics, tested).
+5. **selora-app/src/app_state.rs** — the orchestrator-owned
+   Effect/AppMessage/AppState spine (ARCHITECTURE §2/§3.1). Subagents
+   PROPOSE enum/AppState additions as diffs in their reports; the
+   orchestrator applies them (AGENT_ORCHESTRATION §10 shared-file rule).
+   The spike's wiring.rs remains until Phase 2's shell replaces it.
+
+Gate at stop: build + 80 tests + fmt + clippy ALL GREEN (exit 0). Known
+flake: `cargo test --workspace` occasionally prints "could not compile
+selora-editor (lib test)" from MSVC/Defender file-locking during parallel
+test compilation — rerun confirms exit 0; not a code problem. If it ever
+hard-fails, capture the full error before assuming flake.
+
+## IMPORTANT — uncommitted owner edits in the working tree
+
+The owner edited the plan pack while the build ran (NOT committed, not
+mine to commit): PLAN.md, ROADMAP.md, RISKS.md, RELEASE.md,
+AGENT_ORCHESTRATION.md — inserting **Phase 5 — Agent Mode** (Claude
+Code-style tool loop: file read/edit/write/delete, bash, web search,
+approval-gated) and renumbering Polish & ship to Phase 6.
+- PLAN.md's phase table currently has a DUPLICATED "5 — Agent Mode" row
+  (paste slip) — the owner should finish/tidy these edits.
+- Before the NEXT session's first action, re-read the changed sections of
+  the plan pack (especially any new ROADMAP Phase 5 briefs) — they change
+  nothing for Phase 2, but Phase 5+ orchestration must follow the new text.
+- `git diff` those five .md files to see exactly what changed.
+
+## Next actions (in order)
+
+1. Confirm the tree is green:
+   `export PATH="/c/Users/Toxic/.cargo/bin:$PATH"` then
+   `cargo build --workspace && cargo test --workspace && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+2. (Owner) finish the plan-pack edits; commit them as the owner.
+3. Write the six Phase 2 briefs (2a tabs/splits, 2b file tree, 2c fuzzy
+   find, 2d syntax highlighting, 2e command palette, 2f settings) from
+   ROADMAP.md §Phase 2 + the §6 brief template, with file ownership from
+   AGENT_ORCHESTRATION.md §10 and these constraints baked in:
+   - Only touch files inside your ownership; stubs are yours to replace.
+   - Do NOT edit any lib.rs, any Cargo.toml, or selora-app files;
+     propose AppState/Effect/AppMessage additions as a diff in the report.
+   - Do NOT commit Cargo.lock; the orchestrator commits it at the gate.
+   - egui is 0.36.2 (`eframe::App::ui(&mut self, ui, frame)`,
+     `egui::Panel::top/left/right(...)`) — ARCHITECTURE.md's 0.29-era
+     snippets are design contracts, not copy-paste code.
+   - Editor font is 14px until 2f's settings make font_size user-driven.
+4. Launch all six in ONE message (parallel). Gate each merge
+   (build+test+fmt+clippy); apply their AppState diffs; commit Cargo.lock
+   at each gate. 2d also needs: migration from whole-line galleys to
+   LayoutJob for per-glyph SYN_* colors (Phase 1a report explains how).
+5. After all six merge: orchestrator builds the Phase 2 app shell
+   (tab bar + activity bar + file tree + editor + palette + settings,
+   replacing the spike UI in selora-app — Tier 3, orchestrator-owned),
+   run ROADMAP §Phase 2 acceptance tests, update STATUS.md.
+6. cargo-deny is STILL not installed locally (classifier outages blocked
+   `cargo install cargo-deny --locked` all session). CI enforces it. Try
+   again: `cargo install cargo-deny --locked && cargo deny check licenses`.
+
+## Environment (machine, not in any repo doc)
+
+- Toolchain installed fresh this session: rustup + stable 1.99.0
+  x86_64-pc-windows-msvc + VS 2022 Build Tools (C++ workload incl.
+  Windows SDK). cargo at C:\Users\Toxic\.cargo\bin — bash shells need
+  `export PATH="/c/Users/Toxic/.cargo/bin:$PATH"`.
+- No git remote yet; `gh repo create` is an owner action (RELEASE.md §7).
+- The sk-gw- test key passed through chat — owner should rotate it at the
+  gateway when convenient.
+
+## Blockers
+
+None. Phase 2 is fully staged; the next session starts at step 1 above.
