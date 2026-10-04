@@ -3230,6 +3230,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "selora-core",
+ "selora-tokens",
 ]
 
 [[package]]
@@ -3252,6 +3253,13 @@ name = "selora-settings"
 version = "0.1.0"
 
 [[package]]
+name = "selora-tokens"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "selora-ui"
 version = "0.1.0"
 dependencies = [
@@ -3262,6 +3270,7 @@ dependencies = [
  "selora-git",
  "selora-lsp",
  "selora-settings",
+ "selora-tokens",
 ]
 
 [[package]]

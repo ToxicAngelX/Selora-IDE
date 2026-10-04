@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 egui.workspace = true
 
+selora-tokens.workspace = true
 selora-editor.workspace = true
 selora-fs.workspace = true
 selora-ai.workspace = true

@@ -14,6 +14,8 @@
 
 It looks and behaves like the Selora brand: monochrome, hairline, calm. The differentiator is not the editing surface (Zed/VS Code already do that well) — it is that the AI is *native* to the editor and the gateway is *first-class*. No API key to paste in a third-party settings panel, no extension marketplace between the user and the models, no "BYO provider" detours.
 
+And the AI is not a spectator: **Agent Mode** (in scope for Lite) lets the model read, edit, create, and delete files in the workspace and search the web — Claude Code-style — with every write gated behind an approve-the-diff card in the chat. The agent runs through Selora, so the owner's gateway is also the agent's brain.
+
 ### Lite Edition = the shippable core
 
 This plan covers a **Lite Edition** that ships real, working features end-to-end. Not a demo. Not a mockup. Every feature in scope has a verification step that proves it works.
@@ -28,6 +30,8 @@ These are **explicitly out of scope** to keep the Lite Edition honest and shippa
 |---|---|---|
 | Real-time collaboration (CRDT/OT) | Zed-grade multiplayer is a multi-engineer investment; we don't need it on day one | v2+ if Selora collab backend ever exists |
 | Built-in terminal | Quality shells are deep work; users can run `wt`/`Terminal.app` for now | v1.x |
+| Agent sandboxing (devcontainer/VM isolation for bash) | Lite's agent runs commands with per-command approval gates, not sandboxing; true isolation is a large systems project | v1.x |
+| Background/unattended agents | Lite's agent loop only runs while the user is watching the chat; background agents need a trust + scheduling design | v2 |
 | Debugger / DAP | DAP client complexity rivals LSP | v1.x after LSP is solid |
 | Extension marketplace / VS Code extension compat | The whole point of Selora IDE is *not* being a VS Code reskin | If ever — own extension model |
 | Mobile / web client | IDE is a desktop app | Never (the gateway itself is web-accessible separately) |
@@ -53,7 +57,7 @@ Every non-goal is a deliberate trade. The owner + agents will be tempted to drif
                 ┌───────────────────▼────────────┐   ┌─────────▼─────────────┐
                 │       selora-ui  (egui)        │   │   tokio runtime        │
                 │  chrome, panels, palette,      │   │   - HTTP (reqwest)     │
-                │  command palette, modals,      │   │   - SSE consumer       │
+                │  command palette, modals,      │   │   - SSE + agent loop   │
                 │  settings, first-run           │   │   - file I/O           │
                 └────────┬──────────┬────────────┘   │   - keyring            │
                          │          │                │   - LSP client actor   │
@@ -84,6 +88,7 @@ Every non-goal is a deliberate trade. The owner + agents will be tempted to drif
 - **Tokio runtime** drives all I/O: HTTP, SSE, file IO, LSP.
 - **Main thread** runs the egui frame loop. UI state is owned by the main thread; workers communicate back via `tokio::mpsc` channels.
 - **LSP servers are spawned subprocesses** of the main process (rust-analyzer, typescript-language-server). Messages flow over stdio JSON-RPC.
+- **Agent Mode is a tool loop in the tokio runtime.** The model's tool_calls (read/edit/write/delete files, web search/fetch) execute there; every write pauses the loop until the user approves a diff card in the chat. Full design: `ARCHITECTURE.md` §17.
 - **The editor pane is a custom widget** drawn on top of egui's canvas (egui is for chrome; we paint text ourselves to control ghost-text rendering and animations).
 
 ---

@@ -693,3 +693,95 @@ If the Lite Edition ships and we hit a real performance or rendering ceiling wit
 2. Move just the editor pane to a lower-level renderer (raw OpenGL via `glow`, or `wgpu` directly), keeping egui for chrome.
 
 This is documented as the v2 path. The Lite plan does not depend on it.
+
+---
+
+## 17. Agent Mode (the Claude Code-style tool loop)
+
+Agent Mode turns the chat sidebar into an agent: the model receives a tool manifest with every request, may respond with `tool_calls`, and the IDE executes those tools and feeds results back into the conversation — streaming, in a loop, until the model produces a final answer with no tool calls. The model can read, edit, create, and delete files, run shell commands, and search/fetch the web. Every side-effecting action pauses the loop until the user approves it in the chat.
+
+### 17.1 Tool set (Lite)
+
+| Tool | Implementation | Approval |
+|---|---|---|
+| `read_file(path, start_line?, end_line?)` | runtime fs read, ≤4MB, path resolved against workspace root | none (read-only) |
+| `list_dir(path)` | `selora-fs` tree node | none |
+| `fuzzy_find(query)` | `selora-fs::fuzzy_find` over workspace files | none |
+| `search_files(query)` | `selora-fs::search_in_files` (ripgrep if on PATH) | none |
+| `write_file(path, content)` | create/overwrite via runtime fs write | **diff card** (create shown as all-additions) |
+| `edit_file(path, old_str, new_str, replace_all?)` | exact-match string replace; applied to the open buffer if the file is open, then saved | **diff card** (unified diff) |
+| `delete_file(path)` | runtime fs delete (git-tracked files recoverable via git) | **approval card** |
+| `bash(command, timeout_secs?, cwd?)` | `tokio::process` spawn | **command card**, auto-run if allowlisted (§17.5) |
+| `web_search(query)` | pluggable provider, default DuckDuckGo Lite HTML (no API key); Brave Search API supported via settings key | none |
+| `web_fetch(url)` | reqwest GET → strip HTML to text, 256KB cap | none, SSRF-guarded |
+
+### 17.2 Path and network safety (non-negotiable invariants)
+
+- **Path rooting:** every path tool resolves against the workspace root. `..` traversal or an absolute path outside the root is rejected with a tool-result error (which the model sees and can correct). Escape outside the root is only possible with a per-session user opt-in.
+- **SSRF guard on `web_fetch`:** only `http`/`https`; localhost, `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, and non-routable/reserved ranges are refused.
+- **The API key never leaves the client.** It is never included in tool results, messages, bash environment, or logs.
+- **No eval.** The model cannot execute code except through the `bash` tool, which is approval-gated.
+- **Bounded I/O:** reads ≤4MB, fetch output ≤256KB, bash output ≤256KB (truncated with a notice in the tool result).
+
+### 17.3 The loop
+
+```
+user sends agent message (chat composer; agent toggle is on)
+  → ChatRequest { model, messages, tools: TOOL_MANIFEST, stream: true }
+  → stream deltas render live in the chat bubble
+  → finish_reason == "tool_calls"
+  → for each tool_call, in order:
+      read-type tool  → execute immediately in the runtime
+      write/edit/delete → build diff/approval card → PAUSE loop → wait for user
+      bash            → allowlist check → auto-run or command card → maybe PAUSE
+  → results appended as { role: "tool", tool_call_id, content } messages
+  → next ChatRequest with the grown conversation → repeat
+  → finish_reason == "stop" → agent turn done → receipt → cost meter
+```
+
+**Loop caps (defaults, user-tunable in settings `agent.*`):** max 25 tool iterations per turn, max 10 minutes per turn, max `$1.00` estimated cost per turn. Any cap exceeded → abort the loop, surface a toast + final partial answer. A **Stop** button on the streaming bubble aborts immediately, killing any running bash child.
+
+### 17.4 Approval protocol
+
+- While the loop is paused on an approval, the runtime holds the conversation in an `AgentTurn` state machine (`Thinking → RunningTool(tool) → AwaitingApproval(id) → RunningTool → … → Done`).
+- The UI renders an approval card (UI_SPEC §4.2) with the diff or command. The user's decision returns to the runtime as `Effect::AgentDecision(turn_id, approval_id, Decision)` where `Decision ∈ { Approve, ApproveAllThisTurn, Deny, Stop }`.
+- `ApproveAllThisTurn` pre-approves remaining writes and non-allowlisted bash for the rest of this turn only — never persisted across turns or sessions.
+- A denied tool returns a tool-result of `"user denied this action"`, and the loop continues (the model usually adapts); `Stop` aborts.
+
+### 17.5 The bash tool
+
+- **Shell:** PowerShell (`pwsh` if installed, else `powershell`) on Windows; user-configurable in settings (`agent.shell`).
+- **cwd:** workspace root (or the tool's `cwd` argument, still root-contained).
+- **Allowlist (auto-run, no card):** read-only commands by prefix match — `git status`, `git diff`, `git log`, `git show`, `ls`, `dir`, `cat`, `type`, `Get-Content`, `cargo check`, `cargo build`, `cargo test`, `cargo clippy`, `cargo tree`, `node --version`, `rustc --version`, `where`, `Get-ChildItem`. The list is user-editable in settings (`agent.auto_approve_commands`). Everything else shows a command card.
+- **Timeout:** default 120s per command, max 600s; on timeout the child is killed and the tool result reports it.
+- **Environment:** a clean environment — the Selora key and any secrets from the app's process env are stripped from the child's env.
+- **Output:** stdout+stderr combined, 256KB cap, truncated with a notice.
+
+### 17.6 Tool plumbing in the existing types
+
+The `Effect`/`AppMessage` enums grow (additive — existing variants untouched):
+
+```rust
+// Effect
+AgentSend(ChatId, String),                      // starts a turn with tools armed
+AgentDecision(ChatId, ApprovalId, AgentDecision),
+
+// AppMessage
+ToolCallStarted(ChatId, ToolCall),
+ToolResult(ChatId, ToolCallId, ToolResult),
+ApprovalNeeded(ChatId, ApprovalId, ApprovalCard),  // diff card / command card / delete card
+AgentTurnDone(ChatId, ChatReceipt, AgentSummary),  // iterations, tools used, cost
+```
+
+`ChatRequest` gains `tools: Option<Vec<ToolSpec>>`; `ChatEvent` gains `ToolCallDelta` (streaming partial tool-call JSON, same accumulate-then-parse pattern as content deltas). Tool execution lives in one `agent` module in `selora-ai` — **it does not get its own crate**; it composes `selora-core`, `selora-fs`, and the runtime, and is the only module allowed to spawn bash children.
+
+### 17.7 Interaction with open buffers
+
+`edit_file`/`write_file` on a file that is open in an editor: the edit is applied to the in-memory buffer (so the user sees it live and undo works), the buffer is marked dirty, and saving is the normal user flow (the agent does not silently save; the diff card is the save moment — approving it writes the file to disk). Edits to closed files write directly to disk with the same diff card. This keeps a single source of truth (the buffer) and makes agent edits undoable with Ctrl+Z like any human edit.
+
+### 17.8 What Agent Mode is NOT (still non-goals)
+
+- No background/unattended agents — the loop only runs while the user is watching.
+- No sandboxing (approval gates are the trust boundary; container isolation is v1.x).
+- No agent-initiated git operations beyond read-only git commands through `bash` (no agent commit/push).
+- No MCP/external tool servers — the manifest is fixed, defined by us, versioned with the app.

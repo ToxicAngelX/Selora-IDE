@@ -8,6 +8,7 @@ members = [
     "crates/selora-git",
     "crates/selora-ai",
     "crates/selora-settings",
+    "crates/selora-tokens",
     "crates/selora-ui",
     "crates/selora-app",
 ]
@@ -42,6 +43,7 @@ selora-lsp = { path = "crates/selora-lsp" }
 selora-git = { path = "crates/selora-git" }
 selora-ai = { path = "crates/selora-ai" }
 selora-settings = { path = "crates/selora-settings" }
+selora-tokens = { path = "crates/selora-tokens" }
 selora-ui = { path = "crates/selora-ui" }
 selora-app = { path = "crates/selora-app" }
 

@@ -236,6 +236,71 @@ The editor reads `Vec<Diagnostic>` from the buffer's overlay layer and draws a 3
 
 ---
 
+### 4.2 Agent Mode (tool calls, diffs, approvals in the chat)
+
+Agent Mode is a toggle in the chat header (a small "agent" pill, `--type-xs`, `--fg-muted`; on = `--ok` dot). When on, the conversation renders **tool cards** inline between bubbles:
+
+**Read-type tool card (collapsed by default):**
+
+```
+┌─ read_file ─ src/editor/mod.rs :42-88 ────────── ✓ ┐
+```
+
+One line, 24px tall, `--ink-canvas` background, 1px `--ink-hi` border, `--radius-1`. Tool name in `--type-xs --fg-faint`, argument summary in `--type-sm --fg-muted`, result-status glyph on the right (`✓` in `--ok`, `✕` in `--err`). Click expands to show the tool result (monospace, max 200px tall, scrolls).
+
+**Diff approval card (write_file / edit_file):**
+
+```
+┌─ edit_file ─ src/editor/mod.rs ─────────────────────┐
+│ ┌──────────────────────────────────────────────────┐ │
+│ │  41 │ pub fn theme() -> Theme {                  │ │
+│ │  42 │-    Theme::from_tokens(TOKENS)             │ │
+│ │  42 │+    Theme::from_tokens(TOKENS, dpi_scale)  │ │
+│ │  43 │ }                                          │ │
+│ └──────────────────────────────────────────────────┘ │
+│                       [ Deny ]  [ Approve all ]  [ Approve ] │
+└──────────────────────────────────────────────────────┘
+```
+
+- Unified diff, monospace `--type-sm`, line numbers in `--fg-faint`.
+- Removed lines prefixed `-`, text in `--err`; added lines prefixed `+`, text in `--ok`. (The only two saturated uses in the chat — semantic, not decorative.)
+- Diff body max 240px tall, scrolls; "expand full file" link below when truncated.
+- Buttons right-aligned: `Deny` (ghost, `--fg-muted`), `Approve all` (`--type-sm`, appears only from the second approval in a turn), `Approve` (`--ink-mid` background, `--fg-default`).
+- While the card waits, the agent loop status line under the last bubble reads `awaiting your approval` with the `pulse` animation on the dot.
+
+**Bash command card:**
+
+```
+┌─ bash ──────────────────────────────────────────────┐
+│  cargo test -p selora-core                           │
+│ ────────────────────────────────────────────────────│
+│  running 4 tests                                     │
+│  test buffer_insert ... ok                           │
+│                                                      │
+│  test result: ok. 4 passed                          │
+│                       [ Deny ]            [ Approve ] │
+└──────────────────────────────────────────────────────┘
+```
+
+- Command line prefixed `$` in `--fg-faint`, command in `--type-md --fg-default` (monospace).
+- If auto-approved (allowlist), no buttons: the card shows the command, then live output as it streams, then `✓ exit 0` (or `✕ exit N` in `--err`) in the header.
+- Output area: `--ink-canvas` background, monospace `--type-sm`, max 200px, scrolls, 256KB cap with "output truncated" notice.
+- A running command shows a `spin` glyph in the header and a **Stop** button replaces Approve.
+
+**Web tool cards:** same one-line collapsed style — `web_search "ropey crate"` expands to a numbered result list (title + URL, click = copy URL); `web_fetch https://…` expands to the fetched text (truncated, with the source URL in the header).
+
+**Turn summary footer** (after `AgentTurnDone`):
+
+```
+  6 tools · 3 approved · 1 denied · 12.4k tokens · $0.041
+```
+
+`--type-xs --fg-faint`, left-aligned under the final bubble.
+
+**Agent loop status line** (while the turn is running, under the last bubble): a 24px line with the current state — `thinking` (`pulse` dot), `reading src/main.rs` (tool name), `awaiting your approval` (`pulse`), `running cargo test` (`spin`) — plus a **Stop** button on the right (`--type-xs --fg-muted`, hover `--err`).
+
+All cards animate in with `fade` (`--dur-quick`). No card uses any color outside `--ok`/`--err` semantics. Reduced-motion replaces `pulse`/`spin` with static dots.
+
 ## 5. Command palette (`Ctrl+Shift+P`)
 
 ```

@@ -14,9 +14,9 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() {
     let key = std::env::var("SELORA_KEY").expect("SELORA_KEY must be set");
-    let base_url = std::env::args().nth(1).unwrap_or_else(|| {
-        "https://api.selora.lol".to_owned()
-    });
+    let base_url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "https://api.selora.lol".to_owned());
 
     let client = SeloraClient::new(&base_url, &key);
 
@@ -48,11 +48,8 @@ async fn main() {
                 .unwrap_or_else(|| "default".to_owned())
         });
 
-    let request = ChatRequest::new(
-        model_id.clone(),
-        vec![ChatMessage::user("say hi")],
-    )
-    .with_stream(true);
+    let request =
+        ChatRequest::new(model_id.clone(), vec![ChatMessage::user("say hi")]).with_stream(true);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stream = tokio::spawn(async move { client.stream_chat(request, tx).await });
@@ -86,7 +83,10 @@ async fn main() {
 
     match stream.await {
         Ok(Ok(_)) => {
-            println!("--- first 200 chars: {}", &streamed.chars().take(200).collect::<String>());
+            println!(
+                "--- first 200 chars: {}",
+                &streamed.chars().take(200).collect::<String>()
+            );
             println!("SMOKE TEST PASSED");
         }
         Ok(Err(error)) => {
