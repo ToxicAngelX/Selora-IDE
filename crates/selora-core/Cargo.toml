@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ropey.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
