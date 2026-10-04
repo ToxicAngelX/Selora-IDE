@@ -1,11 +1,29 @@
 # Status — 2026-10-04
 
 ## Last completed
-Phase 0 — Foundation
-Branch: main (commit 7c0f5f8 + orchestrator follow-up)
+Phase 1 — Risk spike (1a editor, 1b selora-ai, 1c spike app) — CODE MERGED, GATE GREEN
+Branch: main (1a: 3c2d5f7, 1b: 6d5cbb2, 1c: e362aeb)
 Merged: 2026-10-04
-Acceptance: all green (build / test / fmt / clippy verified by orchestrator, not just reported)
-Notes:
+Acceptance: cargo build/test/fmt/clippy all green (77 tests). REMAINING: the
+human live smoke test with a real `sk-gw-` key (ROADMAP Phase 1 acceptance):
+  cargo run -p selora-app
+  → paste key, Connect ("connected (N models)"), send "say hi",
+  → real SSE text within 5s, tokens/cost on Done, clean close.
+Notes: 1c's process died after committing but before reporting; the orchestrator
+verified its work directly (code review + full gate). All three spike verdicts:
+egui fit for Lite (LayoutJob migration needed for syntax HL), ropey fit,
+reqwest/rustls fit.
+
+## Next
+Phase 2 — Editor core (2a tabs/splits, 2b file tree, 2c fuzzy, 2d syntax HL,
+2e command palette, 2f settings)
+Briefs: templates in ROADMAP.md §Phase 2; file ownership per
+AGENT_ORCHESTRATION.md §10 Phase 2.
+Blockers: none technical. Owner decision pending: theme-token cycle fix
+(see KNOWN DEBT below) — orchestrator will resolve via dev-dep equality test
+or token hoist when Phase 2 launches.
+START HERE AFTER THE SMOKE TEST: confirm the spike window streams, then
+launch Phase 2's six subagents.
 - Workspace: all 9 crates wired per PLAN.md §5 dependency graph.
 - `crates/selora-ui/src/theme.rs` = DESIGN_TOKENS.md §11 contract, verified value-by-value.
 - egui is **0.36.2**: `eframe::App::ui(&mut self, ui, frame)` replaces `update`;
