@@ -1,0 +1,10 @@
+[package]
+name = "selora-lsp"
+description = "LSP client actor over stdio JSON-RPC (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+selora-core.workspace = true

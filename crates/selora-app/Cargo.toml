@@ -1,0 +1,24 @@
+[package]
+name = "selora-app"
+description = "Selora IDE application binary: wires the workspace crates together (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+
+selora-core.workspace = true
+selora-fs.workspace = true
+selora-editor.workspace = true
+selora-lsp.workspace = true
+selora-git.workspace = true
+selora-ai.workspace = true
+selora-settings.workspace = true
+selora-ui.workspace = true
+
+[[bin]]
+name = "selora-app"
+path = "src/main.rs"

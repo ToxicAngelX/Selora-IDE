@@ -1,0 +1,9 @@
+[package]
+name = "selora-git"
+description = "git2 wrapper: status, diff, stage/unstage, commit (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

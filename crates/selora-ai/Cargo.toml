@@ -1,0 +1,11 @@
+[package]
+name = "selora-ai"
+description = "Selora gateway client: models, streaming chat, ghost text, cost meter (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+selora-core.workspace = true
+selora-settings.workspace = true

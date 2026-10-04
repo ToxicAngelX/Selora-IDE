@@ -1,0 +1,9 @@
+[package]
+name = "selora-fs"
+description = "File tree traversal, fuzzy finder, search-in-files (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/selora-core",
+    "crates/selora-fs",
+    "crates/selora-editor",
+    "crates/selora-lsp",
+    "crates/selora-git",
+    "crates/selora-ai",
+    "crates/selora-settings",
+    "crates/selora-ui",
+    "crates/selora-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ToxicAngelX/Selora-IDE"
+homepage = "https://github.com/ToxicAngelX/Selora-IDE"
+
+[workspace.dependencies]
+egui = "0.36"
+eframe = "0.36"
+
+selora-core = { path = "crates/selora-core" }
+selora-fs = { path = "crates/selora-fs" }
+selora-editor = { path = "crates/selora-editor" }
+selora-lsp = { path = "crates/selora-lsp" }
+selora-git = { path = "crates/selora-git" }
+selora-ai = { path = "crates/selora-ai" }
+selora-settings = { path = "crates/selora-settings" }
+selora-ui = { path = "crates/selora-ui" }
+selora-app = { path = "crates/selora-app" }
+
+# Release profile per ARCHITECTURE.md §14.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"

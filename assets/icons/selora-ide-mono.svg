@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Selora orbital planet brand mark (source of truth).
+
+  Construction per DESIGN_TOKENS.md §9, at the 32px reference size:
+    - White core orb, 8px diameter (circle r=4 at the center).
+    - Tilted ring: 16x4 ellipse (rx=8, ry=2) rotated 20 degrees.
+    - Satellite: 2px dot (circle r=1) at the ring's far end
+      (local point (8, 0) rotated by the tilt -> 23.52, 18.74).
+
+  Monochrome white on transparent. The IDE renders this mark in code
+  (crates/selora-ui/src/brand.rs), not as a raster. Use this file to
+  generate selora-ide.ico / .png (see NOTE.md in this directory).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- tilted ring -->
+  <ellipse cx="16" cy="16" rx="8" ry="2" fill="none" stroke="#ffffff" stroke-width="1"
+           transform="rotate(20 16 16)"/>
+  <!-- core orb -->
+  <circle cx="16" cy="16" r="4" fill="#ffffff"/>
+  <!-- satellite at the ring's far end -->
+  <circle cx="23.52" cy="18.74" r="1" fill="#ffffff"/>
+</svg>
