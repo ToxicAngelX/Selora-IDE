@@ -11,4 +11,8 @@
 #![forbid(unsafe_code)]
 
 pub mod brand;
+pub mod dialogs;
+pub mod editor;
+pub mod palette;
+pub mod sidebar;
 pub mod theme;

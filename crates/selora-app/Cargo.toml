@@ -22,6 +22,9 @@ selora-ai.workspace = true
 selora-settings.workspace = true
 selora-ui.workspace = true
 
+# Phase 2: chat request ids in Effect::SeloraChat (ARCHITECTURE.md §2.2).
+uuid.workspace = true
+
 [[bin]]
 name = "selora-app"
 path = "src/main.rs"

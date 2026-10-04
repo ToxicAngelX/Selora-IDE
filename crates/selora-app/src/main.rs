@@ -11,6 +11,7 @@
 //! every frame (§2). No theming work, no persistence, no chrome beyond the
 //! spike — this is a tech demo, not the product.
 
+mod app_state;
 mod wiring;
 
 use std::sync::{Arc, RwLock};

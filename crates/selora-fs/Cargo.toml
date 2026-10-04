@@ -7,3 +7,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ignore = "0.4.33"
+nucleo-matcher = "0.3.1"

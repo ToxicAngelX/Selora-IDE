@@ -18,6 +18,7 @@
 mod editor;
 mod layout;
 mod motion;
+pub mod syntax;
 mod theme;
 
 pub use editor::Editor;

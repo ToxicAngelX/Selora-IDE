@@ -11,6 +11,8 @@
 
 mod buffer;
 mod error;
+mod workspace;
 
 pub use buffer::{Buffer, BufferId, Position};
 pub use error::SeloraError;
+pub use workspace::Workspace;
