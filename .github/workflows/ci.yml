@@ -34,3 +34,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: cargo-deny (licenses + advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --hide-inclusion

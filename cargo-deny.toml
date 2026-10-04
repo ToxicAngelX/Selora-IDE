@@ -1,0 +1,35 @@
+# cargo-deny configuration for Selora IDE.
+# The license gate is part of the merge gate (AGENT_ORCHESTRATION.md §5):
+# any crate with a non-MIT-compatible license fails the build (RISKS.md §9).
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# MIT-compatible / permissive only. Anything not on this list fails CI.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+
+[bans]
+# Multiple versions of the same crate are noisy but not fatal; duplicates = warn.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
