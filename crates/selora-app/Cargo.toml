@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 egui.workspace = true
 eframe.workspace = true
+# Phase 1c: the multi-threaded runtime the gateway workers are spawned onto
+# (ARCHITECTURE.md §1.4), and the mpsc channel drained each frame (§2).
+tokio.workspace = true
 
 selora-core.workspace = true
 selora-fs.workspace = true
@@ -22,3 +25,8 @@ selora-ui.workspace = true
 [[bin]]
 name = "selora-app"
 path = "src/main.rs"
+
+[dev-dependencies]
+# Mock gateway for the headless end-to-end wiring tests (Phase 1c).
+wiremock.workspace = true
+uuid.workspace = true

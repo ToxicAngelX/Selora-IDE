@@ -3210,6 +3210,9 @@ dependencies = [
  "selora-lsp",
  "selora-settings",
  "selora-ui",
+ "tokio",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
