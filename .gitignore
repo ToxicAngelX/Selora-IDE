@@ -3,3 +3,4 @@
 
 # Rust backup files
 **/*.rs.bk
+.claude/worktrees/
