@@ -36,10 +36,12 @@ use selora_ai::{ChatReceipt, ChatRequest, Model};
 use selora_core::{Buffer, SeloraError, Workspace};
 use selora_editor::Editor;
 use selora_fs::tree::FileTreeNode;
+use selora_git::GitStatus;
 use selora_settings::Settings;
 use selora_ui::editor::split::EditorArea;
 use selora_ui::palette::command::CommandPalette;
 use selora_ui::palette::fuzzy::FuzzyFileFinder;
+use selora_ui::panel::git::GitPanel;
 use selora_ui::sidebar::FileTreePanel;
 use uuid::Uuid;
 
@@ -79,6 +81,17 @@ pub enum Effect {
     /// Hold the Selora key for this session (the OS keyring itself is
     /// Phase 4, ARCHITECTURE.md §7).
     SeloraKeyringSet(String),
+
+    // Git (Phase 3b)
+    /// Snapshot the status of the repo containing `root` (git2 discover;
+    /// resolves to [`AppMessage::GitNoRepo`] when there is no repo).
+    GitStatus(PathBuf),
+    /// Stage one file (absolute path — a `GitStatus` entry's `abs_path`).
+    GitStage(PathBuf),
+    /// Unstage one file (absolute path).
+    GitUnstage(PathBuf),
+    /// Commit the index of the repo containing `root`.
+    GitCommit(PathBuf, String),
 }
 
 /// Messages workers send to the main thread (ARCHITECTURE.md §2.1).
@@ -132,6 +145,17 @@ pub enum AppMessage {
     /// Phase 4).
     #[allow(dead_code)]
     KeyringError(SeloraError),
+
+    // Git (Phase 3b)
+    /// A fresh status snapshot (also sent after every stage/unstage/commit
+    /// so the panel and the tree badges refresh).
+    GitStatusChanged(GitStatus),
+    /// The open folder is not inside a git repository (not an error).
+    GitNoRepo,
+    /// A commit landed; the payload is the short oid, for the toast.
+    GitCommitted(String),
+    /// A git effect failed — toast (PLAN.md §8).
+    GitError(SeloraError),
 }
 
 /// Toast severity (UI_SPEC.md §13): info dismisses after 4s, error after 8s.
@@ -217,6 +241,15 @@ pub struct AppState {
     /// nothing in the Phase 2 shell; the chat sidebar lands in Phase 4).
     pub chat_stream: String,
     pub chat_receipt: Option<ChatReceipt>,
+    /// Latest git status snapshot; `None` until the first
+    /// [`AppMessage::GitStatusChanged`] (Phase 3b).
+    pub git_status: Option<GitStatus>,
+    /// Whether the workspace is inside a git repository at all.
+    pub in_git_repo: bool,
+    /// The git panel's view state (commit draft, selection, sections;
+    /// Phase 3b). Data comes from `git_status`; actions go out as
+    /// `Effect`s via the shell.
+    pub git_panel: GitPanel,
 }
 
 impl Default for AppState {
@@ -237,6 +270,9 @@ impl Default for AppState {
             models: Vec::new(),
             chat_stream: String::new(),
             chat_receipt: None,
+            git_status: None,
+            in_git_repo: false,
+            git_panel: GitPanel::new(),
         }
     }
 }
@@ -329,6 +365,24 @@ impl AppState {
             AppMessage::KeyringError(error) => {
                 self.toast(format!("{error}"), Severity::Error);
             }
+
+            // -- Git (Phase 3b) -------------------------------------------------
+            AppMessage::GitStatusChanged(status) => {
+                self.in_git_repo = true;
+                self.file_tree.set_git_status(Some(&status));
+                self.git_status = Some(status);
+            }
+            AppMessage::GitNoRepo => {
+                self.in_git_repo = false;
+                self.git_status = None;
+                self.file_tree.set_git_status(None);
+            }
+            AppMessage::GitCommitted(short_id) => {
+                self.toast(format!("committed {short_id}"), Severity::Info);
+            }
+            AppMessage::GitError(error) => {
+                self.toast(format!("git: {error}"), Severity::Error);
+            }
         }
     }
 
@@ -417,6 +471,8 @@ impl AppState {
         self.workspace = Some(Workspace::new(root));
         self.file_tree = FileTreePanel::new();
         self.fuzzy_source.clear();
+        self.git_status = None;
+        self.in_git_repo = false;
     }
 
     /// Dirty derivation, one frame per painted editor (see the module docs).
@@ -839,6 +895,73 @@ mod tests {
         assert!(state.editors.is_empty());
         assert!(state.fuzzy_source.is_empty());
         assert!(state.file_tree.tree().is_none());
+    }
+
+    // --- git (Phase 3b wiring) ------------------------------------------------
+
+    /// A status snapshot installs the panel data and the tree badges; the
+    /// no-repo marker clears both.
+    #[test]
+    fn git_messages_drive_panel_data_and_tree_badges() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::FolderOpened(path("/repo")));
+
+        let status = selora_git::GitStatus {
+            branch: Some("main".into()),
+            entries: vec![selora_git::FileStatus {
+                abs_path: path("/repo/src/a.rs"),
+                path: path("src/a.rs"),
+                staged: selora_git::Slot::Unmodified,
+                worktree: selora_git::Slot::Modified,
+            }],
+        };
+        state.apply(AppMessage::GitStatusChanged(status));
+        assert!(state.in_git_repo);
+        assert_eq!(
+            state.git_status.as_ref().and_then(|s| s.branch.clone()),
+            Some("main".into())
+        );
+        // The tree can map the changed file to its badge.
+        assert_eq!(
+            state.file_tree.git_decoration(&path("/repo/src/a.rs")),
+            Some(('M', selora_ui::theme::color::WARN))
+        );
+
+        state.apply(AppMessage::GitNoRepo);
+        assert!(!state.in_git_repo);
+        assert!(state.git_status.is_none());
+        assert_eq!(
+            state.file_tree.git_decoration(&path("/repo/src/a.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn git_committed_and_git_error_toast() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::GitCommitted("abc1234".into()));
+        state.apply(AppMessage::GitError(SeloraError::Git("bad object".into())));
+        assert_eq!(state.toasts.len(), 2);
+        assert_eq!(state.toasts[0].text, "committed abc1234");
+        assert_eq!(state.toasts[0].severity, Severity::Info);
+        assert_eq!(state.toasts[1].severity, Severity::Error);
+        assert!(state.toasts[1].text.contains("git"));
+    }
+
+    /// A folder switch resets the git surface along with the tree.
+    #[test]
+    fn switch_folder_resets_git_state() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::FolderOpened(path("/old")));
+        state.apply(AppMessage::GitStatusChanged(selora_git::GitStatus {
+            branch: Some("main".into()),
+            entries: vec![],
+        }));
+        assert!(state.in_git_repo);
+
+        state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
+        assert!(!state.in_git_repo);
+        assert!(state.git_status.is_none());
     }
 
     // --- workspace snapshot ---------------------------------------------------

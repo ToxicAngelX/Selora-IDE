@@ -39,6 +39,7 @@ use selora_settings::{Keybind, KeybindsSettings};
 use selora_ui::dialogs::settings::{SettingsDialog, SettingsEvent};
 use selora_ui::editor::split::{self, PaneView};
 use selora_ui::palette::registry::CommandId;
+use selora_ui::panel::git::GitAction;
 use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, TreeEvent};
 use selora_ui::{brand, theme};
 use tokio::runtime::Handle;
@@ -63,6 +64,12 @@ const TREE_MIN_WIDTH: f32 = 160.0;
 const TREE_MAX_WIDTH: f32 = 480.0;
 /// The `workspace.json` cadence (ARCHITECTURE.md §8.2: "every 5s").
 const WORKSPACE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Bottom panel (region ④, UI_SPEC.md §2): 200px default, 0–50% of the
+/// workbench height. Shown when the git (Phase 3b) / search (Phase 3c)
+/// activity is selected.
+const PANEL_HEIGHT: f32 = 200.0;
+const PANEL_MIN_HEIGHT: f32 = 0.0;
+const PANEL_MAX_HEIGHT_FRAC: f32 = 0.5;
 /// Toast anchoring (UI_SPEC.md §13): 12px from each edge, above the 24px
 /// status bar.
 const TOAST_EDGE: f32 = 12.0;
@@ -208,12 +215,29 @@ impl SeloraApp {
                 AppMessage::DialogFolderPicked(Some(path)) => Some(path.clone()),
                 _ => None,
             };
+            // A new tree (folder opened or refreshed) and every save both
+            // re-snapshot git status: the tree's badges and the panel's
+            // rows must follow the disk (Phase 3b).
+            let tree_or_save = match &message {
+                AppMessage::FileTreeUpdated { root, .. } => Some(root.clone()),
+                AppMessage::BufferSaved(path) => Some(
+                    self.state
+                        .workspace
+                        .as_ref()
+                        .map(|workspace| workspace.root.clone())
+                        .unwrap_or_else(|| path.clone()),
+                ),
+                _ => None,
+            };
             self.state.apply(message);
             if is_settings {
                 self.settings_loaded = true;
             }
             if let Some(root) = folder_picked {
                 let _ = self.effect_tx.send(Effect::OpenFolder(root));
+            }
+            if let Some(root) = tree_or_save {
+                let _ = self.effect_tx.send(Effect::GitStatus(root));
             }
             // A restore open that failed leaves the queue so the next one
             // can proceed (the error itself already became a toast).
@@ -361,7 +385,9 @@ impl SeloraApp {
 
         // The tree panel first appears with the *loaded* sidebar width, so
         // it waits for the settings effect to resolve (a frame or two).
-        if self.show_tree && self.settings_loaded {
+        // Region ① shows the tree only while the "files" activity is
+        // selected (UI_SPEC.md §2.1); search/git take over region ④.
+        if self.show_tree && self.settings_loaded && self.activity_bar.selected == Activity::Files {
             let default_width = self.state.settings.ui.sidebar_width as f32;
             let response = egui::Panel::left("file_tree_panel")
                 .resizable(true)
@@ -384,12 +410,17 @@ impl SeloraApp {
         match activity {
             Activity::Files => {}
             Activity::Search => {
+                // Wired in Phase 3c (search lands in region ④).
                 self.state
                     .toast("search in files lands in Phase 3", Severity::Info);
             }
             Activity::Git => {
-                self.state
-                    .toast("git panel lands in Phase 3", Severity::Info);
+                // Selecting the git activity shows the panel (region ④) and
+                // refreshes its data — a status snapshot is cheap and always
+                // current on click (Phase 3b).
+                if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    let _ = self.effect_tx.send(Effect::GitStatus(root));
+                }
             }
             Activity::Chat => {
                 self.state
@@ -432,6 +463,58 @@ impl SeloraApp {
         let _ = self.effect_tx.send(Effect::SettingsSave(settings));
     }
 
+    /// Region ④ (UI_SPEC.md §2): the bottom panel, shown while the git (or,
+    /// from Phase 3c on, search) activity is selected. Painted above the
+    /// status bar (which is added first and keeps the lowest strip).
+    /// Resizable, 200px default, capped at half the workbench.
+    fn bottom_panel(&mut self, ui: &mut egui::Ui) {
+        if self.activity_bar.selected != Activity::Git {
+            return;
+        }
+        let max_height = ui.max_rect().height() * PANEL_MAX_HEIGHT_FRAC;
+        egui::Panel::bottom("bottom_panel")
+            .resizable(true)
+            .default_size(PANEL_HEIGHT)
+            .min_size(PANEL_MIN_HEIGHT)
+            .max_size(max_height)
+            .show_separator_line(true)
+            .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+            .show(ui, |ui| {
+                let outcome = self
+                    .state
+                    .git_panel
+                    .show(ui, self.state.git_status.as_ref());
+                for action in outcome.actions {
+                    self.route_git_action(action);
+                }
+            });
+    }
+
+    /// A git-panel action → `Effect` (the panel never touches the runtime).
+    fn route_git_action(&mut self, action: GitAction) {
+        match action {
+            GitAction::Stage(path) => {
+                let _ = self.effect_tx.send(Effect::GitStage(path));
+            }
+            GitAction::Unstage(path) => {
+                let _ = self.effect_tx.send(Effect::GitUnstage(path));
+            }
+            GitAction::Commit(message) => {
+                if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    let _ = self.effect_tx.send(Effect::GitCommit(root, message));
+                } else {
+                    self.state
+                        .toast("no folder open to commit", Severity::Error);
+                }
+            }
+            GitAction::OpenDiff(path) => {
+                // Open the file itself for now (Lite Phase 3); the
+                // read-only diff view is a v1.x refinement (UI_SPEC.md §8).
+                self.open_path(path);
+            }
+        }
+    }
+
     /// The 24px status bar (UI_SPEC.md §1.2, Phase 2 subset): workspace root
     /// name (or "no folder") left, cursor line:col + language center, a
     /// muted "○ selora disconnected" right (live status is Phase 4).
@@ -447,22 +530,69 @@ impl SeloraApp {
                 let sans = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS);
                 let mono = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_MONO);
 
-                // Left: the workspace root's name.
-                let left = self
-                    .state
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.root.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "no folder".to_owned());
+                // Left: the git branch + "●" + change count (UI_SPEC.md §1.2,
+                // the Phase 3b subset — ahead/behind need remotes, out of
+                // Lite). Outside a repository: the workspace root's name.
+                let left = match self.state.git_status.as_ref() {
+                    Some(status) => {
+                        let branch = status.branch.clone().unwrap_or_default();
+                        format!("{branch} ● {}", status.changed_count())
+                    }
+                    None => self
+                        .state
+                        .workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.root.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "no folder".to_owned()),
+                };
                 let left_font = sans();
+                // In a repo with changes, the dot runs hot (--warn); the
+                // rest of the run stays --fg-muted. Painted as one text run
+                // in --fg-muted plus a warn-colored "●" glyph over it at the
+                // branch-name offset (measured with the same font).
+                let dirty = self
+                    .state
+                    .git_status
+                    .as_ref()
+                    .is_some_and(|status| status.changed_count() > 0);
+                let dot_pos = if dirty {
+                    let branch = self
+                        .state
+                        .git_status
+                        .as_ref()
+                        .and_then(|status| status.branch.clone())
+                        .unwrap_or_default();
+                    let galley = painter.layout_no_wrap(
+                        format!("{branch} "),
+                        left_font.clone(),
+                        theme::color::FG_MUTED,
+                    );
+                    Some(egui::pos2(
+                        rect.left() + theme::space::S3 + galley.size().x,
+                        rect.center().y,
+                    ))
+                } else {
+                    None
+                };
                 painter.text(
                     egui::pos2(rect.left() + theme::space::S3, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     left,
-                    left_font,
+                    left_font.clone(),
                     theme::color::FG_MUTED,
                 );
+                if let Some(pos) = dot_pos {
+                    // Same font as the run it overlays, so the x offset
+                    // measured above lands exactly on the dot.
+                    painter.text(
+                        pos,
+                        egui::Align2::LEFT_CENTER,
+                        "●",
+                        left_font,
+                        theme::color::WARN,
+                    );
+                }
 
                 // Center: cursor line:col + language of the active tab.
                 let pane = self.state.editor_area.active_pane_id();
@@ -965,6 +1095,7 @@ impl SeloraApp {
         // Stages 4–6: layout, chrome, editor.
         title_strip(ui);
         self.status_bar(ui);
+        self.bottom_panel(ui);
         self.left_region(ui);
         let mut workbench = egui::Rect::ZERO;
         self.editor_region(ui, &mut workbench);
@@ -1286,6 +1417,30 @@ mod tests {
         app.settings_dialog = Some(SettingsDialog::new(Settings::default()));
         frame(&mut app);
         app.settings_dialog = None;
+
+        // The git activity takes over region ④: the bottom panel paints the
+        // status snapshot's rows, and the tree keeps its badges (Phase 3b).
+        app.activity_bar.selected = Activity::Git;
+        app.state
+            .apply(AppMessage::GitStatusChanged(selora_git::GitStatus {
+                branch: Some("main".into()),
+                entries: vec![selora_git::FileStatus {
+                    abs_path: main_rs.clone(),
+                    path: PathBuf::from("src/main.rs"),
+                    staged: selora_git::Slot::Unmodified,
+                    worktree: selora_git::Slot::Modified,
+                }],
+            }));
+        frame(&mut app);
+        assert!(app.state.git_status.is_some());
+        assert_eq!(
+            app.state
+                .file_tree
+                .git_decoration(&main_rs)
+                .map(|(letter, _)| letter),
+            Some('M')
+        );
+        app.activity_bar.selected = Activity::Files;
 
         // Painting alone never surfaces an error (PLAN.md §8).
         assert!(app.state.toasts.is_empty());

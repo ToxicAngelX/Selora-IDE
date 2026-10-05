@@ -32,6 +32,7 @@ use std::sync::{Arc, RwLock};
 use selora_ai::{ChatEvent, SeloraClient};
 use selora_core::{Buffer, SeloraError};
 use selora_fs::tree::build_tree;
+use selora_git::{open_repo, GitError};
 use selora_settings::Settings;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -218,6 +219,131 @@ pub fn spawn_settings_save(
         let _ = tx.send(message);
         notify();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Effect workers: git (Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// `GitError` → `SeloraError` at the wiring seam (selora-git deliberately
+/// depends on no workspace crate, PLAN.md §5).
+fn git_error(error: GitError) -> SeloraError {
+    SeloraError::Git(error.to_string())
+}
+
+/// Effect (§2.2): snapshot the status of the repo containing `root`.
+/// Not-a-repo is [`AppMessage::GitNoRepo`], not an error (the panel shows
+/// its "no repository" state).
+pub fn spawn_git_status(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    root: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let message = match open_repo(&root) {
+            Ok(repo) => match repo.status() {
+                Ok(status) => AppMessage::GitStatusChanged(status),
+                Err(error) => AppMessage::GitError(git_error(error)),
+            },
+            // Discover failing means "no repository here" — the common,
+            // non-error case for any non-git folder.
+            Err(_) => AppMessage::GitNoRepo,
+        };
+        let _ = tx.send(message);
+        notify();
+    });
+}
+
+/// Effect (§2.2): stage one file, then re-snapshot so the panel and the
+/// tree badges refresh in one round trip.
+pub fn spawn_git_stage(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    path: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let outcome = open_repo(&path)
+            .map_err(git_error)
+            .and_then(|repo| repo.stage(&path).map_err(git_error))
+            .map(|()| None);
+        send_git_outcome(&tx, &notify, outcome, &path);
+    });
+}
+
+/// Effect (§2.2): unstage one file, then re-snapshot.
+pub fn spawn_git_unstage(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    path: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let outcome = open_repo(&path)
+            .map_err(git_error)
+            .and_then(|repo| repo.unstage(&path).map_err(git_error))
+            .map(|()| None);
+        send_git_outcome(&tx, &notify, outcome, &path);
+    });
+}
+
+/// Effect (§2.2): commit the index of the repo containing `root`, toast
+/// the short oid, then re-snapshot.
+pub fn spawn_git_commit(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    root: PathBuf,
+    message: String,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let outcome = open_repo(&root).map_err(git_error).and_then(|repo| {
+            repo.commit(&message)
+                .map(|oid| Some(oid.to_string()[..7].to_owned()))
+                .map_err(git_error)
+        });
+        send_git_outcome(&tx, &notify, outcome, &root);
+    });
+}
+
+/// The shared tail of every mutating git worker: surface the outcome
+/// (short-oid toast on commit, silent success on stage/unstage, an error
+/// toast otherwise), then always send a fresh status snapshot so the panel
+/// and the tree badges never show stale rows.
+fn send_git_outcome(
+    tx: &UnboundedSender<AppMessage>,
+    notify: &Notify,
+    outcome: Result<Option<String>, SeloraError>,
+    repo_path: &Path,
+) {
+    match outcome {
+        Ok(Some(short_id)) => {
+            let _ = tx.send(AppMessage::GitCommitted(short_id));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = tx.send(AppMessage::GitError(error));
+        }
+    }
+    // The refreshed snapshot (or the not-a-repo marker).
+    let message = match open_repo(repo_path) {
+        Ok(repo) => match repo.status() {
+            Ok(status) => AppMessage::GitStatusChanged(status),
+            Err(error) => AppMessage::GitError(git_error(error)),
+        },
+        Err(_) => AppMessage::GitNoRepo,
+    };
+    let _ = tx.send(message);
+    notify();
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +563,18 @@ pub fn spawn_dispatcher(
                     // The OS keyring is Phase 4 (ARCHITECTURE.md §7); for now
                     // the key lives only in this dispatcher's memory.
                     api_key = Some(key);
+                }
+                Effect::GitStatus(root) => {
+                    spawn_git_status(&dispatch_handle, &notify, &msg_tx, root);
+                }
+                Effect::GitStage(path) => {
+                    spawn_git_stage(&dispatch_handle, &notify, &msg_tx, path);
+                }
+                Effect::GitUnstage(path) => {
+                    spawn_git_unstage(&dispatch_handle, &notify, &msg_tx, path);
+                }
+                Effect::GitCommit(root, message) => {
+                    spawn_git_commit(&dispatch_handle, &notify, &msg_tx, root, message);
                 }
             }
         }
@@ -719,6 +857,29 @@ mod tests {
 
         std::env::remove_var(selora_settings::SETTINGS_DIR_ENV);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_reports_git_no_repo_for_a_plain_folder() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+        );
+
+        // A plain temp folder: not an error, just GitNoRepo.
+        let root = unique_temp_path("not-a-repo");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let _ = effect_tx.send(Effect::GitStatus(root.clone()));
+        let message = recv_until(&mut msg_rx, |m| matches!(m, AppMessage::GitNoRepo)).await;
+        assert!(matches!(message, AppMessage::GitNoRepo));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
