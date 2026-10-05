@@ -371,6 +371,38 @@ pub fn spawn_search(
 }
 
 // ---------------------------------------------------------------------------
+// Effect workers: LSP (Phase 3a)
+// ---------------------------------------------------------------------------
+
+/// Spawn the LSP manager task plus the `LspEvent` → [`AppMessage::Lsp`]
+/// relay: the app drains one message channel (ARCHITECTURE.md §2.1), so the
+/// manager's events are forwarded onto it with a repaint after each send.
+/// The task pair ends when the shell drops the effect sender or the app
+/// drops the message receiver.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_lsp_manager(
+    handle: &Handle,
+    notify: Notify,
+    effect_rx: UnboundedReceiver<selora_lsp::LspEffect>,
+    msg_tx: UnboundedSender<AppMessage>,
+    config: selora_lsp::LspManagerConfig,
+) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<selora_lsp::LspEvent>();
+    let relay_notify = notify.clone();
+    handle.spawn(async move {
+        let mut event_rx = event_rx;
+        while let Some(event) = event_rx.recv().await {
+            // Receiver dropped (window closed): stop relaying.
+            if msg_tx.send(AppMessage::Lsp(event)).is_err() {
+                return;
+            }
+            relay_notify();
+        }
+    });
+    selora_lsp::spawn_manager(handle, notify, effect_rx, event_tx, config);
+}
+
+// ---------------------------------------------------------------------------
 // Effect workers: blocking file/folder pickers (rfd)
 // ---------------------------------------------------------------------------
 
@@ -501,6 +533,7 @@ pub fn spawn_dispatcher(
     effect_rx: UnboundedReceiver<Effect>,
     msg_tx: UnboundedSender<AppMessage>,
     base_url: String,
+    lsp_effect_tx: UnboundedSender<selora_lsp::LspEffect>,
 ) {
     let dispatch_handle = handle.clone();
     handle.spawn(async move {
@@ -603,6 +636,12 @@ pub fn spawn_dispatcher(
                 Effect::Search { id, root, query } => {
                     spawn_search(&dispatch_handle, &notify, &msg_tx, id, root, query);
                 }
+                Effect::Lsp(effect) => {
+                    // Forward to the LSP manager task (spawned by the shell
+                    // once settings + workspace root are known; effects sent
+                    // before that queue in the channel harmlessly).
+                    let _ = lsp_effect_tx.send(effect);
+                }
             }
         }
     });
@@ -619,6 +658,12 @@ mod tests {
     /// Headless stand-in for the UI's `ctx.request_repaint()` notify seam.
     fn noop_notify() -> Notify {
         Arc::new(|| {})
+    }
+
+    /// The LSP effect channel the dispatcher forwards onto (tests never
+    /// drive the manager, so the receiver is dropped immediately).
+    fn lsp_effect_tx() -> UnboundedSender<selora_lsp::LspEffect> {
+        mpsc::unbounded_channel::<selora_lsp::LspEffect>().0
     }
 
     const TEST_KEY: &str = "sk-gw-test-key";
@@ -727,6 +772,7 @@ mod tests {
             effect_rx,
             msg_tx.clone(),
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         let file = unique_temp_path("dispatch.rs");
@@ -783,6 +829,7 @@ mod tests {
             effect_rx,
             msg_tx,
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         let big = unique_temp_path("dispatch-big.bin");
@@ -817,6 +864,7 @@ mod tests {
             effect_rx,
             msg_tx,
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         let root = unique_temp_path("tree-root");
@@ -860,6 +908,7 @@ mod tests {
             effect_rx,
             msg_tx,
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         let mut settings = Settings::default();
@@ -897,6 +946,7 @@ mod tests {
             effect_rx,
             msg_tx,
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         // A plain temp folder: not an error, just GitNoRepo.
@@ -920,6 +970,7 @@ mod tests {
             effect_rx,
             msg_tx,
             DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
         );
 
         let chat_id = Uuid::new_v4();

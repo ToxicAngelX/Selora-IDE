@@ -28,7 +28,7 @@
 //!
 //! Blocking `rfd` pickers run on worker threads, never the UI thread.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,6 +74,9 @@ const PANEL_MAX_HEIGHT_FRAC: f32 = 0.5;
 /// Toast anchoring (UI_SPEC.md §13): 12px from each edge, above the 24px
 /// status bar.
 const TOAST_EDGE: f32 = 12.0;
+/// How long the first stroke of `Ctrl+K …` stays armed (UI_SPEC.md §15
+/// chords).
+const CHORD_WINDOW: Duration = Duration::from_millis(500);
 
 /// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
 /// channels, and the transient view state that is not part of the document
@@ -106,6 +109,20 @@ pub struct SeloraApp {
     /// Result rows whose file was not open yet: opened via
     /// `Effect::OpenFile`, the line jump happens when the buffer loads.
     goto_after_load: VecDeque<(PathBuf, usize)>,
+    /// The LSP manager's effect receiver, held until the manager can start
+    /// (settings + workspace root known — both arrive via messages after
+    /// boot). The dispatcher forwards `Effect::Lsp` onto the sender.
+    lsp_effect_rx: Option<mpsc::UnboundedReceiver<selora_lsp::LspEffect>>,
+    /// Whether the LSP manager task has been spawned (once per session).
+    lsp_started: bool,
+    /// The buffer *shape* (char + line counts — O(log n) rope queries) as
+    /// of the last `LspEffect::Change` per path, plus the opened-guard:
+    /// present = didOpen sent. Per *path*, not per pane — split panes
+    /// share one buffer, and the shape is identical from either pane, so
+    /// this cannot flap between them the way a per-editor counter would.
+    lsp_shapes: BTreeMap<PathBuf, BufferShape>,
+    /// When the `Ctrl+K` chord stroke was pressed, if armed.
+    chord_ctrl_k: Option<Instant>,
     /// Settings have arrived (the tree panel's initial width is taken from
     /// them, so the panel first shows *after* the load resolves).
     settings_loaded: bool,
@@ -177,12 +194,17 @@ impl SeloraApp {
             let ctx = ctx.clone();
             Arc::new(move || ctx.request_repaint())
         };
+        // The LSP manager's effect channel: the dispatcher forwards
+        // `Effect::Lsp` here; the manager itself is spawned lazily (see
+        // `maybe_start_lsp`) once settings and the workspace root are known.
+        let (lsp_effect_tx, lsp_effect_rx) = mpsc::unbounded_channel::<selora_lsp::LspEffect>();
         wiring::spawn_dispatcher(
             &handle,
             notify.clone(),
             effect_rx,
             msg_tx.clone(),
             wiring::DEFAULT_BASE_URL.to_owned(),
+            lsp_effect_tx,
         );
 
         Self {
@@ -197,6 +219,10 @@ impl SeloraApp {
             show_tree: true,
             show_bottom_panel: false,
             goto_after_load: VecDeque::new(),
+            lsp_effect_rx: Some(lsp_effect_rx),
+            lsp_started: false,
+            lsp_shapes: BTreeMap::new(),
+            chord_ctrl_k: None,
             settings_loaded: false,
             settings_dialog: None,
             workspace_dir: persistence::state_dir(),
@@ -245,6 +271,11 @@ impl SeloraApp {
                 self.settings_loaded = true;
             }
             if let Some(root) = folder_picked {
+                // The old session's buffers all close with the re-root —
+                // tell the language servers before the workspace switches.
+                for path in self.state.buffers.keys().cloned().collect::<Vec<_>>() {
+                    self.close_lsp_doc(&path);
+                }
                 let _ = self.effect_tx.send(Effect::OpenFolder(root));
             }
             if let Some(root) = tree_or_save {
@@ -260,6 +291,12 @@ impl SeloraApp {
                     self.restore_in_flight = None;
                     self.restore_queue.retain(|queued| *queued != path);
                 }
+            }
+            // An F12 definition resolved (set by apply_lsp): jump — opening
+            // the target file first when it is not loaded (the same
+            // open-then-jump queue the search results use).
+            if let Some(location) = self.state.pending_definition.take() {
+                self.open_at_line(location.path, location.range.start.line as usize + 1);
             }
         }
     }
@@ -317,6 +354,50 @@ impl SeloraApp {
         }
     }
 
+    /// §2 stage 3 (LSP half): spawn the LSP manager once its two inputs
+    /// exist — the loaded settings (server paths) and the workspace root
+    /// (handed to servers at `initialize`). Both arrive as messages after
+    /// boot, so this runs every frame until it fires, once. Effects sent
+    /// before the manager exists queue in the channel.
+    fn maybe_start_lsp(&mut self) {
+        if self.lsp_started || !self.settings_loaded {
+            return;
+        }
+        let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) else {
+            return;
+        };
+        self.lsp_started = true;
+        let registry = selora_lsp::LspRegistry::new(selora_lsp::LspServerPaths {
+            rust_analyzer: self.state.settings.lsp.rust_analyzer_path.clone(),
+            typescript_language_server: self.state.settings.lsp.typescript_server_path.clone(),
+        });
+        let config = selora_lsp::LspManagerConfig::new(registry).with_root(Some(root));
+        let effect_rx = self
+            .lsp_effect_rx
+            .take()
+            .expect("the manager starts at most once");
+        wiring::spawn_lsp_manager(
+            &self.handle,
+            self.notify.clone(),
+            effect_rx,
+            self.msg_tx.clone(),
+            config,
+        );
+    }
+
+    /// A buffer was fully dropped (no tab anywhere): close its LSP document
+    /// and forget the sync state. No-op for paths never opened with a
+    /// server (plain-text files have no entry in `lsp_shapes`).
+    fn close_lsp_doc(&mut self, path: &Path) {
+        if self.lsp_shapes.remove(path).is_some() {
+            let _ = self
+                .effect_tx
+                .send(Effect::Lsp(selora_lsp::LspEffect::Close {
+                    path: path.to_path_buf(),
+                }));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Keybinds (UI_SPEC.md §15)
     // -----------------------------------------------------------------------
@@ -331,26 +412,62 @@ impl SeloraApp {
     }
 
     fn handle_keybinds(&mut self, ctx: &egui::Context) {
+        // While the completion popup is open it owns the keyboard: its
+        // keys are consumed here (removed from the input the editors will
+        // see this frame) and the global binds stay quiet.
+        if self.state.lsp.completion.is_some() {
+            self.drive_completion_popup(ctx);
+            return;
+        }
         if self.overlay_open(ctx) {
+            self.chord_ctrl_k = None;
             return;
         }
         let keybinds = self.state.settings.keybinds.clone();
-        let actions: Vec<KeyAction> = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => key_action(&keybinds, &egui::KeyboardShortcut::new(*modifiers, *key)),
-                    _ => None,
-                })
-                .collect()
+        let (mut actions, chord_events) = ctx.input(|input| {
+            let mut actions = Vec::new();
+            let mut ctrl_k = false;
+            let mut plain_i = false;
+            for event in &input.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    actions.push(key_action(
+                        &keybinds,
+                        &egui::KeyboardShortcut::new(*modifiers, *key),
+                    ));
+                    // The `Ctrl+K Ctrl+I` hover chord (UI_SPEC.md §15): the
+                    // first stroke arms, a plain `I` within 500ms completes.
+                    let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.shift;
+                    if *key == egui::Key::K && modifiers.ctrl && !modifiers.shift && !modifiers.alt
+                    {
+                        ctrl_k = true;
+                    }
+                    if plain && *key == egui::Key::I {
+                        plain_i = true;
+                    }
+                }
+            }
+            (actions, (ctrl_k, plain_i))
         });
-        for action in actions {
+        if chord_events.0 {
+            self.chord_ctrl_k = Some(Instant::now());
+        }
+        if chord_events.1
+            && self
+                .chord_ctrl_k
+                .is_some_and(|at| at.elapsed() < CHORD_WINDOW)
+        {
+            self.chord_ctrl_k = None;
+            actions.push(Some(KeyAction::Hover));
+        } else if chord_events.1 {
+            self.chord_ctrl_k = None;
+        }
+        for action in actions.into_iter().flatten() {
             self.run_key_action(action);
         }
     }
@@ -370,14 +487,120 @@ impl SeloraApp {
             KeyAction::SplitEditor => self.state.split_editor(),
             KeyAction::CloseEditor => {
                 if let Some(closed) = self.state.close_editor() {
-                    self.state.prune_closed(&closed);
+                    if self.state.prune_closed(&closed) {
+                        self.close_lsp_doc(&closed);
+                    }
                 }
             }
             KeyAction::OpenSettings => self.open_settings(),
             KeyAction::OpenFile => self.pick_file(),
             KeyAction::TogglePanel => self.toggle_bottom_panel(),
             KeyAction::SearchInFiles => self.open_search(),
+            KeyAction::GoToDefinition => self.request_lsp(selora_lsp::LspEffect::Definition {
+                path: PathBuf::new(),
+                position: Default::default(),
+            }),
+            KeyAction::Completions => self.request_lsp(selora_lsp::LspEffect::Completion {
+                path: PathBuf::new(),
+                position: Default::default(),
+            }),
+            KeyAction::Hover => self.request_lsp(selora_lsp::LspEffect::Hover {
+                path: PathBuf::new(),
+                position: Default::default(),
+            }),
         }
+    }
+
+    /// F12 / Ctrl+Space / Ctrl+K Ctrl+I: send an LSP request for the active
+    /// tab's caret position. The blank path/position are replaced with the
+    /// active editor's cursor (the enum carries them; the shell fills them
+    /// from focus).
+    fn request_lsp(&mut self, template: selora_lsp::LspEffect) {
+        let Some(path) = self.state.active_path() else {
+            return; // no file open — nothing to ask about
+        };
+        let pane = self.state.editor_area.active_pane_id();
+        let Some(position) = self
+            .state
+            .editors
+            .get(&(pane, path.clone()))
+            .map(selora_editor::Editor::cursor)
+        else {
+            return;
+        };
+        let effect = match template {
+            selora_lsp::LspEffect::Definition { .. } => {
+                selora_lsp::LspEffect::Definition { path, position }
+            }
+            selora_lsp::LspEffect::Hover { .. } => selora_lsp::LspEffect::Hover { path, position },
+            selora_lsp::LspEffect::Completion { .. } => {
+                selora_lsp::LspEffect::Completion { path, position }
+            }
+            other => other,
+        };
+        let _ = self.effect_tx.send(Effect::Lsp(effect));
+    }
+
+    /// While the completion popup is open (Phase 3a): its keys are consumed
+    /// from the frame's input (so the editor never sees Enter as a newline
+    /// or the arrows as caret moves). Enter/Tab accept the selected entry —
+    /// replacing the typed identifier prefix — and Esc dismisses. Typing
+    /// stays with the editor; the filter re-derives from the caret word
+    /// every frame (see `lsp_popups`).
+    fn drive_completion_popup(&mut self, ctx: &egui::Context) {
+        let Some((path, popup)) = self.state.lsp.completion.take() else {
+            return;
+        };
+        let mut delta: i32 = 0;
+        let mut accept = false;
+        let mut dismiss = false;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => match key {
+                    egui::Key::ArrowUp => {
+                        delta -= 1;
+                        false
+                    }
+                    egui::Key::ArrowDown => {
+                        delta += 1;
+                        false
+                    }
+                    egui::Key::Enter | egui::Key::Tab => {
+                        accept = true;
+                        false
+                    }
+                    egui::Key::Escape => {
+                        dismiss = true;
+                        false
+                    }
+                    _ => true,
+                },
+                _ => true,
+            });
+        });
+        let mut popup = popup;
+        if delta != 0 {
+            popup.move_selection(delta);
+        }
+        if accept {
+            let label = popup
+                .filtered()
+                .get(popup.selected_index())
+                .map(|entry| entry.label.clone());
+            if let Some(label) = label {
+                let pane = self.state.editor_area.active_pane_id();
+                if let Some(editor) = self.state.editors.get_mut(&(pane, path)) {
+                    editor.insert_completion(&label);
+                }
+            }
+            return; // popup consumed by acceptance
+        }
+        if dismiss {
+            return; // popup dropped
+        }
+        self.state.lsp.completion = Some((path, popup));
     }
 
     /// `Ctrl+J` / View→Toggle Panel (UI_SPEC.md §2 region ④). Toggling on
@@ -670,7 +893,7 @@ impl SeloraApp {
                 painter.text(
                     egui::pos2(rect.left() + theme::space::S3, rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    left,
+                    left.clone(),
                     left_font.clone(),
                     theme::color::FG_MUTED,
                 );
@@ -686,9 +909,68 @@ impl SeloraApp {
                     );
                 }
 
-                // Center: cursor line:col + language of the active tab.
+                // Left, after the git run: per-server LSP status
+                // ("rust-analyzer: ready", Phase 3a). A dead server is a
+                // click target for `Effect::Lsp(Restart)` (§5.6).
+                let mut status_x = painter
+                    .layout_no_wrap(
+                        format!("{left}  "),
+                        egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS),
+                        theme::color::FG_MUTED,
+                    )
+                    .size()
+                    .x
+                    + rect.left()
+                    + theme::space::S3;
+                let servers: Vec<(selora_lsp::LanguageId, selora_lsp::ServerStatus)> = self
+                    .state
+                    .lsp
+                    .status
+                    .iter()
+                    .map(|(language, status)| (*language, status.clone()))
+                    .collect();
+                for (language, status) in servers {
+                    let label = match &status {
+                        selora_lsp::ServerStatus::Starting => "starting".to_owned(),
+                        selora_lsp::ServerStatus::Ready => "ready".to_owned(),
+                        selora_lsp::ServerStatus::Dead(_) => "dead — click to restart".to_owned(),
+                    };
+                    let text = format!("{}: {label}", language.server_name());
+                    let color = match &status {
+                        selora_lsp::ServerStatus::Dead(_) => theme::color::ERR,
+                        _ => theme::color::FG_MUTED,
+                    };
+                    let font = sans();
+                    let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+                    let text_rect = egui::Rect::from_min_size(
+                        egui::pos2(status_x, rect.top()),
+                        egui::vec2(galley.size().x + theme::space::S3, rect.height()),
+                    );
+                    painter.galley(
+                        egui::pos2(status_x, rect.center().y - galley.size().y / 2.0),
+                        galley,
+                        color,
+                    );
+                    if matches!(status, selora_lsp::ServerStatus::Dead(_)) {
+                        let response = ui.interact(
+                            text_rect,
+                            egui::Id::new(("lsp_restart", language)),
+                            egui::Sense::click(),
+                        );
+                        if response.clicked() {
+                            let _ = self
+                                .effect_tx
+                                .send(Effect::Lsp(selora_lsp::LspEffect::Restart(language)));
+                        }
+                    }
+                    status_x = text_rect.right() + theme::space::S3;
+                }
+
+                // Center: cursor line:col + language of the active tab, and
+                // the LSP work-done progress line while a server indexes
+                // ("rust-analyzer: Indexing 42%", Phase 3a).
                 let pane = self.state.editor_area.active_pane_id();
-                let center = self
+                let mut center = self
                     .state
                     .active_path()
                     .and_then(|path| self.state.editors.get(&(pane, path)))
@@ -702,6 +984,12 @@ impl SeloraApp {
                         )
                     })
                     .unwrap_or_default();
+                if let Some(progress) = self.state.lsp.progress.clone() {
+                    if !center.is_empty() {
+                        center.push_str("   ");
+                    }
+                    center.push_str(&progress);
+                }
                 if !center.is_empty() {
                     let center_font = mono();
                     painter.text(
@@ -743,7 +1031,9 @@ impl SeloraApp {
                     if let Some(workspace) = &mut self.state.workspace {
                         workspace.close(&closed);
                     }
-                    self.state.prune_closed(&closed);
+                    if self.state.prune_closed(&closed) {
+                        self.close_lsp_doc(&closed);
+                    }
                 }
                 for _pane in &response.new_tab {
                     self.open_fuzzy(); // "+" opens quick-open (UI_SPEC.md §3.1)
@@ -815,6 +1105,44 @@ impl SeloraApp {
             .unwrap_or_default();
         let edit_input = response.has_focus() && edit_typed_this_frame(ui.ctx());
         self.state.note_editor_frame(&path, shape, edit_input);
+
+        // LSP document sync (Phase 3a, deliverable 4): didOpen on the first
+        // paint of the *path* (per-path guard — split panes share one
+        // document), didChange when the buffer's shape moved or the focused
+        // pane took edit input (same detection as the dirty derivation —
+        // the shape alone cannot see same-length replacements), and hover
+        // requests from the 600ms pointer-hold gesture. The manager
+        // debounces changes 250ms and drops no-op texts itself.
+        let editor = self
+            .state
+            .editors
+            .get_mut(&(view.pane, path.clone()))
+            .expect("the editor was just painted");
+        if !self.lsp_shapes.contains_key(&path) {
+            let _ = self
+                .effect_tx
+                .send(Effect::Lsp(selora_lsp::LspEffect::Open {
+                    path: path.clone(),
+                    text: editor.text(),
+                }));
+            self.lsp_shapes.insert(path.clone(), shape);
+        } else if self.lsp_shapes.get(&path).is_none_or(|last| *last != shape) || edit_input {
+            self.lsp_shapes.insert(path.clone(), shape);
+            let _ = self
+                .effect_tx
+                .send(Effect::Lsp(selora_lsp::LspEffect::Change {
+                    path: path.clone(),
+                    text: editor.text(),
+                }));
+        }
+        for position in editor.take_lsp_requests() {
+            let _ = self
+                .effect_tx
+                .send(Effect::Lsp(selora_lsp::LspEffect::Hover {
+                    path: path.clone(),
+                    position,
+                }));
+        }
     }
 
     /// Empty state: no folder open (UI_SPEC.md §12).
@@ -972,6 +1300,94 @@ impl SeloraApp {
         }
     }
 
+    /// LSP overlays (Phase 3a): the hover tooltip and the completion popup,
+    /// painted in a foreground layer anchored at the caret of the pane's
+    /// editor that requested them.
+    fn lsp_popups(&mut self, ctx: &egui::Context) {
+        // The hover card dismisses on any key press or click (a tooltip is
+        // transient by nature; a new hover event replaces it).
+        if let Some((path, lines)) = self.state.lsp.hover.clone() {
+            let transient_input = ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                    )
+                })
+            });
+            if transient_input {
+                self.state.lsp.hover = None;
+            } else if let Some(anchor) = self.editor_caret(&path) {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("lsp_hover"),
+                ));
+                selora_editor::lsp_overlay::paint_hover_tooltip(&painter, anchor, &lines);
+            }
+        }
+
+        // The completion popup: re-derive the filter from the identifier
+        // prefix ending at the caret (typing stays with the editor), then
+        // paint at the caret. A popup whose tab closed is dropped.
+        if let Some((path, mut popup)) = self.state.lsp.completion.take() {
+            let mut painted = false;
+            if let Some(editor) = self.active_editor_for(&path) {
+                let (line, col) = (editor.cursor().line, editor.cursor().col);
+                let word = self
+                    .state
+                    .buffers
+                    .get(&path)
+                    .and_then(|buffer| buffer.read().ok())
+                    .and_then(|buffer| buffer.line(line).map(|text| text.to_owned()))
+                    .map(|text| {
+                        let start = selora_editor::lsp_overlay::completion_word_start(&text, col);
+                        // Char columns, not byte offsets (the line may hold
+                        // non-ASCII before the caret).
+                        text.chars()
+                            .skip(start)
+                            .take(col.saturating_sub(start))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                popup.set_filter(&word);
+                if let Some(anchor) = editor.caret_screen_pos() {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("lsp_completion"),
+                    ));
+                    selora_editor::lsp_overlay::paint_completion_popup(&painter, anchor, &popup);
+                    painted = true;
+                }
+            }
+            if painted {
+                self.state.lsp.completion = Some((path, popup));
+            }
+        }
+    }
+
+    /// The active pane's editor for `path`, or the first pane showing it.
+    fn active_editor_for(&self, path: &Path) -> Option<&Editor> {
+        let active = self.state.editor_area.active_pane_id();
+        self.state
+            .editors
+            .get(&(active, path.to_path_buf()))
+            .or_else(|| {
+                self.state
+                    .editor_area
+                    .pane_ids()
+                    .into_iter()
+                    .find_map(|pane| self.state.editors.get(&(pane, path.to_path_buf())))
+            })
+    }
+
+    /// The last-painted caret position of the pane's editor for `path`
+    /// (the popup anchor).
+    fn editor_caret(&self, path: &Path) -> Option<egui::Pos2> {
+        self.active_editor_for(path)
+            .and_then(|editor| editor.caret_screen_pos())
+    }
+
     /// Toasts (UI_SPEC.md §13): bottom-right above the status bar, `--ink-mid`
     /// fill, 1px `--ink-hi` hairline, radius-1, 12px padding, max 3.
     fn toasts(&mut self, ctx: &egui::Context) {
@@ -1051,13 +1467,17 @@ impl SeloraApp {
             CommandId::FileSaveAll => self.save_all(),
             CommandId::FileCloseEditor => {
                 if let Some(closed) = self.state.close_editor() {
-                    self.state.prune_closed(&closed);
+                    if self.state.prune_closed(&closed) {
+                        self.close_lsp_doc(&closed);
+                    }
                 }
             }
             CommandId::FileCloseAllEditors => {
                 let closed = self.state.close_all_editors();
                 for path in &closed {
-                    self.state.prune_closed(path);
+                    if self.state.prune_closed(path) {
+                        self.close_lsp_doc(path);
+                    }
                 }
             }
             CommandId::FileGoToFile => self.open_fuzzy(),
@@ -1131,6 +1551,13 @@ impl SeloraApp {
             path: path.to_path_buf(),
             buffer,
         });
+        // The save also tells the language server (didSave flushes any
+        // pending debounced didChange first, Phase 3a).
+        let _ = self
+            .effect_tx
+            .send(Effect::Lsp(selora_lsp::LspEffect::Save {
+                path: path.to_path_buf(),
+            }));
     }
 
     fn save_all(&mut self) {
@@ -1185,8 +1612,9 @@ impl SeloraApp {
         // in `toasts` below, which owns their clock).
         self.maybe_save_workspace();
         // Stage 3: derived state (sequential restore, dirty derivation per
-        // painted editor).
+        // painted editor, the LSP manager's lazy start).
         self.pump_restore();
+        self.maybe_start_lsp();
 
         // Keybinds run only when no overlay owns the keyboard.
         self.handle_keybinds(ui.ctx());
@@ -1201,6 +1629,7 @@ impl SeloraApp {
 
         // Overlays.
         self.command_palette(ui.ctx(), workbench);
+        self.lsp_popups(ui.ctx());
         self.settings_dialog(ui.ctx());
         self.toasts(ui.ctx());
     }
@@ -1306,6 +1735,12 @@ enum KeyAction {
     TogglePanel,
     /// `Ctrl+Shift+F` — search in files (ROADMAP.md Phase 3 acceptance).
     SearchInFiles,
+    /// `F12` — go to definition (UI_SPEC.md §15; Phase 3a).
+    GoToDefinition,
+    /// `Ctrl+Space` — completions (Phase 3a).
+    Completions,
+    /// `Ctrl+K Ctrl+I` — hover (a two-stroke chord; Phase 3a).
+    Hover,
 }
 
 /// The fixed Phase 2 bindings (parsed once). The rebindable four live in
@@ -1335,6 +1770,17 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
                 action,
             )
         };
+        let bare = |key: egui::Key, action: KeyAction| {
+            (
+                Keybind {
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    key,
+                },
+                action,
+            )
+        };
         vec![
             ctrl(egui::Key::B, KeyAction::ToggleFileTree),
             ctrl(egui::Key::Backslash, KeyAction::SplitEditor),
@@ -1343,6 +1789,8 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
             ctrl(egui::Key::O, KeyAction::OpenFile),
             ctrl(egui::Key::J, KeyAction::TogglePanel),
             ctrl_shift(egui::Key::F, KeyAction::SearchInFiles),
+            bare(egui::Key::F12, KeyAction::GoToDefinition),
+            ctrl(egui::Key::Space, KeyAction::Completions),
         ]
     })
 }
@@ -1615,6 +2063,124 @@ mod tests {
 
         // Painting alone never surfaces an error (PLAN.md §8).
         assert!(app.state.toasts.is_empty());
+    }
+
+    /// The Phase 3a document sync, headless: the paint loop sends didOpen
+    /// on a tab's first paint, didChange after the buffer's shape moves,
+    /// didSave on FileSave, and didClose when the last tab for the buffer
+    /// closes. Settings never "arrive" here, so the LSP manager never
+    /// starts and the shell keeps the manager's effect receiver — the test
+    /// observes the dispatcher's forwarded stream directly (the dispatcher
+    /// task gets the runtime's turns via the yields).
+    #[tokio::test]
+    async fn lsp_document_sync_flows_open_change_save_close_from_the_shell() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        let mut app = SeloraApp::shell(
+            ctx.clone(),
+            Handle::current(),
+            msg_tx,
+            msg_rx,
+            effect_tx,
+            effect_rx,
+        );
+        app.workspace_dir = None;
+
+        // A real (unique) file so FileSave's worker actually succeeds.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let main_rs =
+            std::env::temp_dir().join(format!("selora-app-shell-lsp-{}-{n}", std::process::id()));
+        std::fs::write(&main_rs, "fn main() {}\n").expect("write temp file");
+
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |app: &mut SeloraApp| {
+            ctx.run_ui(raw.clone(), |ui| app.ui_body(ui))
+                .drop_without_applying_deltas();
+        };
+
+        // Open the file: the first paint is the didOpen.
+        app.state
+            .apply(AppMessage::FolderOpened(std::env::temp_dir()));
+        app.state.apply(AppMessage::BufferLoaded {
+            path: main_rs.clone(),
+            text: "fn main() {}\n".to_owned(),
+        });
+        frame(&mut app);
+
+        // Edit the shared buffer: the next paint's shape check sends
+        // didChange with the full new text.
+        {
+            let buffer = app
+                .state
+                .buffers
+                .get(&main_rs)
+                .cloned()
+                .expect("shared buffer");
+            buffer
+                .write()
+                .expect("lock")
+                .insert(selora_core::Position::new(1, 0), "// edited\n");
+        }
+        frame(&mut app);
+
+        // Ctrl+S and closing the tab complete the lifecycle.
+        app.run_command(CommandId::FileSave);
+        app.run_command(CommandId::FileCloseEditor);
+
+        // Give the dispatcher task turns to forward the LSP effects.
+        let mut effects = Vec::new();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if let Some(receiver) = app.lsp_effect_rx.as_mut() {
+                while let Ok(effect) = receiver.try_recv() {
+                    effects.push(effect);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&main_rs);
+
+        assert_eq!(effects.len(), 4, "effects: {effects:?}");
+        assert!(
+            matches!(
+                &effects[0],
+                selora_lsp::LspEffect::Open { path, text }
+                    if path == &main_rs && text == "fn main() {}\n"
+            ),
+            "effects: {effects:?}"
+        );
+        assert!(
+            matches!(
+                &effects[1],
+                selora_lsp::LspEffect::Change { path, text }
+                    if path == &main_rs && text == "fn main() {}\n// edited\n"
+            ),
+            "effects: {effects:?}"
+        );
+        assert!(
+            matches!(
+                &effects[2],
+                selora_lsp::LspEffect::Save { path } if path == &main_rs
+            ),
+            "effects: {effects:?}"
+        );
+        assert!(
+            matches!(
+                &effects[3],
+                selora_lsp::LspEffect::Close { path } if path == &main_rs
+            ),
+            "effects: {effects:?}"
+        );
     }
 
     /// The UI_SPEC.md §15 routing table, over the default settings: every

@@ -1016,7 +1016,7 @@ mod tests {
 
         let buffer: Vec<&SearchHit> = hits
             .iter()
-            .filter(|hit| hit.path == PathBuf::from("src/editor/buffer.rs"))
+            .filter(|hit| hit.path == *Path::new("src/editor/buffer.rs"))
             .collect();
         assert_eq!(buffer.len(), 2);
         assert_eq!(buffer[0].line_number, 42);
@@ -1030,14 +1030,14 @@ mod tests {
 
         let theme: Vec<&SearchHit> = hits
             .iter()
-            .filter(|hit| hit.path == PathBuf::from("src/ui/theme.rs"))
+            .filter(|hit| hit.path == *Path::new("src/ui/theme.rs"))
             .collect();
         assert_eq!(theme.len(), 2);
         // Trailing newline trimmed from the display text.
         assert_eq!(theme[0].line_text, "let s = \"f\u{f6}hn\"; // insert here");
         // byte span (20, 26) over "föhn…" is char span (19, 25).
-        assert_eq!(spans_of(&theme[0]), vec![(19, 25)]);
-        assert_eq!(spans_of(&theme[1]), vec![(21, 28), (31, 38)]);
+        assert_eq!(spans_of(theme[0]), vec![(19, 25)]);
+        assert_eq!(spans_of(theme[1]), vec![(21, 28), (31, 38)]);
     }
 
     #[test]

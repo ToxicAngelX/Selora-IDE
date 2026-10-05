@@ -104,6 +104,11 @@ pub enum Effect {
         root: PathBuf,
         query: SearchQuery,
     },
+
+    // LSP (Phase 3a)
+    /// Forward a language-server effect to the LSP manager task (opened by
+    /// the shell once settings + workspace root are known).
+    Lsp(selora_lsp::LspEffect),
 }
 
 /// Messages workers send to the main thread (ARCHITECTURE.md §2.1).
@@ -176,6 +181,11 @@ pub enum AppMessage {
         id: SearchId,
         results: Result<Vec<SearchHit>, SearchError>,
     },
+
+    // LSP (Phase 3a)
+    /// A language-server event (status, diagnostics, hover, definition,
+    /// completions, progress) — reduced by [`AppState::apply_lsp`].
+    Lsp(selora_lsp::LspEvent),
 }
 
 /// Toast severity (UI_SPEC.md §13): info dismisses after 4s, error after 8s.
@@ -274,6 +284,27 @@ pub struct AppState {
     /// Phase 3c). Results arrive via [`AppMessage::SearchResults`];
     /// searches go out as [`Effect::Search`] via the shell.
     pub search: SearchPanel,
+    /// LSP view state (Phase 3a): server status, the progress line, the
+    /// hover card, and the completion popup — the status-bar and overlay
+    /// data the shell paints.
+    pub lsp: LspViewState,
+    /// The F12 definition to jump to once its file is open (a definition
+    /// into a not-yet-loaded file is opened first, then jumped).
+    pub pending_definition: Option<selora_lsp::LspLocation>,
+}
+
+/// Phase 3a LSP view state (status bar, hover card, completion popup).
+#[derive(Debug, Default)]
+pub struct LspViewState {
+    /// Per-language server status (status bar).
+    pub status: BTreeMap<selora_lsp::LanguageId, selora_lsp::ServerStatus>,
+    /// The latest work-done progress line, status bar center
+    /// ("rust-analyzer: Indexing 42%").
+    pub progress: Option<String>,
+    /// Shaped hover tooltip content, for the path it was requested on.
+    pub hover: Option<(PathBuf, Vec<String>)>,
+    /// The open completion popup, for the path it was requested on.
+    pub completion: Option<(PathBuf, selora_editor::lsp_overlay::CompletionPopup)>,
 }
 
 impl Default for AppState {
@@ -298,6 +329,8 @@ impl Default for AppState {
             in_git_repo: false,
             git_panel: GitPanel::new(),
             search: SearchPanel::new(),
+            lsp: LspViewState::default(),
+            pending_definition: None,
         }
     }
 }
@@ -419,6 +452,97 @@ impl AppState {
                     self.toast(format!("search: {error}"), Severity::Error);
                 }
             },
+
+            // -- LSP (Phase 3a) ---------------------------------------------------
+            AppMessage::Lsp(event) => self.apply_lsp(event),
+        }
+    }
+
+    /// Reduce one [`LspEvent`] (Phase 3a). Diagnostics are applied to every
+    /// pane's editor for the path (buffers are shared per path); hover and
+    /// completions become shell-paintable view state; a definition into an
+    /// unopened file is stashed for the shell to open-then-jump.
+    fn apply_lsp(&mut self, event: selora_lsp::LspEvent) {
+        use selora_editor::lsp_overlay as view;
+        use selora_lsp::LspEvent;
+
+        match event {
+            LspEvent::ServerStatus { server, status } => {
+                if let selora_lsp::ServerStatus::Dead(reason) = &status {
+                    self.toast(
+                        format!("{}: {reason}", server.server_name()),
+                        Severity::Error,
+                    );
+                }
+                self.lsp.status.insert(server, status);
+            }
+            LspEvent::ServerMissing { server } => {
+                self.toast(
+                    format!(
+                        "{} not found; install it or set the path in settings",
+                        server.server_name()
+                    ),
+                    Severity::Info,
+                );
+            }
+            LspEvent::Progress { server: _, message } => {
+                self.lsp.progress = Some(message);
+            }
+            LspEvent::Diagnostics { path, diagnostics } => {
+                let mapped: Vec<view::LspDiagnostic> = diagnostics
+                    .into_iter()
+                    .map(|diagnostic| view::LspDiagnostic {
+                        range: view::LspRange {
+                            start: view::LspPosition {
+                                line: diagnostic.range.start.line,
+                                character: diagnostic.range.start.character,
+                            },
+                            end: view::LspPosition {
+                                line: diagnostic.range.end.line,
+                                character: diagnostic.range.end.character,
+                            },
+                        },
+                        severity: match diagnostic.severity {
+                            selora_lsp::LspSeverity::Error => view::LspSeverity::Error,
+                            selora_lsp::LspSeverity::Warning => view::LspSeverity::Warning,
+                            selora_lsp::LspSeverity::Information => view::LspSeverity::Information,
+                            selora_lsp::LspSeverity::Hint => view::LspSeverity::Hint,
+                        },
+                        source: diagnostic.source,
+                        message: diagnostic.message,
+                    })
+                    .collect();
+                // Every pane showing this buffer shares it by path.
+                for ((_pane, tab_path), editor) in self.editors.iter_mut() {
+                    if tab_path == &path {
+                        editor.set_diagnostics(mapped.clone());
+                    }
+                }
+            }
+            LspEvent::Hover {
+                path,
+                position: _,
+                content,
+            } => {
+                self.lsp.hover =
+                    content.map(|text| (path, selora_editor::lsp_overlay::shape_hover(&text)));
+            }
+            LspEvent::Definition { locations, .. } => {
+                // The first location wins (Lite has no result picker); the
+                // shell resolves the jump (open-then-jump if needed).
+                self.pending_definition = locations.into_iter().next();
+            }
+            LspEvent::Completions { path, items, .. } => {
+                let entries = items
+                    .into_iter()
+                    .map(|item| view::CompletionEntry {
+                        label: item.label,
+                        kind: item.kind,
+                        detail: item.detail,
+                    })
+                    .collect();
+                self.lsp.completion = Some((path, view::CompletionPopup::new(entries)));
+            }
         }
     }
 
@@ -498,7 +622,7 @@ impl AppState {
     /// Drop the buffer, dirty baselines, and per-pane editors for a path
     /// that no longer has a tab anywhere. A file still open in another pane
     /// keeps everything (the buffer is shared by path).
-    pub fn prune_closed(&mut self, path: &Path) {
+    pub fn prune_closed(&mut self, path: &Path) -> bool {
         let still_open = self.editor_area.pane_ids().iter().any(|pane| {
             self.editor_area
                 .pane(*pane)
@@ -509,7 +633,9 @@ impl AppState {
             self.saved_shapes.remove(path);
             self.last_shapes.remove(path);
             self.editors.retain(|open_tab, _| open_tab.1 != path);
+            return true;
         }
+        false
     }
 
     /// A new folder was picked: close the old session's tabs and buffers,
@@ -526,6 +652,10 @@ impl AppState {
         self.git_status = None;
         self.in_git_repo = false;
         self.search = SearchPanel::new();
+        self.lsp.hover = None;
+        self.lsp.completion = None;
+        self.lsp.progress = None;
+        self.pending_definition = None;
     }
 
     /// Dirty derivation, one frame per painted editor (see the module docs).
@@ -1065,6 +1195,143 @@ mod tests {
         assert!(!state.search.is_running());
         assert_eq!(state.toasts.len(), 1);
         assert!(state.toasts[0].text.contains("ripgrep failed"));
+    }
+
+    // --- LSP (Phase 3a wiring) ------------------------------------------------
+
+    /// Diagnostics land in the editor overlay, hover/completions become
+    /// shell-paintable view state, and the first definition location is
+    /// stashed for the open-then-jump (ARCHITECTURE.md §5).
+    #[test]
+    fn lsp_events_land_in_view_state_and_the_editor_overlay() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "a.rs", "fn main() {}");
+        let pane = state.editor_area.active_pane_id();
+        // The shell creates the per-pane editor at paint time; stand one up
+        // the same way (shell.rs paint_editor).
+        let buffer = state.buffers.get(&p).cloned().expect("buffer");
+        state
+            .editors
+            .insert((pane, p.clone()), selora_editor::Editor::new(buffer));
+
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::ServerStatus {
+            server: selora_lsp::LanguageId::Rust,
+            status: selora_lsp::ServerStatus::Ready,
+        }));
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::Diagnostics {
+            path: p.clone(),
+            diagnostics: vec![selora_lsp::LspDiagnostic {
+                range: selora_lsp::LspRange {
+                    start: selora_lsp::LspPosition {
+                        line: 0,
+                        character: 3,
+                    },
+                    end: selora_lsp::LspPosition {
+                        line: 0,
+                        character: 7,
+                    },
+                },
+                severity: selora_lsp::LspSeverity::Error,
+                source: Some("rust-analyzer".into()),
+                message: "unresolved symbol".into(),
+            }],
+        }));
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::Hover {
+            path: p.clone(),
+            position: selora_core::Position::new(0, 3),
+            content: Some("fn main()\nthe entry point".into()),
+        }));
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::Definition {
+            path: p.clone(),
+            position: selora_core::Position::new(0, 3),
+            locations: vec![selora_lsp::LspLocation {
+                path: path("lib.rs"),
+                range: selora_lsp::LspRange::default(),
+            }],
+        }));
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::Completions {
+            path: p.clone(),
+            position: selora_core::Position::new(0, 4),
+            items: vec![selora_lsp::LspCompletionItem {
+                label: "main".into(),
+                kind: Some(3),
+                detail: None,
+                sort_text: None,
+            }],
+        }));
+
+        // Status bar data.
+        assert_eq!(
+            state.lsp.status.get(&selora_lsp::LanguageId::Rust),
+            Some(&selora_lsp::ServerStatus::Ready)
+        );
+        // The editor overlay carries the diagnostic.
+        let editor = state.editors.get(&(pane, p.clone())).expect("editor");
+        assert_eq!(editor.diagnostics().len(), 1);
+        assert_eq!(editor.diagnostics()[0].message, "unresolved symbol");
+        // The hover card is shaped and bound to the requested path.
+        let (hover_path, lines) = state.lsp.hover.as_ref().expect("hover");
+        assert_eq!(hover_path, &p);
+        assert!(lines.join("\n").contains("fn main()"));
+        // The definition jump is pending for the shell.
+        assert_eq!(
+            state
+                .pending_definition
+                .as_ref()
+                .map(|location| location.path.clone()),
+            Some(path("lib.rs"))
+        );
+        // The completion popup is open with the entry (unfiltered).
+        let (completion_path, popup) = state.lsp.completion.as_ref().expect("completion");
+        assert_eq!(completion_path, &p);
+        assert_eq!(popup.filtered().len(), 1);
+        // Happy-path events toast nothing.
+        assert!(state.toasts.is_empty());
+    }
+
+    /// A dead server is an error toast; a missing one is an info toast.
+    #[test]
+    fn lsp_dead_and_missing_servers_toast() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::ServerStatus {
+            server: selora_lsp::LanguageId::Rust,
+            status: selora_lsp::ServerStatus::Dead("exit code 1".into()),
+        }));
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].severity, Severity::Error);
+        assert!(state.toasts[0].text.contains("rust-analyzer"));
+        assert!(state.toasts[0].text.contains("exit code 1"));
+
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::ServerMissing {
+            server: selora_lsp::LanguageId::TypeScript,
+        }));
+        assert_eq!(state.toasts.len(), 2);
+        assert_eq!(state.toasts[1].severity, Severity::Info);
+        assert!(state.toasts[1].text.contains("typescript-language-server"));
+    }
+
+    /// A folder switch clears the LSP popups and the pending jump (the
+    /// servers themselves are told by the shell's close-before-re-root).
+    #[test]
+    fn switch_folder_clears_lsp_popups_and_pending_jump() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "a.rs", "fn main() {}");
+        state.apply(AppMessage::Lsp(selora_lsp::LspEvent::Hover {
+            path: p,
+            position: selora_core::Position::new(0, 3),
+            content: Some("fn main()".into()),
+        }));
+        state.pending_definition = Some(selora_lsp::LspLocation {
+            path: path("lib.rs"),
+            range: selora_lsp::LspRange::default(),
+        });
+        assert!(state.lsp.hover.is_some());
+
+        state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
+        assert!(state.lsp.hover.is_none());
+        assert!(state.lsp.completion.is_none());
+        assert!(state.lsp.progress.is_none());
+        assert!(state.pending_definition.is_none());
     }
 
     // --- workspace snapshot ---------------------------------------------------

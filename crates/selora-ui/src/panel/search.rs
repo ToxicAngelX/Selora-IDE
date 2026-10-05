@@ -778,6 +778,16 @@ mod tests {
         }
     }
 
+    /// A focused window's input carrying one key press (focus is what
+    /// makes egui deliver key events to the widgets at all).
+    fn raw_input_with(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            focused: true,
+            events: vec![key_event(key)],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn enter_runs_the_query_and_reports_the_search_id() {
         let mut panel = SearchPanel::new();
@@ -797,9 +807,7 @@ mod tests {
         // test only reads widget state, so the delta is dropped cleanly.
         output.textures_delta.clear();
 
-        let mut raw = egui::RawInput::default();
-        raw.focused = true;
-        raw.events.push(key_event(egui::Key::Enter));
+        let raw = raw_input_with(egui::Key::Enter);
         let mut events = Vec::new();
         let mut output = ctx.run_ui(raw, |ui| {
             ui.set_min_size(vec2(360.0, 400.0));
@@ -826,9 +834,7 @@ mod tests {
         let mut panel = SearchPanel::new();
         panel.set_query("ropey");
         let ctx = egui::Context::default();
-        let mut raw = egui::RawInput::default();
-        raw.focused = true;
-        raw.events.push(key_event(egui::Key::Enter));
+        let raw = raw_input_with(egui::Key::Enter);
         let mut events = Vec::new();
         let mut output = ctx.run_ui(raw, |ui| {
             ui.set_min_size(vec2(360.0, 400.0));

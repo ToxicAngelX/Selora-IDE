@@ -333,7 +333,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut options = git2::RepositoryInitOptions::new();
         options.initial_head("main");
-        let raw = git2::Repository::init_opts(dir.path(), &mut options).expect("git init");
+        let raw = git2::Repository::init_opts(dir.path(), &options).expect("git init");
         let mut config = raw.config().expect("config");
         config
             .set_str("user.name", "Selora Test")
