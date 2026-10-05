@@ -33,6 +33,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use egui::{
     pos2, vec2, Align2, Event, FontId, Galley, Key, Painter, PointerButton, Pos2, Rangef, Rect,
@@ -40,6 +41,7 @@ use egui::{
 };
 use selora_core::{Buffer, Position};
 
+use crate::lsp_overlay::{self, OverlayState};
 use crate::syntax::{Language, LineSection, Span, SyntaxKind, SyntaxLayer};
 use crate::{layout, motion, theme};
 
@@ -62,6 +64,9 @@ pub struct Editor {
     /// The frame clock (egui `input.time`), fed to the syntax layer for its
     /// large-file re-parse debounce.
     frame_time: f64,
+    /// The LSP overlay (Phase 3a): diagnostics to squiggle, document-sync
+    /// bookkeeping, and the hover-hold gesture. See `lsp_overlay.rs`.
+    lsp: OverlayState,
 }
 
 impl Editor {
@@ -75,6 +80,7 @@ impl Editor {
             pending_reveal: None,
             syntax: None,
             frame_time: 0.0,
+            lsp: OverlayState::default(),
         }
     }
 
@@ -86,6 +92,11 @@ impl Editor {
         self.anchor = None;
         self.scroll = 0;
         self.pending_reveal = None;
+        // The old document's diagnostics no longer apply to the new text;
+        // the commit bump makes the shell emit a didChange so the server
+        // re-diagnoses (Phase 3a).
+        self.lsp.diagnostics.clear();
+        self.lsp.commits += 1;
         if let Some(layer) = &mut self.syntax {
             layer.set_source(text);
         }
@@ -159,6 +170,67 @@ impl Editor {
         if let Some(layer) = &mut self.syntax {
             layer.edit(start, old_end, new_text, self.frame_time);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // LSP overlay (Phase 3a — the editor side of language intelligence;
+    // the types and pure logic live in `lsp_overlay.rs`)
+    // ------------------------------------------------------------------
+
+    /// Replace this editor's diagnostics (applied from an LSP
+    /// `Diagnostics` event for this buffer's path). The next paint
+    /// squiggles them (UI_SPEC.md §3.6).
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<lsp_overlay::LspDiagnostic>) {
+        self.lsp.diagnostics = diagnostics;
+    }
+
+    /// The diagnostics currently overlaid (read-only view for tests and the
+    /// future problems panel).
+    pub fn diagnostics(&self) -> &[lsp_overlay::LspDiagnostic] {
+        &self.lsp.diagnostics
+    }
+
+    /// First call returns `true` — the signal for the shell to send the
+    /// `didOpen` effect on the first paint of a tab (deliverable 4).
+    pub fn note_lsp_opened(&mut self) -> bool {
+        if self.lsp.opened {
+            false
+        } else {
+            self.lsp.opened = true;
+            true
+        }
+    }
+
+    /// The buffer's commit counter: every buffer-mutating edit (typed text,
+    /// deletes, completions, `set_text`) bumps it. The shell compares it
+    /// across frames to emit the debounced `didChange` effect.
+    pub fn document_version(&self) -> u64 {
+        self.lsp.commits
+    }
+
+    /// Drain the hover requests raised by the 600 ms hover-hold gesture
+    /// (deliverable 6); the shell forwards each as a hover effect.
+    pub fn take_lsp_requests(&mut self) -> Vec<Position> {
+        std::mem::take(&mut self.lsp.requests)
+    }
+
+    /// Where the caret was last painted (screen coordinates), for anchoring
+    /// the hover tooltip and the completion popup above the caret.
+    pub fn caret_screen_pos(&self) -> Option<Pos2> {
+        self.lsp.caret_screen
+    }
+
+    /// Apply a completion (Enter/Tab in the popup): the identifier prefix
+    /// ending at the caret is replaced by `label`.
+    pub fn insert_completion(&mut self, label: &str) {
+        let line = self.cursor.line;
+        let line_text = self.read_buffer().line(line).unwrap_or_default();
+        let start = lsp_overlay::completion_word_start(&line_text, self.cursor.col);
+        // Reuse the typed-input path: a selection from the word start to the
+        // caret is replaced by the label (syntax layer + undo-friendly edit
+        // + caret placement all included).
+        self.anchor = Some(Position::new(line, start));
+        self.insert_text(label);
     }
 
     // ------------------------------------------------------------------
@@ -249,6 +321,9 @@ impl Editor {
         };
         self.cursor = new_cursor;
         self.anchor = None;
+        // One buffer-mutating commit (Phase 3a: the shell watches this to
+        // emit the debounced LSP didChange).
+        self.lsp.commits += 1;
     }
 
     /// Backspace: remove the selection, or the character before the caret
@@ -278,6 +353,7 @@ impl Editor {
         self.write_buffer().remove(start, end);
         self.cursor = start;
         self.anchor = None;
+        self.lsp.commits += 1;
     }
 
     // ------------------------------------------------------------------
@@ -509,7 +585,7 @@ impl Editor {
     // Painting
     // ------------------------------------------------------------------
 
-    fn paint(&self, painter: &Painter, rect: Rect, char_width: f32, focused: bool, time: f64) {
+    fn paint(&mut self, painter: &Painter, rect: Rect, char_width: f32, focused: bool, time: f64) {
         // Canvas (UI_SPEC.md §3.2: background --ink-canvas, no padding).
         painter.rect_filled(rect, theme::radius::R0, theme::color::INK_CANVAS);
 
@@ -640,6 +716,9 @@ impl Editor {
                 .get(self.cursor.col)
                 .copied()
                 .unwrap_or(visuals.width);
+            // Remember where the caret was painted — the hover tooltip and
+            // the completion popup anchor here (Phase 3a).
+            self.lsp.caret_screen = Some(pos2(text_x + x, row_y(cursor_row)));
             painter.rect_filled(
                 Rect::from_min_size(
                     pos2(text_x + x, row_y(cursor_row)),
@@ -648,6 +727,59 @@ impl Editor {
                 theme::radius::R0,
                 theme::color::FG_DEFAULT,
             );
+        } else {
+            self.lsp.caret_screen = None;
+        }
+
+        // Diagnostic squiggles (UI_SPEC.md §3.6): a 3px wave under each
+        // diagnostic's range, at least one character cell wide (servers
+        // report zero-width ranges at the error position). Multi-line
+        // diagnostics underline each visible line of the range.
+        for diagnostic in &self.lsp.diagnostics {
+            let color = diagnostic.severity.color();
+            let start_line = diagnostic.range.start.line as usize;
+            let end_line = diagnostic.range.end.line as usize;
+            for line in start_line..=end_line {
+                let row = line.wrapping_sub(self.scroll);
+                if row >= rows {
+                    continue; // also skips lines "before" the viewport (wrapping)
+                }
+                let Some(line_text) = self.read_buffer().line(line) else {
+                    continue;
+                };
+                let line_chars = line_text.chars().count();
+                let col_start = if line == start_line {
+                    lsp_overlay::utf16_col_to_char(&line_text, diagnostic.range.start.character)
+                        .min(line_chars)
+                } else {
+                    0
+                };
+                let col_end = if line == end_line {
+                    lsp_overlay::utf16_col_to_char(&line_text, diagnostic.range.end.character)
+                        .min(line_chars)
+                        .max(col_start)
+                } else {
+                    line_chars
+                };
+                let visuals = &visuals[row];
+                let x_start = visuals
+                    .x_offsets
+                    .get(col_start)
+                    .copied()
+                    .unwrap_or(visuals.width);
+                let x_end = visuals
+                    .x_offsets
+                    .get(col_end)
+                    .copied()
+                    .unwrap_or_else(|| visuals.width.max(char_width));
+                lsp_overlay::paint_squiggle(
+                    painter,
+                    text_x + x_start,
+                    text_x + x_end.max(x_start + char_width),
+                    row_y(row) + layout::LINE_HEIGHT - 2.0,
+                    color,
+                );
+            }
         }
     }
 
@@ -679,6 +811,28 @@ impl Widget for &mut Editor {
         self.handle_wheel(ui.ctx(), &response, visible);
         let cursor_moved = self.handle_pointer(ui.ctx(), &response, &painter, &font_id, rect);
         let text_changed = self.handle_keyboard(ui.ctx(), &response);
+        // The LSP hover gesture (Phase 3a): a 600 ms hold over one buffer
+        // position raises a hover request for the shell to forward. The
+        // repaint request keeps the frame clock running while the pointer
+        // rests (egui otherwise sleeps between frames).
+        let hover_position = if response.hovered() && !response.dragged() {
+            ui.ctx()
+                .pointer_hover_pos()
+                .and_then(|pointer| self.position_from_pointer(pointer, rect, &painter, &font_id))
+        } else {
+            None
+        };
+        if response.hovered() {
+            ui.ctx().request_repaint_after(Duration::from_millis(150));
+        }
+        if let Some(position) = self.lsp.hover_gesture.tick(
+            response.hovered(),
+            response.dragged(),
+            hover_position,
+            time,
+        ) {
+            self.lsp.requests.push(position);
+        }
 
         if cursor_moved || text_changed {
             self.scroll = layout::ensure_cursor_visible(self.scroll, self.cursor.line, visible);
@@ -1106,5 +1260,141 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.kind == SyntaxKind::Function && span.start <= theme && theme < span.end
         }));
+    }
+
+    // --- LSP overlay (Phase 3a — see lsp_overlay.rs) --------------------------
+
+    fn lsp_diagnostic(
+        line: u32,
+        start: u32,
+        end: u32,
+        severity: lsp_overlay::LspSeverity,
+    ) -> lsp_overlay::LspDiagnostic {
+        lsp_overlay::LspDiagnostic {
+            range: lsp_overlay::LspRange {
+                start: lsp_overlay::LspPosition {
+                    line,
+                    character: start,
+                },
+                end: lsp_overlay::LspPosition {
+                    line,
+                    character: end,
+                },
+            },
+            severity,
+            source: Some("rust-analyzer".into()),
+            message: "unclosed delimiter".into(),
+        }
+    }
+
+    /// The full squiggle paint path runs headlessly: diagnostics on visible
+    /// lines (single-line, another line, zero-width, and below the viewport)
+    /// paint without panicking, and the state survives the frame.
+    #[test]
+    fn squiggles_paint_headlessly_for_all_range_shapes() {
+        let mut editor = editor("fn broken( {\n    Vec::new()\n}\n");
+        editor.set_diagnostics(vec![
+            lsp_diagnostic(0, 3, 11, lsp_overlay::LspSeverity::Error),
+            lsp_diagnostic(1, 4, 7, lsp_overlay::LspSeverity::Warning),
+            lsp_diagnostic(0, 4, 4, lsp_overlay::LspSeverity::Information),
+            lsp_diagnostic(9, 0, 2, lsp_overlay::LspSeverity::Error),
+        ]);
+        assert_eq!(editor.diagnostics().len(), 4);
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        assert_eq!(editor.diagnostics().len(), 4);
+    }
+
+    #[test]
+    fn note_lsp_opened_fires_exactly_once() {
+        let mut editor = editor("fn main() {}");
+        assert!(
+            editor.note_lsp_opened(),
+            "the first paint opens the document"
+        );
+        assert!(!editor.note_lsp_opened());
+        assert!(!editor.note_lsp_opened());
+    }
+
+    #[test]
+    fn document_version_bumps_on_every_commit_kind() {
+        let mut editor = editor("let x = 1;\n");
+        let before = editor.document_version();
+
+        editor.cursor = Position::new(0, 10);
+        editor.insert_text(" + 1"); // typed input
+        assert_eq!(editor.document_version(), before + 1);
+
+        editor.cursor = Position::new(0, 0);
+        editor.delete_forward(); // delete "l"
+        assert_eq!(editor.document_version(), before + 2);
+
+        editor.set_text("fn a() {}"); // wholesale replace
+        assert_eq!(editor.document_version(), before + 3);
+
+        // A pure read (no edit) does not bump.
+        let _ = editor.text();
+        assert_eq!(editor.document_version(), before + 3);
+    }
+
+    #[test]
+    fn insert_completion_replaces_the_typed_prefix() {
+        let mut editor = editor("    let v: Vec<u8> = ve");
+        editor.cursor = Position::new(0, 23); // just after "ve"
+        editor.insert_completion("vec![]");
+        assert_eq!(editor.text(), "    let v: Vec<u8> = vec![]");
+        // The caret lands after the inserted label.
+        assert_eq!(editor.cursor(), Position::new(0, 27));
+        // And it counts as a commit (the shell re-syncs the server).
+        assert_eq!(editor.document_version(), 1);
+    }
+
+    #[test]
+    fn caret_screen_position_is_reported_after_paint() {
+        let mut editor = editor("fn a() {}");
+        assert!(editor.caret_screen_pos().is_none(), "nothing painted yet");
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        let caret = editor.caret_screen_pos().expect("caret painted");
+        // The caret sits in the text area (past the 44px gutter), row 0.
+        assert!(caret.x >= 44.0, "caret x: {}", caret.x);
+        assert!(caret.y >= 0.0 && caret.y < 48.0, "caret y: {}", caret.y);
+    }
+
+    #[test]
+    fn take_lsp_requests_drains() {
+        let mut editor = editor("fn a() {}");
+        assert!(editor.take_lsp_requests().is_empty());
+        // The gesture pushes requests (the gesture itself is unit-tested in
+        // lsp_overlay).
+        editor.lsp.requests.push(Position::new(0, 3));
+        assert_eq!(editor.take_lsp_requests(), vec![Position::new(0, 3)]);
+        assert!(editor.take_lsp_requests().is_empty(), "drained");
+    }
+
+    /// The squiggle overlay and the syntax layer coexist: a frame with
+    /// highlighting, a selection, and diagnostics paints cleanly.
+    #[test]
+    fn paint_runs_headlessly_with_syntax_and_diagnostics() {
+        let mut editor = editor("fn theme() {\n    Vec::new()\n} // done\n");
+        editor.set_language(Some(Language::Rust));
+        editor.set_diagnostics(vec![lsp_diagnostic(
+            1,
+            4,
+            7,
+            lsp_overlay::LspSeverity::Error,
+        )]);
+        editor.cursor = Position::new(1, 4);
+        editor.anchor = Some(Position::new(0, 3));
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        assert_eq!(editor.diagnostics().len(), 1);
+        assert!(editor.caret_screen_pos().is_some());
     }
 }
