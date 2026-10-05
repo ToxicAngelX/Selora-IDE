@@ -1,0 +1,1425 @@
+//! The Phase 2 workbench shell — the `eframe::App` that wires every Phase 2
+//! component together (PLAN.md §9 Phase 2, UI_SPEC.md §2).
+//!
+//! The frame pipeline follows ARCHITECTURE.md §2's seven stages, in order:
+//!
+//! 1. drain worker messages → [`AppState::apply`][crate::app_state::AppState::apply]
+//!    (the `mpsc` receiver plus the Phase 1c notify seam — workers call
+//!    `ctx.request_repaint()` after every send so results always reach the
+//!    screen);
+//! 2. timeouts — the 5s `workspace.json` autosave (§8.2) and toast expiry;
+//! 3. derived state — the sequential restore pump (tab order) and the
+//!    per-frame dirty derivation fed by [`AppState::note_editor_frame`];
+//! 4. layout — title strip, status bar, activity bar + file tree, central
+//!    editor area (UI_SPEC.md §2);
+//! 5. chrome — tree, palettes, settings dialog, toasts, empty states;
+//! 6. editor panes — the split tree's per-pane tab bars, then the active
+//!    tab's `Editor` painted into each pane's content rect;
+//! 7. effects — saves/opens/pickers the interactions above enqueued onto
+//!    the runtime via the `Effect` channel (dispatched by
+//!    [`crate::wiring::spawn_dispatcher`]).
+//!
+//! Keybinds (UI_SPEC.md §15) are routed through `selora-settings`'
+//! [`Keybind`] with `settings.keybinds` as the source for the rebindable
+//! four; the rest of the Phase 2 table is fixed. While any palette or
+//! dialog is open — or any text edit (the tree's inline rename, a palette
+//! input) has keyboard focus — the global keybinds stay quiet so they never
+//! fire into a modal surface.
+//!
+//! Blocking `rfd` pickers run on worker threads, never the UI thread.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use selora_editor::{Editor, Language};
+use selora_settings::{Keybind, KeybindsSettings};
+use selora_ui::dialogs::settings::{SettingsDialog, SettingsEvent};
+use selora_ui::editor::split::{self, PaneView};
+use selora_ui::palette::registry::CommandId;
+use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, TreeEvent};
+use selora_ui::{brand, theme};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+
+use crate::app_state::{AppMessage, AppState, BufferShape, Effect, Severity};
+use crate::persistence::{self, WorkspaceState};
+use crate::wiring;
+
+/// Status bar height (UI_SPEC.md §1.2).
+const STATUS_BAR_HEIGHT: f32 = 24.0;
+/// Title bar height (UI_SPEC.md §1.1).
+const TITLE_BAR_HEIGHT: f32 = 32.0;
+/// Brand mark size in the title bar (UI_SPEC.md §1.1: 16px).
+const MARK_SIZE: f32 = 16.0;
+/// Brand mark inset from the window edge (UI_SPEC.md §1.1: 8px).
+const EDGE_PADDING: f32 = 8.0;
+/// Gap between the mark and the app title (UI_SPEC.md §1.1: 8px).
+const TITLE_GAP: f32 = 8.0;
+/// File-tree panel bounds (UI_SPEC.md §2: 240px default, 160–480 resizable).
+const TREE_MIN_WIDTH: f32 = 160.0;
+const TREE_MAX_WIDTH: f32 = 480.0;
+/// The `workspace.json` cadence (ARCHITECTURE.md §8.2: "every 5s").
+const WORKSPACE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Toast anchoring (UI_SPEC.md §13): 12px from each edge, above the 24px
+/// status bar.
+const TOAST_EDGE: f32 = 12.0;
+
+/// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
+/// channels, and the transient view state that is not part of the document
+/// model (dialog visibility, tree toggle).
+pub struct SeloraApp {
+    /// Cloned egui context — the notify seam handed to workers so they can
+    /// `request_repaint()` after every message.
+    ctx: egui::Context,
+    /// Handle onto the tokio runtime the workers are spawned onto.
+    handle: Handle,
+    /// Worker → main-thread messages (drained at the top of every frame).
+    msg_rx: mpsc::UnboundedReceiver<AppMessage>,
+    /// Main-thread → worker messages (cloned to workers by the dispatcher).
+    msg_tx: mpsc::UnboundedSender<AppMessage>,
+    /// The main-thread → runtime effect channel.
+    effect_tx: mpsc::UnboundedSender<Effect>,
+    /// The repaint callback workers invoke after each message send.
+    notify: wiring::Notify,
+    /// All document/IDE state. Main-thread only (ARCHITECTURE.md §3.1).
+    state: AppState,
+    /// The activity-bar strip's selection (UI_SPEC.md §2.1).
+    activity_bar: ActivityBar,
+    /// Whether the file tree panel is visible (`Ctrl+B`, UI_SPEC.md §2).
+    show_tree: bool,
+    /// Settings have arrived (the tree panel's initial width is taken from
+    /// them, so the panel first shows *after* the load resolves).
+    settings_loaded: bool,
+    /// The Settings dialog, while open (UI_SPEC.md §6).
+    settings_dialog: Option<SettingsDialog>,
+    /// Where `workspace.json` is persisted; `None` = no APPDATA (headless).
+    workspace_dir: Option<PathBuf>,
+    /// When `workspace.json` was last written (the 5s autosave clock).
+    last_workspace_save: Instant,
+    /// The last persisted snapshot (skip no-op writes).
+    last_workspace_snapshot: Option<WorkspaceState>,
+    /// Files to reopen on restore, in tab order. Opens are issued one at a
+    /// time — unbounded-channel ordering is only guaranteed per sender, and
+    /// tab order *is* the restore contract (ARCHITECTURE.md §8.2).
+    restore_queue: VecDeque<PathBuf>,
+    /// The restore open currently in flight.
+    restore_in_flight: Option<PathBuf>,
+    /// The file-tree panel width as of the previous frame (for persistence).
+    last_tree_width: Option<f32>,
+}
+
+impl SeloraApp {
+    /// Build the shell: spawn the effect dispatcher, request the settings
+    /// load, and restore the last session if its root still exists
+    /// (ARCHITECTURE.md §8.2).
+    pub fn new(
+        ctx: egui::Context,
+        handle: Handle,
+        msg_tx: mpsc::UnboundedSender<AppMessage>,
+        msg_rx: mpsc::UnboundedReceiver<AppMessage>,
+        effect_tx: mpsc::UnboundedSender<Effect>,
+        effect_rx: mpsc::UnboundedReceiver<Effect>,
+    ) -> Self {
+        let mut app = Self::shell(ctx, handle, msg_tx, msg_rx, effect_tx, effect_rx);
+
+        // Settings first (§8.1) — the tree panel waits on the width.
+        let _ = app.effect_tx.send(Effect::SettingsLoad);
+
+        // Restore the last session (§8.2): a root that still exists reopens
+        // the workspace and requeues its files in tab order.
+        if let Some(dir) = app.workspace_dir.clone() {
+            if let Some(saved) = persistence::load(&dir) {
+                let saved = persistence::restorable(&saved);
+                if let Some(root) = saved.root {
+                    app.state.workspace = Some(selora_core::Workspace::new(root.clone()));
+                    let _ = app.effect_tx.send(Effect::OpenFolder(root));
+                    app.restore_queue = saved.open_files.into();
+                }
+            }
+        }
+
+        app
+    }
+
+    /// The bare shell: dispatcher spawned, channels wired, nothing loaded,
+    /// nothing restored. The boot sequence in [`Self::new`] layers the
+    /// settings load and session restore on top; the headless smoke test
+    /// builds this directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn shell(
+        ctx: egui::Context,
+        handle: Handle,
+        msg_tx: mpsc::UnboundedSender<AppMessage>,
+        msg_rx: mpsc::UnboundedReceiver<AppMessage>,
+        effect_tx: mpsc::UnboundedSender<Effect>,
+        effect_rx: mpsc::UnboundedReceiver<Effect>,
+    ) -> Self {
+        let notify: wiring::Notify = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        wiring::spawn_dispatcher(
+            &handle,
+            notify.clone(),
+            effect_rx,
+            msg_tx.clone(),
+            wiring::DEFAULT_BASE_URL.to_owned(),
+        );
+
+        Self {
+            ctx,
+            handle,
+            msg_rx,
+            msg_tx,
+            effect_tx,
+            notify,
+            state: AppState::default(),
+            activity_bar: ActivityBar::default(),
+            show_tree: true,
+            settings_loaded: false,
+            settings_dialog: None,
+            workspace_dir: persistence::state_dir(),
+            last_workspace_save: Instant::now(),
+            last_workspace_snapshot: None,
+            restore_queue: VecDeque::new(),
+            restore_in_flight: None,
+            last_tree_width: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame stages 1–3: drain, timeouts, derived state
+    // -----------------------------------------------------------------------
+
+    /// §2 stage 1: drain every worker message into the AppState.
+    fn drain_messages(&mut self) {
+        while let Ok(message) = self.msg_rx.try_recv() {
+            let is_settings = matches!(message, AppMessage::SettingsLoaded(_));
+            let failed_path = match &message {
+                AppMessage::BufferLoadFailed { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            // A picked folder re-roots the workspace and needs a follow-up
+            // tree build (the effect can't be sent from inside `apply`).
+            let folder_picked = match &message {
+                AppMessage::DialogFolderPicked(Some(path)) => Some(path.clone()),
+                _ => None,
+            };
+            self.state.apply(message);
+            if is_settings {
+                self.settings_loaded = true;
+            }
+            if let Some(root) = folder_picked {
+                let _ = self.effect_tx.send(Effect::OpenFolder(root));
+            }
+            // A restore open that failed leaves the queue so the next one
+            // can proceed (the error itself already became a toast).
+            if let Some(path) = failed_path {
+                if self.restore_in_flight.as_deref() == Some(path.as_path()) {
+                    self.restore_in_flight = None;
+                    self.restore_queue.retain(|queued| *queued != path);
+                }
+            }
+        }
+    }
+
+    /// §2 stage 2: the 5s workspace-state autosave (§8.2). Writes only when
+    /// the snapshot changed since the last write.
+    fn maybe_save_workspace(&mut self) {
+        if self.last_workspace_save.elapsed() < WORKSPACE_SAVE_INTERVAL {
+            return;
+        }
+        self.last_workspace_save = Instant::now();
+        self.save_workspace_now();
+    }
+
+    /// Persist the session snapshot synchronously (a tiny atomic write; also
+    /// the graceful-close path). `None` workspace_dir = persistence off.
+    fn save_workspace_now(&mut self) {
+        let Some(dir) = self.workspace_dir.clone() else {
+            return;
+        };
+        let snapshot = self.state.workspace_snapshot();
+        if self.last_workspace_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        if let Err(error) = persistence::save(&dir, &snapshot) {
+            self.state.toast(
+                format!("workspace state not saved: {error}"),
+                Severity::Error,
+            );
+        }
+        self.last_workspace_snapshot = Some(snapshot);
+    }
+
+    /// §2 stage 3 (restore half): issue the queued opens one at a time so
+    /// arrival order — and therefore tab order — matches the persisted
+    /// `open_files` order exactly.
+    fn pump_restore(&mut self) {
+        if let Some(in_flight) = self.restore_in_flight.clone() {
+            if self.state.buffers.contains_key(&in_flight) {
+                self.restore_in_flight = None;
+            }
+        }
+        while let Some(next) = self.restore_queue.front().cloned() {
+            if self.state.buffers.contains_key(&next) {
+                // Already open (e.g. re-opened by hand during restore).
+                self.restore_queue.pop_front();
+                continue;
+            }
+            if self.restore_in_flight.is_some() {
+                break; // wait for the current open to land
+            }
+            self.restore_in_flight = Some(next.clone());
+            let _ = self.effect_tx.send(Effect::OpenFile(next));
+            break;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keybinds (UI_SPEC.md §15)
+    // -----------------------------------------------------------------------
+
+    /// Whether an overlay owns the keyboard right now: any palette, the
+    /// settings dialog, or a focused text edit (the tree's inline rename).
+    fn overlay_open(&self, ctx: &egui::Context) -> bool {
+        self.state.palette.is_open()
+            || self.state.fuzzy.is_open()
+            || self.settings_dialog.is_some()
+            || ctx.text_edit_focused()
+    }
+
+    fn handle_keybinds(&mut self, ctx: &egui::Context) {
+        if self.overlay_open(ctx) {
+            return;
+        }
+        let keybinds = self.state.settings.keybinds.clone();
+        let actions: Vec<KeyAction> = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => key_action(&keybinds, &egui::KeyboardShortcut::new(*modifiers, *key)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for action in actions {
+            self.run_key_action(action);
+        }
+    }
+
+    fn run_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::FuzzyFind => self.open_fuzzy(),
+            KeyAction::CommandPalette => self.toggle_command_palette(),
+            KeyAction::Save => self.save_active(),
+            KeyAction::ToggleChat => {
+                self.state
+                    .toast("chat sidebar lands in Phase 4", Severity::Info);
+            }
+            KeyAction::ToggleFileTree => {
+                self.show_tree = !self.show_tree;
+            }
+            KeyAction::SplitEditor => self.state.split_editor(),
+            KeyAction::CloseEditor => {
+                if let Some(closed) = self.state.close_editor() {
+                    self.state.prune_closed(&closed);
+                }
+            }
+            KeyAction::OpenSettings => self.open_settings(),
+            KeyAction::OpenFile => self.pick_file(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout (§2 stages 4–6)
+    // -----------------------------------------------------------------------
+
+    /// The left region: the 48px activity strip (always visible) plus the
+    /// resizable file tree panel (UI_SPEC.md §2.1, §2.2). The panels' built-in
+    /// 1px separators are the `--ink-hi` hairlines between regions.
+    fn left_region(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("activity_strip")
+            .exact_size(activity_bar::STRIP_WIDTH)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+            .show(ui, |ui| {
+                if let Some(activity) = self.activity_bar.show(ui) {
+                    self.route_activity(activity);
+                }
+            });
+
+        // The tree panel first appears with the *loaded* sidebar width, so
+        // it waits for the settings effect to resolve (a frame or two).
+        if self.show_tree && self.settings_loaded {
+            let default_width = self.state.settings.ui.sidebar_width as f32;
+            let response = egui::Panel::left("file_tree_panel")
+                .resizable(true)
+                .default_size(default_width)
+                .min_size(TREE_MIN_WIDTH)
+                .max_size(TREE_MAX_WIDTH)
+                .show_separator_line(true)
+                .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+                .show(ui, |ui| {
+                    let outcome = self.state.file_tree.show(ui);
+                    for event in outcome.events {
+                        self.route_tree_event(event);
+                    }
+                });
+            self.persist_tree_width(response.response.rect.width());
+        }
+    }
+
+    fn route_activity(&mut self, activity: Activity) {
+        match activity {
+            Activity::Files => {}
+            Activity::Search => {
+                self.state
+                    .toast("search in files lands in Phase 3", Severity::Info);
+            }
+            Activity::Git => {
+                self.state
+                    .toast("git panel lands in Phase 3", Severity::Info);
+            }
+            Activity::Chat => {
+                self.state
+                    .toast("chat sidebar lands in Phase 4", Severity::Info);
+            }
+        }
+    }
+
+    fn route_tree_event(&mut self, event: TreeEvent) {
+        match event {
+            TreeEvent::OpenFile(path) => self.open_path(path),
+            TreeEvent::TreeChanged => {
+                if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    let _ = self.effect_tx.send(Effect::RefreshFileTree(root));
+                }
+            }
+            TreeEvent::Error(message) => {
+                self.state.toast(message, Severity::Error);
+            }
+        }
+    }
+
+    /// Persist the dragged sidebar width into `settings.json` (on release,
+    /// not per pixel). Runs off the frame path via `Effect::SettingsSave`.
+    fn persist_tree_width(&mut self, width: f32) {
+        let width = width.round().clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH);
+        if self
+            .last_tree_width
+            .is_some_and(|last| (last - width).abs() < 0.5)
+        {
+            return;
+        }
+        if self.ctx.input(|input| input.pointer.primary_down()) {
+            return; // mid-drag; persist on release
+        }
+        self.last_tree_width = Some(width);
+        let mut settings = self.state.settings.clone();
+        settings.ui.sidebar_width = width as u32;
+        self.state.settings = settings.clone();
+        let _ = self.effect_tx.send(Effect::SettingsSave(settings));
+    }
+
+    /// The 24px status bar (UI_SPEC.md §1.2, Phase 2 subset): workspace root
+    /// name (or "no folder") left, cursor line:col + language center, a
+    /// muted "○ selora disconnected" right (live status is Phase 4).
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status_bar")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter_at(rect);
+                let sans = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS);
+                let mono = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_MONO);
+
+                // Left: the workspace root's name.
+                let left = self
+                    .state
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.root.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "no folder".to_owned());
+                let left_font = sans();
+                painter.text(
+                    egui::pos2(rect.left() + theme::space::S3, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    left,
+                    left_font,
+                    theme::color::FG_MUTED,
+                );
+
+                // Center: cursor line:col + language of the active tab.
+                let pane = self.state.editor_area.active_pane_id();
+                let center = self
+                    .state
+                    .active_path()
+                    .and_then(|path| self.state.editors.get(&(pane, path)))
+                    .map(|editor| {
+                        let cursor = editor.cursor();
+                        format!(
+                            "Ln {}, Col {}   {}",
+                            cursor.line + 1,
+                            cursor.col + 1,
+                            language_name(editor.language()),
+                        )
+                    })
+                    .unwrap_or_default();
+                if !center.is_empty() {
+                    let center_font = mono();
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        center,
+                        center_font,
+                        theme::color::FG_MUTED,
+                    );
+                }
+
+                // Right: connection state (Phase 2: always disconnected).
+                let right_font = sans();
+                painter.text(
+                    egui::pos2(rect.right() - theme::space::S3, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "○ selora disconnected",
+                    right_font,
+                    theme::color::FG_MUTED,
+                );
+            });
+    }
+
+    /// The central editor area: the split tree with its tab bars, the
+    /// per-pane editors, the empty states, and the fuzzy-file overlay.
+    fn editor_region(&mut self, ui: &mut egui::Ui, workbench: &mut egui::Rect) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+            .show(ui, |ui| {
+                *workbench = ui.max_rect();
+                if self.state.workspace.is_none() {
+                    self.empty_no_folder(ui);
+                    return;
+                }
+
+                // Stages 5–6: the split chrome, then the editors it reports.
+                let response = split::show(ui, &mut self.state.editor_area);
+                for closed in response.closed.clone() {
+                    if let Some(workspace) = &mut self.state.workspace {
+                        workspace.close(&closed);
+                    }
+                    self.state.prune_closed(&closed);
+                }
+                for _pane in &response.new_tab {
+                    self.open_fuzzy(); // "+" opens quick-open (UI_SPEC.md §3.1)
+                }
+                for view in response.panes {
+                    self.paint_pane(ui, view);
+                }
+
+                // The Ctrl+P overlay is scoped to the workbench (UI_SPEC §5.1).
+                if let Some(path) = self.state.fuzzy.show_ui(ui) {
+                    self.open_path(path);
+                }
+            });
+    }
+
+    /// Paint one pane's active-tab editor into the pane's content rect
+    /// (UI_SPEC.md §3.2). Each (pane, tab) keeps its own `Editor` — its own
+    /// cursor and scroll — over the buffer shared by path.
+    fn paint_pane(&mut self, ui: &mut egui::Ui, view: PaneView) {
+        let Some(path) = self
+            .state
+            .editor_area
+            .pane(view.pane)
+            .and_then(|tabs| tabs.active_path().map(Path::to_path_buf))
+        else {
+            self.empty_folder_no_file(ui, view.content);
+            return;
+        };
+        let Some(buffer) = self.state.buffers.get(&path).cloned() else {
+            return; // a tab never points at an unloaded buffer
+        };
+        let is_new = !self.state.editors.contains_key(&(view.pane, path.clone()));
+        let editor = self
+            .state
+            .editors
+            .entry((view.pane, path.clone()))
+            .or_insert_with(|| Editor::new(buffer.clone()));
+        if is_new {
+            // Syntax highlighting by extension (Phase 2d).
+            editor.set_language_from_path(&path);
+        }
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(view.content), |ui| {
+                ui.add(editor)
+            })
+            .inner;
+        // Editor interaction focuses its pane (the split's own hit-test only
+        // sees the background beneath the widget painted on top).
+        if response.clicked() {
+            self.state.editor_area.set_active_pane(view.pane);
+        }
+
+        // §2 stage 3, per frame: dirty derivation. The shape is O(log n);
+        // the edit signal covers same-length replacements the shape cannot
+        // see. See app_state's module docs.
+        let shape = buffer
+            .read()
+            .map(|buffer| BufferShape::of(&buffer))
+            .unwrap_or_default();
+        let edit_input = response.has_focus() && edit_typed_this_frame(ui.ctx());
+        self.state.note_editor_frame(&path, shape, edit_input);
+    }
+
+    /// Empty state: no folder open (UI_SPEC.md §12).
+    fn empty_no_folder(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.35);
+            ui.label(
+                egui::RichText::new("No folder open")
+                    .color(theme::color::FG_DEFAULT)
+                    .font(egui::FontId::new(
+                        theme::type_scale::LG,
+                        theme::font::FAMILY_SANS,
+                    )),
+            );
+            ui.add_space(theme::space::S2);
+            ui.label(
+                egui::RichText::new("Open a folder to start editing.")
+                    .italics()
+                    .color(theme::color::FG_MUTED)
+                    .font(egui::FontId::new(
+                        theme::type_scale::MD,
+                        theme::font::FAMILY_SANS,
+                    )),
+            );
+            ui.add_space(theme::space::S3);
+            ui.horizontal(|ui| {
+                let button = egui::Button::new(
+                    egui::RichText::new("Open Folder").color(theme::color::FG_DEFAULT),
+                )
+                .fill(theme::color::INK_MID)
+                .corner_radius(theme::radius::R1 as u8);
+                if ui.add(button).clicked() {
+                    self.pick_folder();
+                }
+                ui.add_space(theme::space::S1);
+                let button = egui::Button::new(
+                    egui::RichText::new("Clone Repo").color(theme::color::FG_DEFAULT),
+                )
+                .fill(theme::color::INK_MID)
+                .corner_radius(theme::radius::R1 as u8);
+                if ui.add(button).clicked() {
+                    self.state
+                        .toast("Clone Repo is coming soon", Severity::Info);
+                }
+            });
+        });
+    }
+
+    /// Empty state: a folder is open but this pane has no tab (UI_SPEC.md
+    /// §12) — the keybind hint line, with chips from the live settings.
+    fn empty_folder_no_file(&mut self, ui: &mut egui::Ui, content: egui::Rect) {
+        let fuzzy_key = self.state.settings.keybinds.fuzzy_find.clone();
+        let palette_key = self.state.settings.keybinds.command_palette.clone();
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.4);
+                ui.horizontal(|ui| {
+                    keybind_chip(ui, &fuzzy_key);
+                    ui.label(
+                        egui::RichText::new("to find a file")
+                            .italics()
+                            .color(theme::color::FG_MUTED)
+                            .font(egui::FontId::new(
+                                theme::type_scale::MD,
+                                theme::font::FAMILY_SANS,
+                            )),
+                    );
+                    ui.add_space(theme::space::S2);
+                    keybind_chip(ui, &palette_key);
+                    ui.label(
+                        egui::RichText::new("for commands")
+                            .italics()
+                            .color(theme::color::FG_MUTED)
+                            .font(egui::FontId::new(
+                                theme::type_scale::MD,
+                                theme::font::FAMILY_SANS,
+                            )),
+                    );
+                });
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlays (stage 5): palettes, dialog, toasts
+    // -----------------------------------------------------------------------
+
+    fn command_palette(&mut self, ctx: &egui::Context, workbench: egui::Rect) {
+        if let Some(id) = self.state.palette.show_ui(ctx, workbench) {
+            self.run_command(id);
+        }
+    }
+
+    fn toggle_command_palette(&mut self) {
+        if self.state.fuzzy.is_open() {
+            self.state.fuzzy.hide();
+        }
+        self.state.palette.toggle();
+    }
+
+    fn open_fuzzy(&mut self) {
+        if self.state.palette.is_open() {
+            self.state.palette.hide();
+        }
+        if self.state.fuzzy_source.is_empty() {
+            self.state
+                .toast("no files to find — open a folder first", Severity::Info);
+            return;
+        }
+        self.state.fuzzy.show();
+    }
+
+    fn open_settings(&mut self) {
+        if self.settings_dialog.is_none() {
+            self.settings_dialog = Some(SettingsDialog::new(self.state.settings.clone()));
+        }
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.settings_dialog.as_mut() else {
+            return;
+        };
+        let events = dialog.show(ctx);
+        let mut close = false;
+        let mut adopt: Option<selora_settings::Settings> = None;
+        for event in events {
+            match event {
+                SettingsEvent::Close => close = true,
+                SettingsEvent::Saved => {
+                    self.state.toast("Settings saved", Severity::Info);
+                    adopt = Some(dialog.settings().clone());
+                }
+                SettingsEvent::SaveFailed(message) => {
+                    self.state.toast(message, Severity::Error);
+                    adopt = Some(dialog.settings().clone());
+                }
+                // The keyring is Phase 4 (ARCHITECTURE.md §7); the key is
+                // never stored on disk. It is held for this session by the
+                // dispatcher (the live network half), and the toast says
+                // exactly that.
+                SettingsEvent::SaveKeyring(key) => {
+                    let _ = self.effect_tx.send(Effect::SeloraKeyringSet(key));
+                    self.state.toast(
+                        "secure keyring storage arrives in Phase 4 — the key is held for this session only",
+                        Severity::Info,
+                    );
+                }
+            }
+        }
+        if let Some(settings) = adopt {
+            self.state.settings = settings;
+        }
+        if close {
+            self.settings_dialog = None;
+        }
+    }
+
+    /// Toasts (UI_SPEC.md §13): bottom-right above the status bar, `--ink-mid`
+    /// fill, 1px `--ink-hi` hairline, radius-1, 12px padding, max 3.
+    fn toasts(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if let Some(next) = self.state.expire_toasts(now) {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
+        }
+        if self.state.toasts.is_empty() {
+            return;
+        }
+
+        let toasts = std::mem::take(&mut self.state.toasts);
+        let mut dismissed = None;
+        egui::Area::new(egui::Id::new("selora_toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-TOAST_EDGE, -(TOAST_EDGE + STATUS_BAR_HEIGHT)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.spacing_mut().item_spacing.y = theme::space::S2;
+                for (index, toast) in toasts.iter().enumerate() {
+                    let (glyph, color) = match toast.severity {
+                        Severity::Info => ("i", theme::color::INFO),
+                        Severity::Error => ("!", theme::color::ERR),
+                    };
+                    egui::Frame::default()
+                        .fill(theme::color::INK_MID)
+                        .stroke(egui::Stroke::new(1.0, theme::color::INK_HI))
+                        .corner_radius(theme::radius::R1 as u8)
+                        .inner_margin(egui::Margin::same(theme::space::S3 as i8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(glyph).color(color).font(
+                                    egui::FontId::new(
+                                        theme::type_scale::XS,
+                                        theme::font::FAMILY_MONO,
+                                    ),
+                                ));
+                                ui.label(
+                                    egui::RichText::new(toast.text.as_str())
+                                        .color(theme::color::FG_DEFAULT)
+                                        .font(egui::FontId::new(
+                                            theme::type_scale::SM,
+                                            theme::font::FAMILY_SANS,
+                                        )),
+                                );
+                                if ui
+                                    .button(egui::RichText::new("×").color(theme::color::FG_FAINT))
+                                    .clicked()
+                                {
+                                    dismissed = Some(index);
+                                }
+                            });
+                        });
+                }
+            });
+        self.state.toasts = toasts;
+        if let Some(index) = dismissed {
+            self.state.toasts.remove(index);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Commands and effects (§2 stage 7)
+    // -----------------------------------------------------------------------
+
+    /// Route a command-palette [`CommandId`] (UI_SPEC.md §5). The
+    /// Phase 2-reachable subset runs; the rest toast their landing phase —
+    /// no silent no-ops (PLAN.md §8).
+    fn run_command(&mut self, id: CommandId) {
+        match id {
+            CommandId::FileOpenFile => self.pick_file(),
+            CommandId::FileOpenFolder => self.pick_folder(),
+            CommandId::FileSave => self.save_active(),
+            CommandId::FileSaveAll => self.save_all(),
+            CommandId::FileCloseEditor => {
+                if let Some(closed) = self.state.close_editor() {
+                    self.state.prune_closed(&closed);
+                }
+            }
+            CommandId::FileCloseAllEditors => {
+                let closed = self.state.close_all_editors();
+                for path in &closed {
+                    self.state.prune_closed(path);
+                }
+            }
+            CommandId::FileGoToFile => self.open_fuzzy(),
+            CommandId::ViewToggleFileTree => {
+                self.show_tree = !self.show_tree;
+            }
+            CommandId::ViewSplitEditor => self.state.split_editor(),
+            CommandId::ViewCommandPalette => self.toggle_command_palette(),
+            CommandId::SettingsOpen => self.open_settings(),
+            // Phase 3: LSP, search, bottom panel.
+            CommandId::ViewTogglePanel => {
+                self.state
+                    .toast("bottom panel lands in Phase 3", Severity::Info);
+            }
+            CommandId::ViewGoToSymbol => {
+                self.state
+                    .toast("go to symbol lands in Phase 3", Severity::Info);
+            }
+            CommandId::EditToggleComment => {
+                self.state
+                    .toast("toggle comment lands in Phase 3", Severity::Info);
+            }
+            CommandId::EditFindInFile => {
+                self.state
+                    .toast("find in file lands in Phase 3", Severity::Info);
+            }
+            CommandId::EditReplaceInFile => {
+                self.state
+                    .toast("replace in file lands in Phase 3", Severity::Info);
+            }
+            CommandId::EditGoToDefinition => {
+                self.state
+                    .toast("go to definition lands in Phase 3", Severity::Info);
+            }
+            // Phase 4: the Selora UI.
+            CommandId::ViewToggleChatSidebar => {
+                self.state
+                    .toast("chat sidebar lands in Phase 4", Severity::Info);
+            }
+            CommandId::SeloraSwitchModel => {
+                self.state
+                    .toast("model switching lands in Phase 4", Severity::Info);
+            }
+            CommandId::SeloraClearApiKey => {
+                self.state
+                    .toast("API key management lands in Phase 4", Severity::Info);
+            }
+        }
+    }
+
+    /// Open `path`: reuse the loaded buffer (focus the tab) or enqueue an
+    /// async read (ARCHITECTURE.md §4.1).
+    fn open_path(&mut self, path: PathBuf) {
+        if self.state.buffers.contains_key(&path) {
+            self.state.open_file(path);
+        } else {
+            let _ = self.effect_tx.send(Effect::OpenFile(path));
+        }
+    }
+
+    fn save_active(&mut self) {
+        let Some(path) = self.state.active_path() else {
+            self.state.toast("no file open to save", Severity::Info);
+            return;
+        };
+        self.save_path(&path);
+    }
+
+    fn save_path(&mut self, path: &Path) {
+        let Some(buffer) = self.state.buffers.get(path).cloned() else {
+            return;
+        };
+        let _ = self.effect_tx.send(Effect::SaveBuffer {
+            path: path.to_path_buf(),
+            buffer,
+        });
+    }
+
+    fn save_all(&mut self) {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for pane in self.state.editor_area.pane_ids() {
+            if let Some(tabs) = self.state.editor_area.pane(pane) {
+                for path in tabs.paths() {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        if paths.is_empty() {
+            self.state.toast("no open files to save", Severity::Info);
+            return;
+        }
+        for path in paths {
+            self.save_path(&path);
+        }
+    }
+
+    /// Blocking `rfd` pickers run on worker threads, never the UI thread.
+    fn pick_folder(&mut self) {
+        wiring::spawn_pick_folder(&self.handle, &self.notify, &self.msg_tx);
+    }
+
+    fn pick_file(&mut self) {
+        wiring::spawn_pick_file(&self.handle, &self.notify, &self.msg_tx);
+    }
+}
+
+impl eframe::App for SeloraApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_body(ui);
+    }
+
+    /// Graceful close: persist the session one last time (§8.2).
+    fn on_exit(&mut self) {
+        self.save_workspace_now();
+    }
+}
+
+impl SeloraApp {
+    /// One frame, in ARCHITECTURE.md §2 stage order. Split from the
+    /// `eframe::App` impl so the headless smoke test can drive the exact
+    /// production frame body without an `eframe::Frame`.
+    fn ui_body(&mut self, ui: &mut egui::Ui) {
+        // §2 stage 1: drain worker messages before any painting.
+        self.drain_messages();
+        // Stage 2: timeouts (the 5s workspace autosave; toast expiry happens
+        // in `toasts` below, which owns their clock).
+        self.maybe_save_workspace();
+        // Stage 3: derived state (sequential restore, dirty derivation per
+        // painted editor).
+        self.pump_restore();
+
+        // Keybinds run only when no overlay owns the keyboard.
+        self.handle_keybinds(ui.ctx());
+
+        // Stages 4–6: layout, chrome, editor.
+        title_strip(ui);
+        self.status_bar(ui);
+        self.left_region(ui);
+        let mut workbench = egui::Rect::ZERO;
+        self.editor_region(ui, &mut workbench);
+
+        // Overlays.
+        self.command_palette(ui.ctx(), workbench);
+        self.settings_dialog(ui.ctx());
+        self.toasts(ui.ctx());
+    }
+}
+
+/// The title strip: brand mark on the left, 8px from the window edge, then
+/// an 8px gap, then "Selora IDE" in `--type-xl` / `--weight-semibold`
+/// (UI_SPEC.md §1.1). The OS draws the native window chrome above this.
+fn title_strip(ui: &mut egui::Ui) {
+    egui::Panel::top("title_strip")
+        .exact_size(TITLE_BAR_HEIGHT)
+        .show_separator_line(false)
+        .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+        .show(ui, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(EDGE_PADDING);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(MARK_SIZE, MARK_SIZE), egui::Sense::hover());
+                brand::paint_mark(ui.painter(), rect);
+                ui.add_space(TITLE_GAP);
+                let title = egui::RichText::new("Selora IDE")
+                    .color(theme::color::FG_DEFAULT)
+                    .font(egui::FontId::new(
+                        theme::type_scale::XL,
+                        theme::font::family_sans_semibold(),
+                    ));
+                ui.add(egui::Label::new(title));
+            });
+        });
+}
+
+/// Whether edit-capable keyboard input arrived this frame: printable text or
+/// the destructive keys. (Arrow navigation is deliberately excluded — moving
+/// the caret does not dirty a buffer.)
+fn edit_typed_this_frame(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.events.iter().any(|event| match event {
+            egui::Event::Text(_) => true,
+            egui::Event::Key {
+                key, pressed: true, ..
+            } => matches!(
+                key,
+                egui::Key::Backspace | egui::Key::Delete | egui::Key::Enter | egui::Key::Tab
+            ),
+            _ => false,
+        })
+    })
+}
+
+/// The display name of the active highlighting language (status bar).
+fn language_name(language: Option<Language>) -> &'static str {
+    match language {
+        None => "Plain Text",
+        Some(Language::Rust) => "Rust",
+        Some(Language::TypeScript) => "TypeScript",
+        Some(Language::Tsx) => "TSX",
+        Some(Language::JavaScript) => "JavaScript",
+        Some(Language::Python) => "Python",
+        Some(Language::Json) => "JSON",
+        Some(Language::Toml) => "TOML",
+        Some(Language::Markdown) => "Markdown",
+        Some(Language::Html) => "HTML",
+        Some(Language::Css) => "CSS",
+    }
+}
+
+/// A keybind chip for the empty-state hint (UI_SPEC.md §12): `--ink-mid`
+/// background, radius-1, `--type-xs` mono.
+fn keybind_chip(ui: &mut egui::Ui, key: &str) {
+    egui::Frame::default()
+        .fill(theme::color::INK_MID)
+        .corner_radius(theme::radius::R1 as u8)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(key)
+                    .color(theme::color::FG_DEFAULT)
+                    .font(egui::FontId::new(
+                        theme::type_scale::XS,
+                        theme::font::FAMILY_MONO,
+                    )),
+            );
+        });
+}
+
+// ---------------------------------------------------------------------------
+// The keybind routing table (UI_SPEC.md §15)
+// ---------------------------------------------------------------------------
+
+/// A global keybind action the shell knows how to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    FuzzyFind,
+    CommandPalette,
+    Save,
+    ToggleChat,
+    ToggleFileTree,
+    SplitEditor,
+    CloseEditor,
+    OpenSettings,
+    OpenFile,
+}
+
+/// The fixed Phase 2 bindings (parsed once). The rebindable four live in
+/// `settings.keybinds` and are checked first, so user rebinds win.
+fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
+    static FIXED: std::sync::OnceLock<Vec<(Keybind, KeyAction)>> = std::sync::OnceLock::new();
+    FIXED.get_or_init(|| {
+        let ctrl = |key: egui::Key, action: KeyAction| {
+            (
+                Keybind {
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    key,
+                },
+                action,
+            )
+        };
+        vec![
+            ctrl(egui::Key::B, KeyAction::ToggleFileTree),
+            ctrl(egui::Key::Backslash, KeyAction::SplitEditor),
+            ctrl(egui::Key::W, KeyAction::CloseEditor),
+            ctrl(egui::Key::Comma, KeyAction::OpenSettings),
+            ctrl(egui::Key::O, KeyAction::OpenFile),
+        ]
+    })
+}
+
+/// Route one keyboard shortcut to an action: the user-rebindable entries
+/// from `settings.keybinds` (UI_SPEC.md §15, Settings → Keybinds), then the
+/// fixed Phase 2 table.
+fn key_action(keybinds: &KeybindsSettings, shortcut: &egui::KeyboardShortcut) -> Option<KeyAction> {
+    let rebindable = [
+        (&keybinds.fuzzy_find, KeyAction::FuzzyFind),
+        (&keybinds.command_palette, KeyAction::CommandPalette),
+        (&keybinds.save, KeyAction::Save),
+        (&keybinds.toggle_chat, KeyAction::ToggleChat),
+    ];
+    for (binding, action) in rebindable {
+        if let Some(keybind) = Keybind::parse(binding) {
+            if keybind.matches(shortcut) {
+                return Some(action);
+            }
+        }
+    }
+    fixed_keybinds()
+        .iter()
+        .find(|(keybind, _)| keybind.matches(shortcut))
+        .map(|(_, action)| *action)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use selora_fs::tree::FileTreeNode;
+    use selora_settings::Settings;
+
+    fn shortcut(ctrl: bool, shift: bool, alt: bool, key: egui::Key) -> egui::KeyboardShortcut {
+        egui::KeyboardShortcut::new(
+            egui::Modifiers {
+                alt,
+                ctrl,
+                shift,
+                mac_cmd: false,
+                command: ctrl, // egui on Windows sets command = ctrl
+            },
+            key,
+        )
+    }
+
+    /// A small tree fixture: /repo { src/{main.rs, ui.rs}, Cargo.toml }.
+    fn fixture_tree() -> FileTreeNode {
+        fn node(path: &str, is_dir: bool, children: Vec<FileTreeNode>) -> FileTreeNode {
+            FileTreeNode {
+                name: std::path::Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_owned()),
+                path: PathBuf::from(path),
+                is_dir,
+                children,
+                truncated: false,
+            }
+        }
+        node(
+            "/repo",
+            true,
+            vec![
+                node(
+                    "/repo/src",
+                    true,
+                    vec![
+                        node("/repo/src/main.rs", false, vec![]),
+                        node("/repo/src/ui.rs", false, vec![]),
+                    ],
+                ),
+                node("/repo/Cargo.toml", false, vec![]),
+            ],
+        )
+    }
+
+    /// The whole workbench, headless: boot → open folder → open file →
+    /// edit (dirty) → split → every overlay, one production frame body per
+    /// step, with the bundled fonts so text layout is real. Nothing may
+    /// panic and nothing may silently toast.
+    #[tokio::test]
+    async fn workbench_paints_boot_tree_editor_split_and_overlays_headlessly() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        let mut app = SeloraApp::shell(
+            ctx.clone(),
+            Handle::current(),
+            msg_tx,
+            msg_rx,
+            effect_tx,
+            effect_rx,
+        );
+        // Isolated from the real %APPDATA%: no session restore, no writes.
+        app.workspace_dir = None;
+        app.settings_loaded = true;
+
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |app: &mut SeloraApp| {
+            ctx.run_ui(raw.clone(), |ui| app.ui_body(ui))
+                .drop_without_applying_deltas();
+        };
+
+        // Boot with no folder: the "No folder open" empty state paints.
+        frame(&mut app);
+        frame(&mut app);
+        assert!(app.state.workspace.is_none());
+        assert!(app.state.toasts.is_empty());
+
+        // Open Folder (worker messages): the tree and fuzzy source install.
+        app.state
+            .apply(AppMessage::FolderOpened(PathBuf::from("/repo")));
+        app.state.apply(AppMessage::FileTreeUpdated {
+            root: PathBuf::from("/repo"),
+            tree: fixture_tree(),
+        });
+        frame(&mut app);
+        assert!(app.state.file_tree.tree().is_some());
+        assert_eq!(app.state.fuzzy_source.len(), 3);
+
+        // Open a file: the tab opens, and the first paint creates the pane's
+        // editor with Rust highlighting selected by extension.
+        let main_rs = PathBuf::from("/repo/src/main.rs");
+        app.state.apply(AppMessage::BufferLoaded {
+            path: main_rs.clone(),
+            text: "fn main() {}\n".to_owned(),
+        });
+        frame(&mut app);
+        let pane = app.state.editor_area.active_pane_id();
+        let editor = app
+            .state
+            .editors
+            .get(&(pane, main_rs.clone()))
+            .expect("the pane's editor was created on first paint");
+        assert_eq!(editor.language(), Some(Language::Rust));
+        assert!(!app.state.is_dirty(&main_rs));
+
+        // Edit the shared buffer: the next paint's shape check dirties the tab.
+        {
+            let buffer = app
+                .state
+                .buffers
+                .get(&main_rs)
+                .cloned()
+                .expect("shared buffer");
+            buffer
+                .write()
+                .expect("lock")
+                .insert(selora_core::Position::new(1, 0), "// edited\n");
+        }
+        frame(&mut app);
+        assert!(app.state.is_dirty(&main_rs));
+
+        // Ctrl+\: two panes, both with the tab, both painted.
+        app.state.split_editor();
+        frame(&mut app);
+        assert_eq!(app.state.editor_area.pane_ids().len(), 2);
+        for pane in app.state.editor_area.pane_ids() {
+            assert!(app.state.editors.contains_key(&(pane, main_rs.clone())));
+        }
+
+        // Every overlay paints (and stays open — no input in a headless
+        // frame dismisses anything).
+        app.state.palette.show();
+        frame(&mut app);
+        assert!(app.state.palette.is_open());
+        app.state.palette.hide();
+
+        app.state.fuzzy.show();
+        frame(&mut app);
+        assert!(app.state.fuzzy.is_open());
+        app.state.fuzzy.hide();
+
+        app.settings_dialog = Some(SettingsDialog::new(Settings::default()));
+        frame(&mut app);
+        app.settings_dialog = None;
+
+        // Painting alone never surfaces an error (PLAN.md §8).
+        assert!(app.state.toasts.is_empty());
+    }
+
+    /// The UI_SPEC.md §15 routing table, over the default settings: every
+    /// default binding routes to its action, and nothing else does.
+    #[test]
+    fn keybind_routing_table_matches_the_defaults() {
+        let keybinds = KeybindsSettings::default();
+
+        let cases = [
+            (KeyAction::FuzzyFind, true, false, false, egui::Key::P),
+            (KeyAction::CommandPalette, true, true, false, egui::Key::P),
+            (KeyAction::Save, true, false, false, egui::Key::S),
+            (KeyAction::ToggleChat, true, false, false, egui::Key::L),
+            (KeyAction::ToggleFileTree, true, false, false, egui::Key::B),
+            (
+                KeyAction::SplitEditor,
+                true,
+                false,
+                false,
+                egui::Key::Backslash,
+            ),
+            (KeyAction::CloseEditor, true, false, false, egui::Key::W),
+            (
+                KeyAction::OpenSettings,
+                true,
+                false,
+                false,
+                egui::Key::Comma,
+            ),
+            (KeyAction::OpenFile, true, false, false, egui::Key::O),
+        ];
+        for (expected, ctrl, shift, alt, key) in cases {
+            let got = key_action(&keybinds, &shortcut(ctrl, shift, alt, key));
+            assert_eq!(
+                got,
+                Some(expected),
+                "shortcut ctrl={ctrl} shift={shift} alt={alt} {key:?} routed to {got:?}, expected {expected:?}"
+            );
+        }
+
+        // Bare keys and wrong modifiers route to nothing.
+        for (ctrl, shift, alt, key) in [
+            (false, false, false, egui::Key::P),
+            (false, false, false, egui::Key::S),
+            (false, false, false, egui::Key::B),
+            (true, true, false, egui::Key::S),
+            (true, false, true, egui::Key::P),
+            (false, true, false, egui::Key::O),
+        ] {
+            assert_eq!(
+                key_action(&keybinds, &shortcut(ctrl, shift, alt, key)),
+                None,
+                "unexpected action for ctrl={ctrl} shift={shift} alt={alt} {key:?}"
+            );
+        }
+    }
+
+    /// User rebinds (Settings → Keybinds) win over the defaults: a remapped
+    /// fuzzy finder routes to FuzzyFind on the new key, and the old default
+    /// goes quiet (Ctrl+P now matches nothing rebindable — the fixed table
+    /// has no Ctrl+P either).
+    #[test]
+    fn user_rebinds_win_over_the_default_table() {
+        let keybinds = KeybindsSettings {
+            fuzzy_find: "Ctrl+K".into(),
+            command_palette: "Ctrl+Alt+P".into(),
+            ..KeybindsSettings::default()
+        };
+
+        assert_eq!(
+            key_action(&keybinds, &shortcut(true, false, false, egui::Key::K)),
+            Some(KeyAction::FuzzyFind)
+        );
+        assert_eq!(
+            key_action(&keybinds, &shortcut(true, true, false, egui::Key::P)),
+            None
+        );
+        // Ctrl+Shift+P no longer opens the palette; the new binding does.
+        assert_eq!(
+            key_action(&keybinds, &shortcut(true, false, true, egui::Key::P)),
+            Some(KeyAction::CommandPalette)
+        );
+        // Unparsable bindings are skipped, not fatal.
+        let garbage = KeybindsSettings {
+            save: "not a keybind".into(),
+            ..KeybindsSettings::default()
+        };
+        assert_eq!(
+            key_action(&garbage, &shortcut(true, false, false, egui::Key::S)),
+            None
+        );
+    }
+
+    /// The edit signal used for dirty derivation: text and destructive keys
+    /// count; arrows and releases do not.
+    #[test]
+    fn edit_signal_classifies_input_events() {
+        let ctx = egui::Context::default();
+        let run = |events: Vec<egui::Event>| {
+            ctx.input_mut(|input| input.events = events);
+            edit_typed_this_frame(&ctx)
+        };
+        assert!(run(vec![egui::Event::Text("x".into())]));
+        assert!(run(vec![egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }]));
+        assert!(!run(vec![egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }]));
+        assert!(!run(vec![egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Default::default(),
+        }]));
+        assert!(!run(vec![egui::Event::PointerMoved(egui::Pos2::ZERO)]));
+    }
+
+    #[test]
+    fn language_names_are_stable() {
+        assert_eq!(language_name(None), "Plain Text");
+        assert_eq!(language_name(Some(Language::Rust)), "Rust");
+        assert_eq!(language_name(Some(Language::Markdown)), "Markdown");
+    }
+}

@@ -27,7 +27,7 @@
 //! of a bare `FileTreeView` — owning the view twice would fork expanded/
 //! selection state.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -68,9 +68,13 @@ pub enum Effect {
     /// `Settings::save` off the frame path.
     SettingsSave(Settings),
 
-    // Selora (the Phase 1c network half — live until the Phase 4 chat UI)
+    // Selora (the Phase 1c network half — live until the Phase 4 chat UI
+    // constructs them; the dispatcher and the wiremock tests exercise them).
+    #[allow(dead_code)]
     SeloraConnect(String),
+    #[allow(dead_code)]
     SeloraListModels,
+    #[allow(dead_code)]
     SeloraChat(Uuid, ChatRequest),
     /// Hold the Selora key for this session (the OS keyring itself is
     /// Phase 4, ARCHITECTURE.md §7).
@@ -126,6 +130,7 @@ pub enum AppMessage {
     // App
     /// A keyring operation failed (ARCHITECTURE.md §2.1; runtime side in
     /// Phase 4).
+    #[allow(dead_code)]
     KeyringError(SeloraError),
 }
 
@@ -281,7 +286,7 @@ impl AppState {
                 let shape = BufferShape::of(&buffer.read().unwrap_or_else(|e| e.into_inner()));
                 self.buffers.insert(path.clone(), buffer);
                 self.saved_shapes.insert(path.clone(), shape);
-                self.last_shapes.insert(path, shape);
+                self.last_shapes.insert(path.clone(), shape);
                 // Open the tab only now — a tab never points at a buffer
                 // that has not loaded (no blank editors).
                 self.open_file_from_load(path);
@@ -397,7 +402,7 @@ impl AppState {
             self.buffers.remove(path);
             self.saved_shapes.remove(path);
             self.last_shapes.remove(path);
-            self.editors.retain(|(_, open), open_path| open_path != path);
+            self.editors.retain(|open_tab, _| open_tab.1 != path);
         }
     }
 
@@ -428,15 +433,21 @@ impl AppState {
         }
     }
 
-    /// Whether the tab for `path` is dirty.
+    /// Whether the tab for `path` is dirty. Inspection helper for the
+    /// close-prompt / git-gutter features of later phases; the shell's
+    /// dirty *derivation* is [`Self::note_editor_frame`].
+    #[allow(dead_code)]
     pub fn is_dirty(&self, path: &Path) -> bool {
-        self.editor_area
-            .pane_ids()
-            .iter()
-            .any(|pane| self.editor_area.pane(*pane).is_some_and(|t| t.is_dirty(path)))
+        self.editor_area.pane_ids().iter().any(|pane| {
+            self.editor_area
+                .pane(*pane)
+                .is_some_and(|t| t.is_dirty(path))
+        })
     }
 
-    /// The shape baseline the buffer had when it was last loaded/saved.
+    /// The shape baseline the buffer had when it was last loaded/saved
+    /// (tests assert the reset-on-save behavior).
+    #[allow(dead_code)]
     pub fn saved_shape(&self, path: &Path) -> Option<BufferShape> {
         self.saved_shapes.get(path).copied()
     }
@@ -488,7 +499,10 @@ impl AppState {
     /// order, and the active file.
     pub fn workspace_snapshot(&self) -> WorkspaceState {
         WorkspaceState {
-            root: self.workspace.as_ref().map(|workspace| workspace.root.clone()),
+            root: self
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.root.clone()),
             open_files: self
                 .workspace
                 .as_ref()
@@ -511,9 +525,6 @@ fn collect_files(node: &FileTreeNode, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Requeue paths for restore (used by the shell's sequential-open pump).
-pub type RestoreQueue = VecDeque<PathBuf>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,12 +535,13 @@ mod tests {
     }
 
     fn loaded(state: &mut AppState, name: &str, text: &str) -> PathBuf {
-        let path = path(name);
+        let loaded_path = path(name);
+        state.apply(AppMessage::FolderOpened(path("/repo")));
         state.apply(AppMessage::BufferLoaded {
-            path: path.clone(),
+            path: loaded_path.clone(),
             text: text.to_owned(),
         });
-        path
+        loaded_path
     }
 
     // --- message-drain reduction -------------------------------------------
@@ -546,12 +558,15 @@ mod tests {
             Some(p.as_path())
         );
         assert_eq!(
-            state.workspace.as_ref().map(|w| w.active_path.clone()),
-            Some(Some(p.clone()))
+            state.workspace.as_ref().and_then(|w| w.active_path.clone()),
+            Some(p.clone())
         );
         assert!(!state.is_dirty(&p));
         // The clean baseline matches the loaded shape.
-        assert_eq!(state.saved_shape(&p), Some(BufferShape::of(&Buffer::from_text("fn main() {}"))));
+        assert_eq!(
+            state.saved_shape(&p),
+            Some(BufferShape::of(&Buffer::from_text("fn main() {}")))
+        );
     }
 
     #[test]
@@ -635,16 +650,24 @@ mod tests {
     fn buffer_saved_clears_the_dirty_flag_and_rebases_the_shape() {
         let mut state = AppState::default();
         let p = loaded(&mut state, "a.rs", "one\ntwo");
-        let shape = BufferShape {
-            len_chars: 7,
-            line_count: 2,
-        };
-        state.note_editor_frame(&p, shape, false); // clean paint
-        state.note_editor_frame(&p, BufferShape::of(&Buffer::from_text("one\ntwo\nthree")), false);
+        state.note_editor_frame(&p, BufferShape::of(&Buffer::from_text("one\ntwo")), false);
+
+        // The user edits the shared buffer (the worker saves *its* text).
+        {
+            let buffer = state.buffers.get(&p).cloned().expect("buffer");
+            buffer
+                .write()
+                .expect("lock")
+                .insert(selora_core::Position::new(1, 3), "\nthree");
+        }
+        state.note_editor_frame(
+            &p,
+            BufferShape::of(&Buffer::from_text("one\ntwo\nthree")),
+            false,
+        );
         assert!(state.is_dirty(&p));
 
-        // The buffer on disk (in this test, the shared buffer) was written;
-        // the worker replies BufferSaved.
+        // The write completed; the worker replies BufferSaved.
         state.apply(AppMessage::BufferSaved(p.clone()));
         assert!(!state.is_dirty(&p));
         assert_eq!(
@@ -662,7 +685,14 @@ mod tests {
         state.toast("d", Severity::Info);
         assert_eq!(state.toasts.len(), 3);
         // Oldest dropped, newest kept.
-        assert_eq!(state.toasts.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["b", "c", "d"]);
+        assert_eq!(
+            state
+                .toasts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
         assert_eq!(Severity::Info.lifetime(), Duration::from_secs(4));
         assert_eq!(Severity::Error.lifetime(), Duration::from_secs(8));
     }
@@ -676,11 +706,17 @@ mod tests {
         // Nothing expired yet.
         let next = state.expire_toasts(now);
         assert!(next.is_some());
-        // After the info lifetime (4s) only the error toast survives.
+        // After the info lifetime (4s) only the error toast survives, and
+        // the reported expiry is its own (8s), still in the future.
         let later = now + Duration::from_secs(5);
-        assert_eq!(state.expire_toasts(later), None);
+        let next_error = state.expire_toasts(later);
+        assert!(next_error.is_some_and(|expiry| expiry > later));
         assert_eq!(state.toasts.len(), 1);
         assert_eq!(state.toasts[0].severity, Severity::Error);
+        // And past its lifetime too, everything is gone.
+        let much_later = now + Duration::from_secs(9);
+        assert_eq!(state.expire_toasts(much_later), None);
+        assert!(state.toasts.is_empty());
     }
 
     // --- dirty-flag derivation ----------------------------------------------
@@ -750,7 +786,7 @@ mod tests {
         assert_eq!(state.close_editor(), Some(b));
         assert_eq!(state.active_path().as_deref(), Some(a.as_path()));
         assert_eq!(
-            state.workspace.as_ref().unwrap().open_files,
+            state.workspace.as_ref().expect("workspace").open_files,
             vec![a.clone()]
         );
     }

@@ -57,9 +57,7 @@ pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Read a file's text for a buffer, rejecting files over [`MAX_FILE_BYTES`]
 /// (ARCHITECTURE.md §4.1). Runs inside `spawn_blocking`.
 pub fn read_file_text(path: &Path) -> Result<String, SeloraError> {
-    let len = std::fs::metadata(path)
-        .map_err(|error| SeloraError::Io(error))?
-        .len();
+    let len = std::fs::metadata(path).map_err(SeloraError::Io)?.len();
     if len > MAX_FILE_BYTES {
         return Err(SeloraError::Other(format!(
             "file is {} MB — over the {} MB Lite limit and will not open",
@@ -96,7 +94,12 @@ pub fn atomic_write_text(path: &Path, text: &str) -> Result<(), SeloraError> {
 /// Effect (§2.2): read a file off the frame path. Replies
 /// [`AppMessage::BufferLoaded`] (the shell creates the shared buffer and
 /// opens the tab) or [`AppMessage::BufferLoadFailed`].
-pub fn spawn_open_file(handle: &Handle, notify: &Notify, tx: &UnboundedSender<AppMessage>, path: PathBuf) {
+pub fn spawn_open_file(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    path: PathBuf,
+) {
     let tx = tx.clone();
     let notify = notify.clone();
     handle.spawn_blocking(move || {
@@ -258,6 +261,7 @@ pub fn spawn_connect(
     base_url: String,
     api_key: String,
 ) {
+    let notify = notify.clone();
     handle.spawn(async move {
         let client = SeloraClient::new(&base_url, &api_key);
         let result = client.list_models().await;
@@ -283,6 +287,7 @@ pub fn spawn_chat(
     chat_id: Uuid,
     request: selora_ai::ChatRequest,
 ) {
+    let notify = notify.clone();
     let stream_handle = handle.clone();
     handle.spawn(async move {
         let client = SeloraClient::new(&base_url, &api_key);
@@ -347,7 +352,7 @@ pub fn spawn_dispatcher(
     msg_tx: UnboundedSender<AppMessage>,
     base_url: String,
 ) {
-    let handle = handle.clone();
+    let dispatch_handle = handle.clone();
     handle.spawn(async move {
         let mut effect_rx = effect_rx;
         let mut api_key: Option<String> = None;
@@ -355,23 +360,23 @@ pub fn spawn_dispatcher(
         while let Some(effect) = effect_rx.recv().await {
             match effect {
                 Effect::OpenFile(path) => {
-                    spawn_open_file(&handle, &notify, &msg_tx, path);
+                    spawn_open_file(&dispatch_handle, &notify, &msg_tx, path);
                 }
                 Effect::OpenFolder(root) => {
-                    spawn_open_folder(&handle, &notify, &msg_tx, root);
+                    spawn_open_folder(&dispatch_handle, &notify, &msg_tx, root);
                 }
                 Effect::RefreshFileTree(root) => {
-                    spawn_refresh_tree(&handle, &notify, &msg_tx, root);
+                    spawn_refresh_tree(&dispatch_handle, &notify, &msg_tx, root);
                 }
                 Effect::SaveBuffer { path, buffer } => {
-                    spawn_save_buffer(&handle, &notify, &msg_tx, path, buffer);
+                    spawn_save_buffer(&dispatch_handle, &notify, &msg_tx, path, buffer);
                 }
                 Effect::SettingsLoad => {
-                    spawn_settings_load(&handle, &notify, &msg_tx);
+                    spawn_settings_load(&dispatch_handle, &notify, &msg_tx);
                 }
                 Effect::SettingsSave(settings) => {
                     base_url = settings.selora.base_url.clone();
-                    spawn_settings_save(&handle, &notify, &msg_tx, settings);
+                    spawn_settings_save(&dispatch_handle, &notify, &msg_tx, settings);
                 }
                 Effect::SeloraConnect(key) => {
                     base_url = if base_url.is_empty() {
@@ -379,11 +384,23 @@ pub fn spawn_dispatcher(
                     } else {
                         base_url
                     };
-                    spawn_connect(&handle, &notify, msg_tx.clone(), base_url.clone(), key);
+                    spawn_connect(
+                        &dispatch_handle,
+                        &notify,
+                        msg_tx.clone(),
+                        base_url.clone(),
+                        key,
+                    );
                 }
                 Effect::SeloraListModels => match api_key.clone() {
                     Some(key) => {
-                        spawn_connect(&handle, &notify, msg_tx.clone(), base_url.clone(), key);
+                        spawn_connect(
+                            &dispatch_handle,
+                            &notify,
+                            msg_tx.clone(),
+                            base_url.clone(),
+                            key,
+                        );
                     }
                     None => {
                         // No silent no-op (PLAN.md §8): an unconnected list
@@ -397,7 +414,7 @@ pub fn spawn_dispatcher(
                 Effect::SeloraChat(chat_id, request) => match api_key.clone() {
                     Some(key) => {
                         spawn_chat(
-                            &handle,
+                            &dispatch_handle,
                             &notify,
                             msg_tx.clone(),
                             base_url.clone(),
@@ -410,8 +427,7 @@ pub fn spawn_dispatcher(
                         let _ = msg_tx.send(AppMessage::ChatError(
                             chat_id,
                             SeloraError::Auth(
-                                "no API key connected — keyring storage arrives in Phase 4"
-                                    .into(),
+                                "no API key connected — keyring storage arrives in Phase 4".into(),
                             ),
                         ));
                         notify();
@@ -471,7 +487,7 @@ mod tests {
     fn read_file_text_reads_small_files_and_rejects_the_oversize() {
         let small = unique_temp_path("small.txt");
         std::fs::write(&small, b"hello").expect("write");
-        assert_eq!(read_file_text(&small).as_deref(), Ok("hello"));
+        assert_eq!(read_file_text(&small).expect("read small file"), "hello");
 
         // Over the cap: a file extended to 4 MB + 1 (set_len, no bytes
         // actually written).
@@ -481,10 +497,7 @@ mod tests {
         drop(file);
 
         let error = read_file_text(&big).expect_err("oversize must be rejected");
-        assert!(
-            error.to_string().contains("Lite limit"),
-            "got: {error:?}"
-        );
+        assert!(error.to_string().contains("Lite limit"), "got: {error:?}");
 
         let _ = std::fs::remove_file(small);
         let _ = std::fs::remove_file(big);
@@ -493,17 +506,17 @@ mod tests {
     #[test]
     fn read_file_text_missing_file_is_a_clean_io_error() {
         let missing = unique_temp_path("missing.txt");
-        assert!(matches!(
-            read_file_text(&missing),
-            Err(SeloraError::Io(_))
-        ));
+        assert!(matches!(read_file_text(&missing), Err(SeloraError::Io(_))));
     }
 
     #[test]
     fn atomic_write_text_writes_and_leaves_no_temp_file() {
         let target = unique_temp_path("nested").join("out.rs");
         atomic_write_text(&target, "one\ntwo").expect("write");
-        assert_eq!(std::fs::read_to_string(&target).as_deref(), Ok("one\ntwo"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            "one\ntwo"
+        );
         assert!(!target
             .parent()
             .map(|dir| dir.join("out.rs.tmp").exists())
@@ -511,7 +524,10 @@ mod tests {
 
         // A second write replaces the first atomically.
         atomic_write_text(&target, "three").expect("replace");
-        assert_eq!(std::fs::read_to_string(&target).as_deref(), Ok("three"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            "three"
+        );
 
         let _ = std::fs::remove_dir_all(target.parent().expect("parent"));
     }
@@ -540,13 +556,22 @@ mod tests {
         let handle = Handle::current();
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
         let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
-        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx.clone(), DEFAULT_BASE_URL.into());
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx.clone(),
+            DEFAULT_BASE_URL.into(),
+        );
 
         let file = unique_temp_path("dispatch.rs");
         std::fs::write(&file, b"fn main() {}").expect("write");
         let _ = effect_tx.send(Effect::OpenFile(file.clone()));
         let loaded = recv_until(&mut msg_rx, |m| {
-            matches!(m, AppMessage::BufferLoaded { .. } | AppMessage::BufferLoadFailed { .. })
+            matches!(
+                m,
+                AppMessage::BufferLoaded { .. } | AppMessage::BufferLoadFailed { .. }
+            )
         })
         .await;
         match loaded {
@@ -564,7 +589,10 @@ mod tests {
             buffer,
         });
         let saved = recv_until(&mut msg_rx, |m| {
-            matches!(m, AppMessage::BufferSaved(_) | AppMessage::BufferSaveFailed { .. })
+            matches!(
+                m,
+                AppMessage::BufferSaved(_) | AppMessage::BufferSaveFailed { .. }
+            )
         })
         .await;
         match saved {
@@ -572,8 +600,8 @@ mod tests {
             other => panic!("expected BufferSaved, got {other:?}"),
         }
         assert_eq!(
-            std::fs::read_to_string(&file).as_deref(),
-            Ok("fn main() { /* edited */ }")
+            std::fs::read_to_string(&file).expect("read back"),
+            "fn main() { /* edited */ }"
         );
 
         let _ = std::fs::remove_file(file);
@@ -584,7 +612,13 @@ mod tests {
         let handle = Handle::current();
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
         let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
-        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+        );
 
         let big = unique_temp_path("dispatch-big.bin");
         let file = std::fs::File::create(&big).expect("create");
@@ -612,7 +646,13 @@ mod tests {
         let handle = Handle::current();
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
         let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
-        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+        );
 
         let root = unique_temp_path("tree-root");
         std::fs::create_dir_all(root.join("src")).expect("mkdir");
@@ -624,8 +664,11 @@ mod tests {
         })
         .await;
         match message {
-            AppMessage::FileTreeUpdated { path, tree } => {
-                assert_eq!(path, root);
+            AppMessage::FileTreeUpdated {
+                root: message_root,
+                tree,
+            } => {
+                assert_eq!(message_root, root);
                 assert!(tree.is_dir);
                 assert!(tree.child("src").is_some_and(|src| src.is_dir));
             }
@@ -646,7 +689,13 @@ mod tests {
         let handle = Handle::current();
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
         let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
-        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+        );
 
         let mut settings = Settings::default();
         settings.editor.font_size = 19;
@@ -655,14 +704,14 @@ mod tests {
             matches!(m, AppMessage::SettingsSaved | AppMessage::SettingsError(_))
         })
         .await;
-        assert!(matches!(message, AppMessage::SettingsSaved), "got {message:?}");
+        assert!(
+            matches!(message, AppMessage::SettingsSaved),
+            "got {message:?}"
+        );
         assert!(dir.join("settings.json").is_file());
 
         let _ = effect_tx.send(Effect::SettingsLoad);
-        let message = recv_until(&mut msg_rx, |m| {
-            matches!(m, AppMessage::SettingsLoaded(_))
-        })
-        .await;
+        let message = recv_until(&mut msg_rx, |m| matches!(m, AppMessage::SettingsLoaded(_))).await;
         match message {
             AppMessage::SettingsLoaded(loaded) => assert_eq!(loaded.editor.font_size, 19),
             other => panic!("expected SettingsLoaded, got {other:?}"),
@@ -677,16 +726,19 @@ mod tests {
         let handle = Handle::current();
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
         let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
-        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+        );
 
         let chat_id = Uuid::new_v4();
         let request = selora_ai::ChatRequest::new("test-model", vec![]);
         let _ = effect_tx.send(Effect::SeloraChat(chat_id, request));
 
-        let message = recv_until(&mut msg_rx, |m| {
-            matches!(m, AppMessage::ChatError(..))
-        })
-        .await;
+        let message = recv_until(&mut msg_rx, |m| matches!(m, AppMessage::ChatError(..))).await;
         match message {
             AppMessage::ChatError(id, error) => {
                 assert_eq!(id, chat_id);
@@ -732,8 +784,7 @@ mod tests {
         let handle = Handle::current();
         let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
         let chat_id = Uuid::new_v4();
-        let request = selora_ai::ChatRequest::new("test-model", vec![])
-            .with_stream(true);
+        let request = selora_ai::ChatRequest::new("test-model", vec![]).with_stream(true);
         spawn_chat(
             &handle,
             &noop_notify(),

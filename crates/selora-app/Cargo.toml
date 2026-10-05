@@ -25,6 +25,9 @@ selora-ui.workspace = true
 # Phase 2: chat request ids in Effect::SeloraChat (ARCHITECTURE.md §2.2).
 uuid.workspace = true
 rfd = "0.17.2"
+# Phase 2 shell: workspace.json persistence (ARCHITECTURE.md §8.2).
+serde.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "selora-app"

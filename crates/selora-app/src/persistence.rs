@@ -41,8 +41,9 @@ pub fn state_dir() -> Option<PathBuf> {
 
 /// Save the session state atomically (temp + rename, same directory).
 pub fn save(dir: &Path, state: &WorkspaceState) -> Result<(), SeloraError> {
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|error| SeloraError::Config(format!("failed to serialize workspace state: {error}")))?;
+    let json = serde_json::to_string_pretty(state).map_err(|error| {
+        SeloraError::Config(format!("failed to serialize workspace state: {error}"))
+    })?;
 
     std::fs::create_dir_all(dir)?;
     let target = workspace_path(dir);
@@ -75,33 +76,25 @@ pub fn load(dir: &Path) -> Option<WorkspaceState> {
 /// on disk, and the open files that still exist (a deleted file is dropped,
 /// not fatal — it simply does not reopen).
 pub fn restorable(state: &WorkspaceState) -> WorkspaceState {
-    let root = state
-        .root
-        .as_ref()
-        .filter(|root| root.is_dir())
-        .cloned();
+    let root = state.root.as_ref().filter(|root| root.is_dir()).cloned();
     let open_files = match &root {
         Some(root) => state
             .open_files
             .iter()
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .strip_prefix(root)
-                        .is_ok()
-            })
+            .filter(|path| path.is_file() && path.strip_prefix(root).is_ok())
             .cloned()
             .collect(),
         None => Vec::new(),
     };
+    let active_path = state
+        .active_path
+        .as_ref()
+        .filter(|path| open_files.contains(path))
+        .cloned();
     WorkspaceState {
         root,
         open_files,
-        active_path: state
-            .active_path
-            .as_ref()
-            .filter(|path| open_files.contains(path))
-            .cloned(),
+        active_path,
     }
 }
 
@@ -129,10 +122,7 @@ mod tests {
 
         let state = WorkspaceState {
             root: Some(root.clone()),
-            open_files: vec![
-                root.join("Cargo.toml"),
-                root.join("src").join("main.rs"),
-            ],
+            open_files: vec![root.join("Cargo.toml"), root.join("src").join("main.rs")],
             active_path: Some(root.join("src").join("main.rs")),
         };
         (root, state)
@@ -199,10 +189,7 @@ mod tests {
 
         let restored = restorable(&state);
         assert_eq!(restored.root, Some(root.clone()));
-        assert_eq!(
-            restored.open_files,
-            vec![root.join("src").join("main.rs")]
-        );
+        assert_eq!(restored.open_files, vec![root.join("src").join("main.rs")]);
         // The active file must be one of the restored tabs.
         assert_eq!(restored.active_path, None);
 
@@ -217,14 +204,16 @@ mod tests {
     #[test]
     fn restorable_rejects_files_outside_the_root() {
         let (root, mut state) = fixture_session();
-        let outside = temp_dir().join("elsewhere.rs");
+        let outside_dir = temp_dir();
+        std::fs::create_dir_all(&outside_dir).expect("mkdir outside dir");
+        let outside = outside_dir.join("elsewhere.rs");
         std::fs::write(&outside, b"x").expect("write");
         state.open_files = vec![outside.clone(), root.join("Cargo.toml")];
 
         let restored = restorable(&state);
         assert_eq!(restored.open_files, vec![root.join("Cargo.toml")]);
 
-        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(outside_dir);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -239,10 +228,7 @@ mod tests {
         let state = WorkspaceState::default();
         let result = save(&not_a_dir, &state);
         assert!(result.is_err());
-        assert!(
-            matches!(result, Err(SeloraError::Io(_))),
-            "got: {result:?}"
-        );
+        assert!(matches!(result, Err(SeloraError::Io(_))), "got: {result:?}");
 
         let _ = std::fs::remove_dir_all(blocker);
     }
