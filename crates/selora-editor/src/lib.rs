@@ -9,6 +9,8 @@
 //!
 //! Layout of this crate:
 //! - [`Editor`] — the egui widget: input, painting, buffer access.
+//! - [`ghost_text`] — the Phase 4d inline-completion overlay: state, the
+//!   comet fade-in, and paint-only rendering at the caret.
 //! - [`syntax`] — tree-sitter highlighting: the Lite grammars, incremental
 //!   re-parse on edit, SYN_* palette spans.
 //! - `motion` (private module) — pure cursor-movement rules over a
@@ -27,4 +29,5 @@ pub mod syntax;
 mod theme;
 
 pub use editor::Editor;
+pub use ghost_text::GhostText;
 pub use syntax::{Language, LineSection, Span, SyntaxKind, SyntaxLayer};

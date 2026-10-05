@@ -41,6 +41,7 @@ use egui::{
 };
 use selora_core::{Buffer, Position};
 
+use crate::ghost_text::{self, GhostText};
 use crate::lsp_overlay::{self, OverlayState};
 use crate::syntax::{Language, LineSection, Span, SyntaxKind, SyntaxLayer};
 use crate::{layout, motion, theme};
@@ -67,6 +68,14 @@ pub struct Editor {
     /// The LSP overlay (Phase 3a): diagnostics to squiggle, document-sync
     /// bookkeeping, and the hover-hold gesture. See `lsp_overlay.rs`.
     lsp: OverlayState,
+    /// The ghost-text suggestion (Phase 4d), painted at the caret until Tab
+    /// accepts it or any other input dismisses it. See `ghost_text.rs`.
+    ghost: Option<ghost_text::GhostText>,
+    /// When the last buffer-mutating edit happened, on the egui frame clock
+    /// (`input.time`). The shell's 350 ms ghost debounce (ARCHITECTURE.md
+    /// §2 stage 2) compares this against the current frame time — see
+    /// [`Editor::last_edit_time`].
+    last_edit: Option<f64>,
 }
 
 impl Editor {
@@ -81,6 +90,8 @@ impl Editor {
             syntax: None,
             frame_time: 0.0,
             lsp: OverlayState::default(),
+            ghost: None,
+            last_edit: None,
         }
     }
 
@@ -97,6 +108,7 @@ impl Editor {
         // re-diagnoses (Phase 3a).
         self.lsp.diagnostics.clear();
         self.lsp.commits += 1;
+        self.ghost = None; // the suggestion belonged to the replaced text
         if let Some(layer) = &mut self.syntax {
             layer.set_source(text);
         }
@@ -234,6 +246,85 @@ impl Editor {
     }
 
     // ------------------------------------------------------------------
+    // Ghost text (Phase 4d — the editor side of PLAN.md §6.4; state,
+    // the comet, and painting live in `ghost_text.rs`)
+    // ------------------------------------------------------------------
+
+    /// Set (or clear) the ghost suggestion: the shell calls this when a
+    /// `GhostTextReady` reply lands.
+    ///
+    /// `request_caret` is the caret position the shell captured when it
+    /// *sent* the request (the caret the up-to-caret prefix was taken at).
+    /// A reply arriving after the caret moved is stale — the suggestion was
+    /// computed for a different document position — and is dropped rather
+    /// than painted (same spirit as ARCHITECTURE.md §5.5: stale responses
+    /// are dropped silently). A `None` or blank suggestion clears any open
+    /// ghost (blank replies mean "nothing to suggest").
+    pub fn set_ghost(&mut self, suggestion: Option<String>, request_caret: Position) {
+        match suggestion {
+            Some(text) if !text.trim().is_empty() && request_caret == self.cursor => {
+                self.ghost = Some(GhostText::new(text, request_caret));
+            }
+            _ => self.ghost = None,
+        }
+    }
+
+    /// The open ghost suggestion, if any (`None` when dismissed/cleared).
+    pub fn ghost(&self) -> Option<&str> {
+        self.ghost.as_ref().map(GhostText::suggestion)
+    }
+
+    /// Dismiss the ghost without inserting it (Esc, or any input that is
+    /// not Tab). Idempotent.
+    pub fn dismiss_ghost(&mut self) {
+        self.ghost = None;
+    }
+
+    /// Accept the ghost (Tab): insert the suggestion at the caret as one
+    /// edit and clear it. The buffer has no undo log yet, so this is a
+    /// plain insert through the normal edit path — one commit, syntax-layer
+    /// notification, and caret placement included (the moment a undo log
+    /// lands, the single `insert_text` here becomes one undo step for
+    /// free). Returns whether a ghost was open to accept.
+    pub fn accept_ghost(&mut self) -> bool {
+        let Some(ghost) = self.ghost.take() else {
+            return false;
+        };
+        let suggestion = ghost.into_suggestion();
+        self.insert_text(&suggestion);
+        true
+    }
+
+    /// The up-to-caret prefix a ghost request is made of (PLAN.md §6.4:
+    /// the prompt is the text preceding the caret). Everything before the
+    /// caret, across lines.
+    pub fn text_to_caret(&self) -> String {
+        let buffer = self.read_buffer();
+        let chars = buffer.position_to_char(self.cursor);
+        buffer.text().chars().take(chars).collect()
+    }
+
+    /// When the last buffer-mutating edit happened, in seconds on the egui
+    /// frame clock (`input.time`); `None` if this pane has never been
+    /// edited.
+    ///
+    /// This is the idle-detection seam for the shell's 350 ms ghost
+    /// debounce (ARCHITECTURE.md §2 stage 2 — the timer itself belongs to
+    /// the shell, the editor only reports when it last saw edit input):
+    ///
+    /// ```text
+    /// let now = ui.ctx().input(|i| i.time);
+    /// let idle = editor.last_edit_time().is_none_or(|t| now - t >= 0.350);
+    /// ```
+    ///
+    /// The shell then captures `editor.cursor()`, emits the ghost request
+    /// with `editor.text_to_caret()`, and routes the reply back through
+    /// [`Editor::set_ghost`] with that captured caret.
+    pub fn last_edit_time(&self) -> Option<f64> {
+        self.last_edit
+    }
+
+    // ------------------------------------------------------------------
     // Buffer access
     //
     // A poisoned lock is recovered from rather than panicked on
@@ -322,8 +413,10 @@ impl Editor {
         self.cursor = new_cursor;
         self.anchor = None;
         // One buffer-mutating commit (Phase 3a: the shell watches this to
-        // emit the debounced LSP didChange).
+        // emit the debounced LSP didChange) and one edit-input timestamp
+        // (Phase 4d: the shell's 350 ms ghost debounce idles on this).
         self.lsp.commits += 1;
+        self.last_edit = Some(self.frame_time);
     }
 
     /// Backspace: remove the selection, or the character before the caret
@@ -354,6 +447,7 @@ impl Editor {
         self.cursor = start;
         self.anchor = None;
         self.lsp.commits += 1;
+        self.last_edit = Some(self.frame_time);
     }
 
     // ------------------------------------------------------------------
@@ -418,6 +512,10 @@ impl Editor {
             }
         } else if response.clicked_by(PointerButton::Primary) {
             if let Some(pointer) = response.interact_pointer_pos() {
+                // Any input that is not Tab dismisses the ghost (Phase 4d):
+                // a click that moves the caret invalidates the suggestion's
+                // position even though the buffer is untouched.
+                self.ghost = None;
                 if pointer.x < rect.left() + layout::GUTTER_WIDTH {
                     self.select_line_at(pointer, rect, shift);
                 } else if let Some(position) =
@@ -493,6 +591,9 @@ impl Editor {
         for event in events {
             match event {
                 Event::Text(text) => {
+                    // Typed input is edit input: it dismisses the ghost
+                    // (Phase 4d — any keypress other than Tab).
+                    self.ghost = None;
                     self.insert_text(&text);
                     interacted = true;
                 }
@@ -512,6 +613,12 @@ impl Editor {
 
     /// One keypress. Returns whether the cursor moved or text changed.
     fn handle_key(&mut self, key: Key, extend: bool) -> bool {
+        // Tab accepts an open ghost; every other keypress dismisses it
+        // (Phase 4d, UI_SPEC.md §3.5) *before* its normal handling runs,
+        // so the dismiss happens even for keys that are otherwise no-ops.
+        if key != Key::Tab {
+            self.ghost = None;
+        }
         match key {
             Key::ArrowLeft => {
                 let target = {
@@ -570,13 +677,17 @@ impl Editor {
                 true
             }
             Key::Escape => {
-                // Collapse the selection. (Ghost-text dismissal arrives with
-                // selora-ai in Phase 4.)
+                // Collapse the selection; an open ghost was already
+                // dismissed by the any-other-key rule above.
                 self.anchor = None;
                 false
             }
-            // Tab is reserved for ghost-text acceptance (Phase 4); left
-            // unhandled for now so nothing is inserted silently.
+            // Tab accepts the ghost (Phase 4d, UI_SPEC.md §15); without a
+            // ghost it stays unhandled so nothing is inserted silently.
+            Key::Tab if self.ghost.is_some() => {
+                self.accept_ghost();
+                true
+            }
             _ => false,
         }
     }
@@ -731,6 +842,35 @@ impl Editor {
             self.lsp.caret_screen = None;
         }
 
+        // Ghost text (Phase 4d, UI_SPEC.md §3.5): the suggestion paints at
+        // the caret in --fg-faint with a 2px --ink-rule underline —
+        // paint-only, the buffer is untouched until Tab. The comet clock is
+        // driven from this paint loop (the frame time), so a ghost whose
+        // caret row is scrolled off-screen keeps its first appearance
+        // un-animated for when it scrolls back in.
+        if cursor_row < rows {
+            let caret_x = visuals[cursor_row]
+                .x_offsets
+                .get(self.cursor.col)
+                .copied()
+                .unwrap_or(visuals[cursor_row].width);
+            let font_id = self.font_id();
+            if let Some(ghost) = self.ghost.as_mut() {
+                ghost_text::paint_ghost(
+                    painter,
+                    ghost,
+                    time,
+                    ghost_text::GhostGeometry {
+                        caret_x: text_x + caret_x,
+                        line_start_x: text_x,
+                        row_top: row_y(cursor_row),
+                        rows_below: rows - cursor_row - 1,
+                    },
+                    &font_id,
+                );
+            }
+        }
+
         // Diagnostic squiggles (UI_SPEC.md §3.6): a 3px wave under each
         // diagnostic's range, at least one character cell wide (servers
         // report zero-width ranges at the error position). Multi-line
@@ -798,6 +938,25 @@ impl Widget for &mut Editor {
 
         if response.clicked() {
             response.request_focus();
+        }
+
+        // While focused, keep the keyboard: egui's focus traversal would
+        // otherwise steal Tab / arrows / Esc and move focus away — but the
+        // editor handles all of these itself (Tab accepts the ghost, arrows
+        // move the caret, Esc collapses the selection). The same lock egui's
+        // own TextEdit and Slider widgets take.
+        if response.has_focus() {
+            ui.ctx().memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
         }
 
         let font_id = self.font_id();
@@ -868,6 +1027,17 @@ impl Widget for &mut Editor {
 
         let focused = response.has_focus();
         self.paint(&painter, rect, char_width, focused, time);
+
+        // The comet needs frames while it runs (Phase 4d): egui otherwise
+        // sleeps between input and the fade-in would freeze mid-flight.
+        // Same pattern as the caret blink and hover-hold repaints above.
+        if let Some(until_settled) = self
+            .ghost
+            .as_ref()
+            .and_then(|ghost| ghost.needs_repaint(time))
+        {
+            ui.ctx().request_repaint_after(until_settled);
+        }
 
         response
     }
@@ -1396,5 +1566,203 @@ mod tests {
         });
         assert_eq!(editor.diagnostics().len(), 1);
         assert!(editor.caret_screen_pos().is_some());
+    }
+
+    // --- Ghost text (Phase 4d — see ghost_text.rs) ----------------------------
+
+    /// The ghost is paint-only: a full frame with a multi-line ghost paints
+    /// headlessly and leaves the buffer, the commit counter, and the ghost
+    /// itself untouched.
+    #[test]
+    fn ghost_paints_headlessly_without_touching_the_buffer() {
+        let mut editor = editor("fn theme() {\n");
+        editor.cursor = Position::new(1, 0);
+        editor.set_ghost(
+            Some("    Theme::from_tokens(TOKENS)\n}".into()),
+            Position::new(1, 0),
+        );
+        assert_eq!(editor.ghost(), Some("    Theme::from_tokens(TOKENS)\n}"));
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        // Nothing about the buffer moved.
+        assert_eq!(editor.text(), "fn theme() {\n");
+        assert_eq!(editor.document_version(), 0);
+        assert_eq!(editor.cursor(), Position::new(1, 0));
+        // And the ghost survived the frame (the widget borrows, never resets).
+        assert_eq!(editor.ghost(), Some("    Theme::from_tokens(TOKENS)\n}"));
+    }
+
+    /// Tab accepts: the suggestion is inserted at the caret as one edit and
+    /// the ghost clears — one commit, caret after the text.
+    #[test]
+    fn tab_accepts_the_ghost_into_the_buffer() {
+        let mut editor = editor("fn main()");
+        editor.cursor = Position::new(0, 9);
+        editor.set_ghost(Some(" {}".into()), Position::new(0, 9));
+        assert!(editor.handle_key(Key::Tab, false));
+        assert_eq!(editor.text(), "fn main() {}");
+        assert_eq!(editor.cursor(), Position::new(0, 12));
+        assert_eq!(editor.ghost(), None);
+        assert_eq!(editor.document_version(), 1);
+        // Accepting with no ghost open is a no-op (Tab falls through
+        // unhandled, nothing inserts silently).
+        assert!(!editor.handle_key(Key::Tab, false));
+        assert_eq!(editor.text(), "fn main() {}");
+    }
+
+    /// Any other keypress dismisses the ghost — editing keys, motion keys,
+    /// and keys the editor does not even handle.
+    #[test]
+    fn non_tab_keys_dismiss_the_ghost() {
+        let mut editor = editor("let x = 1;");
+        editor.cursor = Position::new(0, 10);
+        editor.set_ghost(Some(" // done".into()), Position::new(0, 10));
+
+        // An editing key: dismissed AND handled.
+        assert!(editor.handle_key(Key::Enter, false));
+        assert_eq!(editor.ghost(), None);
+        assert_eq!(editor.text(), "let x = 1;\n");
+
+        // A motion key: dismissed, caret moved, buffer unchanged.
+        editor.set_ghost(Some(" again".into()), editor.cursor());
+        assert!(editor.handle_key(Key::ArrowLeft, false));
+        assert_eq!(editor.ghost(), None);
+        assert_eq!(editor.text(), "let x = 1;\n");
+
+        // A key the editor does not handle at all: still dismissed.
+        editor.set_ghost(Some(" once more".into()), editor.cursor());
+        assert!(!editor.handle_key(Key::PageDown, false));
+        assert_eq!(editor.ghost(), None);
+    }
+
+    /// Esc dismisses the ghost (UI_SPEC.md §15) and still collapses the
+    /// selection, as it did before Phase 4d.
+    #[test]
+    fn escape_dismisses_the_ghost_and_collapses_the_selection() {
+        let mut editor = editor("select me");
+        editor.cursor = Position::new(0, 9);
+        editor.set_ghost(Some(" now".into()), Position::new(0, 9));
+        editor.anchor = Some(Position::new(0, 0));
+        assert!(!editor.handle_key(Key::Escape, false));
+        assert_eq!(editor.ghost(), None);
+        assert!(editor.selection().is_none());
+        assert_eq!(editor.text(), "select me", "Esc never edits the buffer");
+    }
+
+    /// A reply for a caret that has since moved is stale and is dropped —
+    /// never painted, and any previously open ghost is cleared too.
+    #[test]
+    fn stale_ghost_reply_is_dropped() {
+        let mut editor = editor("fn a() {}");
+        editor.cursor = Position::new(0, 8);
+        editor.set_ghost(Some(" x".into()), Position::new(0, 8));
+        assert_eq!(editor.ghost(), Some(" x"));
+        // The caret moves (arrow) — the old ghost was dismissed by the key;
+        // a reply for the old position now lands.
+        editor.handle_key(Key::ArrowLeft, false);
+        editor.set_ghost(Some(" stale".into()), Position::new(0, 8));
+        assert_eq!(editor.ghost(), None, "stale reply dropped");
+        // A fresh reply for the current caret is kept.
+        editor.set_ghost(Some(" fresh".into()), editor.cursor());
+        assert_eq!(editor.ghost(), Some(" fresh"));
+    }
+
+    /// `None` and blank replies clear an open ghost (a blank reply is the
+    /// provider saying "nothing to suggest").
+    #[test]
+    fn none_and_blank_ghost_replies_clear() {
+        let mut editor = editor("fn a() {}");
+        editor.cursor = Position::new(0, 8);
+        editor.set_ghost(Some(" x".into()), Position::new(0, 8));
+        editor.set_ghost(None, Position::new(0, 8));
+        assert_eq!(editor.ghost(), None);
+        editor.set_ghost(Some(" x".into()), Position::new(0, 8));
+        editor.set_ghost(Some("   ".into()), Position::new(0, 8));
+        assert_eq!(editor.ghost(), None);
+        editor.set_ghost(Some(" x".into()), Position::new(0, 8));
+        editor.set_ghost(Some(String::new()), Position::new(0, 8));
+        assert_eq!(editor.ghost(), None);
+    }
+
+    /// The full input path through real frames: click to focus (which
+    /// dismisses, per the any-input rule), type (dismisses + edits), then
+    /// a ghost arrives and Tab accepts it through the focused widget.
+    #[test]
+    fn ghost_input_flows_through_real_frames() {
+        let ctx = egui::Context::default();
+        let mut editor = editor("let v = ");
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0));
+        let raw = |events: Vec<Event>| egui::RawInput {
+            events,
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        // Frame 1: the pane takes focus (a click does this in the real app;
+        // requesting it directly keeps the test off pointer-hit-testing).
+        ctx.run_ui(raw(vec![]), |ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor).request_focus();
+        })
+        .drop_without_applying_deltas();
+
+        // Frame 2: focused typing inserts at the caret and would dismiss
+        // any ghost.
+        editor.cursor = Position::new(0, 8); // "let v = |"
+        ctx.run_ui(raw(vec![Event::Text("1".into())]), |ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(editor.text(), "let v = 1");
+
+        // The reply lands for the current caret; Tab in the next frame
+        // accepts it (the widget is still focused from frame 1).
+        editor.set_ghost(Some("; // done".into()), editor.cursor());
+        ctx.run_ui(
+            raw(vec![Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]),
+            |ui| {
+                ui.set_max_size(vec2(640.0, 480.0));
+                ui.add(&mut editor);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(editor.text(), "let v = 1; // done");
+        assert_eq!(editor.ghost(), None);
+    }
+
+    /// The idle seam: every buffer-mutating edit stamps the frame clock;
+    /// reads never do.
+    #[test]
+    fn last_edit_time_tracks_edits_not_reads() {
+        let mut editor = editor("let x = 1;\n");
+        assert_eq!(editor.last_edit_time(), None, "never edited");
+        editor.frame_time = 5.0;
+        editor.cursor = Position::new(0, 10);
+        editor.insert_text(" + 1");
+        assert_eq!(editor.last_edit_time(), Some(5.0));
+        editor.delete_backward();
+        assert_eq!(editor.last_edit_time(), Some(5.0));
+        // A read is not an edit.
+        let _ = editor.text();
+        assert_eq!(editor.last_edit_time(), Some(5.0));
+    }
+
+    /// The request prefix: everything before the caret, across lines.
+    #[test]
+    fn text_to_caret_returns_the_prefix() {
+        let mut editor = editor("fn theme() {\n    Theme::from_");
+        editor.cursor = Position::new(1, 17);
+        assert_eq!(editor.text_to_caret(), "fn theme() {\n    Theme::from_");
+        editor.cursor = Position::start();
+        assert_eq!(editor.text_to_caret(), "");
     }
 }
