@@ -53,6 +53,9 @@ pub struct Editor {
     /// Index of the top visible line. Whole lines only — jump scroll, no
     /// smoothing (UI_SPEC.md §3.2).
     scroll: usize,
+    /// A line the next paint must scroll into view (set by
+    /// [`Editor::goto_line`]; the visible-row count is only known at paint).
+    pending_reveal: Option<usize>,
     /// Syntax state for this pane (Phase 2d). `None` = plain text (no
     /// language detected, or the grammar failed to load).
     syntax: Option<SyntaxLayer>,
@@ -69,6 +72,7 @@ impl Editor {
             cursor: Position::start(),
             anchor: None,
             scroll: 0,
+            pending_reveal: None,
             syntax: None,
             frame_time: 0.0,
         }
@@ -81,6 +85,7 @@ impl Editor {
         self.cursor = Position::start();
         self.anchor = None;
         self.scroll = 0;
+        self.pending_reveal = None;
         if let Some(layer) = &mut self.syntax {
             layer.set_source(text);
         }
@@ -201,6 +206,20 @@ impl Editor {
             self.anchor = None;
         }
         self.cursor = target;
+    }
+
+    /// Jump the caret to a **1-based** line (search results, the problems
+    /// panel, go-to-definition): collapses the selection, clamps to the
+    /// buffer, and asks the next paint to scroll the line into view (the
+    /// viewport's visible-row count is only known there). Called on every
+    /// pane's editor that shows this buffer.
+    pub fn goto_line(&mut self, line_1based: usize) {
+        let line_count = self.read_buffer().line_count();
+        let line = line_1based
+            .saturating_sub(1)
+            .min(line_count.saturating_sub(1));
+        self.move_cursor(Position::new(line, 0), false);
+        self.pending_reveal = Some(line);
     }
 
     // ------------------------------------------------------------------
@@ -669,6 +688,12 @@ impl Widget for &mut Editor {
         let line_count = self.read_buffer().line_count();
         self.scroll = layout::clamp_scroll(self.scroll, line_count, visible);
 
+        // A goto_line request from this frame (or just before): pull the
+        // viewport to the revealed line now that `visible` is known.
+        if let Some(line) = self.pending_reveal.take() {
+            self.scroll = layout::ensure_cursor_visible(self.scroll, line, visible);
+        }
+
         // Keep the syntax layer in step with the buffer and pump its
         // re-parse debounce. The char/line counts are a cheap O(log n)
         // staleness guard against buffer mutations nobody told the editor
@@ -785,6 +810,28 @@ mod tests {
         assert_eq!(editor.text(), "replaced\ncontent\nhere");
         assert_eq!(editor.cursor(), Position::start());
         assert!(editor.selection().is_none());
+    }
+
+    #[test]
+    fn goto_line_clamps_collapses_and_flags_a_reveal() {
+        let mut editor = editor("one\ntwo\nthree\nfour");
+        // A mid-file line: 1-based → 0-based, selection collapsed.
+        editor.anchor = Some(Position::new(0, 0));
+        editor.goto_line(3);
+        assert_eq!(editor.cursor(), Position::new(2, 0));
+        assert!(editor.selection().is_none());
+        assert_eq!(editor.pending_reveal, Some(2));
+
+        // Beyond the end clamps to the last line; before the start to the
+        // first (a 1-based line 0 is really "line 1").
+        editor.goto_line(99);
+        assert_eq!(editor.cursor(), Position::new(3, 0));
+        editor.goto_line(0);
+        assert_eq!(editor.cursor(), Position::new(0, 0));
+
+        // And set_text clears any pending reveal with the rest of the view.
+        editor.set_text("x");
+        assert_eq!(editor.pending_reveal, None);
     }
 
     #[test]

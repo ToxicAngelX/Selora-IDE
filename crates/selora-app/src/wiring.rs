@@ -347,6 +347,30 @@ fn send_git_outcome(
 }
 
 // ---------------------------------------------------------------------------
+// Effect workers: search (Phase 3c)
+// ---------------------------------------------------------------------------
+
+/// Effect (§2.2): run a workspace search off the frame path and reply
+/// [`AppMessage::SearchResults`] with the same id (the panel drops stale
+/// replies).
+pub fn spawn_search(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    id: selora_fs::search::SearchId,
+    root: PathBuf,
+    query: selora_fs::search::SearchQuery,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let results = selora_fs::search::search_in_files(&root, &query);
+        let _ = tx.send(AppMessage::SearchResults { id, results });
+        notify();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Effect workers: blocking file/folder pickers (rfd)
 // ---------------------------------------------------------------------------
 
@@ -575,6 +599,9 @@ pub fn spawn_dispatcher(
                 }
                 Effect::GitCommit(root, message) => {
                     spawn_git_commit(&dispatch_handle, &notify, &msg_tx, root, message);
+                }
+                Effect::Search { id, root, query } => {
+                    spawn_search(&dispatch_handle, &notify, &msg_tx, id, root, query);
                 }
             }
         }

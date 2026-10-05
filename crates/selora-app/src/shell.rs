@@ -40,6 +40,7 @@ use selora_ui::dialogs::settings::{SettingsDialog, SettingsEvent};
 use selora_ui::editor::split::{self, PaneView};
 use selora_ui::palette::registry::CommandId;
 use selora_ui::panel::git::GitAction;
+use selora_ui::panel::search::SearchEvent;
 use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, TreeEvent};
 use selora_ui::{brand, theme};
 use tokio::runtime::Handle;
@@ -97,6 +98,14 @@ pub struct SeloraApp {
     activity_bar: ActivityBar,
     /// Whether the file tree panel is visible (`Ctrl+B`, UI_SPEC.md §2).
     show_tree: bool,
+    /// Whether region ④ (the bottom panel) is visible (`Ctrl+J`,
+    /// UI_SPEC.md §2). The *content* follows the activity bar: git shows
+    /// the git panel, search the search panel. Selecting one of those
+    /// activities also shows the panel.
+    show_bottom_panel: bool,
+    /// Result rows whose file was not open yet: opened via
+    /// `Effect::OpenFile`, the line jump happens when the buffer loads.
+    goto_after_load: VecDeque<(PathBuf, usize)>,
     /// Settings have arrived (the tree panel's initial width is taken from
     /// them, so the panel first shows *after* the load resolves).
     settings_loaded: bool,
@@ -186,6 +195,8 @@ impl SeloraApp {
             state: AppState::default(),
             activity_bar: ActivityBar::default(),
             show_tree: true,
+            show_bottom_panel: false,
+            goto_after_load: VecDeque::new(),
             settings_loaded: false,
             settings_dialog: None,
             workspace_dir: persistence::state_dir(),
@@ -239,9 +250,12 @@ impl SeloraApp {
             if let Some(root) = tree_or_save {
                 let _ = self.effect_tx.send(Effect::GitStatus(root));
             }
-            // A restore open that failed leaves the queue so the next one
-            // can proceed (the error itself already became a toast).
             if let Some(path) = failed_path {
+                // A queued search-result jump whose file failed to load:
+                // drop it (the load failure already became a toast).
+                self.goto_after_load.retain(|(queued, _)| queued != &path);
+                // A restore open that failed leaves the queue so the next
+                // one can proceed.
                 if self.restore_in_flight.as_deref() == Some(path.as_path()) {
                     self.restore_in_flight = None;
                     self.restore_queue.retain(|queued| *queued != path);
@@ -361,7 +375,34 @@ impl SeloraApp {
             }
             KeyAction::OpenSettings => self.open_settings(),
             KeyAction::OpenFile => self.pick_file(),
+            KeyAction::TogglePanel => self.toggle_bottom_panel(),
+            KeyAction::SearchInFiles => self.open_search(),
         }
+    }
+
+    /// `Ctrl+J` / View→Toggle Panel (UI_SPEC.md §2 region ④). Toggling on
+    /// with the files activity selected defaults the content to search.
+    fn toggle_bottom_panel(&mut self) {
+        self.show_bottom_panel = !self.show_bottom_panel;
+        if self.show_bottom_panel
+            && !matches!(self.activity_bar.selected, Activity::Git | Activity::Search)
+        {
+            self.activity_bar.selected = Activity::Search;
+            if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                self.state.search.set_root(root);
+            }
+        }
+    }
+
+    /// `Ctrl+Shift+F`: switch to the search activity, show region ④, and
+    /// focus the query bar.
+    fn open_search(&mut self) {
+        self.activity_bar.selected = Activity::Search;
+        self.show_bottom_panel = true;
+        if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+            self.state.search.set_root(root);
+        }
+        self.state.search.focus_query();
     }
 
     // -----------------------------------------------------------------------
@@ -410,14 +451,19 @@ impl SeloraApp {
         match activity {
             Activity::Files => {}
             Activity::Search => {
-                // Wired in Phase 3c (search lands in region ④).
-                self.state
-                    .toast("search in files lands in Phase 3", Severity::Info);
+                // Selecting search takes region ④ with the search panel
+                // and focuses the query bar (Phase 3c).
+                self.show_bottom_panel = true;
+                if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    self.state.search.set_root(root);
+                }
+                self.state.search.focus_query();
             }
             Activity::Git => {
                 // Selecting the git activity shows the panel (region ④) and
                 // refreshes its data — a status snapshot is cheap and always
                 // current on click (Phase 3b).
+                self.show_bottom_panel = true;
                 if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
                     let _ = self.effect_tx.send(Effect::GitStatus(root));
                 }
@@ -463,12 +509,14 @@ impl SeloraApp {
         let _ = self.effect_tx.send(Effect::SettingsSave(settings));
     }
 
-    /// Region ④ (UI_SPEC.md §2): the bottom panel, shown while the git (or,
-    /// from Phase 3c on, search) activity is selected. Painted above the
-    /// status bar (which is added first and keeps the lowest strip).
-    /// Resizable, 200px default, capped at half the workbench.
+    /// Region ④ (UI_SPEC.md §2): the bottom panel, visible while
+    /// `Ctrl+J`/an activity selection turned it on AND a panel-bearing
+    /// activity (git, search) is selected. Painted above the status bar
+    /// (which is added first and keeps the lowest strip). Resizable,
+    /// 200px default, capped at half the workbench.
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
-        if self.activity_bar.selected != Activity::Git {
+        let selected = self.activity_bar.selected;
+        if !self.show_bottom_panel || !matches!(selected, Activity::Git | Activity::Search) {
             return;
         }
         let max_height = ui.max_rect().height() * PANEL_MAX_HEIGHT_FRAC;
@@ -479,15 +527,59 @@ impl SeloraApp {
             .max_size(max_height)
             .show_separator_line(true)
             .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
-            .show(ui, |ui| {
-                let outcome = self
-                    .state
-                    .git_panel
-                    .show(ui, self.state.git_status.as_ref());
-                for action in outcome.actions {
-                    self.route_git_action(action);
+            .show(ui, |ui| match selected {
+                Activity::Git => {
+                    let outcome = self
+                        .state
+                        .git_panel
+                        .show(ui, self.state.git_status.as_ref());
+                    for action in outcome.actions {
+                        self.route_git_action(action);
+                    }
                 }
+                Activity::Search => {
+                    let outcome = self.state.search.show(ui);
+                    for event in outcome.events {
+                        self.route_search_event(event);
+                    }
+                }
+                _ => {}
             });
+    }
+
+    /// A search-panel event → `Effect` / editor jump (Phase 3c).
+    fn route_search_event(&mut self, event: SearchEvent) {
+        match event {
+            SearchEvent::RunSearch { id, query } => {
+                match self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    Some(root) => {
+                        let _ = self.effect_tx.send(Effect::Search { id, root, query });
+                    }
+                    None => {
+                        self.state.toast("open a folder to search", Severity::Info);
+                    }
+                }
+            }
+            SearchEvent::OpenResultAtLine { path, line } => {
+                self.open_at_line(path, line);
+            }
+            SearchEvent::Info(text) => {
+                self.state.toast(text, Severity::Info);
+            }
+        }
+    }
+
+    /// Open `path` and jump to a **1-based** line (a search result; later
+    /// also problems and LSP go-to-definition). A buffer that has to load
+    /// first queues the jump — its pane editor is created at first paint.
+    fn open_at_line(&mut self, path: PathBuf, line: usize) {
+        if self.state.buffers.contains_key(&path) {
+            self.state.open_file(path.clone());
+            self.state.goto_line(&path, line);
+        } else {
+            self.goto_after_load.push_back((path.clone(), line));
+            let _ = self.effect_tx.send(Effect::OpenFile(path));
+        }
     }
 
     /// A git-panel action → `Effect` (the panel never touches the runtime).
@@ -692,6 +784,16 @@ impl SeloraApp {
         if is_new {
             // Syntax highlighting by extension (Phase 2d).
             editor.set_language_from_path(&path);
+            // A queued search-result jump for this freshly-created editor:
+            // the line was known before the buffer loaded.
+            if let Some(index) = self
+                .goto_after_load
+                .iter()
+                .position(|(queued, _)| queued == &path)
+            {
+                let (_, line) = self.goto_after_load.remove(index).expect("indexed entry");
+                editor.goto_line(line);
+            }
         }
         let response = ui
             .scope_builder(egui::UiBuilder::new().max_rect(view.content), |ui| {
@@ -966,10 +1068,7 @@ impl SeloraApp {
             CommandId::ViewCommandPalette => self.toggle_command_palette(),
             CommandId::SettingsOpen => self.open_settings(),
             // Phase 3: LSP, search, bottom panel.
-            CommandId::ViewTogglePanel => {
-                self.state
-                    .toast("bottom panel lands in Phase 3", Severity::Info);
-            }
+            CommandId::ViewTogglePanel => self.toggle_bottom_panel(),
             CommandId::ViewGoToSymbol => {
                 self.state
                     .toast("go to symbol lands in Phase 3", Severity::Info);
@@ -1203,6 +1302,10 @@ enum KeyAction {
     CloseEditor,
     OpenSettings,
     OpenFile,
+    /// `Ctrl+J` — toggle region ④, the bottom panel (UI_SPEC.md §15).
+    TogglePanel,
+    /// `Ctrl+Shift+F` — search in files (ROADMAP.md Phase 3 acceptance).
+    SearchInFiles,
 }
 
 /// The fixed Phase 2 bindings (parsed once). The rebindable four live in
@@ -1221,12 +1324,25 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
                 action,
             )
         };
+        let ctrl_shift = |key: egui::Key, action: KeyAction| {
+            (
+                Keybind {
+                    ctrl: true,
+                    alt: false,
+                    shift: true,
+                    key,
+                },
+                action,
+            )
+        };
         vec![
             ctrl(egui::Key::B, KeyAction::ToggleFileTree),
             ctrl(egui::Key::Backslash, KeyAction::SplitEditor),
             ctrl(egui::Key::W, KeyAction::CloseEditor),
             ctrl(egui::Key::Comma, KeyAction::OpenSettings),
             ctrl(egui::Key::O, KeyAction::OpenFile),
+            ctrl(egui::Key::J, KeyAction::TogglePanel),
+            ctrl_shift(egui::Key::F, KeyAction::SearchInFiles),
         ]
     })
 }
@@ -1442,6 +1558,61 @@ mod tests {
         );
         app.activity_bar.selected = Activity::Files;
 
+        // The search activity takes over region ④ (Phase 3c): the panel
+        // paints installed results, and a result click jumps the editor —
+        // for an already-open buffer directly, for a new one after load.
+        app.activity_bar.selected = Activity::Search;
+        app.show_bottom_panel = true;
+        app.state.search.set_root(PathBuf::from("/repo"));
+        app.state.search.set_query("main");
+        let run = app.state.search.submit_query().expect("run event");
+        let search_id = match run {
+            SearchEvent::RunSearch { id, .. } => id,
+            other => panic!("unexpected search event: {other:?}"),
+        };
+        app.state.apply(AppMessage::SearchResults {
+            id: search_id,
+            results: Ok(vec![selora_fs::search::SearchHit {
+                path: main_rs.clone(),
+                line_number: 2,
+                line_text: "// edited".into(),
+                spans: vec![],
+            }]),
+        });
+        frame(&mut app);
+        assert_eq!(app.state.search.groups().len(), 1);
+
+        // Already-open buffer: the jump lands on the next paint.
+        app.open_at_line(main_rs.clone(), 2);
+        frame(&mut app);
+        let pane = app.state.editor_area.active_pane_id();
+        let editor = app
+            .state
+            .editors
+            .get(&(pane, main_rs.clone()))
+            .expect("editor");
+        assert_eq!(editor.cursor(), selora_core::Position::new(1, 0));
+
+        // Not-yet-open file: queued, then applied when the buffer loads and
+        // the pane's editor is created (Phase 3c's pending-goto seam).
+        let ui_rs = PathBuf::from("/repo/src/ui.rs");
+        app.open_at_line(ui_rs.clone(), 1);
+        assert!(app
+            .goto_after_load
+            .front()
+            .is_some_and(|(path, _)| path == &ui_rs));
+        app.state.apply(AppMessage::BufferLoaded {
+            path: ui_rs.clone(),
+            text: "fn ui() {}\n".to_owned(),
+        });
+        frame(&mut app);
+        assert!(app.goto_after_load.is_empty());
+        let pane = app.state.editor_area.active_pane_id();
+        let editor = app.state.editors.get(&(pane, ui_rs)).expect("editor");
+        assert_eq!(editor.cursor(), selora_core::Position::new(0, 0));
+        app.activity_bar.selected = Activity::Files;
+        app.show_bottom_panel = false;
+
         // Painting alone never surfaces an error (PLAN.md §8).
         assert!(app.state.toasts.is_empty());
     }
@@ -1474,6 +1645,8 @@ mod tests {
                 egui::Key::Comma,
             ),
             (KeyAction::OpenFile, true, false, false, egui::Key::O),
+            (KeyAction::TogglePanel, true, false, false, egui::Key::J),
+            (KeyAction::SearchInFiles, true, true, false, egui::Key::F),
         ];
         for (expected, ctrl, shift, alt, key) in cases {
             let got = key_action(&keybinds, &shortcut(ctrl, shift, alt, key));

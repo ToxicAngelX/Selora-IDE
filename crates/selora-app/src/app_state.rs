@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use selora_ai::{ChatReceipt, ChatRequest, Model};
 use selora_core::{Buffer, SeloraError, Workspace};
 use selora_editor::Editor;
+use selora_fs::search::{SearchError, SearchHit, SearchId, SearchQuery};
 use selora_fs::tree::FileTreeNode;
 use selora_git::GitStatus;
 use selora_settings::Settings;
@@ -42,6 +43,7 @@ use selora_ui::editor::split::EditorArea;
 use selora_ui::palette::command::CommandPalette;
 use selora_ui::palette::fuzzy::FuzzyFileFinder;
 use selora_ui::panel::git::GitPanel;
+use selora_ui::panel::search::SearchPanel;
 use selora_ui::sidebar::FileTreePanel;
 use uuid::Uuid;
 
@@ -92,6 +94,16 @@ pub enum Effect {
     GitUnstage(PathBuf),
     /// Commit the index of the repo containing `root`.
     GitCommit(PathBuf, String),
+
+    // Search (Phase 3c)
+    /// Run a workspace search off the frame path; the reply is
+    /// [`AppMessage::SearchResults`] with the same id (stale replies are
+    /// dropped by the panel).
+    Search {
+        id: SearchId,
+        root: PathBuf,
+        query: SearchQuery,
+    },
 }
 
 /// Messages workers send to the main thread (ARCHITECTURE.md §2.1).
@@ -156,6 +168,14 @@ pub enum AppMessage {
     GitCommitted(String),
     /// A git effect failed — toast (PLAN.md §8).
     GitError(SeloraError),
+
+    // Search (Phase 3c)
+    /// The results of search `id` — `Ok` installs them in the panel
+    /// (stale ids dropped), `Err` toasts and clears the running flag.
+    SearchResults {
+        id: SearchId,
+        results: Result<Vec<SearchHit>, SearchError>,
+    },
 }
 
 /// Toast severity (UI_SPEC.md §13): info dismisses after 4s, error after 8s.
@@ -250,6 +270,10 @@ pub struct AppState {
     /// Phase 3b). Data comes from `git_status`; actions go out as
     /// `Effect`s via the shell.
     pub git_panel: GitPanel,
+    /// The search panel's view state (query, toggles, collapsed groups;
+    /// Phase 3c). Results arrive via [`AppMessage::SearchResults`];
+    /// searches go out as [`Effect::Search`] via the shell.
+    pub search: SearchPanel,
 }
 
 impl Default for AppState {
@@ -273,6 +297,7 @@ impl Default for AppState {
             git_status: None,
             in_git_repo: false,
             git_panel: GitPanel::new(),
+            search: SearchPanel::new(),
         }
     }
 }
@@ -312,9 +337,11 @@ impl AppState {
             }
             AppMessage::FileTreeUpdated { root, tree } => {
                 if self.workspace.is_none() {
-                    self.workspace = Some(Workspace::new(root));
+                    self.workspace = Some(Workspace::new(root.clone()));
                 }
                 self.file_tree.set_tree(tree);
+                // The search panel displays results relative to the root.
+                self.search.set_root(root);
                 self.refresh_fuzzy_source();
             }
             AppMessage::BufferLoaded { path, text } => {
@@ -383,6 +410,15 @@ impl AppState {
             AppMessage::GitError(error) => {
                 self.toast(format!("git: {error}"), Severity::Error);
             }
+
+            // -- Search (Phase 3c) ----------------------------------------------
+            AppMessage::SearchResults { id, results } => match results {
+                Ok(hits) => self.search.set_results(id, hits),
+                Err(error) => {
+                    self.search.search_failed(id);
+                    self.toast(format!("search: {error}"), Severity::Error);
+                }
+            },
         }
     }
 
@@ -404,6 +440,22 @@ impl AppState {
     /// `Ctrl+\` (UI_SPEC.md §15): split the active editor pane.
     pub fn split_editor(&mut self) {
         self.editor_area.request_split();
+    }
+
+    /// Jump every pane's editor that shows `path` to a **1-based** line (a
+    /// search-result click, Phase 3c; later also the problems panel and
+    /// go-to-definition). Returns whether any editor jumped — `false`
+    /// means the buffer is not open yet and the caller should open it.
+    pub fn goto_line(&mut self, path: &Path, line_1based: usize) -> bool {
+        let panes = self.editor_area.pane_ids();
+        let mut jumped = false;
+        for pane in panes {
+            if let Some(editor) = self.editors.get_mut(&(pane, path.to_path_buf())) {
+                editor.goto_line(line_1based);
+                jumped = true;
+            }
+        }
+        jumped
     }
 
     /// `Ctrl+W`: close the active tab (prunes an emptied pane). Returns the
@@ -473,6 +525,7 @@ impl AppState {
         self.fuzzy_source.clear();
         self.git_status = None;
         self.in_git_repo = false;
+        self.search = SearchPanel::new();
     }
 
     /// Dirty derivation, one frame per painted editor (see the module docs).
@@ -962,6 +1015,56 @@ mod tests {
         state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
         assert!(!state.in_git_repo);
         assert!(state.git_status.is_none());
+    }
+
+    // --- search (Phase 3c wiring) ----------------------------------------------
+
+    /// Search results install for the current id, stale replies are
+    /// dropped, and a failure toasts (PLAN.md §8).
+    #[test]
+    fn search_results_install_fresh_and_drop_stale() {
+        let mut state = AppState::default();
+        state.search.set_query("rope");
+        let run = state.search.submit_query().expect("run");
+        let id = match run {
+            selora_ui::panel::search::SearchEvent::RunSearch { id, .. } => id,
+            other => panic!("{other:?}"),
+        };
+        assert!(state.search.is_running());
+
+        state.apply(AppMessage::SearchResults {
+            id,
+            results: Ok(vec![selora_fs::search::SearchHit {
+                path: path("/repo/a.rs"),
+                line_number: 7,
+                line_text: "let r = Rope::new();".into(),
+                spans: vec![],
+            }]),
+        });
+        assert!(!state.search.is_running());
+        assert_eq!(state.search.hit_count(), 1);
+        assert!(state.toasts.is_empty());
+
+        // A stale reply (a second Enter raced the first worker): ignored.
+        let stale = selora_fs::search::SearchId::next();
+        state.apply(AppMessage::SearchResults {
+            id: stale,
+            results: Ok(vec![]),
+        });
+        assert_eq!(state.search.hit_count(), 1);
+
+        // A failure for the current id: toast + not running.
+        let failed_id = match state.search.submit_query().expect("second run") {
+            selora_ui::panel::search::SearchEvent::RunSearch { id, .. } => id,
+            other => panic!("{other:?}"),
+        };
+        state.apply(AppMessage::SearchResults {
+            id: failed_id,
+            results: Err(selora_fs::search::SearchError::Rg("boom".into())),
+        });
+        assert!(!state.search.is_running());
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.toasts[0].text.contains("ripgrep failed"));
     }
 
     // --- workspace snapshot ---------------------------------------------------
