@@ -1,67 +1,72 @@
-# Status — 2026-10-05 (mid-Phase 3)
+# Status — 2026-10-05 (Phase 3 complete)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
 
-## Where we are
+## Last completed
 
-**Phase 3 (LSP + Git + Search) is 2/3 merged.** 3b (git) and 3c (search)
-are merged AND orchestrator-wired into `selora-app`; the full gate is
-green on main (`d6c92b1`): build, 286 tests, fmt, clippy -D warnings,
-cargo deny. **3a (LSP) is still in flight** in a subagent worktree —
-nothing of it has landed; when its notification arrives, follow the
-merge/wiring pattern below.
+**Phase 3 (LSP + Git + Search) — all three subagents merged AND
+orchestrator-wired.** Full gate green on main (`75e18f5`): build, 355
+tests, fmt, `clippy --workspace --all-targets -- -D warnings`, cargo
+deny. Main is pushed through `75e18f5`.
 
-## Phase 3 progress record
+## Phase 3 record
 
 | Item | State | Notes |
 |---|---|---|
-| 3b selora-git + panel/git.rs + tree badges | merged `c270fc2`, wired `4fc574b` | GitRepo open/status/stage/unstage/commit/diff_workdir; 12 temp-repo tests; region ④ bottom panel; status-bar branch + warn dirty dot; GitStatus re-snapshot on tree update + save |
-| 3c selora-fs search + panel/search.rs | merged `e2136f0`, wired `d6c92b1` | rg-if-on-PATH else ignore-walker fallback (20 tests); Ctrl+J toggles region ④, Ctrl+Shift+F opens search; result click opens file at line via new `Editor::goto_line` |
-| 3a selora-lsp + lsp_overlay.rs | **in flight** | subagent in worktree, brief = verbatim ROADMAP 3a + addendum (no selora-app edits; report proposes Effect/AppMessage diffs) |
+| 3b selora-git + panel/git.rs + tree badges | merged `c270fc2`, wired `4fc574b` | GitRepo open/status/stage/unstage/commit/diff_workdir; region ④ bottom panel; status-bar branch + warn dirty dot |
+| 3c selora-fs search + panel/search.rs | merged `e2136f0`, wired `d6c92b1` | rg-if-on-PATH else fallback walker; Ctrl+J panel, Ctrl+Shift+F search; result click opens file at line |
+| 3a selora-lsp + lsp_overlay.rs | merged `590b76b`/`0d915f5`, wired `75e18f5` | client actor + manager (debounced didChange, crash-restart, doc replay), registry, UTF-16 position translation; wiring: per-path didOpen guard + shape-tracked didChange in the paint loop, didSave, didClose (last tab close + before re-root), F12 open-then-jump, Ctrl+Space popup (owns keyboard: arrows/Enter/Tab/Esc), Ctrl+K Ctrl+I chord (500ms window), diagnostics → editor overlay, status-bar server status + progress + dead-server restart click. Tests: apply_lsp reducer coverage + headless shell document-sync stream (Open→Change→Save→Close) |
 
-Orchestrator prep for Phase 3 (commit `0468f2a`): workspace deps
-lsp-types 0.97 + git2 0.21 (vendored) pre-added, module stubs
-(panel/{git,search}.rs, lsp_overlay.rs) pre-registered, so 3a/3b/3c had
-strictly disjoint ownership. `.claude/worktrees/` is gitignored.
+Wiring-test pattern (reusable in Phase 4/5): with settings never
+"arrived", the shell keeps `lsp_effect_rx` and a test can observe the
+dispatcher's forwarded `LspEffect` stream after `yield_now().await` —
+see `shell::tests::lsp_document_sync_flows_open_change_save_close_from_the_shell`.
 
-## When 3a lands (the exact plan)
+## Next
 
-1. Review its branch against the ROADMAP 3a brief + ARCHITECTURE §5
-   (actor per server, framing, registry, crash recovery; ≥3 tests:
-   framing, request-id routing, crash recovery).
-2. `git merge <branch> --no-ff`; gate (build/test/fmt/clippy/deny).
-   Beware: 3a may add additive hooks in selora-editor files — main's
-   editor.rs has since gained `goto_line`/`pending_reveal` (from 3c
-   wiring); resolve any conflict keeping both.
-3. Apply its proposed Effect/AppMessage/AppState additions (pattern is
-   in `app_state.rs`/`wiring.rs`/`shell.rs` — same as the 3b/3c wiring
-   commits). Wire: didOpen/didChange/didSave/didClose lifecycle in the
-   drain/paint loop, F12 definition, Ctrl+K Ctrl+I hover, Ctrl+Space
-   completion, diagnostics into the editor overlay, LSP status in the
-   status-bar center. UI hooks that need `state.editors` reuse
-   `AppState::goto_line` for jumps.
-4. Gate again, commit, update STATUS.md, close Phase 3.
-5. Then: owner smoke test (§11 after Phase 3: LSP hover + go-to-def,
-   git commit, search), then Phase 4.
+**Phase 4 — Selora AI** (six parallel subagents 4a–4f, briefs in
+ROADMAP.md Phase 4; ownership table in AGENT_ORCHESTRATION.md §10):
+4a settings Selora section, 4b model picker, 4c chat sidebar,
+4d ghost text, 4e cost meter, 4f Selora status. All consume
+`selora-ai` from Phase 1. `Effect`/`AppMessage` additions go through
+the orchestrator (same shared-file rule as before).
+
+Before spawning: the §11 owner smoke tests for Phase 2 and Phase 3
+are still pending (below) — recommend the owner runs them first; they
+are not a blocker for starting Phase 4 subagents that only touch
+`selora-ui`/`selora-ai`, but 4c (chat sidebar) wiring will want a
+verified Phase 2 chat stream.
+
+### Owner smoke tests pending (§11, after Phase 2 / Phase 3)
+
+- Phase 2: open folder, edit, fuzzy find, syntax highlight, settings
+  persist, split panes.
+- Phase 3: LSP hover + go-to-def on a real Rust file (needs
+  `rustup component add rust-analyzer` — NOT yet verified on PATH),
+  git stage/commit from the panel, search in files.
+
+## Blockers
+
+None. Owner smoke tests pending (not blocking Phase 4 spawn).
 
 ## Environment (machine, not in any repo doc)
 
 - Toolchain: rustup + stable 1.99.0 MSVC + VS 2022 Build Tools. cargo at
   C:\Users\Toxic\.cargo\bin — bash needs the PATH export.
-- A git remote `origin` now exists (github.com/ToxicAngelX/Selora-IDE);
-  main is pushed through `d6c92b1`'s predecessor. Push after gates.
+- Remote `origin` = github.com/ToxicAngelX/Selora-IDE; main pushed
+  through `75e18f5`.
 - Known flake: `cargo test --workspace` occasionally prints "could not
   compile selora-… (lib test)" from MSVC/Defender file-locking during
   parallel compilation — rerun confirms exit 0.
 - `rg` is NOT on the Windows PATH for the app (the bash `rg` is a
   Claude Code shim) — search uses the built-in fallback scanner. Works,
   just slower on big workspaces.
-- `rust-analyzer`: NOT verified on PATH — 3a's report will say; Phase 3
-  LSP acceptance needs it (rustup component add rust-analyzer).
+- `rust-analyzer`: NOT verified on PATH; Phase 3 LSP acceptance needs
+  it (`rustup component add rust-analyzer`).
 - The sk-gw- test key passed through chat in session 1 — rotate at the
   gateway when convenient.
-
-## Blockers
-
-None. 3a pending; owner smoke tests for Phase 2 and Phase 3 pending.
+- Gate note: the earlier "clippy -D warnings green" on `d6c92b1` had
+  not used `--all-targets`; 7 test-target warnings were fixed in
+  `75e18f5`. Future gates: `cargo clippy --workspace --all-targets --
+  -D warnings`.
