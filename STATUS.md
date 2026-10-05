@@ -1,61 +1,99 @@
-# Status — 2026-10-05 (Phase 3 complete)
+# Status — 2026-10-05 (mid-Phase 4)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
 
-## Last completed
+## Where we are
 
-**Phase 3 (LSP + Git + Search) — all three subagents merged AND
-orchestrator-wired.** Full gate green on main (`75e18f5`): build, 355
-tests, fmt, `clippy --workspace --all-targets -- -D warnings`, cargo
-deny. Main is pushed through `75e18f5`.
+**Phase 3 complete** (3a/3b/3c merged AND wired; gate green on `75e18f5`,
+pushed). **Phase 4 (Selora AI) is in flight**: six subagents (4a–4f)
+spawned in parallel worktrees from prep commit `4f334d4` (pushed).
+Nothing of Phase 4 has landed on main yet. When completion notifications
+arrive, merge each branch with the full gate, then do the orchestrator
+wiring (below).
 
-## Phase 3 record
+## Phase 4 ownership (AGENT_ORCHESTRATION.md §10)
 
-| Item | State | Notes |
+| Agent | Owns | Merged? |
 |---|---|---|
-| 3b selora-git + panel/git.rs + tree badges | merged `c270fc2`, wired `4fc574b` | GitRepo open/status/stage/unstage/commit/diff_workdir; region ④ bottom panel; status-bar branch + warn dirty dot |
-| 3c selora-fs search + panel/search.rs | merged `e2136f0`, wired `d6c92b1` | rg-if-on-PATH else fallback walker; Ctrl+J panel, Ctrl+Shift+F search; result click opens file at line |
-| 3a selora-lsp + lsp_overlay.rs | merged `590b76b`/`0d915f5`, wired `75e18f5` | client actor + manager (debounced didChange, crash-restart, doc replay), registry, UTF-16 position translation; wiring: per-path didOpen guard + shape-tracked didChange in the paint loop, didSave, didClose (last tab close + before re-root), F12 open-then-jump, Ctrl+Space popup (owns keyboard: arrows/Enter/Tab/Esc), Ctrl+K Ctrl+I chord (500ms window), diagnostics → editor overlay, status-bar server status + progress + dead-server restart click. Tests: apply_lsp reducer coverage + headless shell document-sync stream (Open→Change→Save→Close) |
+| 4a | selora-ui/src/dialogs/settings/ (selora_section.rs — Connect flow, Disconnect) | pending |
+| 4b | selora-ui/src/picker/ (model_picker.rs) | pending |
+| 4c | selora-ui/src/sidebar/chat.rs | pending |
+| 4d | selora-editor/src/ghost_text.rs (+ minimal editor.rs integration) | pending |
+| 4e | selora-ui/src/status_bar/cost_meter.rs | pending |
+| 4f | selora-ui/src/status_bar/selora_status.rs | pending |
 
-Wiring-test pattern (reusable in Phase 4/5): with settings never
-"arrived", the shell keeps `lsp_effect_rx` and a test can observe the
-dispatcher's forwarded `LspEffect` stream after `yield_now().await` —
-see `shell::tests::lsp_document_sync_flows_open_change_save_close_from_the_shell`.
+Shared-file rule in force: subagents propose Effect/AppMessage/AppState
+and persistence diffs in their reports; the orchestrator applies them.
+All six were told: no selora-app edits, no Cargo.toml edits, gate their
+worktree (build/fmt/clippy --all-targets -D warnings/test) before commit.
+
+## Phase 4 prep (`4f334d4`), already on main
+
+- workspace + selora-settings: `keyring = 3` dep;
+  `selora_settings::keyring::{api_key_get,api_key_set,api_key_delete}`
+  (Windows Credential Manager; get-missing = Ok(None); delete idempotent).
+- selora-ai: `ghost_complete(model, prompt)` (non-streaming completion,
+  blank → Ok(None)) and `status()` (HEAD ping →
+  Connected{model:None,latency}/Disconnected) — fills ARCHITECTURE §10.6
+  gaps. NOTE: ghost_complete gained a model param vs the §10.6 sketch;
+  the shell passes settings.selora.active_model.
+- selora-ui stubs pre-registered: dialogs/settings split into
+  settings/{mod.rs,selora_section.rs} (pane_selora moved), picker/,
+  status_bar/{cost_meter.rs, selora_status.rs}, sidebar/chat.rs.
+- selora-editor: ghost_text.rs stub.
+
+## Phase 4 wiring checklist (orchestrator, after merges)
+
+1. Keyring at boot: Effect::SeloraConnect already stores the key
+   in-session; swap storage to selora_settings::keyring (set on Connect,
+   get at boot, delete on Disconnect). 4a's SettingsEvent additions tell
+   the exact flow (validate via list_models → keyring set → status).
+2. Chat: replace AppState's raw `chat_stream`/`chat_receipt` fields with
+   4c's ChatPanel state; drive it from ChatDelta/ChatDone/ChatError;
+   Ctrl+L toggle (settings.keybinds.toggle_chat); persist last 20 turns
+   + visibility in persistence.rs (WorkspaceState).
+3. Model picker: fetch on boot (Effect::SeloraListModels exists), hand
+   4b's picker the list, write settings.selora.active_model on Select.
+4. Ghost text: frame stage 2 gets the 350ms idle debounce →
+   Effect::SeloraGhostText(path, prefix) → wiring calls
+   client.ghost_complete(model, prompt) → AppMessage::GhostTextReady(path,
+   Option<String>) → Editor::set_ghost. 4d's report has the exact seams.
+5. Cost meter: on ChatDone, feed 4e's state; paint in the status bar
+   right zone.
+6. Status bar right: replace the hardcoded "○ selora disconnected"
+   (shell.rs status_bar fn) with 4f's widget; 30s ping loop (frame stage 2
+   clock) calling client.status(); click → open settings on Selora
+   section. Mid-chat disconnect policy: in-flight complete, new chats
+   toast.
+7. Gate, commit, update STATUS.md, owner smoke test (ROADMAP Phase 4
+   acceptance list), then Phase 5.
 
 ## Next
 
-**Phase 4 — Selora AI** (six parallel subagents 4a–4f, briefs in
-ROADMAP.md Phase 4; ownership table in AGENT_ORCHESTRATION.md §10):
-4a settings Selora section, 4b model picker, 4c chat sidebar,
-4d ghost text, 4e cost meter, 4f Selora status. All consume
-`selora-ai` from Phase 1. `Effect`/`AppMessage` additions go through
-the orchestrator (same shared-file rule as before).
+Phase 4 merges + wiring (above). Then Phase 5 (Agent Mode).
 
-Before spawning: the §11 owner smoke tests for Phase 2 and Phase 3
-are still pending (below) — recommend the owner runs them first; they
-are not a blocker for starting Phase 4 subagents that only touch
-`selora-ui`/`selora-ai`, but 4c (chat sidebar) wiring will want a
-verified Phase 2 chat stream.
-
-### Owner smoke tests pending (§11, after Phase 2 / Phase 3)
+### Owner smoke tests still pending (§11)
 
 - Phase 2: open folder, edit, fuzzy find, syntax highlight, settings
   persist, split panes.
-- Phase 3: LSP hover + go-to-def on a real Rust file (needs
-  `rustup component add rust-analyzer` — NOT yet verified on PATH),
-  git stage/commit from the panel, search in files.
+- Phase 3: LSP hover + go-to-def (needs `rustup component add
+  rust-analyzer` — NOT yet verified on PATH), git commit from panel,
+  search in files.
+- Phase 4 (after wiring): the ROADMAP Phase 4 acceptance list (connect
+  real key, stream chat, ghost text accept, nonzero cost meter, model
+  switch).
 
 ## Blockers
 
-None. Owner smoke tests pending (not blocking Phase 4 spawn).
+None. Owner smoke tests pending (not blocking Phase 4).
 
 ## Environment (machine, not in any repo doc)
 
 - Toolchain: rustup + stable 1.99.0 MSVC + VS 2022 Build Tools. cargo at
   C:\Users\Toxic\.cargo\bin — bash needs the PATH export.
 - Remote `origin` = github.com/ToxicAngelX/Selora-IDE; main pushed
-  through `75e18f5`.
+  through `4f334d4`.
 - Known flake: `cargo test --workspace` occasionally prints "could not
   compile selora-… (lib test)" from MSVC/Defender file-locking during
   parallel compilation — rerun confirms exit 0.
@@ -66,7 +104,9 @@ None. Owner smoke tests pending (not blocking Phase 4 spawn).
   it (`rustup component add rust-analyzer`).
 - The sk-gw- test key passed through chat in session 1 — rotate at the
   gateway when convenient.
-- Gate note: the earlier "clippy -D warnings green" on `d6c92b1` had
-  not used `--all-targets`; 7 test-target warnings were fixed in
-  `75e18f5`. Future gates: `cargo clippy --workspace --all-targets --
-  -D warnings`.
+- Gate note: clippy gate must run `--all-targets` (`cargo clippy
+  --workspace --all-targets -- -D warnings`) — the 3b/3c-era gate missed
+  test-target warnings; fixed in `75e18f5`.
+- Subagent worktrees live under .claude/worktrees/ (gitignored); each
+  agent commits to its own branch (4a/4b/4c/4d/4e/4f reports name them).
+  Check `git worktree list` + `git branch -a` when resuming mid-phase;
