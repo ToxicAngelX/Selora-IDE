@@ -6,22 +6,32 @@
 ## Where we are
 
 **Phase 3 complete** (3a/3b/3c merged AND wired; gate green on `75e18f5`,
-pushed). **Phase 4 (Selora AI) is in flight**: six subagents (4a–4f)
-spawned in parallel worktrees from prep commit `4f334d4` (pushed).
-Nothing of Phase 4 has landed on main yet. When completion notifications
-arrive, merge each branch with the full gate, then do the orchestrator
-wiring (below).
+pushed). **Phase 4 (Selora AI) in flight**: 4e and 4f are merged AND
+wired (through `d8dcd15`); 4a, 4b, 4c, 4d are still running in subagent
+worktrees. Merge each on its notification, then wire (checklist below).
+
+## IMPORTANT for merging the remaining branches
+
+All six subagent worktrees were cut from `origin/main` at `0a09a99` —
+BEFORE prep commit `4f334d4` (they lack the stubs; each recreated its
+own registrations). Merging against current main yields add/add
+conflicts; the resolution pattern that worked for 4e/4f:
+- `git checkout --theirs <their-owned file>` (their implementation
+  replaces the stub),
+- `git checkout --ours` for registration files (`mod.rs`, `lib.rs`) where
+  main's version is the superset,
+- then full gate + `git commit --no-edit` on the `--no-ff` merge.
 
 ## Phase 4 ownership (AGENT_ORCHESTRATION.md §10)
 
-| Agent | Owns | Merged? |
+| Agent | Owns | State |
 |---|---|---|
-| 4a | selora-ui/src/dialogs/settings/ (selora_section.rs — Connect flow, Disconnect) | pending |
-| 4b | selora-ui/src/picker/ (model_picker.rs) | pending |
-| 4c | selora-ui/src/sidebar/chat.rs | pending |
-| 4d | selora-editor/src/ghost_text.rs (+ minimal editor.rs integration) | pending |
-| 4e | selora-ui/src/status_bar/cost_meter.rs | pending |
-| 4f | selora-ui/src/status_bar/selora_status.rs | pending |
+| 4a | selora-ui/src/dialogs/settings/ (selora_section.rs — Connect flow, Disconnect) | in flight |
+| 4b | selora-ui/src/picker/ (model_picker.rs) | in flight |
+| 4c | selora-ui/src/sidebar/chat.rs | in flight |
+| 4d | selora-editor/src/ghost_text.rs (+ minimal editor.rs integration) | in flight |
+| 4e | selora-ui/src/status_bar/cost_meter.rs | merged `df492e3`, wired `d8dcd15` |
+| 4f | selora-ui/src/status_bar/selora_status.rs | merged `ba43f52`, wired `d8dcd15` |
 
 Shared-file rule in force: subagents propose Effect/AppMessage/AppState
 and persistence diffs in their reports; the orchestrator applies them.
@@ -45,6 +55,17 @@ worktree (build/fmt/clippy --all-targets -D warnings/test) before commit.
 
 ## Phase 4 wiring checklist (orchestrator, after merges)
 
+DONE (in `d8dcd15`):
+- Cost meter: AppState.cost_meter + ChatDone feed + day sync + the
+  status-bar right-zone paint (left of the connection run).
+- Status bar right: 4f's widget + Effect::SeloraPing + AppMessage::
+  SeloraStatus + the stage-2 30s ping loop (first ping when settings
+  arrive); Connected = key present + gateway answered (no-key pings
+  reply Disconnected without network); OpenConnect click → open
+  settings. NOTE: the dialog currently opens on its default section —
+  preselecting the Selora section waits for 4a's dialog API.
+
+REMAINING:
 1. Keyring at boot: Effect::SeloraConnect already stores the key
    in-session; swap storage to selora_settings::keyring (set on Connect,
    get at boot, delete on Disconnect). 4a's SettingsEvent additions tell
