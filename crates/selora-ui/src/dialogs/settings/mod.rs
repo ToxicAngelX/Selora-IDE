@@ -7,16 +7,24 @@
 //! [`SettingsEvent`] the shell turns into a "Settings saved" toast. There
 //! are no Apply/Cancel buttons. Esc closes (emits [`SettingsEvent::Close`]).
 //!
-//! The Selora section's "Connect with API key" flow is UI only in Phase 2:
-//! the "Save to keyring" button emits [`SettingsEvent::SaveKeyring`] and the
-//! dialog says so in muted text — the keyring itself is Phase 4
-//! (ARCHITECTURE.md §7).
+//! The Selora section's Connect flow is live as of Phase 4a
+//! (`selora_section.rs`): the "Connect" button emits
+//! [`SettingsEvent::Connect`] carrying the pasted key — the *shell*
+//! validates it with `SeloraClient::list_models` and writes the OS keyring
+//! (ARCHITECTURE.md §7.2); the dialog is a widget and never touches the
+//! network or the keyring itself. "Disconnect" emits
+//! [`SettingsEvent::Disconnect`]. The shell hands the live connection
+//! state back with [`SettingsDialog::set_selora_status`] whenever it
+//! changes (or once per frame, right before `show`) — the status line
+//! paints exactly the state it is handed, including the gateway's own
+//! error words, verbatim.
 //!
 //! Every color, font, and spacing value comes from `selora-tokens`
 //! (DESIGN_TOKENS.md §12: the no-decoration rule).
 
 use std::path::PathBuf;
 
+use selora_ai::SeloraStatus;
 use selora_settings::{find_on_path, Keybind, Settings, SETTINGS_FILE_NAME};
 use selora_tokens::{color, font, radius, space, type_scale};
 
@@ -138,7 +146,11 @@ impl KeybindField {
 }
 
 /// Events the dialog emits to the shell. The dialog never toasts directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is implemented by hand: the key-carrying variant redacts its
+/// payload so the `sk-gw-…` key can never leak into logs, `dbg!` output,
+/// or test-failure messages.
+#[derive(Clone, PartialEq, Eq)]
 pub enum SettingsEvent {
     /// Esc was pressed — close the modal.
     Close,
@@ -146,10 +158,27 @@ pub enum SettingsEvent {
     Saved,
     /// Writing settings failed; the shell toasts the error message.
     SaveFailed(String),
-    /// The user pressed "Save to keyring" with a key in the masked input.
-    /// Phase 2 is UI only: the shell receives the raw key and decides
-    /// (the keyring itself is Phase 4 — ARCHITECTURE.md §7).
-    SaveKeyring(String),
+    /// The user pressed "Connect" with a key in the masked input. The raw
+    /// `sk-gw-…` key is carried here and nowhere else: the shell validates
+    /// it with `SeloraClient::list_models` and writes it to the OS keyring
+    /// (ARCHITECTURE.md §7.2). Replaces the Phase 2f `SaveKeyring`.
+    Connect(String),
+    /// The user pressed "Disconnect". The shell deletes the keyring entry
+    /// and sets the connection state back to `Disconnected`.
+    Disconnect,
+}
+
+impl std::fmt::Debug for SettingsEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Close => f.write_str("Close"),
+            Self::Saved => f.write_str("Saved"),
+            Self::SaveFailed(message) => f.debug_tuple("SaveFailed").field(message).finish(),
+            // The key is a secret: never in Debug output.
+            Self::Connect(_) => f.debug_tuple("Connect").field(&"[REDACTED]").finish(),
+            Self::Disconnect => f.write_str("Disconnect"),
+        }
+    }
 }
 
 /// The Settings dialog. Owns a working copy of [`Settings`] and a snapshot
@@ -167,8 +196,14 @@ pub struct SettingsDialog {
     save_dir: Option<PathBuf>,
     events: Vec<SettingsEvent>,
     /// The masked "Connect with API key" buffer. Never persisted, never
-    /// written to a file (the keyring owns it in Phase 4).
+    /// written to a file, never in `Debug` output — the OS keyring (via
+    /// the shell) is the key's only home. Cleared the moment the key is
+    /// emitted in a [`SettingsEvent::Connect`] event.
     api_key: String,
+    /// The live Selora connection state, handed in by the shell via
+    /// [`SettingsDialog::set_selora_status`]. Painted verbatim by the
+    /// Selora section's status line.
+    selora_status: SeloraStatus,
     /// Which keybind row (if any) is waiting for the user to press a key.
     keybind_capture: Option<KeybindField>,
     /// Inline result note for the rust-analyzer "Auto-detect" button.
@@ -195,6 +230,7 @@ impl SettingsDialog {
             save_dir: dir,
             events: Vec::new(),
             api_key: String::new(),
+            selora_status: SeloraStatus::Disconnected,
             keybind_capture: None,
             rust_detect_note: String::new(),
             ts_detect_note: String::new(),
@@ -212,6 +248,21 @@ impl SettingsDialog {
     pub fn update(&mut self, settings: Settings) {
         self.snapshot = settings.clone();
         self.settings = settings;
+    }
+
+    /// Hand the dialog the live connection state (the shell calls this
+    /// whenever it changes — e.g. on a `SeloraStatusChanged` message — or
+    /// once per frame right before `show`). The Selora section's status
+    /// line paints exactly this state, including the gateway's own error
+    /// words in [`SeloraStatus::Error`], verbatim.
+    ///
+    /// On a transition to `Connected` the masked key buffer is cleared:
+    /// the key now lives in the OS keyring and the dialog keeps no copy.
+    pub fn set_selora_status(&mut self, status: SeloraStatus) {
+        if matches!(status, SeloraStatus::Connected { .. }) {
+            self.api_key.clear();
+        }
+        self.selora_status = status;
     }
 
     /// Paint the modal and return the events emitted this frame.
@@ -757,5 +808,47 @@ mod tests {
         assert!(matches!(&dialog.events[0], SettingsEvent::SaveFailed(_)));
 
         let _ = std::fs::remove_dir_all(blocker);
+    }
+
+    #[test]
+    fn settings_event_debug_redacts_the_api_key() {
+        let event = SettingsEvent::Connect("sk-gw-live-secret-key".into());
+        let printed = format!("{event:?}");
+        assert_eq!(printed, r#"Connect("[REDACTED]")"#);
+        assert!(!printed.contains("sk-gw-live-secret-key"));
+    }
+
+    #[test]
+    fn set_selora_status_updates_state_and_clears_the_key_on_connected() {
+        let dir = temp_dir();
+        let mut dialog = SettingsDialog::with_save_dir(Settings::default(), Some(dir.clone()));
+        dialog.api_key = "sk-gw-typed".into();
+
+        dialog.set_selora_status(SeloraStatus::Connecting);
+        assert_eq!(dialog.selora_status, SeloraStatus::Connecting);
+        assert_eq!(dialog.api_key, "sk-gw-typed");
+
+        // Failure keeps the buffer (the user may retry) — the key itself
+        // is the shell's business now (it stayed in the keyring).
+        dialog.set_selora_status(SeloraStatus::Error("HTTP 401".into()));
+        assert_eq!(dialog.api_key, "sk-gw-typed");
+
+        dialog.set_selora_status(SeloraStatus::Connected {
+            model: Some("opus-5-5".into()),
+            latency_ms: 142,
+        });
+        assert_eq!(
+            dialog.selora_status,
+            SeloraStatus::Connected {
+                model: Some("opus-5-5".into()),
+                latency_ms: 142,
+            }
+        );
+        assert!(
+            dialog.api_key.is_empty(),
+            "connected dialog keeps no key copy"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
