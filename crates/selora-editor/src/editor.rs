@@ -4,9 +4,17 @@
 //! `Arc<RwLock<…>` (ARCHITECTURE.md §3.2: LSP, file IO, and the editor all
 //! hold handles to the same buffer). The widget owns only view state:
 //! cursor, selection anchor, and the scroll offset. Rendering is done by
-//! hand on the [`egui::Painter`] — each visible line is laid out as a galley
-//! and painted at its row position; the gutter, selection rectangles, caret
+//! hand on the [`egui::Painter`] — each visible line is laid out as a
+//! per-glyph [`egui::text::LayoutJob`] whose sections carry the SYN_*
+//! colors of the active [`crate::syntax::SyntaxLayer`] (Phase 2d), and
+//! painted at its row position; the gutter, selection rectangles, caret
 //! row, and blinking caret are painted underneath and on top of it.
+//!
+//! The job's glyph positions double as the per-character x offsets used
+//! for selection, caret placement, and click→column mapping — colors and
+//! italics don't change glyph advances, so the click math is exactly the
+//! math for what is on screen (see
+//! `colored_sections_preserve_click_geometry`).
 //!
 //! Usage (this is the shape Phase 1c embeds) — the widget is added by
 //! mutable reference, like all stateful egui widgets, so the view state
@@ -23,6 +31,7 @@
 //! });
 //! ```
 
+use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use egui::{
@@ -31,6 +40,7 @@ use egui::{
 };
 use selora_core::{Buffer, Position};
 
+use crate::syntax::{Language, LineSection, Span, SyntaxKind, SyntaxLayer};
 use crate::{layout, motion, theme};
 
 /// An editor pane: gutter + text canvas for one shared [`Buffer`].
@@ -43,6 +53,12 @@ pub struct Editor {
     /// Index of the top visible line. Whole lines only — jump scroll, no
     /// smoothing (UI_SPEC.md §3.2).
     scroll: usize,
+    /// Syntax state for this pane (Phase 2d). `None` = plain text (no
+    /// language detected, or the grammar failed to load).
+    syntax: Option<SyntaxLayer>,
+    /// The frame clock (egui `input.time`), fed to the syntax layer for its
+    /// large-file re-parse debounce.
+    frame_time: f64,
 }
 
 impl Editor {
@@ -53,6 +69,8 @@ impl Editor {
             cursor: Position::start(),
             anchor: None,
             scroll: 0,
+            syntax: None,
+            frame_time: 0.0,
         }
     }
 
@@ -63,6 +81,9 @@ impl Editor {
         self.cursor = Position::start();
         self.anchor = None;
         self.scroll = 0;
+        if let Some(layer) = &mut self.syntax {
+            layer.set_source(text);
+        }
     }
 
     /// The entire buffer text (allocates — fine for save/round-trip; the
@@ -75,6 +96,64 @@ impl Editor {
     /// status bar's line/col readout.
     pub fn cursor(&self) -> Position {
         self.cursor
+    }
+
+    // ------------------------------------------------------------------
+    // Syntax highlighting (Phase 2d)
+    // ------------------------------------------------------------------
+
+    /// Select the highlighting language for this pane. `None` (or a grammar
+    /// that fails to load) shows plain `SYN_DEFAULT` text. Call when a file
+    /// is opened into the pane, or to override the language by hand.
+    pub fn set_language(&mut self, language: Option<Language>) {
+        self.syntax = None; // keep a plain pane while (re)building
+        if let Some(language) = language {
+            if let Some(mut layer) = SyntaxLayer::new(language) {
+                layer.set_source(&self.read_buffer().text());
+                self.syntax = Some(layer);
+            }
+        }
+    }
+
+    /// Select the highlighting language from a file path's extension
+    /// (unknown extensions fall back to plain text).
+    pub fn set_language_from_path(&mut self, path: &Path) {
+        self.set_language(Language::from_path(path));
+    }
+
+    /// The active highlighting language, if any (`None` for plain text).
+    pub fn language(&self) -> Option<Language> {
+        self.syntax.as_ref().map(SyntaxLayer::language)
+    }
+
+    /// The current syntax spans (byte offsets into the buffer text). Empty
+    /// when no language is active. Read-only view for tests and future
+    /// consumers (Phase 2c symbols read the tree, not these).
+    pub fn syntax_spans(&self) -> &[Span] {
+        self.syntax.as_ref().map_or(&[], SyntaxLayer::spans)
+    }
+
+    /// Force a full re-parse of the buffer text into the syntax layer (e.g.
+    /// after an external buffer mutation the editor wasn't told about —
+    /// Agent Mode's buffer edits in Phase 5 should call this).
+    pub fn resync_syntax(&mut self) {
+        if self.syntax.is_some() {
+            let text = self.read_buffer().text();
+            if let Some(layer) = &mut self.syntax {
+                layer.set_source(&text);
+            }
+        }
+    }
+
+    /// Report one text edit to the syntax layer (LSP-style: the text between
+    /// `start` and `old_end` is replaced by `new_text`). Must be called
+    /// *before* the buffer is mutated, with positions valid for the
+    /// pre-mutation document. The layer keeps its tree and spans in step
+    /// incrementally.
+    fn syntax_edit(&mut self, start: Position, old_end: Position, new_text: &str) {
+        if let Some(layer) = &mut self.syntax {
+            layer.edit(start, old_end, new_text, self.frame_time);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -134,6 +213,13 @@ impl Editor {
     fn insert_text(&mut self, text: &str) {
         let selection = self.selection();
         let at = selection.map_or(self.cursor, |(start, _)| start);
+        // Tell the syntax layer about the edit before mutating the buffer,
+        // with positions valid for the current document: a selection
+        // replacement is a removal followed by an insert at the same spot.
+        if let Some((start, end)) = selection {
+            self.syntax_edit(start, end, "");
+        }
+        self.syntax_edit(at, at, text);
         let new_cursor = {
             let mut buffer = self.write_buffer();
             if let Some((start, end)) = selection {
@@ -169,6 +255,7 @@ impl Editor {
         if start == end {
             return;
         }
+        self.syntax_edit(start, end, "");
         self.write_buffer().remove(start, end);
         self.cursor = start;
         self.anchor = None;
@@ -281,12 +368,23 @@ impl Editor {
                 .min(buffer.line_count() - 1)
         };
         let line_text = self.read_buffer().line(line)?;
-        let visuals = line_visuals(painter, font_id, &line_text);
+        // The same layout path the paint side uses (colors don't change
+        // glyph advances, so this matches what's on screen exactly).
+        let sections = self.line_sections(line, &line_text);
+        let visuals = line_visuals(painter, font_id, &line_text, &sections);
         let x = pointer.x - (rect.left() + layout::GUTTER_WIDTH);
         Some(Position::new(
             line,
             layout::col_from_x(&visuals.x_offsets, visuals.width, x),
         ))
+    }
+
+    /// The syntax sections for one visible line (empty when the pane has no
+    /// highlighting language).
+    fn line_sections(&self, line: usize, line_text: &str) -> Vec<LineSection> {
+        self.syntax
+            .as_ref()
+            .map_or_else(Vec::new, |layer| layer.line_sections(line, line_text))
     }
 
     /// Keyboard input (only while the editor has focus). Returns whether
@@ -400,15 +498,17 @@ impl Editor {
         let visible = layout::visible_line_count(rect.height());
         let rows = visible.min(self.read_buffer().line_count().saturating_sub(self.scroll));
 
-        // Snapshot the visible lines once, then lay each out as a galley.
-        // The galley's glyph positions double as the per-character x offsets
+        // Snapshot the visible lines once, then lay each out as a per-glyph
+        // LayoutJob whose sections carry the SYN_* colors (Phase 2d). The
+        // galley's glyph positions double as the per-character x offsets
         // used below for selection and caret placement.
         let visuals: Vec<LineVisuals> = {
             let buffer = self.read_buffer();
             (self.scroll..self.scroll + rows)
                 .map(|line| {
                     let text = buffer.line(line).unwrap_or_default();
-                    line_visuals(painter, &self.font_id(), &text)
+                    let sections = self.line_sections(line, &text);
+                    line_visuals(painter, &self.font_id(), &text, &sections)
                 })
                 .collect()
         };
@@ -472,12 +572,14 @@ impl Editor {
             let y = row_y(row);
 
             // Galley centered in its line slot (the font's row height is a
-            // few points shorter than the 1.5x line height).
+            // few points shorter than the 1.5x line height). Glyph colors
+            // come baked into the job; the fallback only covers un-colored
+            // glyphs.
             let galley_y = y + (layout::LINE_HEIGHT - line_visual.galley.size().y) / 2.0;
             painter.galley(
                 pos2(text_x, galley_y),
                 line_visual.galley.clone(),
-                theme::color::FG_DEFAULT,
+                theme::color::SYN_DEFAULT,
             );
 
             // Line number, right-aligned in the gutter. The active line's
@@ -550,6 +652,8 @@ impl Widget for &mut Editor {
         let font_id = self.font_id();
         let char_width = painter.fonts_mut(|fonts| fonts.glyph_width(&font_id, '0'));
         let visible = layout::visible_line_count(rect.height());
+        let time = ui.ctx().input(|i| i.time);
+        self.frame_time = time;
 
         // Input first (order per ARCHITECTURE.md §2: gestures before paint,
         // so the frame shows the result of this frame's input).
@@ -565,8 +669,25 @@ impl Widget for &mut Editor {
         let line_count = self.read_buffer().line_count();
         self.scroll = layout::clamp_scroll(self.scroll, line_count, visible);
 
+        // Keep the syntax layer in step with the buffer and pump its
+        // re-parse debounce. The char/line counts are a cheap O(log n)
+        // staleness guard against buffer mutations nobody told the editor
+        // about (Phase 5 agent edits should call `resync_syntax` — this
+        // catches everything that changed the buffer's shape).
+        if let Some(mut layer) = self.syntax.take() {
+            let (chars, lines) = {
+                let buffer = self.read_buffer();
+                (buffer.len_chars(), buffer.line_count())
+            };
+            if layer.char_count() != chars || layer.line_count() != lines {
+                layer.set_source(&self.read_buffer().text());
+            } else {
+                layer.tick(time);
+            }
+            self.syntax = Some(layer);
+        }
+
         let focused = response.has_focus();
-        let time = ui.ctx().input(|i| i.time);
         self.paint(&painter, rect, char_width, focused, time);
 
         response
@@ -582,12 +703,58 @@ struct LineVisuals {
     width: f32,
 }
 
-/// Lay a line out and derive its per-character x offsets from the galley's
-/// glyph positions. egui emits one glyph per `char`, so the offsets line up
-/// 1:1 with the buffer's code-point columns.
-fn line_visuals(painter: &Painter, font_id: &FontId, text: &str) -> LineVisuals {
-    let galley = painter.layout_no_wrap(text.to_owned(), font_id.clone(), theme::color::FG_DEFAULT);
-    let mut x_offsets = Vec::with_capacity(text.chars().count());
+/// Lay a line out as a per-glyph [`egui::text::LayoutJob`] (Phase 2d) and
+/// derive its per-character x offsets from the galley's glyph positions.
+/// egui emits one glyph per `char`, so the offsets line up 1:1 with the
+/// buffer's code-point columns.
+///
+/// Sections split the line into SYN_*-colored runs (DESIGN_TOKENS.md §1.5);
+/// comment runs render italic. Color and italics never change glyph
+/// advances — epaint applies italics as a mesh-time skew — so the geometry
+/// is byte-for-byte the geometry of an unsectioned layout, which is what
+/// keeps click→column mapping exact (see
+/// `colored_sections_preserve_click_geometry`).
+fn line_visuals(
+    painter: &Painter,
+    font_id: &FontId,
+    text: &str,
+    sections: &[LineSection],
+) -> LineVisuals {
+    // Byte offset of each char boundary (plus the end), so sections
+    // specified in code-point columns can slice `&str` ranges.
+    let mut byte_of: Vec<usize> = text.char_indices().map(|(byte, _)| byte).collect();
+    byte_of.push(text.len());
+    let char_count = byte_of.len() - 1;
+
+    let mut job = egui::text::LayoutJob::default(); // no wrap (max_width = inf)
+    let append =
+        |job: &mut egui::text::LayoutJob, char_start: usize, char_end: usize, kind: SyntaxKind| {
+            let (start, end) = (
+                byte_of[char_start.min(char_count)],
+                byte_of[char_end.min(char_count)],
+            );
+            if start >= end {
+                return;
+            }
+            let mut format = egui::text::TextFormat::simple(font_id.clone(), kind.color());
+            format.italics = kind.italics();
+            job.append(&text[start..end], 0.0, format);
+        };
+
+    let mut cursor = 0; // char column up to which the job is filled
+    for section in sections {
+        if section.char_start > cursor {
+            append(&mut job, cursor, section.char_start, SyntaxKind::Default);
+        }
+        append(&mut job, section.char_start, section.char_end, section.kind);
+        cursor = section.char_end.max(cursor);
+    }
+    if cursor < char_count {
+        append(&mut job, cursor, char_count, SyntaxKind::Default);
+    }
+
+    let galley = painter.layout_job(job);
+    let mut x_offsets = Vec::with_capacity(char_count);
     let mut width = 0.0;
     if let Some(row) = galley.rows.first() {
         let base = row.pos.x;
@@ -708,5 +875,189 @@ mod tests {
             editor.selection(),
             Some((Position::new(0, 3), Position::new(1, 4)))
         );
+    }
+
+    /// The core risk of the Phase 2d LayoutJob migration: per-section colors
+    /// (and italics) must not move a single glyph, or click→column mapping
+    /// would drift from what is painted. Colors don't participate in layout
+    /// and epaint skews italic glyphs at mesh time, so the x offsets of a
+    /// fully-sectioned line must equal those of the plain layout.
+    ///
+    /// `egui::__run_test_ui` deliberately installs *no* fonts (all galleys
+    /// would come out glyph-less), so this drives its own context with the
+    /// bundled JetBrains Mono — the font the editor actually paints with.
+    #[test]
+    fn colored_sections_preserve_click_geometry() {
+        let text = "pub fn theme() -> Theme { // note";
+        let font_id = FontId::new(layout::FONT_SIZE, theme::font::FAMILY_MONO);
+        // Sections splitting the line into colored runs, deliberately
+        // misaligned with word boundaries and including an italic comment
+        // run at the end.
+        let sections = vec![
+            LineSection {
+                char_start: 0,
+                char_end: 6,
+                kind: SyntaxKind::Keyword,
+            },
+            LineSection {
+                char_start: 7,
+                char_end: 9,
+                kind: SyntaxKind::Keyword,
+            },
+            LineSection {
+                char_start: 10,
+                char_end: 15,
+                kind: SyntaxKind::Function,
+            },
+            LineSection {
+                char_start: 16,
+                char_end: 25,
+                kind: SyntaxKind::Punctuation,
+            },
+            LineSection {
+                char_start: 26,
+                char_end: 31,
+                kind: SyntaxKind::Type,
+            },
+            LineSection {
+                char_start: 33,
+                char_end: 38,
+                kind: SyntaxKind::Comment,
+            },
+        ];
+        run_with_bundled_mono(|ui| {
+            let painter = ui.painter();
+            let colored = line_visuals(painter, &font_id, text, &sections);
+            let plain = line_visuals(painter, &font_id, text, &[]);
+            assert_eq!(colored.x_offsets, plain.x_offsets);
+            assert_eq!(colored.width, plain.width);
+            // The offset count matches the code-point count, so
+            // `layout::col_from_x` (the click mapping) sees one entry per
+            // column.
+            assert_eq!(colored.x_offsets.len(), text.chars().count());
+            // A monospace line advances uniformly (within pixel rounding),
+            // so the click mapping's cell assumptions hold on real metrics.
+            for window in colored.x_offsets.windows(2) {
+                let advance = window[1] - window[0];
+                assert!(
+                    advance > 4.0 && advance < 12.0,
+                    "monospace advance: {advance}"
+                );
+            }
+        });
+    }
+
+    /// Run a UI closure on a context loaded with the bundled JetBrains Mono
+    /// (what the editor paints with), so layout produces real glyphs.
+    fn run_with_bundled_mono(add_contents: impl FnMut(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/fonts/JetBrainsMono-Regular.ttf");
+        let bytes = std::fs::read(font_path).expect("bundled JetBrains Mono font");
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "JetBrainsMono-Regular".to_owned(),
+            Arc::new(egui::text::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "JetBrainsMono-Regular".to_owned());
+        ctx.set_fonts(fonts);
+        ctx.run_ui(egui::RawInput::default(), add_contents)
+            .drop_without_applying_deltas();
+    }
+
+    /// The full paint path with syntax highlighting active: the LayoutJob
+    /// carries colored + italic sections, and the frame still preserves
+    /// cursor/selection state.
+    #[test]
+    fn paint_runs_headlessly_with_syntax() {
+        let mut editor = editor("fn theme() -> Theme {\n    Theme::from_tokens(TOKENS) // done\n}");
+        editor.set_language(Some(Language::Rust));
+        assert_eq!(editor.language(), Some(Language::Rust));
+        assert!(!editor.syntax_spans().is_empty());
+        editor.cursor = Position::new(1, 4);
+        editor.anchor = Some(Position::new(0, 3));
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        assert_eq!(editor.cursor(), Position::new(1, 4));
+        assert_eq!(
+            editor.selection(),
+            Some((Position::new(0, 3), Position::new(1, 4)))
+        );
+    }
+
+    /// Typing flows into the syntax layer: the buffer edit is reported with
+    /// pre-edit positions, the layer's shadow stays in step, and the spans
+    /// reflect the new text.
+    #[test]
+    fn edits_flow_into_the_syntax_layer() {
+        let mut editor = editor("let x = 1;\n");
+        editor.set_language(Some(Language::Rust));
+        // Typing at the caret (0,0): the layer is notified before the
+        // buffer mutation.
+        editor.insert_text("// ");
+        assert_eq!(editor.text(), "// let x = 1;\n");
+        // The layer's spans now cover the whole line as a comment.
+        let spans = editor.syntax_spans().to_vec();
+        assert!(!spans.is_empty());
+        assert_eq!(spans[0].kind, SyntaxKind::Comment);
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, "// let x = 1;".len() as u32);
+
+        // A deletion is reported too: remove the "// " again via the same
+        // path a Backspace takes.
+        editor.cursor = Position::new(0, 0);
+        editor.anchor = Some(Position::new(0, 3));
+        editor.delete_backward();
+        assert_eq!(editor.text(), "let x = 1;\n");
+        let spans = editor.syntax_spans().to_vec();
+        assert_eq!(spans[0].kind, SyntaxKind::Keyword);
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, 3);
+    }
+
+    /// The editor selects a language from a path, and unknown extensions
+    /// degrade to plain text (no layer, no crash).
+    #[test]
+    fn language_selection_from_path_and_unknown() {
+        let mut editor = editor("fn main() {}");
+        assert_eq!(editor.language(), None);
+        editor.set_language_from_path(Path::new("crates/src/main.rs"));
+        assert_eq!(editor.language(), Some(Language::Rust));
+        assert!(!editor.syntax_spans().is_empty());
+
+        editor.set_language_from_path(Path::new("notes.txt"));
+        assert_eq!(editor.language(), None);
+        assert!(editor.syntax_spans().is_empty());
+    }
+
+    /// An external buffer mutation (outside the editor's input) that changes
+    /// the buffer's shape is caught by the per-frame staleness guard and
+    /// re-synced.
+    #[test]
+    fn external_buffer_mutation_resyncs_the_layer() {
+        let mut editor = editor("let x = 1;\n");
+        editor.set_language(Some(Language::Rust));
+        // Mutate the shared buffer behind the editor's back.
+        *editor.write_buffer() = Buffer::from_text("fn theme() {}\n");
+        // One frame is enough for the guard to notice (char count changed).
+        egui::__run_test_ui(|ui| {
+            ui.set_max_size(vec2(640.0, 480.0));
+            ui.add(&mut editor);
+        });
+        assert!(!editor.syntax_spans().is_empty());
+        // "theme" (a function name) is highlighted — the spans are from the
+        // *new* text, not the stale one.
+        let spans = editor.syntax_spans().to_vec();
+        let text = editor.text();
+        let theme = text.find("theme").unwrap() as u32;
+        assert!(spans.iter().any(|span| {
+            span.kind == SyntaxKind::Function && span.start <= theme && theme < span.end
+        }));
     }
 }
