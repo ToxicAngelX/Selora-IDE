@@ -402,10 +402,11 @@ pub fn spawn_lsp_manager(
     selora_lsp::spawn_manager(handle, notify, effect_rx, event_tx, config);
 }
 
-/// Effect worker: one gateway reachability ping (Phase 4f). The client's
-/// `status()` is a bare HEAD — any HTTP response counts as reachable; the
-/// result lands as [`AppMessage::SeloraStatus`] for the status-bar right
-/// zone.
+/// Effect worker: one gateway connection probe (Phase 4f). The probe is
+/// `list_models` — not a bare HEAD — so `Connected` means the gateway
+/// answered *and* the key is valid; the round-trip is the latency. The
+/// catalog is not re-sent (the 30s probe must not toast when the gateway
+/// is down — status only).
 fn spawn_selora_ping(
     handle: &Handle,
     notify: &Notify,
@@ -416,7 +417,14 @@ fn spawn_selora_ping(
     let notify = notify.clone();
     handle.spawn(async move {
         let client = SeloraClient::new(&base_url, &api_key);
-        let status = client.status().await;
+        let started = std::time::Instant::now();
+        let status = match client.list_models().await {
+            Ok(_) => selora_ai::SeloraStatus::Connected {
+                model: None,
+                latency_ms: started.elapsed().as_millis() as u32,
+            },
+            Err(error) => selora_ai::SeloraStatus::Error(error.to_string()),
+        };
         let _ = msg_tx.send(AppMessage::SeloraStatus(status));
         notify();
     });
@@ -456,18 +464,91 @@ pub fn spawn_pick_file(handle: &Handle, notify: &Notify, tx: &UnboundedSender<Ap
 // ---------------------------------------------------------------------------
 
 /// Effect (§2.2): connect to the gateway and list its models.
+/// Effect (§2.2): validate a key against the gateway and, on success,
+/// make it the session's key.
+///
+/// Validation is `list_models` (a key that lists models is a good key,
+/// Phase 4a); the round-trip doubles as the latency measurement. On
+/// success the reply is `ModelsLoaded(Ok)` + `SeloraStatus(Connected)`;
+/// on failure `ModelsLoaded(Err)` (the toast path) +
+/// `SeloraStatus(Error(gateway words))`. When `persist_key` is set, a
+/// validated key is also written to the OS keyring (validate first, store
+/// second — a bad key never lands in the credential store); tests pass
+/// `false` so they never touch the real Windows Credential Manager.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_connect(
     handle: &Handle,
     notify: &Notify,
     tx: UnboundedSender<AppMessage>,
     base_url: String,
     api_key: String,
+    persist_key: bool,
 ) {
     let notify = notify.clone();
     handle.spawn(async move {
         let client = SeloraClient::new(&base_url, &api_key);
+        let started = std::time::Instant::now();
         let result = client.list_models().await;
+        let latency_ms = started.elapsed().as_millis() as u32;
+        // A single Credential Manager call, ms-scale — fine inline on the
+        // async task (PLAN.md §5; never a file).
+        if persist_key && result.is_ok() {
+            if let Err(error) = selora_settings::keyring::api_key_set(&api_key) {
+                let _ = tx.send(AppMessage::KeyringError(error));
+            }
+        }
+        let status = match &result {
+            Ok(_) => selora_ai::SeloraStatus::Connected {
+                model: None,
+                latency_ms,
+            },
+            Err(error) => selora_ai::SeloraStatus::Error(error.to_string()),
+        };
         let _ = tx.send(AppMessage::ModelsLoaded(result));
+        let _ = tx.send(AppMessage::SeloraStatus(status));
+        notify();
+    });
+}
+
+/// Effect (Phase 4a): delete the stored key (Disconnect). The keyring
+/// delete is idempotent; the reply resets the status to `Disconnected`.
+fn spawn_disconnect(handle: &Handle, notify: &Notify, tx: UnboundedSender<AppMessage>) {
+    let notify = notify.clone();
+    handle.spawn(async move {
+        if let Err(error) = selora_settings::keyring::api_key_delete() {
+            let _ = tx.send(AppMessage::KeyringError(error));
+        }
+        let _ = tx.send(AppMessage::SeloraStatus(
+            selora_ai::SeloraStatus::Disconnected,
+        ));
+        notify();
+    });
+}
+
+/// Effect (Phase 4d): one ghost-text completion. The reply carries the
+/// request's caret back so the editor can stale-drop it; no key → a
+/// `None` suggestion (the ghost simply does not appear).
+#[allow(clippy::too_many_arguments)]
+fn spawn_ghost(
+    handle: &Handle,
+    notify: &Notify,
+    tx: UnboundedSender<AppMessage>,
+    base_url: String,
+    api_key: String,
+    path: std::path::PathBuf,
+    prefix: String,
+    model: String,
+    request_caret: selora_core::Position,
+) {
+    let notify = notify.clone();
+    handle.spawn(async move {
+        let client = SeloraClient::new(&base_url, &api_key);
+        let suggestion = client.ghost_complete(&model, &prefix).await.unwrap_or(None);
+        let _ = tx.send(AppMessage::GhostTextReady {
+            path,
+            request_caret,
+            suggestion,
+        });
         notify();
     });
 }
@@ -593,7 +674,37 @@ pub fn spawn_dispatcher(
                         msg_tx.clone(),
                         base_url.clone(),
                         key,
+                        true,
                     );
+                }
+                Effect::SeloraAutoConnect { base_url: url } => {
+                    // Boot restore (Phase 4a): the key's home is the OS
+                    // keyring; a stored key becomes the session key and is
+                    // re-validated (the reply drives the status bar). The
+                    // read is a single Credential Manager call — inline.
+                    base_url = url;
+                    match selora_settings::keyring::api_key_get() {
+                        Ok(Some(key)) => {
+                            api_key = Some(key.clone());
+                            spawn_connect(
+                                &dispatch_handle,
+                                &notify,
+                                msg_tx.clone(),
+                                base_url.clone(),
+                                key,
+                                false,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = msg_tx.send(AppMessage::KeyringError(error));
+                            notify();
+                        }
+                    }
+                }
+                Effect::SeloraDisconnect => {
+                    api_key = None;
+                    spawn_disconnect(&dispatch_handle, &notify, msg_tx.clone());
                 }
                 Effect::SeloraListModels => match api_key.clone() {
                     Some(key) => {
@@ -603,6 +714,7 @@ pub fn spawn_dispatcher(
                             msg_tx.clone(),
                             base_url.clone(),
                             key,
+                            false,
                         );
                     }
                     None => {
@@ -652,6 +764,37 @@ pub fn spawn_dispatcher(
                         let _ = msg_tx.send(AppMessage::SeloraStatus(
                             selora_ai::SeloraStatus::Disconnected,
                         ));
+                        notify();
+                    }
+                },
+                Effect::SeloraGhostText {
+                    path,
+                    prefix,
+                    model,
+                    request_caret,
+                } => match api_key.clone() {
+                    Some(key) => {
+                        spawn_ghost(
+                            &dispatch_handle,
+                            &notify,
+                            msg_tx.clone(),
+                            base_url.clone(),
+                            key,
+                            path,
+                            prefix,
+                            model,
+                            request_caret,
+                        );
+                    }
+                    // No key: a None suggestion — the ghost simply never
+                    // appears (not an error; PLAN.md §6.4 keeps ghost text
+                    // best-effort).
+                    None => {
+                        let _ = msg_tx.send(AppMessage::GhostTextReady {
+                            path,
+                            request_caret,
+                            suggestion: None,
+                        });
                         notify();
                     }
                 },
@@ -1029,6 +1172,89 @@ mod tests {
     // --- the Phase 1c network half, against a mock gateway -------------------
 
     #[tokio::test]
+    async fn ghost_completion_against_a_mock_gateway_round_trips_the_caret() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"choices":[{"message":{"role":"assistant","content":"foo(bar);"}}]}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = Handle::current();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+        let path = unique_temp_path("ghost.rs");
+        let caret = selora_core::Position::new(3, 7);
+        spawn_ghost(
+            &handle,
+            &noop_notify(),
+            tx,
+            server.uri(),
+            TEST_KEY.into(),
+            path.clone(),
+            "fn main() { ".into(),
+            "test-model".into(),
+            caret,
+        );
+
+        match rx.recv().await.expect("ghost reply") {
+            AppMessage::GhostTextReady {
+                path: reply_path,
+                request_caret,
+                suggestion,
+            } => {
+                assert_eq!(reply_path, path);
+                assert_eq!(request_caret, caret);
+                assert_eq!(suggestion.as_deref(), Some("foo(bar);"));
+            }
+            other => panic!("expected GhostTextReady, got {other:?}"),
+        }
+    }
+
+    /// The no-key ghost path (dispatcher logic): a best-effort `None`
+    /// suggestion, never an error — the ghost just never appears
+    /// (PLAN.md §6.4).
+    #[tokio::test]
+    async fn dispatcher_ghost_text_without_a_key_replies_none() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            DEFAULT_BASE_URL.into(),
+            lsp_effect_tx(),
+        );
+
+        let path = unique_temp_path("ghost-nokey.rs");
+        let _ = effect_tx.send(Effect::SeloraGhostText {
+            path: path.clone(),
+            prefix: "fn main()".into(),
+            model: "test-model".into(),
+            request_caret: selora_core::Position::new(0, 9),
+        });
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::GhostTextReady { .. })
+        })
+        .await;
+        match message {
+            AppMessage::GhostTextReady {
+                path: reply_path,
+                suggestion,
+                ..
+            } => {
+                assert_eq!(reply_path, path);
+                assert_eq!(suggestion, None);
+            }
+            other => panic!("expected GhostTextReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn connect_against_a_mock_gateway_lists_models() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1040,7 +1266,14 @@ mod tests {
 
         let handle = Handle::current();
         let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
-        spawn_connect(&handle, &noop_notify(), tx, server.uri(), TEST_KEY.into());
+        spawn_connect(
+            &handle,
+            &noop_notify(),
+            tx,
+            server.uri(),
+            TEST_KEY.into(),
+            false,
+        );
 
         let message = rx.recv().await.expect("connect result message");
         match message {

@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use selora_ai::{ChatReceipt, ChatRequest, Model, SeloraStatus};
-use selora_core::{Buffer, SeloraError, Workspace};
+use selora_core::{Buffer, Position, SeloraError, Workspace};
 use selora_editor::Editor;
 use selora_fs::search::{SearchError, SearchHit, SearchId, SearchQuery};
 use selora_fs::tree::FileTreeNode;
@@ -87,8 +87,31 @@ pub enum Effect {
     /// `Disconnected` without touching the network — `Connected` always
     /// means key present + gateway answered.
     SeloraPing,
-    /// Hold the Selora key for this session (the OS keyring itself is
-    /// Phase 4, ARCHITECTURE.md §7).
+    /// Boot-time restore (Phase 4a): the worker reads the OS keyring; a
+    /// stored key is validated against `base_url` and becomes the
+    /// session's key. Sent by the shell once settings arrive (the base
+    /// URL is theirs).
+    SeloraAutoConnect {
+        base_url: String,
+    },
+    /// Disconnect (Phase 4a): drop the session key and delete the
+    /// keyring entry; the reply resets the status to `Disconnected`.
+    SeloraDisconnect,
+    /// One ghost-text completion request (Phase 4d, PLAN.md §6.4): the
+    /// up-to-caret `prefix` of `path`, to complete with `model`.
+    /// `request_caret` rides along so the reply can be stale-dropped by
+    /// the editor. The worker replies
+    /// [`AppMessage::GhostTextReady`].
+    SeloraGhostText {
+        path: PathBuf,
+        prefix: String,
+        model: String,
+        request_caret: Position,
+    },
+    /// Hold the Selora key for this session without validation or
+    /// keyring persistence — the wiremock tests' seam (production keys
+    /// enter through `SeloraConnect` / `SeloraAutoConnect`).
+    #[allow(dead_code)]
     SeloraKeyringSet(String),
 
     // Git (Phase 3b)
@@ -131,6 +154,15 @@ pub enum AppMessage {
     /// 30s loop drives; `Connected` implies both gateway reachable and
     /// key present (the worker does not ping without a key).
     SeloraStatus(SeloraStatus),
+    /// A ghost-text completion reply (Phase 4d): the suggestion for
+    /// `path`, requested at `request_caret` — the editor stale-drops a
+    /// reply whose caret no longer matches (buffer keyed by path, not
+    /// the arch doc's BufferId, to match this codebase).
+    GhostTextReady {
+        path: PathBuf,
+        request_caret: Position,
+        suggestion: Option<String>,
+    },
 
     // File system
     FolderOpened(PathBuf),
@@ -390,6 +422,21 @@ impl AppState {
             }
             AppMessage::SeloraStatus(status) => {
                 self.selora_status = status;
+            }
+            AppMessage::GhostTextReady {
+                path,
+                request_caret,
+                suggestion,
+            } => {
+                // Offer the suggestion to every pane's editor for the
+                // path: the editor whose caret still matches the request
+                // keeps it, the rest stale-drop it (the ghost is
+                // paint-only until Tab, ARCHITECTURE.md §9.2).
+                for ((_pane, tab_path), editor) in self.editors.iter_mut() {
+                    if tab_path == &path {
+                        editor.set_ghost(suggestion.clone(), request_caret);
+                    }
+                }
             }
 
             // -- File system ---------------------------------------------------
@@ -1366,6 +1413,68 @@ mod tests {
         assert!(state.lsp.completion.is_none());
         assert!(state.lsp.progress.is_none());
         assert!(state.pending_definition.is_none());
+    }
+
+    // --- ghost text (Phase 4d wiring) ----------------------------------------
+
+    /// A ghost reply lands only on the editor whose caret still matches
+    /// the request; stale replies and `None` leave no ghost (the ghost is
+    /// paint-only until Tab, ARCHITECTURE.md §9.2).
+    #[test]
+    fn ghost_reply_lands_on_the_matching_editor_and_stale_drops() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "a.rs", "fn main() {}");
+        let pane = state.editor_area.active_pane_id();
+        let buffer = state.buffers.get(&p).cloned().expect("buffer");
+        state
+            .editors
+            .insert((pane, p.clone()), selora_editor::Editor::new(buffer));
+
+        // A reply whose caret matches nothing on screen is stale.
+        state.apply(AppMessage::GhostTextReady {
+            path: p.clone(),
+            request_caret: Position::new(9, 9),
+            suggestion: Some("stale()".into()),
+        });
+        assert_eq!(
+            state
+                .editors
+                .get(&(pane, p.clone()))
+                .expect("editor")
+                .ghost(),
+            None
+        );
+
+        // The matching reply (the fresh editor's caret is 0:0) becomes
+        // the ghost.
+        state.apply(AppMessage::GhostTextReady {
+            path: p.clone(),
+            request_caret: Position::new(0, 0),
+            suggestion: Some("foo();".into()),
+        });
+        assert_eq!(
+            state
+                .editors
+                .get(&(pane, p.clone()))
+                .expect("editor")
+                .ghost(),
+            Some("foo();")
+        );
+
+        // A later `None` (the gateway had nothing) clears it.
+        state.apply(AppMessage::GhostTextReady {
+            path: p.clone(),
+            request_caret: Position::new(0, 0),
+            suggestion: None,
+        });
+        assert_eq!(
+            state
+                .editors
+                .get(&(pane, p.clone()))
+                .expect("editor")
+                .ghost(),
+            None
+        );
     }
 
     // --- workspace snapshot ---------------------------------------------------

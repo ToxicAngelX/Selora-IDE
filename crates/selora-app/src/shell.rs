@@ -80,6 +80,9 @@ const CHORD_WINDOW: Duration = Duration::from_millis(500);
 /// The Selora connection ping cadence (Phase 4f, ROADMAP.md: "live ping
 /// every 30s").
 const SELORA_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// The ghost-text idle threshold (Phase 4d, ROADMAP.md: "debounce 350ms
+/// idle") — seconds on the egui frame clock.
+const GHOST_IDLE_SECS: f64 = 0.350;
 
 /// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
 /// channels, and the transient view state that is not part of the document
@@ -130,6 +133,10 @@ pub struct SeloraApp {
     /// settings arrive (the base URL is theirs), then every
     /// [`SELORA_PING_INTERVAL`].
     last_selora_ping: Option<Instant>,
+    /// The last ghost-text request key (Phase 4d): `(path, caret, prefix)`.
+    /// A steady-state idle editor re-requests nothing — only a change of
+    /// prefix or caret (i.e. an edit) triggers the next request.
+    ghost_last_request: Option<(PathBuf, selora_core::Position, String)>,
     /// Settings have arrived (the tree panel's initial width is taken from
     /// them, so the panel first shows *after* the load resolves).
     settings_loaded: bool,
@@ -239,6 +246,7 @@ impl SeloraApp {
             restore_in_flight: None,
             last_tree_width: None,
             last_selora_ping: None,
+            ghost_last_request: None,
         }
     }
 
@@ -277,6 +285,11 @@ impl SeloraApp {
             self.state.apply(message);
             if is_settings {
                 self.settings_loaded = true;
+                // Phase 4a: restore the last session's connection — a key
+                // in the OS keyring is validated and becomes the session
+                // key (the base URL is the freshly loaded settings').
+                let base_url = self.state.settings.selora.base_url.clone();
+                let _ = self.effect_tx.send(Effect::SeloraAutoConnect { base_url });
             }
             if let Some(root) = folder_picked {
                 // The old session's buffers all close with the re-root —
@@ -419,6 +432,56 @@ impl SeloraApp {
             self.state.selora_status = selora_ai::SeloraStatus::Connecting;
             let _ = self.effect_tx.send(Effect::SeloraPing);
         }
+    }
+
+    /// §2 stage 2 (ghost half, Phase 4d): when the active editor has been
+    /// idle for the 350ms debounce, send its up-to-caret prefix for a
+    /// ghost completion. The request key `(path, caret, prefix)` guards
+    /// the steady state — an editor that keeps idling never re-requests;
+    /// only an edit (a new prefix or caret) triggers the next one. The
+    /// reply lands as [`AppMessage::GhostTextReady`], which offers the
+    /// suggestion to the editors (each stale-drops it against its own
+    /// caret).
+    fn drive_ghost_text(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let Some(path) = self.state.active_path() else {
+            return;
+        };
+        let path = path.to_path_buf();
+        let pane = self.state.editor_area.active_pane_id();
+        let Some(editor) = self.state.editors.get(&(pane, path.clone())) else {
+            return;
+        };
+        // A suggestion is already on screen — nothing to request.
+        if editor.ghost().is_some() {
+            return;
+        }
+        // No model picked → nothing to complete with (the picker sets it).
+        let Some(model) = self.state.settings.selora.active_model.clone() else {
+            return;
+        };
+        let idle = editor
+            .last_edit_time()
+            .is_none_or(|last_edit| now - last_edit >= GHOST_IDLE_SECS);
+        if !idle {
+            return;
+        }
+        let caret = editor.cursor();
+        let prefix = editor.text_to_caret();
+        if prefix.is_empty() {
+            return; // nothing to complete
+        }
+        let key = (path.clone(), caret, prefix.clone());
+        if self.ghost_last_request.as_ref() == Some(&key) {
+            return; // this exact request is already in flight / answered
+        }
+        self.ghost_last_request = Some(key);
+        let _ = self.effect_tx.send(Effect::SeloraGhostText {
+            path,
+            prefix,
+            model,
+            request_caret: caret,
+        });
     }
 
     /// A buffer was fully dropped (no tab anywhere): close its LSP document
@@ -1332,6 +1395,10 @@ impl SeloraApp {
         let Some(dialog) = self.settings_dialog.as_mut() else {
             return;
         };
+        // The Selora section paints the live connection state (Phase 4a):
+        // hand it over before every paint — it's cheap, and a transition
+        // to Connected clears the dialog's masked key buffer.
+        dialog.set_selora_status(self.state.selora_status.clone());
         let events = dialog.show(ctx);
         let mut close = false;
         let mut adopt: Option<selora_settings::Settings> = None;
@@ -1346,16 +1413,18 @@ impl SeloraApp {
                     self.state.toast(message, Severity::Error);
                     adopt = Some(dialog.settings().clone());
                 }
-                // The keyring is Phase 4 (ARCHITECTURE.md §7); the key is
-                // never stored on disk. It is held for this session by the
-                // dispatcher (the live network half), and the toast says
-                // exactly that.
-                SettingsEvent::SaveKeyring(key) => {
-                    let _ = self.effect_tx.send(Effect::SeloraKeyringSet(key));
-                    self.state.toast(
-                        "secure keyring storage arrives in Phase 4 — the key is held for this session only",
-                        Severity::Info,
-                    );
+                // Phase 4a (ARCHITECTURE.md §7.2): validate via
+                // list_models, then write the OS keyring. The worker's
+                // SeloraStatus reply drives the dialog's status line and
+                // the status-bar run; the Connecting form is immediate.
+                SettingsEvent::Connect(key) => {
+                    self.state.selora_status = selora_ai::SeloraStatus::Connecting;
+                    let _ = self.effect_tx.send(Effect::SeloraConnect(key));
+                }
+                // Phase 4a: drop the session key + delete the keyring
+                // entry; the reply resets the status to Disconnected.
+                SettingsEvent::Disconnect => {
+                    let _ = self.effect_tx.send(Effect::SeloraDisconnect);
                 }
             }
         }
@@ -1680,6 +1749,7 @@ impl SeloraApp {
         // and the cost meter's day boundary live here too).
         self.maybe_save_workspace();
         self.drive_selora_ping();
+        self.drive_ghost_text(ui.ctx());
         // Stage 3: derived state (sequential restore, dirty derivation per
         // painted editor, the LSP manager's lazy start).
         self.pump_restore();
