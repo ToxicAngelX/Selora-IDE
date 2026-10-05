@@ -3334,6 +3334,12 @@ dependencies = [
 [[package]]
 name = "selora-settings"
 version = "0.1.0"
+dependencies = [
+ "egui",
+ "selora-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "selora-tokens"
