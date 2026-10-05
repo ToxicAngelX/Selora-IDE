@@ -2,6 +2,7 @@
 //! (UI_SPEC.md §2.1, §2.2). Phase 2b.
 
 pub mod activity_bar;
+pub mod chat;
 pub mod file_tree;
 mod icons;
 

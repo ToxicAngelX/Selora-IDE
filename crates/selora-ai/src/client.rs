@@ -9,7 +9,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::types::{ChatEvent, ChatReceipt, ChatRequest, Model};
+use crate::types::{ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model, SeloraStatus};
 
 /// 60s to establish the connection (ARCHITECTURE.md §6.1).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -19,6 +19,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// The SSE sentinel that terminates a chat stream.
 const DONE_SENTINEL: &str = "[DONE]";
+/// The instruction that turns a chat model into a completion engine for
+/// ghost text: continuation only, never prose.
+const GHOST_SYSTEM_PROMPT: &str = "You are an inline code completion engine. You are given the code before the caret. Reply with ONLY the continuation that could be typed next at the caret — no prose, no explanation, no code fences, no repetition of the given code.";
 /// Backoff schedule for HTTP 429/5xx retries (1s, 2s, 4s — the §6.5 hard cap
 /// of 8s bounds any future extension of this schedule).
 const HTTP_RETRY_DELAYS: [Duration; 3] = [
@@ -207,6 +210,67 @@ impl SeloraClient {
         Err(error)
     }
 
+    /// `POST {base_url}/v1/chat/completions` with `stream: false` — one
+    /// ghost-text completion (ARCHITECTURE.md §10.6, PLAN.md §6.4).
+    ///
+    /// `model` is the caller's choice (the shell passes the active model);
+    /// `prompt` is the editor's up-to-caret prefix. The reply's first
+    /// choice content is the suggestion, trimmed. Empty or whitespace-only
+    /// content is `Ok(None)`: a suggestion of nothing is no suggestion.
+    ///
+    /// Non-streaming on purpose — a ghost completion is short and the
+    /// editor needs the whole string in one piece to paint at the caret.
+    /// Receipts for ghost completions are not returned: PLAN.md §6.4 keeps
+    /// the cost meter fed by the `usage` of the *chat* stream; the shell
+    /// can add ghost receipts to the total via the response length if the
+    /// owner asks for it.
+    pub async fn ghost_complete(
+        &self,
+        model: &str,
+        prompt: &str,
+    ) -> Result<Option<String>, SeloraError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let body = ChatRequest::new(
+            model,
+            vec![
+                ChatMessage::system(GHOST_SYSTEM_PROMPT),
+                ChatMessage::user(prompt),
+            ],
+        );
+
+        let response = self
+            .send_with_retry(|| self.http.post(&url).bearer_auth(&self.api_key).json(&body))
+            .await?;
+        let reply: CompletionResponse = response
+            .json()
+            .await
+            .map_err(|err| SeloraError::Ai(format!("invalid completion response: {err}")))?;
+
+        Ok(reply
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message)
+            .map(|message| message.content.unwrap_or_default())
+            .map(|content| content.trim().to_owned())
+            .filter(|content| !content.is_empty()))
+    }
+
+    /// A cheap reachability ping (ARCHITECTURE.md §10.6): `HEAD {base_url}`,
+    /// no retries, no body. Any HTTP response — even an error status —
+    /// means the gateway is reachable; only a transport failure is
+    /// "disconnected". The latency rides along for the status bar.
+    pub async fn status(&self) -> SeloraStatus {
+        let started = Instant::now();
+        match self.http.head(&self.base_url).send().await {
+            Ok(_) => SeloraStatus::Connected {
+                model: None,
+                latency_ms: started.elapsed().as_millis() as u32,
+            },
+            Err(_) => SeloraStatus::Disconnected,
+        }
+    }
+
     /// Send a request under the §6.5 retry policy:
     ///
     /// * network error → one retry after `net_retry_delay`;
@@ -362,6 +426,25 @@ struct ChatChunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+}
+
+/// One non-streaming completion reply (ghost text, ARCHITECTURE.md §10.6).
+#[derive(Debug, Deserialize)]
+struct CompletionResponse {
+    #[serde(default)]
+    choices: Vec<CompletionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionChoice {
+    #[serde(default)]
+    message: Option<CompletionMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +744,116 @@ mod tests {
             matches!(&err, SeloraError::Ai(msg) if msg.contains("oversized")),
             "expected oversized-chunk error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ghost_complete_returns_the_trimmed_first_choice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            // Ghost completions are non-streaming on the wire.
+            .and(body_partial_json(
+                serde_json::json!({ "model": "glm-5.3", "stream": false }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    { "message": { "role": "assistant", "content": "  foo(bar);\n" } },
+                    { "message": { "role": "assistant", "content": "ignored" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let suggestion = client
+            .ghost_complete("glm-5.3", "fn main() { /* caret */ ")
+            .await
+            .expect("ghost_complete succeeds");
+        assert_eq!(suggestion.as_deref(), Some("foo(bar);"));
+    }
+
+    #[tokio::test]
+    async fn ghost_complete_blank_reply_is_none_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [ { "message": { "content": "   " } } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        assert_eq!(
+            client.ghost_complete("m", "prefix").await.expect("ok"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ghost_complete_no_choices_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        assert_eq!(
+            client.ghost_complete("m", "prefix").await.expect("ok"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ghost_complete_401_is_an_auth_error() {
+        let server = MockServer::start().await;
+        let _mock = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let err = client.ghost_complete("m", "prefix").await.unwrap_err();
+        assert!(matches!(&err, SeloraError::Auth(msg) if msg.contains("401")));
+    }
+
+    #[tokio::test]
+    async fn status_reports_connected_on_any_http_response() {
+        // Even a 404 on HEAD means the gateway answered: reachable.
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        match client.status().await {
+            SeloraStatus::Connected { model, latency_ms } => {
+                assert_eq!(model, None);
+                assert!(latency_ms < 60_000, "latency should be small: {latency_ms}");
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_disconnected_on_transport_failure() {
+        // Bind a port and drop the listener: connection refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let client = test_client(&format!("http://127.0.0.1:{port}"));
+        assert_eq!(client.status().await, SeloraStatus::Disconnected);
     }
 
     #[tokio::test]

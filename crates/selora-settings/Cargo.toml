@@ -10,6 +10,8 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 egui.workspace = true
+# OS keyring get/set for the API key (PLAN.md §5; ARCHITECTURE.md §7).
+keyring.workspace = true
 
 # The workspace error model (PLAN.md §8): load/save return
 # `Result<T, SeloraError>`, which is defined in selora-core. selora-core is a

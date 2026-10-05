@@ -38,6 +38,9 @@ lsp-types = "0.97"
 # Git bindings (selora-git): PLAN.md §4.6 — vendored libgit2 so Windows
 # builds don't need a system libgit2.
 git2 = { version = "0.21", features = ["vendored-libgit2"] }
+# OS keyring (selora-settings): the API key's only home (PLAN.md §4.8 —
+# never a file). Windows Credential Manager behind the platform-agnostic API.
+keyring = "3"
 # Dev-only: mock gateway for selora-ai tests (ROADMAP.md Phase 1b).
 wiremock = "0.6"
 

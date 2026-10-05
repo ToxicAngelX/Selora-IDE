@@ -20,6 +20,9 @@ use std::path::PathBuf;
 use selora_settings::{find_on_path, Keybind, Settings, SETTINGS_FILE_NAME};
 use selora_tokens::{color, font, radius, space, type_scale};
 
+/// The Selora section's pane — Phase 4a's file (`selora_section.rs`).
+mod selora_section;
+
 /// Modal size (UI_SPEC.md §6): 720×520.
 const WIDTH: f32 = 720.0;
 const HEIGHT: f32 = 520.0;
@@ -310,7 +313,7 @@ impl SettingsDialog {
             }
             Section::Editor => self.pane_editor(ui),
             Section::Ui => self.pane_ui(ui),
-            Section::Selora => self.pane_selora(ui),
+            Section::Selora => selora_section::pane_selora(self, ui),
             Section::Lsp => self.pane_lsp(ui),
             Section::Git => self.pane_placeholder(ui, "Git settings are coming in Phase 3."),
             Section::Keybinds => self.pane_keybinds(ui),
@@ -377,64 +380,6 @@ impl SettingsDialog {
                 .range(240..=600),
         );
         self.commit_drag(&resp);
-    }
-
-    fn pane_selora(&mut self, ui: &mut egui::Ui) {
-        // Status line: Phase 2 has no live connection state, so the dialog
-        // shows the disconnected form (UI_SPEC.md §6).
-        ui.label(
-            egui::RichText::new("○ selora disconnected")
-                .color(color::FG_MUTED)
-                .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS)),
-        );
-
-        field_gap(ui);
-        // The "Connect with API key" inline flow (UI_SPEC.md §6): a
-        // password-masked input plus a "Save to keyring" button. UI only in
-        // Phase 2 — the keyring is Phase 4.
-        label_style(ui, "Connect with API key");
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut self.api_key)
-                .password(true)
-                .hint_text("sk-gw-…"),
-        );
-        if resp.changed() && self.api_key.contains(char::is_whitespace) {
-            self.api_key.retain(|c| !c.is_whitespace());
-        }
-        let clicked = ui.button("Save to keyring").clicked();
-        if clicked && !self.api_key.is_empty() {
-            let key = std::mem::take(&mut self.api_key);
-            self.events.push(SettingsEvent::SaveKeyring(key));
-        }
-        note_style(
-            ui,
-            "Secure keyring storage arrives in Phase 4; the key is not stored in Phase 2.",
-        );
-
-        field_gap(ui);
-        label_style(ui, "Base URL");
-        let resp = ui.text_edit_singleline(&mut self.settings.selora.base_url);
-        self.commit_text_on_blur(&resp);
-
-        field_gap(ui);
-        // The active model is driven by the chat model picker (Phase 4) —
-        // shown read-only here.
-        label_style(ui, "Active Model");
-        let model = self
-            .settings
-            .selora
-            .active_model
-            .clone()
-            .unwrap_or_default();
-        if model.is_empty() {
-            value_style(ui, "—");
-        } else {
-            value_style(ui, &model);
-        }
-        note_style(
-            ui,
-            "Set from the model picker once Selora is connected (Phase 4).",
-        );
     }
 
     fn pane_lsp(&mut self, ui: &mut egui::Ui) {

@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod editor;
+pub mod ghost_text;
 mod layout;
 pub mod lsp_overlay;
 mod motion;
