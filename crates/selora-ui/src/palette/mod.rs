@@ -3,3 +3,4 @@
 
 pub mod command;
 pub mod fuzzy;
+pub mod registry;
