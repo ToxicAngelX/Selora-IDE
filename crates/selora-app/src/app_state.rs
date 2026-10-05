@@ -30,9 +30,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use selora_ai::{ChatReceipt, ChatRequest, Model};
+use selora_ai::{ChatReceipt, ChatRequest, Model, SeloraStatus};
 use selora_core::{Buffer, SeloraError, Workspace};
 use selora_editor::Editor;
 use selora_fs::search::{SearchError, SearchHit, SearchId, SearchQuery};
@@ -45,6 +45,7 @@ use selora_ui::palette::fuzzy::FuzzyFileFinder;
 use selora_ui::panel::git::GitPanel;
 use selora_ui::panel::search::SearchPanel;
 use selora_ui::sidebar::FileTreePanel;
+use selora_ui::status_bar::cost_meter::CostMeterState;
 use uuid::Uuid;
 
 use crate::persistence::WorkspaceState;
@@ -80,6 +81,12 @@ pub enum Effect {
     SeloraListModels,
     #[allow(dead_code)]
     SeloraChat(Uuid, ChatRequest),
+    /// Ping the gateway for the status-bar connection indicator (Phase
+    /// 4f): the worker calls `SeloraClient::status` and replies with
+    /// [`AppMessage::SeloraStatus`]. Without a connected key it replies
+    /// `Disconnected` without touching the network — `Connected` always
+    /// means key present + gateway answered.
+    SeloraPing,
     /// Hold the Selora key for this session (the OS keyring itself is
     /// Phase 4, ARCHITECTURE.md §7).
     SeloraKeyringSet(String),
@@ -119,6 +126,11 @@ pub enum AppMessage {
     ChatDelta(Uuid, String),
     ChatDone(Uuid, ChatReceipt),
     ChatError(Uuid, SeloraError),
+    /// The latest gateway ping result (Phase 4f): the status-bar right
+    /// zone's connection state. Sent by the ping worker the shell's
+    /// 30s loop drives; `Connected` implies both gateway reachable and
+    /// key present (the worker does not ping without a key).
+    SeloraStatus(SeloraStatus),
 
     // File system
     FolderOpened(PathBuf),
@@ -271,6 +283,14 @@ pub struct AppState {
     /// nothing in the Phase 2 shell; the chat sidebar lands in Phase 4).
     pub chat_stream: String,
     pub chat_receipt: Option<ChatReceipt>,
+    /// Gateway connection state for the status-bar right zone (Phase 4f):
+    /// driven by [`AppMessage::SeloraStatus`] from the 30s ping loop;
+    /// `Connected` implies a key is present and the gateway answered.
+    pub selora_status: SeloraStatus,
+    /// The `Σ today` running total + per-model breakdown (Phase 4e),
+    /// stepped from [`AppMessage::ChatDone`]; painted by the shell's
+    /// status bar right zone.
+    pub cost_meter: CostMeterState,
     /// Latest git status snapshot; `None` until the first
     /// [`AppMessage::GitStatusChanged`] (Phase 3b).
     pub git_status: Option<GitStatus>,
@@ -325,6 +345,8 @@ impl Default for AppState {
             models: Vec::new(),
             chat_stream: String::new(),
             chat_receipt: None,
+            selora_status: SeloraStatus::Disconnected,
+            cost_meter: CostMeterState::new(),
             git_status: None,
             in_git_repo: false,
             git_panel: GitPanel::new(),
@@ -352,10 +374,22 @@ impl AppState {
                 self.chat_stream.push_str(&delta);
             }
             AppMessage::ChatDone(_chat_id, receipt) => {
+                // Feed the cost meter (Phase 4e): the receipt's own cost
+                // when the gateway reported one, else the price table of
+                // the model resolved from the catalog (never a guess).
+                let model = self.models.iter().find(|model| model.id == receipt.model);
+                self.cost_meter.add_receipt(
+                    &receipt,
+                    model,
+                    selora_ui::status_bar::cost_meter::day_number(SystemTime::now()),
+                );
                 self.chat_receipt = Some(receipt);
             }
             AppMessage::ChatError(_chat_id, error) => {
                 self.toast(format!("chat: {error}"), Severity::Error);
+            }
+            AppMessage::SeloraStatus(status) => {
+                self.selora_status = status;
             }
 
             // -- File system ---------------------------------------------------

@@ -77,6 +77,9 @@ const TOAST_EDGE: f32 = 12.0;
 /// How long the first stroke of `Ctrl+K …` stays armed (UI_SPEC.md §15
 /// chords).
 const CHORD_WINDOW: Duration = Duration::from_millis(500);
+/// The Selora connection ping cadence (Phase 4f, ROADMAP.md: "live ping
+/// every 30s").
+const SELORA_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
 /// channels, and the transient view state that is not part of the document
@@ -123,6 +126,10 @@ pub struct SeloraApp {
     lsp_shapes: BTreeMap<PathBuf, BufferShape>,
     /// When the `Ctrl+K` chord stroke was pressed, if armed.
     chord_ctrl_k: Option<Instant>,
+    /// When the last Selora ping effect left (Phase 4f): `None` until
+    /// settings arrive (the base URL is theirs), then every
+    /// [`SELORA_PING_INTERVAL`].
+    last_selora_ping: Option<Instant>,
     /// Settings have arrived (the tree panel's initial width is taken from
     /// them, so the panel first shows *after* the load resolves).
     settings_loaded: bool,
@@ -231,6 +238,7 @@ impl SeloraApp {
             restore_queue: VecDeque::new(),
             restore_in_flight: None,
             last_tree_width: None,
+            last_selora_ping: None,
         }
     }
 
@@ -383,6 +391,34 @@ impl SeloraApp {
             self.msg_tx.clone(),
             config,
         );
+    }
+
+    /// §2 stage 2 (Selora half): the 30s connection ping loop (Phase 4f)
+    /// and the cost meter's day boundary (Phase 4e). The first ping leaves
+    /// as soon as settings arrive — the base URL is theirs — so the status
+    /// bar reflects reality within one reply, not after 30s. Sending the
+    /// effect flips the indicator to `Connecting` until the worker's
+    /// [`AppMessage::SeloraStatus`] lands.
+    fn drive_selora_ping(&mut self) {
+        // The cost meter's "today" window (Phase 4e): clears at the day
+        // boundary even with no traffic.
+        self.state
+            .cost_meter
+            .sync_day(selora_ui::status_bar::cost_meter::day_number(
+                std::time::SystemTime::now(),
+            ));
+
+        if !self.settings_loaded {
+            return;
+        }
+        let due = self
+            .last_selora_ping
+            .is_none_or(|last| last.elapsed() >= SELORA_PING_INTERVAL);
+        if due {
+            self.last_selora_ping = Some(Instant::now());
+            self.state.selora_status = selora_ai::SeloraStatus::Connecting;
+            let _ = self.effect_tx.send(Effect::SeloraPing);
+        }
     }
 
     /// A buffer was fully dropped (no tab anywhere): close its LSP document
@@ -1001,15 +1037,46 @@ impl SeloraApp {
                     );
                 }
 
-                // Right: connection state (Phase 2: always disconnected).
-                let right_font = sans();
-                painter.text(
-                    egui::pos2(rect.right() - theme::space::S3, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    "○ selora disconnected",
-                    right_font,
-                    theme::color::FG_MUTED,
+                // Right: the live Selora connection (Phase 4f) at the very
+                // edge, the `Σ today` cost meter (Phase 4e) left of it.
+                // The active model from settings wins over the ping's own
+                // (the ping cannot see the picker's choice).
+                let active_model = self.state.settings.selora.active_model.clone();
+                let status_events = selora_ui::status_bar::selora_status::show(
+                    ui,
+                    &self.state.selora_status,
+                    active_model.as_deref(),
                 );
+                // Measure the connection run to anchor the meter left of
+                // it without overlap (same font the widget paints with).
+                let connection_run = selora_ui::status_bar::selora_status::label(
+                    &self.state.selora_status,
+                    active_model.as_deref(),
+                );
+                let run_width = painter
+                    .layout_no_wrap(
+                        connection_run,
+                        egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS),
+                        theme::color::FG_MUTED,
+                    )
+                    .size()
+                    .x;
+                let meter_zone = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top()),
+                    egui::pos2(
+                        rect.right() - theme::space::S3 - run_width - theme::space::S4,
+                        rect.bottom(),
+                    ),
+                );
+                selora_ui::status_bar::cost_meter::CostMeter::new(&self.state.cost_meter)
+                    .show(ui, meter_zone);
+                for event in status_events {
+                    match event {
+                        selora_ui::status_bar::selora_status::StatusEvent::OpenConnect => {
+                            self.open_settings();
+                        }
+                    }
+                }
             });
     }
 
@@ -1609,8 +1676,10 @@ impl SeloraApp {
         // §2 stage 1: drain worker messages before any painting.
         self.drain_messages();
         // Stage 2: timeouts (the 5s workspace autosave; toast expiry happens
-        // in `toasts` below, which owns their clock).
+        // in `toasts` below, which owns their clock; the Selora ping loop
+        // and the cost meter's day boundary live here too).
         self.maybe_save_workspace();
+        self.drive_selora_ping();
         // Stage 3: derived state (sequential restore, dirty derivation per
         // painted editor, the LSP manager's lazy start).
         self.pump_restore();

@@ -402,6 +402,26 @@ pub fn spawn_lsp_manager(
     selora_lsp::spawn_manager(handle, notify, effect_rx, event_tx, config);
 }
 
+/// Effect worker: one gateway reachability ping (Phase 4f). The client's
+/// `status()` is a bare HEAD — any HTTP response counts as reachable; the
+/// result lands as [`AppMessage::SeloraStatus`] for the status-bar right
+/// zone.
+fn spawn_selora_ping(
+    handle: &Handle,
+    notify: &Notify,
+    msg_tx: UnboundedSender<AppMessage>,
+    base_url: String,
+    api_key: String,
+) {
+    let notify = notify.clone();
+    handle.spawn(async move {
+        let client = SeloraClient::new(&base_url, &api_key);
+        let status = client.status().await;
+        let _ = msg_tx.send(AppMessage::SeloraStatus(status));
+        notify();
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Effect workers: blocking file/folder pickers (rfd)
 // ---------------------------------------------------------------------------
@@ -612,6 +632,25 @@ pub fn spawn_dispatcher(
                             SeloraError::Auth(
                                 "no API key connected — keyring storage arrives in Phase 4".into(),
                             ),
+                        ));
+                        notify();
+                    }
+                },
+                Effect::SeloraPing => match api_key.clone() {
+                    Some(key) => {
+                        spawn_selora_ping(
+                            &dispatch_handle,
+                            &notify,
+                            msg_tx.clone(),
+                            base_url.clone(),
+                            key,
+                        );
+                    }
+                    // No key → disconnected, no network call: `Connected`
+                    // must always mean key present + gateway answered.
+                    None => {
+                        let _ = msg_tx.send(AppMessage::SeloraStatus(
+                            selora_ai::SeloraStatus::Disconnected,
                         ));
                         notify();
                     }
