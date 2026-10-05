@@ -7,4 +7,4 @@
 //! cargo cycle. Phase 2 hoisted the constants into `selora-tokens`, which
 //! both crates import — one source of truth, no mirror to keep in sync.
 
-pub use selora_tokens::{color, font, motion, radius, space, type_scale};
+pub use selora_tokens::{color, font, radius, type_scale};
