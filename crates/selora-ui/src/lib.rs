@@ -15,5 +15,6 @@ pub mod dialogs;
 pub mod editor;
 pub mod palette;
 pub mod panel;
+pub mod picker;
 pub mod sidebar;
 pub mod theme;
