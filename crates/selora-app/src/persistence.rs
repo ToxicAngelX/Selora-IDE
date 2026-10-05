@@ -17,13 +17,31 @@ use serde::{Deserialize, Serialize};
 /// The file name inside the settings directory (ARCHITECTURE.md §8.2).
 pub const WORKSPACE_FILE_NAME: &str = "workspace.json";
 
+/// One persisted chat turn (Phase 4c): the role tag ("user" /
+/// "assistant") and the content. `workspace.json`'s chat unit — the shell
+/// converts to/from the chat panel's own turn type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTurnState {
+    pub role: String,
+    pub content: String,
+}
+
 /// The persisted session (ARCHITECTURE.md §8.2): the workspace root, the
-/// open files in tab order, and the active file.
+/// open files in tab order, the active file, and the chat sidebar's
+/// visibility + last turns (Phase 4c).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub root: Option<PathBuf>,
     pub open_files: Vec<PathBuf>,
     pub active_path: Option<PathBuf>,
+    /// Whether the chat sidebar was open at close; older files default to
+    /// closed.
+    #[serde(default)]
+    pub chat_open: bool,
+    /// The last 20 chat turns (the Phase 4 brief's cap is enforced by the
+    /// panel's `snapshot_turns`, not here).
+    #[serde(default)]
+    pub chat_turns: Vec<ChatTurnState>,
 }
 
 /// `workspace.json`'s path inside the settings directory `dir`.
@@ -95,6 +113,9 @@ pub fn restorable(state: &WorkspaceState) -> WorkspaceState {
         root,
         open_files,
         active_path,
+        // Chat state is not path-dependent — it restores verbatim.
+        chat_open: state.chat_open,
+        chat_turns: state.chat_turns.clone(),
     }
 }
 
@@ -124,6 +145,8 @@ mod tests {
             root: Some(root.clone()),
             open_files: vec![root.join("Cargo.toml"), root.join("src").join("main.rs")],
             active_path: Some(root.join("src").join("main.rs")),
+            chat_open: false,
+            chat_turns: Vec::new(),
         };
         (root, state)
     }
@@ -137,6 +160,44 @@ mod tests {
         assert!(workspace_path(&dir).is_file(), "workspace.json written");
         assert!(!dir.join(format!("{WORKSPACE_FILE_NAME}.tmp")).is_file());
         assert_eq!(load(&dir).as_ref(), Some(&state));
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Phase 4c: the chat sidebar's visibility and turns round-trip, and a
+    /// pre-Phase-4c file (no chat fields) still loads with defaults.
+    #[test]
+    fn chat_state_round_trips_and_old_files_default() {
+        let (root, state) = fixture_session();
+        let mut state = state;
+        state.chat_open = true;
+        state.chat_turns = vec![
+            ChatTurnState {
+                role: "user".into(),
+                content: "write a haiku".into(),
+            },
+            ChatTurnState {
+                role: "assistant".into(),
+                content: "line one\nline two\nline three".into(),
+            },
+        ];
+        let dir = temp_dir();
+        save(&dir, &state).expect("save");
+        let loaded = load(&dir).expect("load");
+        assert!(loaded.chat_open);
+        assert_eq!(loaded.chat_turns, state.chat_turns);
+
+        // The pre-Phase-4c shape: no chat fields at all → defaults.
+        let legacy = serde_json::json!({
+            "root": root,
+            "open_files": [],
+            "active_path": null,
+        });
+        std::fs::write(workspace_path(&dir), legacy.to_string()).expect("write legacy");
+        let loaded = load(&dir).expect("legacy load");
+        assert!(!loaded.chat_open);
+        assert!(loaded.chat_turns.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(root);

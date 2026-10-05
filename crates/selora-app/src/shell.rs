@@ -41,7 +41,7 @@ use selora_ui::editor::split::{self, PaneView};
 use selora_ui::palette::registry::CommandId;
 use selora_ui::panel::git::GitAction;
 use selora_ui::panel::search::SearchEvent;
-use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, TreeEvent};
+use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, ChatPanelEvent, TreeEvent};
 use selora_ui::{brand, theme};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -83,6 +83,10 @@ const SELORA_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// The ghost-text idle threshold (Phase 4d, ROADMAP.md: "debounce 350ms
 /// idle") — seconds on the egui frame clock.
 const GHOST_IDLE_SECS: f64 = 0.350;
+/// Chat sidebar bounds (UI_SPEC.md §2 region ③): 360px default,
+/// 240–600 resizable.
+const CHAT_MIN_WIDTH: f32 = 240.0;
+const CHAT_MAX_WIDTH: f32 = 600.0;
 
 /// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
 /// channels, and the transient view state that is not part of the document
@@ -137,6 +141,9 @@ pub struct SeloraApp {
     /// A steady-state idle editor re-requests nothing — only a change of
     /// prefix or caret (i.e. an edit) triggers the next request.
     ghost_last_request: Option<(PathBuf, selora_core::Position, String)>,
+    /// Whether the chat sidebar (region ③) is visible (`Ctrl+L`,
+    /// UI_SPEC.md §2 / §15; Phase 4c). Restored from workspace state.
+    show_chat: bool,
     /// Settings have arrived (the tree panel's initial width is taken from
     /// them, so the panel first shows *after* the load resolves).
     settings_loaded: bool,
@@ -185,6 +192,10 @@ impl SeloraApp {
                     let _ = app.effect_tx.send(Effect::OpenFolder(root));
                     app.restore_queue = saved.open_files.into();
                 }
+                // Region ③ restores with the session (Phase 4c): the
+                // sidebar's visibility and the last 20 turns.
+                app.show_chat = saved.chat_open;
+                app.state.restore_chat(saved.chat_turns);
             }
         }
 
@@ -247,6 +258,7 @@ impl SeloraApp {
             last_tree_width: None,
             last_selora_ping: None,
             ghost_last_request: None,
+            show_chat: false,
         }
     }
 
@@ -338,7 +350,7 @@ impl SeloraApp {
         let Some(dir) = self.workspace_dir.clone() else {
             return;
         };
-        let snapshot = self.state.workspace_snapshot();
+        let snapshot = self.state.workspace_snapshot(self.show_chat);
         if self.last_workspace_snapshot.as_ref() == Some(&snapshot) {
             return;
         }
@@ -576,10 +588,7 @@ impl SeloraApp {
             KeyAction::FuzzyFind => self.open_fuzzy(),
             KeyAction::CommandPalette => self.toggle_command_palette(),
             KeyAction::Save => self.save_active(),
-            KeyAction::ToggleChat => {
-                self.state
-                    .toast("chat sidebar lands in Phase 4", Severity::Info);
-            }
+            KeyAction::ToggleChat => self.toggle_chat(),
             KeyAction::ToggleFileTree => {
                 self.show_tree = !self.show_tree;
             }
@@ -790,10 +799,16 @@ impl SeloraApp {
                     let _ = self.effect_tx.send(Effect::GitStatus(root));
                 }
             }
-            Activity::Chat => {
-                self.state
-                    .toast("chat sidebar lands in Phase 4", Severity::Info);
-            }
+            Activity::Chat => self.toggle_chat(),
+        }
+    }
+
+    /// Show / hide region ③ (Phase 4c). Opening focuses the composer so
+    /// typing starts immediately (UI_SPEC.md §4).
+    fn toggle_chat(&mut self) {
+        self.show_chat = !self.show_chat;
+        if self.show_chat {
+            self.state.chat_panel.focus_composer();
         }
     }
 
@@ -1141,6 +1156,73 @@ impl SeloraApp {
                     }
                 }
             });
+    }
+
+    /// Region ③ (Phase 4c): the chat sidebar, a resizable right panel
+    /// (UI_SPEC.md §2: 360px default, 240–600). The panel widget owns the
+    /// content; its events route to effects here (sends become
+    /// `Effect::SeloraChat`, keyed by the panel's ChatId).
+    fn chat_region(&mut self, ui: &mut egui::Ui) {
+        if !self.show_chat {
+            return;
+        }
+        let default_width = self.state.settings.ui.chat_sidebar_width as f32;
+        let mut events = Vec::new();
+        egui::Panel::right("chat_sidebar")
+            .resizable(true)
+            .default_size(default_width)
+            .min_size(CHAT_MIN_WIDTH)
+            .max_size(CHAT_MAX_WIDTH)
+            .show_separator_line(true)
+            .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
+            .show(ui, |ui| {
+                let outcome = self.state.chat_panel.show(ui);
+                events = outcome.events;
+            });
+        for event in events {
+            self.route_chat_event(event);
+        }
+    }
+
+    /// One chat-panel event → its effect (Phase 4c).
+    fn route_chat_event(&mut self, event: ChatPanelEvent) {
+        match event {
+            ChatPanelEvent::Send { id, .. } => {
+                // The user bubble is already in the transcript; the
+                // request carries the whole (stable) conversation.
+                let Some(model) = self.state.chat_panel.model().cloned() else {
+                    self.state
+                        .toast("pick a model first — the header's picker", Severity::Info);
+                    return;
+                };
+                let conversation = self.state.chat_panel.conversation();
+                let request = selora_ai::ChatRequest::new(model, conversation).with_stream(true);
+                let chat_uuid = uuid::Uuid::new_v4();
+                self.state.chat_ids.insert(chat_uuid, id);
+                let _ = self.effect_tx.send(Effect::SeloraChat(chat_uuid, request));
+            }
+            // The panel emptied the transcript itself; an in-flight stream
+            // (if any) lands into a stale id and is dropped.
+            ChatPanelEvent::Clear => {}
+            // The text is already on the clipboard (the panel put it
+            // there); these are the toast hooks.
+            ChatPanelEvent::CopyCode(_) => self.state.toast("code copied", Severity::Info),
+            ChatPanelEvent::CopyTranscript(_) => {
+                self.state.toast("transcript copied", Severity::Info)
+            }
+            ChatPanelEvent::SelectModel(model) => {
+                // The picker flipped its header optimistically; this is
+                // the durable write (settings.json + the dispatcher's
+                // next request both follow).
+                self.state.settings.selora.active_model = Some(model);
+                let _ = self
+                    .effect_tx
+                    .send(Effect::SettingsSave(self.state.settings.clone()));
+            }
+            ChatPanelEvent::RefreshModels => {
+                let _ = self.effect_tx.send(Effect::SeloraListModels);
+            }
+        }
     }
 
     /// The central editor area: the split tree with its tab bars, the
@@ -1646,13 +1728,14 @@ impl SeloraApp {
                     .toast("go to definition lands in Phase 3", Severity::Info);
             }
             // Phase 4: the Selora UI.
-            CommandId::ViewToggleChatSidebar => {
-                self.state
-                    .toast("chat sidebar lands in Phase 4", Severity::Info);
-            }
+            CommandId::ViewToggleChatSidebar => self.toggle_chat(),
             CommandId::SeloraSwitchModel => {
-                self.state
-                    .toast("model switching lands in Phase 4", Severity::Info);
+                // The palette route: open the sidebar with its picker
+                // dropdown armed (Phase 4c).
+                if !self.show_chat {
+                    self.toggle_chat();
+                }
+                self.state.chat_panel.open_model_picker();
             }
             CommandId::SeloraClearApiKey => {
                 self.state
@@ -1763,6 +1846,7 @@ impl SeloraApp {
         self.status_bar(ui);
         self.bottom_panel(ui);
         self.left_region(ui);
+        self.chat_region(ui);
         let mut workbench = egui::Rect::ZERO;
         self.editor_region(ui, &mut workbench);
 

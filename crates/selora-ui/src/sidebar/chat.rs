@@ -503,6 +503,13 @@ impl ChatPanel {
         self.in_flight.is_some()
     }
 
+    /// Mark `id` as the in-flight request. The panel does this itself on
+    /// submit; this is the programmatic seam (tests, and later agent-mode
+    /// turns that start a stream without the composer).
+    pub fn begin_stream(&mut self, id: ChatId) {
+        self.in_flight = Some(id);
+    }
+
     /// The in-flight request's id (the shell matches it against the
     /// `ChatId -> uuid` map it keeps when dispatching).
     pub fn in_flight(&self) -> Option<ChatId> {

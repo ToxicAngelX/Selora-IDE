@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use selora_ai::{ChatReceipt, ChatRequest, Model, SeloraStatus};
+use selora_ai::{ChatReceipt, ChatRequest, Model, Role, SeloraStatus};
 use selora_core::{Buffer, Position, SeloraError, Workspace};
 use selora_editor::Editor;
 use selora_fs::search::{SearchError, SearchHit, SearchId, SearchQuery};
@@ -44,7 +44,7 @@ use selora_ui::palette::command::CommandPalette;
 use selora_ui::palette::fuzzy::FuzzyFileFinder;
 use selora_ui::panel::git::GitPanel;
 use selora_ui::panel::search::SearchPanel;
-use selora_ui::sidebar::FileTreePanel;
+use selora_ui::sidebar::{ChatId, ChatPanel, ChatTurn, FileTreePanel};
 use selora_ui::status_bar::cost_meter::CostMeterState;
 use uuid::Uuid;
 
@@ -308,13 +308,19 @@ pub struct AppState {
     /// All workspace file paths + parent-dir tags, the fuzzy finder's
     /// candidate source (refreshed whenever the tree updates).
     pub fuzzy_source: Vec<(PathBuf, String)>,
-    /// Gateway model catalog (Phase 1c network half; the chat UI lands in
-    /// Phase 4 — kept so `ModelsLoaded` has a home).
+    /// Gateway model catalog (Phase 4): the model picker's list source
+    /// (also the price table the cost meter resolves receipts against).
     pub models: Vec<Model>,
-    /// The last streamed chat reply (Phase 1c spike holdover, surfaced by
-    /// nothing in the Phase 2 shell; the chat sidebar lands in Phase 4).
-    pub chat_stream: String,
-    pub chat_receipt: Option<ChatReceipt>,
+    /// The chat sidebar's view state (Phase 4c): transcript, composer,
+    /// streaming bubble. Driven by [`AppMessage::ChatDelta`] /
+    /// [`ChatDone`] / [`ChatError`] / [`ModelsLoaded`]; sends go out as
+    /// [`Effect::SeloraChat`] from the shell.
+    pub chat_panel: ChatPanel,
+    /// The live chat request map: the `Uuid` of each dispatched
+    /// `Effect::SeloraChat` → the panel's [`ChatId`] it was sent for.
+    /// Entries leave at the stream's terminal message; unknown ids are
+    /// stale replies and dropped.
+    pub chat_ids: BTreeMap<Uuid, ChatId>,
     /// Gateway connection state for the status-bar right zone (Phase 4f):
     /// driven by [`AppMessage::SeloraStatus`] from the 30s ping loop;
     /// `Connected` implies a key is present and the gateway answered.
@@ -375,8 +381,8 @@ impl Default for AppState {
             toasts: Vec::new(),
             fuzzy_source: Vec::new(),
             models: Vec::new(),
-            chat_stream: String::new(),
-            chat_receipt: None,
+            chat_panel: ChatPanel::new(),
+            chat_ids: BTreeMap::new(),
             selora_status: SeloraStatus::Disconnected,
             cost_meter: CostMeterState::new(),
             git_status: None,
@@ -397,15 +403,24 @@ impl AppState {
         match message {
             // -- Selora (Phase 1c network half) --------------------------------
             AppMessage::ModelsLoaded(Ok(models)) => {
+                self.chat_panel.set_models(models.clone());
                 self.models = models;
             }
             AppMessage::ModelsLoaded(Err(error)) => {
                 self.toast(format!("selora: {error}"), Severity::Error);
             }
-            AppMessage::ChatDelta(_chat_id, delta) => {
-                self.chat_stream.push_str(&delta);
+            AppMessage::ChatDelta(chat_uuid, delta) => {
+                // An unknown uuid is a stale reply (the map entry left at
+                // the stream's terminal message) — dropped, not appended.
+                if let Some(chat_id) = self.chat_ids.get(&chat_uuid) {
+                    let chat_id = *chat_id;
+                    self.chat_panel.push_assistant_delta(chat_id, &delta);
+                }
             }
-            AppMessage::ChatDone(_chat_id, receipt) => {
+            AppMessage::ChatDone(chat_uuid, receipt) => {
+                if let Some(chat_id) = self.chat_ids.remove(&chat_uuid) {
+                    self.chat_panel.complete_stream(chat_id);
+                }
                 // Feed the cost meter (Phase 4e): the receipt's own cost
                 // when the gateway reported one, else the price table of
                 // the model resolved from the catalog (never a guess).
@@ -415,9 +430,11 @@ impl AppState {
                     model,
                     selora_ui::status_bar::cost_meter::day_number(SystemTime::now()),
                 );
-                self.chat_receipt = Some(receipt);
             }
-            AppMessage::ChatError(_chat_id, error) => {
+            AppMessage::ChatError(chat_uuid, error) => {
+                if let Some(chat_id) = self.chat_ids.remove(&chat_uuid) {
+                    self.chat_panel.fail_stream(chat_id, &error.to_string());
+                }
                 self.toast(format!("chat: {error}"), Severity::Error);
             }
             AppMessage::SeloraStatus(status) => {
@@ -737,6 +754,9 @@ impl AppState {
         self.lsp.completion = None;
         self.lsp.progress = None;
         self.pending_definition = None;
+        // The conversation belongs to the old workspace (Phase 4c).
+        self.chat_panel.clear();
+        self.chat_ids.clear();
     }
 
     /// Dirty derivation, one frame per painted editor (see the module docs).
@@ -817,7 +837,10 @@ impl AppState {
     /// The session snapshot persisted to `workspace.json`
     /// (ARCHITECTURE.md §8.2): the workspace root, the open files in tab
     /// order, and the active file.
-    pub fn workspace_snapshot(&self) -> WorkspaceState {
+    /// The `workspace.json` snapshot (§8.2): root, tabs in order, the
+    /// active file, and the chat sidebar's state (Phase 4c) — the shell
+    /// passes its visibility flag.
+    pub fn workspace_snapshot(&self, chat_open: bool) -> WorkspaceState {
         WorkspaceState {
             root: self
                 .workspace
@@ -829,7 +852,35 @@ impl AppState {
                 .map(|workspace| workspace.open_files.clone())
                 .unwrap_or_default(),
             active_path: self.active_path(),
+            chat_open,
+            chat_turns: self
+                .chat_panel
+                .snapshot_turns()
+                .into_iter()
+                .map(|turn| crate::persistence::ChatTurnState {
+                    role: match turn.role {
+                        Role::User => "user".to_owned(),
+                        Role::Assistant => "assistant".to_owned(),
+                        Role::System => "system".to_owned(),
+                    },
+                    content: turn.content,
+                })
+                .collect(),
         }
+    }
+
+    /// Rebuild the chat transcript from persisted turns (boot restore,
+    /// Phase 4c). Unknown role tags are dropped, not fatal.
+    pub fn restore_chat(&mut self, turns: Vec<crate::persistence::ChatTurnState>) {
+        let restored: Vec<ChatTurn> = turns
+            .into_iter()
+            .filter_map(|turn| match turn.role.as_str() {
+                "user" => Some(ChatTurn::user(turn.content)),
+                "assistant" => Some(ChatTurn::assistant(turn.content)),
+                _ => None,
+            })
+            .collect();
+        self.chat_panel.restore_turns(restored);
     }
 }
 
@@ -1477,6 +1528,58 @@ mod tests {
         );
     }
 
+    // --- chat (Phase 4c wiring) ------------------------------------------------
+
+    /// Chat messages stream into the panel keyed by the request map; the
+    /// map entry leaves at the terminal message, so a late reply for it
+    /// is dropped; the receipt feeds the cost meter.
+    #[test]
+    fn chat_messages_stream_into_the_panel_and_drop_stale_ids() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::FolderOpened(path("/repo")));
+
+        // The shell's Send half: the panel opened the stream (submit sets
+        // it in flight) and the shell recorded the request id.
+        let chat_uuid = Uuid::new_v4();
+        let chat_id = selora_ui::sidebar::ChatId::next();
+        state.chat_panel.begin_stream(chat_id);
+        state.chat_ids.insert(chat_uuid, chat_id);
+        state.chat_panel.push_user("write a haiku");
+
+        state.apply(AppMessage::ChatDelta(chat_uuid, "line one\n".into()));
+        state.apply(AppMessage::ChatDelta(chat_uuid, "line two".into()));
+        // A reply for an unknown uuid (the entry already left, or a race):
+        // dropped, not appended.
+        state.apply(AppMessage::ChatDelta(Uuid::new_v4(), "garbage".into()));
+        assert!(state.chat_panel.is_streaming());
+
+        state.apply(AppMessage::ChatDone(
+            chat_uuid,
+            ChatReceipt {
+                request_id: Uuid::new_v4(),
+                model: "test-model".into(),
+                prompt_tokens: 9,
+                completion_tokens: 2,
+                cost_usd: 0.001,
+                duration_ms: 42,
+                estimated: false,
+            },
+        ));
+        // The terminal message removed the map entry — a late delta for
+        // the same uuid is now stale and dropped.
+        state.apply(AppMessage::ChatDelta(chat_uuid, "late".into()));
+
+        assert!(state.chat_ids.is_empty());
+        assert!(!state.chat_panel.is_streaming());
+        let transcript = state.chat_panel.transcript();
+        assert!(transcript.contains("write a haiku"), "{transcript}");
+        assert!(transcript.contains("line one\nline two"), "{transcript}");
+        assert!(!transcript.contains("garbage"));
+        assert!(!transcript.contains("late"));
+        // The gateway-reported cost landed in the meter verbatim.
+        assert!((state.cost_meter.total_usd() - 0.001).abs() < f64::EPSILON);
+    }
+
     // --- workspace snapshot ---------------------------------------------------
 
     #[test]
@@ -1486,9 +1589,11 @@ mod tests {
         let a = loaded(&mut state, "a.rs", "a");
         let b = loaded(&mut state, "b.rs", "b");
 
-        let snapshot = state.workspace_snapshot();
+        let snapshot = state.workspace_snapshot(true);
         assert_eq!(snapshot.root, Some(path("/repo")));
         assert_eq!(snapshot.open_files, vec![a, b.clone()]);
         assert_eq!(snapshot.active_path, Some(b));
+        assert!(snapshot.chat_open);
+        assert!(snapshot.chat_turns.is_empty());
     }
 }
