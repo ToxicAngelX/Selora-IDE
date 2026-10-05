@@ -418,7 +418,7 @@ gh repo edit --enable-discussions
 | `.github/workflows/ci.yml` | Phase 0 | 0 |
 | `.github/workflows/release.yml` | Phase 6d | 5d |
 | CI badge in README | Phase 6e | 5e |
-| `cargo-deny.toml` | Phase 0 | 0 |
+| `deny.toml` | Phase 0 | 0 |
 
 ### 7.2 What we do NOT publish
 
