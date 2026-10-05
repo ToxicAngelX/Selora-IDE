@@ -7,3 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+egui.workspace = true
+
+# The workspace error model (PLAN.md §8): load/save return
+# `Result<T, SeloraError>`, which is defined in selora-core. selora-core is a
+# stable Phase 1 leaf crate — depending on it here adds no parallel-build
+# conflict (noted as a deviation from the brief's dependency list).
+selora-core.workspace = true
