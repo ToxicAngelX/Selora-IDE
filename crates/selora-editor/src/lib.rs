@@ -20,6 +20,7 @@
 
 mod editor;
 mod layout;
+pub mod lsp_overlay;
 mod motion;
 pub mod syntax;
 mod theme;

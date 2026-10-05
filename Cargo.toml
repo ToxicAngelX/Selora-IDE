@@ -33,6 +33,11 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
+# LSP client types (selora-lsp): PLAN.md §4.5 — thin client, no tower-lsp.
+lsp-types = "0.97"
+# Git bindings (selora-git): PLAN.md §4.6 — vendored libgit2 so Windows
+# builds don't need a system libgit2.
+git2 = { version = "0.21", features = ["vendored-libgit2"] }
 # Dev-only: mock gateway for selora-ai tests (ROADMAP.md Phase 1b).
 wiremock = "0.6"
 
