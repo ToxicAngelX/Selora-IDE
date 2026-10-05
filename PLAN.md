@@ -247,7 +247,7 @@ selora-ide/
 | `selora-editor` | Editor widget: text paint, cursor, selection, scroll, gestures, ghost text overlay, gutter | `Editor` (egui widget) |
 | `selora-lsp` | LSP client actor over stdio JSON-RPC; queue messages, route responses | `LspClient`, `LspMessage` |
 | `selora-git` | Status, diff, stage/unstage, commit | `GitRepo`, `GitStatus` |
-| `selora-ai` | `GET /v1/models`, `POST /v1/chat/completions` (streaming + non-streaming), ghost-text provider, cost meter | `SeloraClient`, `ChatEvent`, `Model` |
+| `selora-ai` | `GET /v1/models`, `POST /v1/chat/completions` (streaming + non-streaming), ghost-text provider, cost meter, Agent Mode tool loop (§17: tools, router, turn controller) | `SeloraClient`, `ChatEvent`, `Model`, `AgentTurn` |
 | `selora-settings` | JSON config read/write, keyring get/set | `Settings`, `KeyringStore` |
 | `selora-ui` | Top-level egui UI: panel layout, command palette, file tree, chat sidebar, status bar, modals | App-level structs + `UiApp` |
 | `selora-app` | `main.rs`: tokio runtime, egui frame loop, crate wiring, app state | `fn main()` |
@@ -359,7 +359,9 @@ No state is stored in the project directory. No `.selora/` folder is written int
 | 2 — Editor core | Tabs, splits, file tree, fuzzy find, syntax highlight, command palette, settings | Open a folder, navigate to a Rust file, see it highlighted, fuzzy-find it, edit it |
 | 3 — LSP & Git | Real LSP (rust-analyzer + ts-ls), git panel | Open a Rust file, "go to definition" works, hover shows type, status bar shows git branch + changed count |
 | 4 — Selora AI | Key connection, model picker, chat sidebar, ghost text, cost meter | Connect a real `sk-gw-` key, switch models, stream a real chat reply, accept a ghost-text suggestion |
-| 5 — Polish & ship | First-run, splash, about, installer, CI release pipeline, docs | Download installer from CI, install on a clean Windows VM, all Lite features work |
+| 5 — Agent Mode | Claude Code-style tool loop: file read/edit/write/delete, bash, web search — approval-gated | A real agent turn reads files, proposes diffs, runs commands, fetches the web; Deny leaves disk untouched |
+| 5 — Agent Mode | Tool loop: model reads/edits/writes/deletes files, runs bash, searches web; approval cards in chat | Real multi-tool agent turn against a real workspace; every write on disk traceable to an approved diff |
+| 6 — Polish & ship | First-run, splash, about, installer, CI release pipeline, docs | Download installer from CI, install on a clean Windows VM, all Lite features work |
 
 Each phase has its own subagent brief, acceptance tests, and explicit DONE criterion. Detailed in `ROADMAP.md`. Orchestration across phases in `AGENT_ORCHESTRATION.md`.
 

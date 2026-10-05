@@ -379,7 +379,84 @@ cargo run -p selora-app
 
 ---
 
-## Phase 5 — Polish & Ship
+## Phase 5 — Agent Mode
+
+**Goal:** The Claude Code parity feature. The model can read, create, edit, and delete workspace files, run shell commands, and search/fetch the web — through the Selora gateway, with every side-effecting action gated behind an approval card in the chat.
+
+**Why its own phase:** It is the largest single feature in the product and the biggest trust surface. It composes everything from Phases 2–4 (buffers, file tree, search, streaming chat, cost meter) and adds the tool loop, the tool router, and the approval UI. It runs after Phase 4 so every tool it exposes sits on proven primitives.
+
+**Inputs:**
+- Phase 4 merged (streaming chat, model picker, receipts, cost meter all stable).
+- `ARCHITECTURE.md` §17 (the tool loop spec) and `UI_SPEC.md` §4.2 (the card specs) — these are the contract.
+
+**Tasks (parallel subagents — see `AGENT_ORCHESTRATION.md` §10 Phase 5):**
+
+- **5a — Tool types + request plumbing:** extend `selora-ai` with `ToolSpec`, tool-call streaming (`ChatEvent::ToolCallDelta` with accumulate-then-parse), `tools` field on `ChatRequest`, and the tool-result message shape. Unit tests with the mock gateway: a scripted 3-turn conversation that exercises read → write → final-answer.
+- **5b — Tool router + runtime executor:** the `agent` module in `selora-ai`: map tool calls to implementations over `selora-core`/`selora-fs`/runtime fs/`tokio::process`. Path rooting, SSRF guard, size caps, output truncation. All read tools fully implemented; write/bash/delete produce `ApprovalCard`s and pause the loop. Unit tests for every guard (path escape rejected, localhost fetch rejected, oversize read rejected).
+- **5c — Agent loop controller:** the `AgentTurn` state machine (`Thinking → RunningTool → AwaitingApproval → … → Done`), loop caps (25 iterations / 10 min / $1), Stop button wiring, `ApproveAllThisTurn`. Turn summary. Tests: cap-abort, user-stop, deny-and-continue.
+- **5d — Approval + tool cards UI:** chat sidebar renders tool cards, diff cards (unified diff with +/- coloring), bash command cards (live output streaming, exit status), web cards, the agent status line, the turn summary footer. `UI_SPEC.md` §4.2 is the wireframe.
+- **5e — Web tools:** `web_search` (DuckDuckGo Lite default, no key; Brave API optional via settings) + `web_fetch` (HTML→text, 256KB cap, SSRF guard). Results as tool cards in the chat.
+
+**Subagent brief (5c, paste verbatim):**
+
+```
+You are Phase 5c of the Selora IDE build (agent loop controller). 5a, 5b, 5d, 5e run in parallel. Your job is the loop that turns chat into an agent turn.
+
+READ FIRST, in full:
+- C:\Users\Toxic\Desktop\Selora IDE\ARCHITECTURE.md §17 (17.3 The loop, 17.4 Approval protocol, 17.5 bash — this is your spec)
+- C:\Users\Toxic\Desktop\Selora IDE\UI_SPEC.md §4.2 (agent status line, Stop button, turn summary)
+- C:\Users\Toxic\Desktop\Selora IDE\ROADMAP.md Phase 5
+
+THE DEPENDENCIES YOU CONSUME:
+- crates/selora-ai (Phase 5a): ChatRequest now has `tools: Option<Vec<ToolSpec>>`; ChatEvent has ToolCallDelta; the gateway conversation grows tool-result messages.
+- crates/selora-ai agent module (Phase 5b): `execute_tool(call) -> ToolOutcome` where ToolOutcome is Ready(result) or NeedsApproval(card).
+
+DELIVERABLES:
+1. AgentTurn state machine in selora-ai/src/agent/turn.rs: Thinking → RunningTool → AwaitingApproval → RunningTool → … → Done.
+2. The loop task: stream a ChatRequest; on finish_reason == "tool_calls", execute calls in order via 5b's router; on NeedsApproval, emit ApprovalNeeded and park the loop until Effect::AgentDecision arrives (tokio::mpsc, same pattern as the rest of the app).
+3. Decision enum: Approve / ApproveAllThisTurn / Deny / Stop. ApproveAllThisTurn pre-approves remaining write/bash cards this turn only — never persisted.
+4. Loop caps with abort: 25 tool iterations, 10 minutes, $1.00 estimated cost (from streamed receipts). On any cap: abort, surface the partial answer, toast the reason.
+5. Stop button: kills any running bash child (the router exposes an abort handle), cancels the stream, ends the turn with a "stopped by user" summary.
+6. Turn summary: iterations, tools used, approved/denied counts, tokens, cost.
+7. Tests (mock gateway, no network): a 3-tool scripted conversation completes and produces a correct final message + summary; a cap-exceeded turn aborts; a Stop mid-tool aborts and kills the child; a Deny continues the loop with a "user denied" tool result.
+
+DO NOT:
+- Touch the chat UI (5d renders your states).
+- Execute tools yourself — the router (5b) does. You only sequence and gate.
+- Persist any approval across turns or sessions.
+- Add tools to the manifest — the manifest is fixed by ARCHITECTURE.md §17.1.
+
+ACCEPTANCE:
+- cargo test -p selora-ai agent::turn passes with the four scenarios above.
+- The four loop caps are configurable via settings `agent.*` and enforced in tests.
+- No unbounded growth: conversation length is capped at the model's context window minus a 20% reserve; the turn aborts with a clear error if the context overflows.
+
+WHEN DONE, report: commands run, outputs, deviations, open issues.
+```
+
+**Acceptance tests (after merge):**
+```bash
+cargo run -p selora-app
+# 1. Chat sidebar: turn agent mode on. Ask: "read src/main.rs and summarize it"
+# 2. A read_file card appears and completes; the model answers with real file content
+# 3. Ask: "add a comment at the top of src/main.rs saying 'entry point'"
+# 4. A diff card appears showing the + line; press Deny → model adapts, no file changed on disk
+# 5. Ask again; press Approve → the file (open in editor) gains the comment, undoable with Ctrl+Z
+# 6. Ask: "run cargo check"
+# 7. If allowlisted, command card auto-runs with live output; else Approve first
+# 8. Ask: "search the web for the ropey crate docs and summarize"
+# 9. web_search + web_fetch cards appear; answer cites real fetched content
+# 10. Mid-turn, press Stop → turn ends within 1s, "stopped by user" summary
+# 11. Turn summary shows tools used, tokens, and a real cost
+```
+
+**Estimated complexity:** Large. The largest single phase after Phase 2.
+
+**DONE means:** With a real Selora key and a real workspace open, the model autonomously reads files, proposes edits that the user approves as diffs, runs commands with output visible, and fetches the web — and every write on disk is traceable to an approved card.
+
+---
+
+## Phase 6 — Polish & Ship
 
 **Goal:** First-run experience, splash, about, installer, CI release pipeline, docs, screenshots. The whole thing installs on a clean Windows VM and works.
 
@@ -387,18 +464,18 @@ cargo run -p selora-app
 
 **Tasks (mostly sequential, a few parallel):**
 
-- **5a — First-run + splash:** UI_SPEC §7. If no key in keyring on first launch, show the splash. The brand mark uses the `orbit` animation. After Connect, splash fades out with the `fade` animation. After Skip, the empty-state editor shows.
-- **5b — About + check-for-updates:** UI_SPEC §11. About dialog with version, license, link to repo. "Check for updates" calls the GitHub Releases API for the latest release tag. If newer, show a toast "vX.Y.Z is available — download" with a link.
-- **5c — Windows installer (Inno Setup):** `installer/selora-ide.iss` per RELEASE.md. Builds a `Selora-IDE-Setup-X.Y.Z.exe` that installs to `%LOCALAPPDATA%\Programs\Selora IDE\`, adds a Start Menu shortcut, an uninstaller, and registers a default file association for `.txt` (Lite only; no source files). Icon, version, publisher all populated.
-- **5d — GitHub Actions release pipeline:** `.github/workflows/release.yml`. On tag push `v*.*.*`: build with `cargo build --release`, run the Inno Setup compiler, attach the `.exe` to a GitHub Release. CHANGELOG generated from commit messages. Code signing step is present but no-op until the owner provides a cert.
-- **5e — Docs site plan + README polish:** `README.md` with screenshots, build instructions, contributing link, MIT badge, build status badge. A `docs/` folder with a `MkDocs` config for a real site (Phase 5.5 just writes the source — building/deploying the site is a future step).
-- **5f — Open-source publication checklist:** LICENSE, README, CONTRIBUTING, issue templates, PR template, CI badge, code of conduct. The owner runs the actual `gh repo create --public --source=. --push` after this phase is approved.
-- **5g — Screenshots:** 4-5 PNGs in `assets/screenshots/`: main window, chat streaming, LSP hover, git panel, settings. Used in README and docs.
+- **6a — First-run + splash:** UI_SPEC §7. If no key in keyring on first launch, show the splash. The brand mark uses the `orbit` animation. After Connect, splash fades out with the `fade` animation. After Skip, the empty-state editor shows.
+- **6b — About + check-for-updates:** UI_SPEC §11. About dialog with version, license, link to repo. "Check for updates" calls the GitHub Releases API for the latest release tag. If newer, show a toast "vX.Y.Z is available — download" with a link.
+- **6c — Windows installer (Inno Setup):** `installer/selora-ide.iss` per RELEASE.md. Builds a `Selora-IDE-Setup-X.Y.Z.exe` that installs to `%LOCALAPPDATA%\Programs\Selora IDE\`, adds a Start Menu shortcut, an uninstaller, and registers a default file association for `.txt` (Lite only; no source files). Icon, version, publisher all populated.
+- **6d — GitHub Actions release pipeline:** `.github/workflows/release.yml`. On tag push `v*.*.*`: build with `cargo build --release`, run the Inno Setup compiler, attach the `.exe` to a GitHub Release. CHANGELOG generated from commit messages. Code signing step is present but no-op until the owner provides a cert.
+- **6e — Docs site plan + README polish:** `README.md` with screenshots, build instructions, contributing link, MIT badge, build status badge. A `docs/` folder with a `MkDocs` config for a real site (just writes the source — building/deploying the site is a future step).
+- **6f — Open-source publication checklist:** LICENSE, README, CONTRIBUTING, issue templates, PR template, CI badge, code of conduct. The owner runs the actual `gh repo create --public --source=. --push` after this phase is approved.
+- **6g — Screenshots:** 4-5 PNGs in `assets/screenshots/`: main window, chat streaming, LSP hover, git panel, settings. Used in README and docs.
 
-**Subagent brief (e.g. 5c installer):**
+**Subagent brief (e.g. 6c installer):**
 
 ```
-You are Phase 5c of the Selora IDE build (Windows installer). 5a, 5b, 5d, 5e, 5f, 5g are running in parallel. Your job is the Inno Setup installer.
+You are Phase 6c of the Selora IDE build (Windows installer). 6a, 6b, 6d, 6e, 6f, 6g are running in parallel. Your job is the Inno Setup installer.
 
 READ FIRST:
 - C:\Users\Toxic\Desktop\Selora IDE\RELEASE.md (this is your spec for the installer)
@@ -443,7 +520,7 @@ ACCEPTANCE:
 # 12. Uninstall — clean removal
 ```
 
-**Estimated complexity:** Medium. The hard work was Phases 1-4. Phase 5 is packaging and polish.
+**Estimated complexity:** Medium. The hard work was Phases 1-4. Phase 6 is packaging and polish.
 
 **DONE means:** A stranger can install Selora IDE from a GitHub Release on a clean Windows VM, connect their Selora key, open a folder, edit code with LSP, chat with the AI, and commit to git — all within 10 minutes. That is the Lite Edition ship.
 
@@ -456,11 +533,12 @@ ACCEPTANCE:
 - **Phase 2:** ~2-3 sessions. Six parallel subagents, then merge.
 - **Phase 3:** ~2 sessions. Three parallel subagents, then merge.
 - **Phase 4:** ~2-3 sessions. Six parallel subagents, then merge.
-- **Phase 5:** ~1-2 sessions. Mostly sequential.
+- **Phase 5:** ~2-3 sessions. Agent Mode. Five parallel subagents, then merge.
+- **Phase 6:** ~1-2 sessions. Mostly sequential.
 
-**Total: ~8-14 overnight sessions for one owner + one orchestrating agent running subagents.** Realistic for a single motivated owner who runs the orchestrator each evening.
+**Total: ~10-16 overnight sessions for one owner + one orchestrating agent running subagents.** Realistic for a single motivated owner who runs the orchestrator each evening.
 
-If the owner can run two or three sessions a day, Lite ships in roughly two weeks. If only one session a day, three weeks. Either way, the plan is sized for a solo maintainer + AI agent team, not a studio.
+If the owner can run two or three sessions a day, Lite ships in roughly two and a half weeks. If only one session a day, three to four weeks. Either way, the plan is sized for a solo maintainer + AI agent team, not a studio.
 
 ---
 

@@ -2,7 +2,7 @@
 
 This document is the runbook for building, packaging, and publishing Selora IDE Lite Edition. It covers local builds, the Windows installer, the GitHub Actions CI/CD pipeline, code signing, and the open-source publication checklist.
 
-The intended audience is the owner running the build, and the orchestrating AI executing Phase 5.
+The intended audience is the owner running the build, and the orchestrating AI executing Phase 6.
 
 ---
 
@@ -90,7 +90,7 @@ Inno Setup produces a single `.exe` that runs as a normal user (no admin require
 
 ### 2.2 The script: `installer/selora-ide.iss`
 
-The script is a Phase 5c deliverable. It must:
+The script is a Phase 6c deliverable. It must:
 
 1. Read the version from `Cargo.toml` of `selora-app` at build time (use Inno Setup's preprocessor with a small `prebuild.bat` that greps the version).
 2. Install to `%LOCALAPPDATA%\Programs\Selora IDE\`.
@@ -333,7 +333,8 @@ We use **Semantic Versioning 2.0** with a twist: the Lite Edition uses `0.x.y` u
 - `0.2.0` — Phase 2 (editor core; "it feels like an editor").
 - `0.3.0` — Phase 3 (LSP + git).
 - `0.4.0` — Phase 4 (Selora AI).
-- `0.5.0` — Phase 5 (polish + ship).
+- `0.5.0` — Phase 5 (Agent Mode).
+- `0.6.0` — Phase 6 (polish + ship).
 - `1.0.0` — The owner declares 1.0 when they want to. Not in scope of this plan.
 
 The version is in:
@@ -373,7 +374,7 @@ The owner writes the changelog. Subagents update the "Unreleased" section as the
 
 ## 7. Open-source publication checklist
 
-When Phase 5f lands, the repo is ready to be public. The owner runs:
+When Phase 6f lands, the repo is ready to be public. The owner runs:
 
 ```bash
 # 1. Create the repo on GitHub
@@ -406,17 +407,17 @@ gh repo edit --enable-discussions
 | File | Status | Phase |
 |---|---|---|
 | `LICENSE` (MIT) | created in Phase 0 | 0 |
-| `README.md` | polished in Phase 5e | 5e |
-| `CONTRIBUTING.md` | created in Phase 0, polished in Phase 5f | 5f |
-| `CODE_OF_CONDUCT.md` | created in Phase 5f | 5f |
-| `.github/ISSUE_TEMPLATE/bug_report.md` | Phase 5f | 5f |
-| `.github/ISSUE_TEMPLATE/feature_request.md` | Phase 5f | 5f |
-| `.github/PULL_REQUEST_TEMPLATE.md` | Phase 5f | 5f |
+| `README.md` | polished in Phase 6e | 5e |
+| `CONTRIBUTING.md` | created in Phase 0, polished in Phase 6f | 5f |
+| `CODE_OF_CONDUCT.md` | created in Phase 6f | 5f |
+| `.github/ISSUE_TEMPLATE/bug_report.md` | Phase 6f | 5f |
+| `.github/ISSUE_TEMPLATE/feature_request.md` | Phase 6f | 5f |
+| `.github/PULL_REQUEST_TEMPLATE.md` | Phase 6f | 5f |
 | `CHANGELOG.md` | created in Phase 0, updated each release | 0+ |
-| `assets/screenshots/*.png` | Phase 5g | 5g |
+| `assets/screenshots/*.png` | Phase 6g | 5g |
 | `.github/workflows/ci.yml` | Phase 0 | 0 |
-| `.github/workflows/release.yml` | Phase 5d | 5d |
-| CI badge in README | Phase 5e | 5e |
+| `.github/workflows/release.yml` | Phase 6d | 5d |
+| CI badge in README | Phase 6e | 5e |
 | `cargo-deny.toml` | Phase 0 | 0 |
 
 ### 7.2 What we do NOT publish
@@ -427,8 +428,8 @@ gh repo edit --enable-discussions
 
 ### 7.3 What we DO publish (eventually, when written)
 
-- A docs site at `https://selora-ide.selora.lol` (MkDocs + GitHub Pages). Phase 5e writes the source; deploying is a v1.x step.
-- Screenshots. Phase 5g produces 4-5 PNGs.
+- A docs site at `https://selora-ide.selora.lol` (MkDocs + GitHub Pages). Phase 6e writes the source; deploying is a v1.x step.
+- Screenshots. Phase 6g produces 4-5 PNGs.
 - A short demo GIF for the README.
 
 ---
@@ -466,12 +467,12 @@ gh repo edit --enable-discussions
 ## Post-release
 
 - [ ] Announce on https://selora.lol (optional)
-- [ ] Post on relevant communities (Reddit r/rust, Hacker News, etc.) — optional, not Phase 5 scope
+- [ ] Post on relevant communities (Reddit r/rust, Hacker News, etc.) — optional, not Phase 6 scope
 ```
 
 ---
 
-## 9. Open questions (for the owner, before/during Phase 5)
+## 9. Open questions (for the owner, before/during Phase 6)
 
 These are decisions the owner should make, not subagents:
 

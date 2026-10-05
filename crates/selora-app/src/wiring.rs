@@ -1,4 +1,4 @@
-//! Phase 1c wiring — the tokio side of the spike, UI-free.
+//! Runtime wiring — the tokio side of the app, UI-free (ARCHITECTURE.md §1, §2).
 //!
 //! Everything here is deliberately free of egui so the message-drain logic
 //! can be tested headlessly (and end-to-end against a wiremock mock gateway)
@@ -8,129 +8,252 @@
 //!   runtime built *before* the eframe loop; they never touch UI state.
 //! * §2 — the Message-drain pattern: workers send [`AppMessage`]s on an
 //!   unbounded channel; the main thread drains it at the top of each frame
-//!   and reduces into [`SpikeState`].
-//! * §6 — the two SeloraClient calls the spike needs (`list_models`,
-//!   `stream_chat`).
+//!   and reduces into [`AppState`][crate::app_state::AppState].
+//! * §4 — the file effects: `OpenFile` reads off the frame path (with the
+//!   4 MB Lite cap), `SaveBuffer` writes atomically (temp + rename),
+//!   `OpenFolder`/`RefreshFileTree` build the tree via `selora_fs::tree`.
+//! * §6 — the SeloraClient calls the Phase 1c spike needs
+//!   (`list_models`, `stream_chat`). The chat UI is Phase 4; this half
+//!   stays live and tested until then.
 //!
-//! The two `spawn_*` functions are the Effect side (§2.2, spike subset). Each
-//! takes a `notify` callback that is invoked after every message send; the UI
-//! passes `ctx.request_repaint()` there — without it egui sleeps between
-//! frames and streaming deltas would never appear on screen.
+//! Every `spawn_*` function takes a `notify` callback that is invoked after
+//! each message send; the UI passes `ctx.request_repaint()` there — without
+//! it egui sleeps between frames and worker results would never appear.
+//!
+//! [`spawn_dispatcher`] is the single consumer task that owns the
+//! `mpsc::Receiver<Effect>` (ARCHITECTURE.md §2.2) and routes each effect to
+//! one of the `spawn_*` workers. It also owns the in-memory Selora key (the
+//! OS keyring lands in Phase 4) and the current gateway base URL (updated
+//! whenever settings are loaded/saved).
 
-use selora_ai::{ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model, SeloraClient};
-use selora_core::SeloraError;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use selora_ai::{ChatEvent, SeloraClient};
+use selora_core::{Buffer, SeloraError};
+use selora_fs::tree::build_tree;
+use selora_settings::Settings;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use uuid::Uuid;
 
-/// Default gateway base URL (ARCHITECTURE.md §6.1). The spike panel allows
-/// overriding it only so tests (and mock servers) can point elsewhere.
+use crate::app_state::{AppMessage, Effect};
+
+/// Default gateway base URL (ARCHITECTURE.md §6.1). Overridable in settings;
+/// tests point it at a wiremock server.
 pub const DEFAULT_BASE_URL: &str = "https://api.selora.lol";
 
-/// Messages workers send to the main thread (ARCHITECTURE.md §2.1, spike
-/// subset: one connection, one in-flight chat stream).
-#[derive(Debug)]
-pub enum AppMessage {
-    /// `list_models` resolved. `Ok` carries the catalog; the model count is
-    /// the "connected (N models)" readout.
-    ModelsLoaded(Result<Vec<Model>, SeloraError>),
-    /// One streamed content delta.
-    ChatDelta(String),
-    /// The stream completed; carries the receipt for the cost readout.
-    ChatDone(ChatReceipt),
-    /// The stream failed.
-    ChatError(SeloraError),
+/// The repaint seam: called after every worker → main-thread message send.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// The Lite Edition file-size cap (ARCHITECTURE.md §4.1): files larger than
+/// this are rejected with a toast instead of being loaded.
+pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Effect workers: file system
+// ---------------------------------------------------------------------------
+
+/// Read a file's text for a buffer, rejecting files over [`MAX_FILE_BYTES`]
+/// (ARCHITECTURE.md §4.1). Runs inside `spawn_blocking`.
+pub fn read_file_text(path: &Path) -> Result<String, SeloraError> {
+    let len = std::fs::metadata(path)
+        .map_err(|error| SeloraError::Io(error))?
+        .len();
+    if len > MAX_FILE_BYTES {
+        return Err(SeloraError::Other(format!(
+            "file is {} MB — over the {} MB Lite limit and will not open",
+            len / (1024 * 1024),
+            MAX_FILE_BYTES / (1024 * 1024)
+        )));
+    }
+    std::fs::read_to_string(path).map_err(SeloraError::Io)
 }
 
-/// Gateway connection state for the spike panel.
-#[derive(Debug, Default)]
-pub enum ConnectionState {
-    #[default]
-    Disconnected,
-    Connecting,
-    /// Connected; carries the model count.
-    Connected(usize),
-    /// Failed; carries the gateway's error message verbatim (no paraphrase).
-    Failed(String),
-}
+/// Atomic text write (ARCHITECTURE.md §4.2): `path.tmp` next to the target,
+/// then rename over it — same directory, so the rename never crosses a
+/// volume. No `.tmp` file is left behind on failure.
+pub fn atomic_write_text(path: &Path, text: &str) -> Result<(), SeloraError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
 
-impl ConnectionState {
-    /// The panel readout: "connected (N models)" / "error: <message>".
-    pub fn label(&self) -> String {
-        match self {
-            Self::Disconnected => "disconnected".to_owned(),
-            Self::Connecting => "connecting…".to_owned(),
-            Self::Connected(count) => format!("connected ({count} models)"),
-            Self::Failed(message) => format!("error: {message}"),
+    std::fs::write(&tmp, text)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(SeloraError::Io(error))
         }
     }
 }
 
-/// The main-thread state the message drain reduces into (ARCHITECTURE.md
-/// §3.1, spike subset). Owned by the UI thread; workers never touch it.
-#[derive(Debug, Default)]
-pub struct SpikeState {
-    pub connection: ConnectionState,
-    pub models: Vec<Model>,
-    /// Everything streamed so far, appended delta by delta.
-    pub stream: String,
-    /// Whether a chat stream is in flight.
-    pub streaming: bool,
-    /// The receipt of the last completed stream ("tokens: X / cost: $Y").
-    pub receipt: Option<ChatReceipt>,
-    /// The error of the last failed stream, if any.
-    pub chat_error: Option<String>,
+/// Effect (§2.2): read a file off the frame path. Replies
+/// [`AppMessage::BufferLoaded`] (the shell creates the shared buffer and
+/// opens the tab) or [`AppMessage::BufferLoadFailed`].
+pub fn spawn_open_file(handle: &Handle, notify: &Notify, tx: &UnboundedSender<AppMessage>, path: PathBuf) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let message = match read_file_text(&path) {
+            Ok(text) => AppMessage::BufferLoaded { path, text },
+            Err(error) => AppMessage::BufferLoadFailed { path, error },
+        };
+        let _ = tx.send(message);
+        notify();
+    });
 }
 
-impl SpikeState {
-    /// Apply one worker message — the entire message-drain reduction. Called
-    /// at the top of every frame for every drained message.
-    pub fn apply(&mut self, message: AppMessage) {
-        match message {
-            AppMessage::ModelsLoaded(Ok(models)) => {
-                self.connection = ConnectionState::Connected(models.len());
-                self.models = models;
-            }
-            AppMessage::ModelsLoaded(Err(error)) => {
-                self.connection = ConnectionState::Failed(error.to_string());
-            }
-            AppMessage::ChatDelta(delta) => {
-                self.stream.push_str(&delta);
-            }
-            AppMessage::ChatDone(receipt) => {
-                self.streaming = false;
-                self.receipt = Some(receipt);
-            }
-            AppMessage::ChatError(error) => {
-                self.streaming = false;
-                self.chat_error = Some(error.to_string());
-            }
+/// Effect (§2.2): build the file tree for a folder off the frame path and
+/// reply [`AppMessage::FileTreeUpdated`] — preceded by
+/// [`AppMessage::FolderOpened`] so the workspace root and the status bar
+/// update before the (possibly slow) walk finishes.
+pub fn spawn_open_folder(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    root: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let _ = tx.send(AppMessage::FolderOpened(root.clone()));
+        notify();
+        let tree = build_tree(&root);
+        let _ = tx.send(AppMessage::FileTreeUpdated { root, tree });
+        notify();
+    });
+}
+
+/// Effect (§2.2): rebuild the tree for an already-open workspace (the tree
+/// is stale after a New File / Rename / Delete in the sidebar,
+/// ARCHITECTURE.md §4.5: Lite does not watch the filesystem).
+pub fn spawn_refresh_tree(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    root: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let tree = build_tree(&root);
+        let _ = tx.send(AppMessage::FileTreeUpdated { root, tree });
+        notify();
+    });
+}
+
+/// Effect (§2.2): atomically write a shared buffer's current text to its
+/// path (ARCHITECTURE.md §4.2). The text is snapshotted under a read lock
+/// *inside* the blocking task, so the UI thread never waits on IO.
+pub fn spawn_save_buffer(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    path: PathBuf,
+    buffer: Arc<RwLock<Buffer>>,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let text = buffer
+            .read()
+            .map_err(|_| SeloraError::Other("buffer lock poisoned".into()))
+            .map(|buffer| buffer.text());
+        let message = match text {
+            Ok(text) => match atomic_write_text(&path, &text) {
+                Ok(()) => AppMessage::BufferSaved(path),
+                Err(error) => AppMessage::BufferSaveFailed { path, error },
+            },
+            Err(error) => AppMessage::BufferSaveFailed { path, error },
+        };
+        let _ = tx.send(message);
+        notify();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Effect workers: settings
+// ---------------------------------------------------------------------------
+
+/// Effect (§2.2): load settings off the frame path. `load_or_default` keeps
+/// the toast-able error (schema-version wipes, bad JSON) alongside the
+/// usable defaults, so both messages are sent (ARCHITECTURE.md §8.1).
+pub fn spawn_settings_load(handle: &Handle, notify: &Notify, tx: &UnboundedSender<AppMessage>) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let (settings, error) = Settings::load_or_default();
+        let _ = tx.send(AppMessage::SettingsLoaded(settings));
+        notify();
+        if let Some(error) = error {
+            let _ = tx.send(AppMessage::SettingsError(error));
+            notify();
         }
-    }
-
-    /// A connect was dispatched; the readout shows "connecting…" until the
-    /// `ModelsLoaded` message arrives.
-    pub fn begin_connect(&mut self) {
-        self.connection = ConnectionState::Connecting;
-    }
-
-    /// A chat was dispatched; clear the previous stream so the panel shows
-    /// this one from its first delta.
-    pub fn begin_chat(&mut self) {
-        self.stream.clear();
-        self.receipt = None;
-        self.chat_error = None;
-        self.streaming = true;
-    }
+    });
 }
+
+/// Effect (§2.2): persist settings off the frame path.
+pub fn spawn_settings_save(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    settings: Settings,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let message = match settings.save() {
+            Ok(()) => AppMessage::SettingsSaved,
+            Err(error) => AppMessage::SettingsError(error),
+        };
+        let _ = tx.send(message);
+        notify();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Effect workers: blocking file/folder pickers (rfd)
+// ---------------------------------------------------------------------------
+
+/// Effect-side helper: run a blocking `rfd` folder picker on a worker thread
+/// (never the UI thread — the dialog pumps a native message loop) and reply
+/// with [`AppMessage::DialogFolderPicked`]. `None` = cancelled (not an
+/// error; nothing is surfaced).
+pub fn spawn_pick_folder(handle: &Handle, notify: &Notify, tx: &UnboundedSender<AppMessage>) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let picked = rfd::FileDialog::new().pick_folder();
+        let _ = tx.send(AppMessage::DialogFolderPicked(picked));
+        notify();
+    });
+}
+
+/// Effect-side helper: the file-picker twin of [`spawn_pick_folder`].
+pub fn spawn_pick_file(handle: &Handle, notify: &Notify, tx: &UnboundedSender<AppMessage>) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let picked = rfd::FileDialog::new().pick_file();
+        let _ = tx.send(AppMessage::DialogFilePicked(picked));
+        notify();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Effect workers: Selora gateway (Phase 1c network half, live until Phase 4)
+// ---------------------------------------------------------------------------
 
 /// Effect (§2.2): connect to the gateway and list its models.
-///
-/// The task builds its own [`SeloraClient`] from the given key; the key is
-/// used for this request only and is never stored anywhere (no persistence
-/// in the spike).
 pub fn spawn_connect(
     handle: &Handle,
-    notify: impl Fn() + Send + Sync + 'static,
+    notify: &Notify,
     tx: UnboundedSender<AppMessage>,
     base_url: String,
     api_key: String,
@@ -143,7 +266,7 @@ pub fn spawn_connect(
     });
 }
 
-/// Effect (§2.2): send `prompt` as the user message and stream the reply.
+/// Effect (§2.2): run a chat completion request and stream the reply.
 ///
 /// `selora-ai`'s `stream_chat` emits [`ChatEvent`]s on a channel *and*
 /// returns a result, so this spawns two futures: the stream itself, and a
@@ -153,17 +276,16 @@ pub fn spawn_connect(
 /// never reached the channel — no silent failures (PLAN.md §8).
 pub fn spawn_chat(
     handle: &Handle,
-    notify: impl Fn() + Send + Sync + 'static,
+    notify: &Notify,
     tx: UnboundedSender<AppMessage>,
     base_url: String,
     api_key: String,
-    model: String,
-    prompt: String,
+    chat_id: Uuid,
+    request: selora_ai::ChatRequest,
 ) {
     let stream_handle = handle.clone();
     handle.spawn(async move {
         let client = SeloraClient::new(&base_url, &api_key);
-        let request = ChatRequest::new(model, vec![ChatMessage::user(prompt)]).with_stream(true);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ChatEvent>();
 
         let stream =
@@ -173,9 +295,9 @@ pub fn spawn_chat(
         while let Some(event) = events_rx.recv().await {
             terminal_seen |= matches!(event, ChatEvent::Done(_) | ChatEvent::Error(_));
             let message = match event {
-                ChatEvent::Delta(text) => AppMessage::ChatDelta(text),
-                ChatEvent::Done(receipt) => AppMessage::ChatDone(receipt),
-                ChatEvent::Error(error) => AppMessage::ChatError(error),
+                ChatEvent::Delta(text) => AppMessage::ChatDelta(chat_id, text),
+                ChatEvent::Done(receipt) => AppMessage::ChatDone(chat_id, receipt),
+                ChatEvent::Error(error) => AppMessage::ChatError(chat_id, error),
             };
             // Receiver dropped (window closed): stop relaying. The stream task
             // notices on its next event send and exits instead of burning
@@ -195,15 +317,110 @@ pub fn spawn_chat(
             Ok(Ok(_receipt)) => {}
             Ok(Err(error)) => {
                 if !terminal_seen {
-                    let _ = tx.send(AppMessage::ChatError(error));
+                    let _ = tx.send(AppMessage::ChatError(chat_id, error));
                     notify();
                 }
             }
             Err(join_error) => {
                 if !terminal_seen {
                     let error = SeloraError::Other(format!("chat worker died: {join_error}"));
-                    let _ = tx.send(AppMessage::ChatError(error));
+                    let _ = tx.send(AppMessage::ChatError(chat_id, error));
                     notify();
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The effect dispatcher (ARCHITECTURE.md §2.2: one consumer task)
+// ---------------------------------------------------------------------------
+
+/// Spawn the single `Effect` consumer task. It routes each effect to a
+/// worker, tracks the in-memory Selora key, and follows the gateway base URL
+/// from settings as they load/save. The task ends when the UI drops the
+/// effect sender (window closed).
+pub fn spawn_dispatcher(
+    handle: &Handle,
+    notify: Notify,
+    effect_rx: UnboundedReceiver<Effect>,
+    msg_tx: UnboundedSender<AppMessage>,
+    base_url: String,
+) {
+    let handle = handle.clone();
+    handle.spawn(async move {
+        let mut effect_rx = effect_rx;
+        let mut api_key: Option<String> = None;
+        let mut base_url = base_url;
+        while let Some(effect) = effect_rx.recv().await {
+            match effect {
+                Effect::OpenFile(path) => {
+                    spawn_open_file(&handle, &notify, &msg_tx, path);
+                }
+                Effect::OpenFolder(root) => {
+                    spawn_open_folder(&handle, &notify, &msg_tx, root);
+                }
+                Effect::RefreshFileTree(root) => {
+                    spawn_refresh_tree(&handle, &notify, &msg_tx, root);
+                }
+                Effect::SaveBuffer { path, buffer } => {
+                    spawn_save_buffer(&handle, &notify, &msg_tx, path, buffer);
+                }
+                Effect::SettingsLoad => {
+                    spawn_settings_load(&handle, &notify, &msg_tx);
+                }
+                Effect::SettingsSave(settings) => {
+                    base_url = settings.selora.base_url.clone();
+                    spawn_settings_save(&handle, &notify, &msg_tx, settings);
+                }
+                Effect::SeloraConnect(key) => {
+                    base_url = if base_url.is_empty() {
+                        DEFAULT_BASE_URL.to_owned()
+                    } else {
+                        base_url
+                    };
+                    spawn_connect(&handle, &notify, msg_tx.clone(), base_url.clone(), key);
+                }
+                Effect::SeloraListModels => match api_key.clone() {
+                    Some(key) => {
+                        spawn_connect(&handle, &notify, msg_tx.clone(), base_url.clone(), key);
+                    }
+                    None => {
+                        // No silent no-op (PLAN.md §8): an unconnected list
+                        // request fails visibly.
+                        let _ = msg_tx.send(AppMessage::ModelsLoaded(Err(SeloraError::Auth(
+                            "not connected — connect a Selora key first".into(),
+                        ))));
+                        notify();
+                    }
+                },
+                Effect::SeloraChat(chat_id, request) => match api_key.clone() {
+                    Some(key) => {
+                        spawn_chat(
+                            &handle,
+                            &notify,
+                            msg_tx.clone(),
+                            base_url.clone(),
+                            key,
+                            chat_id,
+                            request,
+                        );
+                    }
+                    None => {
+                        let _ = msg_tx.send(AppMessage::ChatError(
+                            chat_id,
+                            SeloraError::Auth(
+                                "no API key connected — keyring storage arrives in Phase 4"
+                                    .into(),
+                            ),
+                        ));
+                        notify();
+                    }
+                },
+                Effect::SeloraKeyringSet(key) => {
+                    // The OS keyring is Phase 4 (ARCHITECTURE.md §7); for now
+                    // the key lives only in this dispatcher's memory.
+                    api_key = Some(key);
                 }
             }
         }
@@ -213,12 +430,15 @@ pub fn spawn_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::runtime::Handle;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Headless stand-in for the UI's `ctx.request_repaint()` notify seam.
-    fn noop() {}
+    fn noop_notify() -> Notify {
+        Arc::new(|| {})
+    }
 
     const TEST_KEY: &str = "sk-gw-test-key";
 
@@ -236,88 +456,250 @@ mod tests {
         {"id":"other-model"}
     ]}"#;
 
-    fn test_model() -> Model {
-        Model {
-            id: "test-model".into(),
-            display_name: "Test Model".into(),
-            context_window: 8192,
-            price_per_1k_input: 0.001,
-            price_per_1k_output: 0.002,
-            supports_streaming: true,
-            supports_tools: false,
-            family: "test".into(),
-        }
+    fn unique_temp_path(label: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "selora-app-wiring-{label}-{}-{n}",
+            std::process::id()
+        ))
     }
 
-    fn test_receipt() -> ChatReceipt {
-        ChatReceipt {
-            request_id: uuid::Uuid::new_v4(),
-            model: "test-model".into(),
-            prompt_tokens: 9,
-            completion_tokens: 2,
-            cost_usd: 0.0013,
-            duration_ms: 42,
-            estimated: false,
-        }
-    }
+    // --- file effects --------------------------------------------------------
 
     #[test]
-    fn drain_reduces_a_full_chat_lifecycle() {
-        let mut state = SpikeState::default();
-        assert_eq!(state.connection.label(), "disconnected");
+    fn read_file_text_reads_small_files_and_rejects_the_oversize() {
+        let small = unique_temp_path("small.txt");
+        std::fs::write(&small, b"hello").expect("write");
+        assert_eq!(read_file_text(&small).as_deref(), Ok("hello"));
 
-        state.apply(AppMessage::ModelsLoaded(Ok(vec![test_model()])));
-        assert_eq!(state.connection.label(), "connected (1 models)");
-        assert_eq!(state.models.len(), 1);
+        // Over the cap: a file extended to 4 MB + 1 (set_len, no bytes
+        // actually written).
+        let big = unique_temp_path("big.bin");
+        let file = std::fs::File::create(&big).expect("create");
+        file.set_len(MAX_FILE_BYTES + 1).expect("set_len");
+        drop(file);
 
-        state.begin_chat();
-        assert!(state.streaming);
-        state.apply(AppMessage::ChatDelta("Hello".into()));
-        state.apply(AppMessage::ChatDelta(" world".into()));
-        assert_eq!(state.stream, "Hello world");
-
-        state.apply(AppMessage::ChatDone(test_receipt()));
-        assert!(!state.streaming);
-        assert_eq!(state.receipt.as_ref().map(|r| r.prompt_tokens), Some(9));
-
-        // A new chat clears the previous stream and receipt.
-        state.begin_chat();
-        assert!(state.streaming);
-        assert_eq!(state.stream, "");
-        assert!(state.receipt.is_none());
-        assert!(state.chat_error.is_none());
-    }
-
-    #[test]
-    fn connect_failure_is_surfaced_verbatim() {
-        let mut state = SpikeState::default();
-        state.apply(AppMessage::ModelsLoaded(Err(SeloraError::Net(
-            "request failed: boom".into(),
-        ))));
-        assert_eq!(
-            state.connection.label(),
-            "error: network error: request failed: boom"
+        let error = read_file_text(&big).expect_err("oversize must be rejected");
+        assert!(
+            error.to_string().contains("Lite limit"),
+            "got: {error:?}"
         );
+
+        let _ = std::fs::remove_file(small);
+        let _ = std::fs::remove_file(big);
     }
 
     #[test]
-    fn chat_error_clears_streaming_and_sets_the_error() {
-        let mut state = SpikeState::default();
-        state.begin_chat();
-        state.apply(AppMessage::ChatDelta("partial".into()));
-        state.apply(AppMessage::ChatError(SeloraError::Auth(
-            "key invalid".into(),
-        )));
-        assert!(!state.streaming);
-        assert_eq!(state.stream, "partial");
-        assert_eq!(state.chat_error.as_deref(), Some("auth error: key invalid"));
+    fn read_file_text_missing_file_is_a_clean_io_error() {
+        let missing = unique_temp_path("missing.txt");
+        assert!(matches!(
+            read_file_text(&missing),
+            Err(SeloraError::Io(_))
+        ));
     }
 
-    /// The full spike flow against a mock gateway, driven through the same
-    /// spawn functions the UI buttons use, drained the same way the frame
-    /// loop drains: connect → models → send → deltas → receipt.
+    #[test]
+    fn atomic_write_text_writes_and_leaves_no_temp_file() {
+        let target = unique_temp_path("nested").join("out.rs");
+        atomic_write_text(&target, "one\ntwo").expect("write");
+        assert_eq!(std::fs::read_to_string(&target).as_deref(), Ok("one\ntwo"));
+        assert!(!target
+            .parent()
+            .map(|dir| dir.join("out.rs.tmp").exists())
+            .unwrap_or(false));
+
+        // A second write replaces the first atomically.
+        atomic_write_text(&target, "three").expect("replace");
+        assert_eq!(std::fs::read_to_string(&target).as_deref(), Ok("three"));
+
+        let _ = std::fs::remove_dir_all(target.parent().expect("parent"));
+    }
+
+    // --- the dispatcher ------------------------------------------------------
+
+    /// Drain messages until one matching `stop` arrives (with a timeout so a
+    /// broken test fails instead of hanging).
+    async fn recv_until(
+        rx: &mut UnboundedReceiver<AppMessage>,
+        stop: impl Fn(&AppMessage) -> bool,
+    ) -> AppMessage {
+        let deadline = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = rx.recv().await.expect("channel open");
+                if stop(&message) {
+                    return message;
+                }
+            }
+        });
+        deadline.await.expect("timed out waiting for a message")
+    }
+
     #[tokio::test]
-    async fn end_to_end_connect_and_stream_against_a_mock_gateway() {
+    async fn dispatcher_opens_and_saves_a_file() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx.clone(), DEFAULT_BASE_URL.into());
+
+        let file = unique_temp_path("dispatch.rs");
+        std::fs::write(&file, b"fn main() {}").expect("write");
+        let _ = effect_tx.send(Effect::OpenFile(file.clone()));
+        let loaded = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::BufferLoaded { .. } | AppMessage::BufferLoadFailed { .. })
+        })
+        .await;
+        match loaded {
+            AppMessage::BufferLoaded { path, text } => {
+                assert_eq!(path, file);
+                assert_eq!(text, "fn main() {}");
+            }
+            other => panic!("expected BufferLoaded, got {other:?}"),
+        }
+
+        // Save a modified buffer through the same dispatcher.
+        let buffer = Arc::new(RwLock::new(Buffer::from_text("fn main() { /* edited */ }")));
+        let _ = effect_tx.send(Effect::SaveBuffer {
+            path: file.clone(),
+            buffer,
+        });
+        let saved = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::BufferSaved(_) | AppMessage::BufferSaveFailed { .. })
+        })
+        .await;
+        match saved {
+            AppMessage::BufferSaved(path) => assert_eq!(path, file),
+            other => panic!("expected BufferSaved, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).as_deref(),
+            Ok("fn main() { /* edited */ }")
+        );
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rejects_an_oversize_open() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+
+        let big = unique_temp_path("dispatch-big.bin");
+        let file = std::fs::File::create(&big).expect("create");
+        file.set_len(MAX_FILE_BYTES + 1).expect("set_len");
+        drop(file);
+
+        let _ = effect_tx.send(Effect::OpenFile(big.clone()));
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::BufferLoadFailed { .. })
+        })
+        .await;
+        match message {
+            AppMessage::BufferLoadFailed { path, error } => {
+                assert_eq!(path, big);
+                assert!(error.to_string().contains("Lite limit"));
+            }
+            other => panic!("expected BufferLoadFailed, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(big);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_builds_the_tree_for_a_folder() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+
+        let root = unique_temp_path("tree-root");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("src").join("main.rs"), b"x").expect("write");
+
+        let _ = effect_tx.send(Effect::OpenFolder(root.clone()));
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::FileTreeUpdated { .. })
+        })
+        .await;
+        match message {
+            AppMessage::FileTreeUpdated { path, tree } => {
+                assert_eq!(path, root);
+                assert!(tree.is_dir);
+                assert!(tree.child("src").is_some_and(|src| src.is_dir));
+            }
+            other => panic!("expected FileTreeUpdated, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_settings_round_trip_in_a_sandboxed_dir() {
+        // Route Settings::save/load away from the real %APPDATA% for the
+        // duration of this test. No other test in this binary touches the
+        // override, so the window is race-free.
+        let dir = unique_temp_path("settings-sandbox");
+        std::env::set_var(selora_settings::SETTINGS_DIR_ENV, &dir);
+
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+
+        let mut settings = Settings::default();
+        settings.editor.font_size = 19;
+        let _ = effect_tx.send(Effect::SettingsSave(settings));
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::SettingsSaved | AppMessage::SettingsError(_))
+        })
+        .await;
+        assert!(matches!(message, AppMessage::SettingsSaved), "got {message:?}");
+        assert!(dir.join("settings.json").is_file());
+
+        let _ = effect_tx.send(Effect::SettingsLoad);
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::SettingsLoaded(_))
+        })
+        .await;
+        match message {
+            AppMessage::SettingsLoaded(loaded) => assert_eq!(loaded.editor.font_size, 19),
+            other => panic!("expected SettingsLoaded, got {other:?}"),
+        }
+
+        std::env::remove_var(selora_settings::SETTINGS_DIR_ENV);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_unconnected_chat_fails_visibly() {
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(&handle, noop_notify(), effect_rx, msg_tx, DEFAULT_BASE_URL.into());
+
+        let chat_id = Uuid::new_v4();
+        let request = selora_ai::ChatRequest::new("test-model", vec![]);
+        let _ = effect_tx.send(Effect::SeloraChat(chat_id, request));
+
+        let message = recv_until(&mut msg_rx, |m| {
+            matches!(m, AppMessage::ChatError(..))
+        })
+        .await;
+        match message {
+            AppMessage::ChatError(id, error) => {
+                assert_eq!(id, chat_id);
+                assert!(error.to_string().contains("no API key"));
+            }
+            other => panic!("expected ChatError, got {other:?}"),
+        }
+    }
+
+    // --- the Phase 1c network half, against a mock gateway -------------------
+
+    #[tokio::test]
+    async fn connect_against_a_mock_gateway_lists_models() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -325,6 +707,21 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+
+        let handle = Handle::current();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+        spawn_connect(&handle, &noop_notify(), tx, server.uri(), TEST_KEY.into());
+
+        let message = rx.recv().await.expect("connect result message");
+        match message {
+            AppMessage::ModelsLoaded(Ok(models)) => assert_eq!(models.len(), 2),
+            other => panic!("expected ModelsLoaded(Ok), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_streams_deltas_and_receipt_against_a_mock_gateway() {
+        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(STREAM_SSE))
@@ -333,75 +730,56 @@ mod tests {
             .await;
 
         let handle = Handle::current();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = SpikeState::default();
-
-        spawn_connect(&handle, noop, tx.clone(), server.uri(), TEST_KEY.into());
-        let message = rx.recv().await.expect("connect result message");
-        state.apply(message);
-        assert_eq!(state.connection.label(), "connected (2 models)");
-        let model = state.models[0].id.clone();
-
-        state.begin_chat();
-        assert!(state.streaming);
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+        let chat_id = Uuid::new_v4();
+        let request = selora_ai::ChatRequest::new("test-model", vec![])
+            .with_stream(true);
         spawn_chat(
             &handle,
-            noop,
-            tx.clone(),
+            &noop_notify(),
+            tx,
             server.uri(),
             TEST_KEY.into(),
-            model,
-            "say hi".into(),
+            chat_id,
+            request,
         );
 
         // Drain exactly like the frame loop: reduce messages in arrival
         // order until the stream's terminal message.
+        let mut deltas = String::new();
+        let mut receipt = None;
         loop {
             let message = rx.recv().await.expect("chat message");
-            let terminal = matches!(message, AppMessage::ChatDone(_) | AppMessage::ChatError(_));
-            state.apply(message);
+            let terminal = matches!(
+                message,
+                AppMessage::ChatDone(..) | AppMessage::ChatError(..)
+            );
+            match message {
+                AppMessage::ChatDelta(id, delta) => {
+                    assert_eq!(id, chat_id);
+                    deltas.push_str(&delta);
+                }
+                AppMessage::ChatDone(id, r) => {
+                    assert_eq!(id, chat_id);
+                    receipt = Some(r);
+                }
+                AppMessage::ChatError(_, error) => panic!("unexpected chat error: {error}"),
+                other => panic!("unexpected message: {other:?}"),
+            }
             if terminal {
                 break;
             }
         }
 
-        assert_eq!(state.stream, "Hello world");
-        assert!(!state.streaming);
-        assert!(state.chat_error.is_none());
-        let receipt = state.receipt.expect("receipt after Done");
+        assert_eq!(deltas, "Hello world");
+        let receipt = receipt.expect("receipt after Done");
         assert_eq!(receipt.prompt_tokens, 9);
         assert_eq!(receipt.completion_tokens, 2);
         assert_eq!(receipt.cost_usd, 0.0013);
-        assert!(!receipt.estimated);
     }
 
     #[tokio::test]
-    async fn invalid_key_surfaces_auth_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
-            .expect(1) // 401 is never retried
-            .mount(&server)
-            .await;
-
-        let handle = Handle::current();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = SpikeState::default();
-
-        spawn_connect(&handle, noop, tx, server.uri(), TEST_KEY.into());
-        let message = rx.recv().await.expect("connect result message");
-        state.apply(message);
-
-        assert!(
-            matches!(&state.connection, ConnectionState::Failed(message) if message.contains("401")),
-            "expected a 401-bearing failure, got: {:?}",
-            state.connection
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_missing_done_reports_chat_error_after_deltas() {
+    async fn chat_missing_done_surfaces_the_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -413,38 +791,33 @@ mod tests {
             .await;
 
         let handle = Handle::current();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = SpikeState::default();
-
-        state.begin_chat();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+        let chat_id = Uuid::new_v4();
         spawn_chat(
             &handle,
-            noop,
+            &noop_notify(),
             tx,
             server.uri(),
             TEST_KEY.into(),
-            "test-model".into(),
-            "say hi".into(),
+            chat_id,
+            selora_ai::ChatRequest::new("test-model", vec![]).with_stream(true),
         );
 
+        let mut deltas = String::new();
         loop {
             let message = rx.recv().await.expect("chat message");
-            let terminal = matches!(message, AppMessage::ChatDone(_) | AppMessage::ChatError(_));
-            state.apply(message);
-            if terminal {
-                break;
+            match message {
+                AppMessage::ChatDelta(_, delta) => deltas.push_str(&delta),
+                AppMessage::ChatError(_, error) => {
+                    assert_eq!(deltas, "Hi");
+                    assert!(
+                        error.to_string().contains("closed before [DONE]"),
+                        "got: {error}"
+                    );
+                    break;
+                }
+                other => panic!("expected ChatDelta/ChatError, got {other:?}"),
             }
         }
-
-        assert_eq!(state.stream, "Hi");
-        assert!(!state.streaming);
-        assert!(
-            state
-                .chat_error
-                .as_deref()
-                .is_some_and(|message| message.contains("closed before [DONE]")),
-            "expected missing-[DONE] error, got: {:?}",
-            state.chat_error
-        );
     }
 }

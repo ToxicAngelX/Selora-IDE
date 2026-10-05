@@ -73,13 +73,13 @@ Phase 4e (Cost meter)     ─┤
 Phase 4f (Conn status)    ─┘
         │
         ▼
-Phase 5a (Splash)       ─┐
-Phase 5b (About)         ─┤
-Phase 5c (Installer)     ─┤
-Phase 5d (CI release)    ─┼─ mostly sequential — depend on Phase 4
-Phase 5e (Docs)          ─┤
-Phase 5f (Repo hygiene)  ─┤
-Phase 5g (Screenshots)   ─┘
+Phase 6a (Splash)       ─┐
+Phase 6b (About)         ─┤
+Phase 6c (Installer)     ─┤
+Phase 6d (CI release)    ─┼─ mostly sequential — depend on Phase 4
+Phase 6e (Docs)          ─┤
+Phase 6f (Repo hygiene)  ─┤
+Phase 6g (Screenshots)   ─┘
 ```
 
 **Critical rules:**
@@ -256,7 +256,7 @@ Different subagents have different strengths. The orchestrator matches the tier 
 |---|---|---|
 | Tier 1 — Fast, single-file | Simple file edits, well-defined output | Tweak a design token, fix a typo, rename a symbol |
 | Tier 2 — Standard implementation | One crate, clear interface, well-specified | Most subagent briefs in this plan |
-| Tier 3 — Architect | Cross-crate changes, negotiation, ambiguity | Phase 1 spike (1c), Phase 2 merge integration, Phase 5d CI |
+| Tier 3 — Architect | Cross-crate changes, negotiation, ambiguity | Phase 1 spike (1c), Phase 2 merge integration, Phase 6d CI |
 
 For Tier 3 tasks, the orchestrator may itself act as the subagent — the human is often the best Tier 3. For Tier 1 and 2, parallel subagents are fine.
 
@@ -326,18 +326,33 @@ For Tier 3 tasks, the orchestrator may itself act as the subagent — the human 
 - **Review:** Heavy on the chat UX. Streaming must feel smooth.
 - **Gate:** Real Selora chat streams, ghost text works, cost meter shows real values.
 
-### Phase 5 — Polish & ship
+### Phase 5 — Agent Mode
 
-- **Pattern:** Mostly sequential. 5c and 5d can run in parallel after 5a-5b. 5e-5g can run in parallel after 5c.
-- **Synchronization:** 5c needs the binary from 5a-5b. 5d needs the installer from 5c. 5e-5g need a working app.
+- **Pattern:** Five parallel subagents (5a tool types, 5b tool router, 5c loop controller, 5d cards UI, 5e web tools).
+- **Synchronization:** Interface-first. 5a defines the tool plumbing types first (`ToolSpec`, `ToolCallDelta`, tool-result messages) — the other four consume that API. The orchestrator has 5a land the type skeletons within the first hour, then all five fill in implementations.
 - **File ownership:**
-  - 5a owns `crates/selora-ui/src/splash.rs`.
-  - 5b owns `crates/selora-ui/src/dialogs/about.rs`.
-  - 5c owns `installer/selora-ide.iss`.
-  - 5d owns `.github/workflows/release.yml`.
-  - 5e owns `README.md`, `docs/`.
-  - 5f owns `.github/ISSUE_TEMPLATE/`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`.
-  - 5g owns `assets/screenshots/`.
+  - 5a owns `crates/selora-ai/src/chat_types.rs` (tool spec/call/result types, request plumbing).
+  - 5b owns `crates/selora-ai/src/agent/router.rs` + `crates/selora-ai/src/agent/tools/` (all tool implementations, guards).
+  - 5c owns `crates/selora-ai/src/agent/turn.rs` (loop state machine, caps, decisions).
+  - 5d owns `crates/selora-ui/src/sidebar/chat/agent_cards.rs` (all card rendering).
+  - 5e owns `crates/selora-ai/src/agent/tools/web.rs` (search + fetch, only this file may add an HTTP dependency outside SeloraClient).
+- **Shared file rule:** `Effect`/`AppMessage` enums in `ARCHITECTURE.md` §17.6 grow additively. The orchestrator applies those enum changes centrally (same pattern as `AppState` in Phase 2) so 5b/5c/5d never touch the same file.
+- **Duration:** ~12-16 hours of agent time total.
+- **Review:** Heaviest review in the project. Every guard (path rooting, SSRF, env stripping, output caps) gets a line-by-line read by the orchestrator. The security-relevant code is small (~500 LOC of guards); read all of it.
+- **Gate:** All Phase 5 acceptance tests in ROADMAP.md pass against a real Selora key and a real workspace; the deny-path test proves no disk write happens without approval.
+
+### Phase 6 — Polish & ship
+
+- **Pattern:** Mostly sequential. 6c and 6d can run in parallel after 6a-6b. 6e-6g can run in parallel after 6c.
+- **Synchronization:** 6c needs the binary from 6a-6b. 6d needs the installer from 6c. 6e-6g need a working app.
+- **File ownership:**
+  - 6a owns `crates/selora-ui/src/splash.rs`.
+  - 6b owns `crates/selora-ui/src/dialogs/about.rs`.
+  - 6c owns `installer/selora-ide.iss`.
+  - 6d owns `.github/workflows/release.yml`.
+  - 6e owns `README.md`, `docs/`.
+  - 6f owns `.github/ISSUE_TEMPLATE/`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`.
+  - 6g owns `assets/screenshots/`.
 - **Duration:** ~6-10 hours of agent time total.
 - **Review:** Light. This is polish.
 - **Gate:** Installer downloads, installs, launches, all features work on a clean Windows VM.
@@ -365,7 +380,8 @@ Plus, after each phase, a **manual smoke test** on the owner's machine:
 | 2 | Open folder, edit, find, settings persist |
 | 3 | LSP hover + go-to-def, git commit, search |
 | 4 | Real chat streams, ghost text, cost meter |
-| 5 | Installer runs, all features work on a fresh install |
+| 5 | Agent reads a file, edits via approved diff, runs an allowlisted command, fetches the web; Deny produces no disk change |
+| 6 | Installer runs, all features work on a fresh install |
 
 If a smoke test fails, the orchestrator decides: re-run the subagent, fix it themselves, or move the feature to a Future list.
 
@@ -377,4 +393,4 @@ This is the literal contract between the planning AI and the executing AI. It ap
 
 > **Take my task → split it into 5 logical phases → identify dependencies → run all independent phases in parallel using subagents → merge and review everything → complete the final result.**
 
-The orchestrator treats this line as the operating principle. The 6 phases in `ROADMAP.md` are an elaboration of "5 logical phases" — Phase 0 (foundation) is preparatory, Phases 1-4 are the four big feature groups, Phase 5 is the ship. The orchestrator can collapse or expand as needed, but the line is the *shape* of the work.
+The orchestrator treats this line as the operating principle. The 6 phases in `ROADMAP.md` are an elaboration of "5 logical phases" — Phase 0 (foundation) is preparatory, Phases 1-4 are the four big feature groups, Phase 6 is the ship. The orchestrator can collapse or expand as needed, but the line is the *shape* of the work.
