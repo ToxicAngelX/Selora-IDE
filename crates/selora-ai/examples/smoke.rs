@@ -85,7 +85,7 @@ async fn main() {
         Ok(Ok(_)) => {
             println!(
                 "--- first 200 chars: {}",
-                &streamed.chars().take(200).collect::<String>()
+                streamed.chars().take(200).collect::<String>()
             );
             println!("SMOKE TEST PASSED");
         }

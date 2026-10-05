@@ -9,6 +9,10 @@
 //!
 //! The spike's `wiring.rs` message set (selora-ai subset) is subsumed here;
 //! `wiring.rs` stays until the Phase 2 shell replaces the spike UI.
+//!
+//! Nothing in this module is consumed by the spike UI yet — the Phase 2
+//! subagent merges wire it in. Silence dead-code until then.
+#![expect(dead_code)]
 
 use std::path::PathBuf;
 
