@@ -60,33 +60,20 @@ approval-gated) and renumbering Polish & ship to Phase 6.
 
 ## Next actions (in order)
 
-1. Confirm the tree is green:
-   `export PATH="/c/Users/Toxic/.cargo/bin:$PATH"` then
-   `cargo build --workspace && cargo test --workspace && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-2. (Owner) finish the plan-pack edits; commit them as the owner.
-3. Write the six Phase 2 briefs (2a tabs/splits, 2b file tree, 2c fuzzy
-   find, 2d syntax highlighting, 2e command palette, 2f settings) from
-   ROADMAP.md §Phase 2 + the §6 brief template, with file ownership from
-   AGENT_ORCHESTRATION.md §10 and these constraints baked in:
-   - Only touch files inside your ownership; stubs are yours to replace.
-   - Do NOT edit any lib.rs, any Cargo.toml, or selora-app files;
-     propose AppState/Effect/AppMessage additions as a diff in the report.
-   - Do NOT commit Cargo.lock; the orchestrator commits it at the gate.
-   - egui is 0.36.2 (`eframe::App::ui(&mut self, ui, frame)`,
-     `egui::Panel::top/left/right(...)`) — ARCHITECTURE.md's 0.29-era
-     snippets are design contracts, not copy-paste code.
-   - Editor font is 14px until 2f's settings make font_size user-driven.
-4. Launch all six in ONE message (parallel). Gate each merge
-   (build+test+fmt+clippy); apply their AppState diffs; commit Cargo.lock
-   at each gate. 2d also needs: migration from whole-line galleys to
-   LayoutJob for per-glyph SYN_* colors (Phase 1a report explains how).
-5. After all six merge: orchestrator builds the Phase 2 app shell
-   (tab bar + activity bar + file tree + editor + palette + settings,
-   replacing the spike UI in selora-app — Tier 3, orchestrator-owned),
-   run ROADMAP §Phase 2 acceptance tests, update STATUS.md.
-6. cargo-deny is STILL not installed locally (classifier outages blocked
-   `cargo install cargo-deny --locked` all session). CI enforces it. Try
-   again: `cargo install cargo-deny --locked && cargo deny check licenses`.
+1. ~~Confirm the tree is green~~ — DONE this session (build/test/fmt/clippy
+   exit 0 after fixing three resume-gate clippy warnings, commit 1e0744b).
+2. ~~Owner plan-pack edits~~ — still uncommitted in the working tree (the
+   owner is present; ARCHITECTURE §17 / UI_SPEC §4.2 exist and are coherent;
+   PLAN.md phase table still has the duplicated Agent Mode row to tidy).
+3. ~~Write and launch the six Phase 2 briefs~~ — DONE: 2a/2b/2c/2d/2e/2f all
+   launched in parallel with strict file ownership + AppState-diff-proposal
+   flow. NOW: gate each merge as it lands; apply AppState diffs; commit
+   Cargo.lock at each gate; then orchestrator builds the Phase 2 app shell
+   (replacing the spike UI) and runs ROADMAP §Phase 2 acceptance.
+4. cargo-deny install running in background this session.
+5. After Phase 2 completes: Phases 3 (LSP+git), 4 (Selora AI), 5 (Agent Mode
+   — the owner's new plan section, read ARCHITECTURE §17 + UI_SPEC §4.2 +
+   ROADMAP Phase 5 briefs in full before Phase 5), 6 (polish & ship).
 
 ## Environment (machine, not in any repo doc)
 
