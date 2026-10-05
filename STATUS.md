@@ -1,68 +1,67 @@
-# Status — 2026-10-05 (session end)
+# Status — 2026-10-05 (mid-Phase 3)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
 
 ## Where we are
 
-**Phase 0, Phase 1, Phase 2 — DONE.** Phase 2 is now fully complete:
-all six feature subagents (2a–2f) merged AND the shell integration landed
-(`a93ce5f`). `cargo run -p selora-app` boots the real workbench: activity
-bar, file tree, split/tab editor area, both palettes, settings dialog,
-toasts, workspace.json session restore. Gate green: build, 229 tests,
-fmt, clippy -D warnings, cargo deny — all exit 0. Boot check: 10s timeout
-run stays alive (exit 143, no panic).
+**Phase 3 (LSP + Git + Search) is 2/3 merged.** 3b (git) and 3c (search)
+are merged AND orchestrator-wired into `selora-app`; the full gate is
+green on main (`d6c92b1`): build, 286 tests, fmt, clippy -D warnings,
+cargo deny. **3a (LSP) is still in flight** in a subagent worktree —
+nothing of it has landed; when its notification arrives, follow the
+merge/wiring pattern below.
 
-## Phase 2 shell merge record
+## Phase 3 progress record
 
-| Item | Commit | Notes |
+| Item | State | Notes |
 |---|---|---|
-| 2a–2f features | (see previous STATUS in git history) | tabs/splits, tree, fuzzy, syntax HL, cmd palette, settings |
-| Shell integration | a93ce5f | shell.rs (frame loop, §2 order), app_state.rs contract grown, persistence.rs (workspace.json), wiring.rs dispatcher; 28 new tests incl. headless whole-workbench smoke test |
+| 3b selora-git + panel/git.rs + tree badges | merged `c270fc2`, wired `4fc574b` | GitRepo open/status/stage/unstage/commit/diff_workdir; 12 temp-repo tests; region ④ bottom panel; status-bar branch + warn dirty dot; GitStatus re-snapshot on tree update + save |
+| 3c selora-fs search + panel/search.rs | merged `e2136f0`, wired `d6c92b1` | rg-if-on-PATH else ignore-walker fallback (20 tests); Ctrl+J toggles region ④, Ctrl+Shift+F opens search; result click opens file at line via new `Editor::goto_line` |
+| 3a selora-lsp + lsp_overlay.rs | **in flight** | subagent in worktree, brief = verbatim ROADMAP 3a + addendum (no selora-app edits; report proposes Effect/AppMessage diffs) |
 
-Reviewed deviations (all accepted):
-- `AppState.file_tree` is a `FileTreePanel` (2b widget owns the view).
-- `Effect::SaveBuffer` carries `{path, Arc<RwLock<Buffer>>}` not a BufferId.
-- `SplitResponse.closed: Vec<PathBuf>`, `new_tab: Vec<PaneId>`,
-  `CommandId` lives in `palette::registry` — sibling APIs differed from the
-  brief; adapted, no sibling crates touched.
-- Dirty tracking: derived per frame from buffer shape (char+line counts)
-  + edit-key signal; `BufferSaved` rebases. selora-editor untouched.
-- Keybind chords (Ctrl+K …) not implemented; rebindable four from
-  settings.keybinds, rest of the §15 table fixed.
+Orchestrator prep for Phase 3 (commit `0468f2a`): workspace deps
+lsp-types 0.97 + git2 0.21 (vendored) pre-added, module stubs
+(panel/{git,search}.rs, lsp_overlay.rs) pre-registered, so 3a/3b/3c had
+strictly disjoint ownership. `.claude/worktrees/` is gitignored.
 
-**Note for the owner:** mid-session, commit `86439d4` landed the previously
-uncommitted plan-pack doc edits (PLAN/ROADMAP/RISKS/RELEASE/
-AGENT_ORCHESTRATION — the Phase 5 Agent Mode insertion) together with an
-in-flight snapshot of the app code. That was attributed to the owner's side
-during the subagent run. If it wasn't you, review that commit; the final
-state in a93ce5f is fully gated and green either way. The PLAN.md phase
-table's duplicated Agent Mode row may still need an owner tidy.
+## When 3a lands (the exact plan)
 
-## Next actions (in order)
-
-1. **Owner smoke test** (AGENT_ORCHESTRATION.md §11, after Phase 2):
-   `cargo run -p selora-app` → open folder via dialog, tree populates,
-   open main.rs highlighted, Ctrl+P finds "theme", Ctrl+Shift+P palette,
-   Ctrl+\ splits, Ctrl+, settings, close+reopen restores session.
-2. Start **Phase 3 (LSP + Git + Search)** — briefs 3a/3b/3c in ROADMAP.md
-   §Phase 3. Per §10: 3a (selora-lsp + lsp_overlay.rs) is Tier 3; 3b
-   (selora-git + panel/git.rs) and 3c (fs/search.rs + panel/search.rs)
-   are Tier 2; all three parallel, disjoint file ownership.
-3. Spawn order: paste the verbatim ROADMAP briefs; AppState/Effect growth
-   for Phase 3 stays orchestrator-owned (same pattern as Phase 2).
+1. Review its branch against the ROADMAP 3a brief + ARCHITECTURE §5
+   (actor per server, framing, registry, crash recovery; ≥3 tests:
+   framing, request-id routing, crash recovery).
+2. `git merge <branch> --no-ff`; gate (build/test/fmt/clippy/deny).
+   Beware: 3a may add additive hooks in selora-editor files — main's
+   editor.rs has since gained `goto_line`/`pending_reveal` (from 3c
+   wiring); resolve any conflict keeping both.
+3. Apply its proposed Effect/AppMessage/AppState additions (pattern is
+   in `app_state.rs`/`wiring.rs`/`shell.rs` — same as the 3b/3c wiring
+   commits). Wire: didOpen/didChange/didSave/didClose lifecycle in the
+   drain/paint loop, F12 definition, Ctrl+K Ctrl+I hover, Ctrl+Space
+   completion, diagnostics into the editor overlay, LSP status in the
+   status-bar center. UI hooks that need `state.editors` reuse
+   `AppState::goto_line` for jumps.
+4. Gate again, commit, update STATUS.md, close Phase 3.
+5. Then: owner smoke test (§11 after Phase 3: LSP hover + go-to-def,
+   git commit, search), then Phase 4.
 
 ## Environment (machine, not in any repo doc)
 
 - Toolchain: rustup + stable 1.99.0 MSVC + VS 2022 Build Tools. cargo at
   C:\Users\Toxic\.cargo\bin — bash needs the PATH export.
-- No git remote yet; `gh repo create` is an owner action (RELEASE.md §7).
+- A git remote `origin` now exists (github.com/ToxicAngelX/Selora-IDE);
+  main is pushed through `d6c92b1`'s predecessor. Push after gates.
 - Known flake: `cargo test --workspace` occasionally prints "could not
   compile selora-… (lib test)" from MSVC/Defender file-locking during
   parallel compilation — rerun confirms exit 0.
+- `rg` is NOT on the Windows PATH for the app (the bash `rg` is a
+  Claude Code shim) — search uses the built-in fallback scanner. Works,
+  just slower on big workspaces.
+- `rust-analyzer`: NOT verified on PATH — 3a's report will say; Phase 3
+  LSP acceptance needs it (rustup component add rust-analyzer).
 - The sk-gw- test key passed through chat in session 1 — rotate at the
   gateway when convenient.
 
 ## Blockers
 
-None. Phase 2 is done pending the owner's manual smoke test.
+None. 3a pending; owner smoke tests for Phase 2 and Phase 3 pending.
