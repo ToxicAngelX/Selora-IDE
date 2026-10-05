@@ -12,19 +12,27 @@
 //!   `--radius-2` popup,
 //! - an inline name editor for New File / New Folder / Rename that
 //!   performs the disk operations via `selora_fs::tree`,
+//! - git status badges (`M` `A` `?` `D` `R`) next to changed files — the
+//!   decoration is data-driven ([`FileTreePanel::set_git_status`] feeds
+//!   it from a `selora_git::GitStatus` snapshot,
+//!   [`FileTreePanel::git_decoration`] maps a path to its letter and
+//!   token color), so the orchestrator drives it straight from
+//!   `AppState.git_status`,
 //! - the bottom-right `+` (new file) affordance.
 //!
 //! Events ([`TreeEvent`]) are returned to the shell each frame; the
 //! shell routes them (open buffers, `Effect::RefreshFileTree`, toasts).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use egui::{pos2, vec2, Align2, Key, Rect, Sense, Ui, Vec2};
+use egui::{pos2, vec2, Align2, Color32, Key, Rect, Sense, Ui, Vec2};
 
 use selora_fs::tree::{
     create_dir, create_file, delete_path, rename, FileTreeNode, FileTreeView, FsError, TreeRow,
     TreeRowKind, LOAD_MORE_LABEL,
 };
+use selora_git::GitStatus;
 
 use crate::sidebar::icons;
 use crate::theme::{color, font, radius, space, type_scale};
@@ -44,6 +52,17 @@ pub const HEADER_LABEL: &str = "FILES";
 /// the file tree is a `--font-mono` surface).
 fn row_font_id() -> egui::FontId {
     egui::FontId::new(type_scale::SM, font::FAMILY_MONO)
+}
+
+/// A git badge's color: `M` / `D` are the dirty-tree states and take
+/// `--warn` (DESIGN_TOKENS.md §1.4 "dirty", matching the status bar's
+/// dirty dot); every other letter stays `--fg-muted` so the tree keeps
+/// its monochrome calm.
+fn badge_color(letter: char) -> Color32 {
+    match letter {
+        'M' | 'D' => color::WARN,
+        _ => color::FG_MUTED,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -157,6 +176,9 @@ pub struct FileTreePanel {
     pub view: FileTreeView,
     /// The active inline name editor, if any.
     pending: Option<PendingEdit>,
+    /// Git status letters by absolute path — fed from the latest
+    /// `GitStatus` snapshot, painted as row badges.
+    git_statuses: BTreeMap<PathBuf, char>,
 }
 
 impl Default for FileTreePanel {
@@ -171,6 +193,7 @@ impl FileTreePanel {
         Self {
             view: FileTreeView::default(),
             pending: None,
+            git_statuses: BTreeMap::new(),
         }
     }
 
@@ -184,6 +207,28 @@ impl FileTreePanel {
     /// The tree root, if a folder is open.
     pub fn tree(&self) -> Option<&FileTreeNode> {
         self.view.root.as_ref()
+    }
+
+    /// Feed the git status snapshot (from `AppMessage::GitStatusChanged`);
+    /// `None` clears every badge (no repo / folder switch). Entries are
+    /// keyed by their absolute path, the same form the tree rows carry,
+    /// so the two meet regardless of repo-root vs workspace-root.
+    pub fn set_git_status(&mut self, status: Option<&GitStatus>) {
+        self.git_statuses.clear();
+        if let Some(status) = status {
+            for entry in &status.entries {
+                self.git_statuses
+                    .insert(entry.abs_path.clone(), entry.letter());
+            }
+        }
+    }
+
+    /// The data-driven decoration: the status letter and its token color
+    /// for `path`, or `None` when the path has no git status. This is the
+    /// seam the orchestrator (or any alternative status source) drives.
+    pub fn git_decoration(&self, path: &Path) -> Option<(char, Color32)> {
+        let letter = *self.git_statuses.get(path)?;
+        Some((letter, badge_color(letter)))
     }
 
     /// Paint the panel content. Returns the frame's events plus a paint
@@ -319,6 +364,20 @@ impl FileTreePanel {
             row_font_id(),
             label_color,
         );
+
+        // Git status badge (file rows only): the letter, right-aligned,
+        // in the row's mono font.
+        if is_node && !row.is_dir {
+            if let Some((letter, badge)) = self.git_decoration(&row.path) {
+                ui.painter().text(
+                    pos2(rect.right() - space::S3, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    letter.to_string(),
+                    row_font_id(),
+                    badge,
+                );
+            }
+        }
 
         if !is_node {
             return; // "load more" marker is display-only in Lite.
@@ -627,5 +686,102 @@ mod tests {
         assert!(panel.view.selected.is_none());
         assert!(panel.view.is_expanded(Path::new("/proj")));
         assert!(!panel.view.is_expanded(Path::new("/proj/src")));
+    }
+
+    // --- git status decorations ---------------------------------------------
+
+    use selora_git::{FileStatus, Slot};
+
+    fn git_status_for(entries: Vec<FileStatus>) -> GitStatus {
+        GitStatus {
+            branch: Some("main".to_owned()),
+            entries,
+        }
+    }
+
+    fn status(path: &str, letter: char) -> FileStatus {
+        let (staged, worktree) = match letter {
+            'A' => (Slot::New, Slot::Unmodified),
+            '?' => (Slot::Unmodified, Slot::New),
+            'D' => (Slot::Deleted, Slot::Unmodified),
+            _ => (Slot::Modified, Slot::Unmodified),
+        };
+        FileStatus {
+            path: PathBuf::from(path),
+            abs_path: PathBuf::from(format!("/repo/{path}")),
+            staged,
+            worktree,
+        }
+    }
+
+    #[test]
+    fn git_decoration_maps_paths_to_letters_and_token_colors() {
+        let mut panel = FileTreePanel::new();
+        panel.set_git_status(Some(&git_status_for(vec![
+            status("src/main.rs", 'M'),
+            status("Cargo.toml", '?'),
+            status("src/gone.rs", 'D'),
+            status("src/lib.rs", 'A'),
+        ])));
+
+        // Only the fed paths decorate; colors come from the theme.
+        assert_eq!(
+            panel.git_decoration(Path::new("/repo/src/main.rs")),
+            Some(('M', color::WARN))
+        );
+        assert_eq!(
+            panel.git_decoration(Path::new("/repo/src/gone.rs")),
+            Some(('D', color::WARN))
+        );
+        assert_eq!(
+            panel.git_decoration(Path::new("/repo/Cargo.toml")),
+            Some(('?', color::FG_MUTED))
+        );
+        assert_eq!(
+            panel.git_decoration(Path::new("/repo/src/lib.rs")),
+            Some(('A', color::FG_MUTED))
+        );
+        assert_eq!(panel.git_decoration(Path::new("/proj/src/main.rs")), None);
+        assert_eq!(panel.git_decoration(Path::new("/repo/src/ui")), None);
+    }
+
+    #[test]
+    fn set_git_status_none_clears_the_badges() {
+        let mut panel = FileTreePanel::new();
+        panel.set_git_status(Some(&git_status_for(vec![status("a", 'M')])));
+        assert!(panel.git_decoration(Path::new("/repo/a")).is_some());
+
+        panel.set_git_status(None);
+        assert!(panel.git_decoration(Path::new("/repo/a")).is_none());
+    }
+
+    #[test]
+    fn git_statuses_survive_a_tree_refresh() {
+        // A refresh (new file, rename) replaces the tree but not the git
+        // snapshot — the badges stay until the next status message. The
+        // entry is keyed onto the tree's own path form (the shell feeds
+        // entries whose abs_path matches the tree rows).
+        let mut entry = status("src/main.rs", 'M');
+        entry.abs_path = PathBuf::from("/proj/src/main.rs");
+        let mut panel = FileTreePanel::new();
+        panel.set_tree(fixture_tree());
+        panel.set_git_status(Some(&git_status_for(vec![entry])));
+        panel.set_tree(fixture_tree());
+        assert_eq!(
+            panel.git_decoration(Path::new("/proj/src/main.rs")),
+            Some(('M', color::WARN))
+        );
+    }
+
+    #[test]
+    fn badges_do_not_change_the_row_count() {
+        egui::__run_test_ui(|ui| {
+            ui.set_min_size(vec2(240.0, 400.0));
+            let mut panel = FileTreePanel::new();
+            panel.set_tree(fixture_tree());
+            panel.set_git_status(Some(&git_status_for(vec![status("src/main.rs", 'M')])));
+            let outcome = panel.show(ui);
+            assert_eq!(outcome.rows_painted, 3);
+        });
     }
 }

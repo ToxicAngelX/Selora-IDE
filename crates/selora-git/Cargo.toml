@@ -9,3 +9,7 @@ repository.workspace = true
 [dependencies]
 git2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Real-repo unit tests: each test inits a repository in a temp dir.
+tempfile = "3"
