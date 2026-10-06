@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use super::router::{self, ToolOutcome};
 use super::{AgentDecision, ApprovalCard, ApprovalId};
-use crate::chat_types::{ToolCall, ToolResult, ToolSpec};
+use crate::chat_types::{ToolCall, ToolCallAccumulator, ToolResult, ToolSpec};
 use crate::types::{compute_cost_usd, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model};
 
 // ---------------------------------------------------------------------------
@@ -440,56 +440,13 @@ impl TurnInput {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming tool-call accumulation (§17.6)
+// Streaming tool-call accumulation (§17.6) — 5a's
+// `chat_types::ToolCallAccumulator`, fed every `ChatEvent` the round
+// streams (it ignores the non-ToolCallDelta variants). A non-empty
+// `finish()` IS the `finish_reason == "tool_calls"` signal: 5a does not
+// surface finish_reason as data (adding it would break three crates),
+// so the loop distinguishes tool-calls-vs-stop by the accumulator.
 // ---------------------------------------------------------------------------
-
-/// Accumulates streaming `ChatEvent::ToolCallDelta` fragments into
-/// complete [`ToolCall`]s — the same accumulate-then-parse pattern as
-/// content deltas. `index` identifies which call of the response is
-/// growing; `id`/`name` ride only the first fragment.
-#[derive(Debug, Default)]
-pub struct ToolCallAccumulator {
-    calls: Vec<ToolCall>,
-}
-
-impl ToolCallAccumulator {
-    /// Merge one fragment into slot `index`.
-    pub fn push(
-        &mut self,
-        index: usize,
-        id: Option<String>,
-        name: Option<String>,
-        arguments: &str,
-    ) {
-        if self.calls.len() <= index {
-            self.calls
-                .resize_with(index + 1, || ToolCall {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: String::new(),
-                });
-        }
-        let slot = &mut self.calls[index];
-        if let Some(id) = id {
-            slot.id = id;
-        }
-        if let Some(name) = name {
-            slot.name = name;
-        }
-        slot.arguments.push_str(arguments);
-    }
-
-    /// The completed calls in index order; slots that never received a
-    /// fragment are dropped.
-    pub fn finish(self) -> Vec<ToolCall> {
-        self.calls
-            .into_iter()
-            .filter(|call| {
-                !call.id.is_empty() || !call.name.is_empty() || !call.arguments.is_empty()
-            })
-            .collect()
-    }
-}
 
 /// Chars/4 token estimate over the conversation (the same fallback the
 /// client's receipts use, RISKS.md §3) — coarse, but it keeps the
@@ -670,15 +627,8 @@ fn absorb(
                 *ui_gone = true;
             }
         }
-        ChatEvent::ToolCallDelta {
-            index,
-            id,
-            name,
-            arguments,
-        } => accumulator.push(index, id, name, &arguments),
-        // The receipt/error arrives on the stream's return value; the
-        // terminal channel events are redundant here.
-        ChatEvent::Done(_) | ChatEvent::Error(_) => {}
+        // The accumulator ignores everything but ToolCallDelta.
+        other => accumulator.feed(&other),
     }
 }
 
@@ -1387,32 +1337,52 @@ mod tests {
     // Event-channel helpers
     // -----------------------------------------------------------------------
 
-    /// Wait for the next approval card and return its id.
-    async fn wait_for_approval(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> ApprovalId {
-        loop {
-            match rx.recv().await.expect("events channel open") {
-                AgentEvent::ApprovalNeeded { approval_id, .. } => return approval_id,
-                _ => continue,
-            }
-        }
+    /// A recording event receiver: every event the test consumes while
+    /// driving the turn (waiting for cards, waiting for tools) is kept,
+    /// so the final assertions see the *whole* stream, not just the tail.
+    struct Recorder {
+        rx: mpsc::UnboundedReceiver<AgentEvent>,
+        seen: Vec<AgentEvent>,
     }
 
-    /// Wait for the state event proving the approved tool is in flight.
-    async fn wait_for_running_tool(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) {
-        loop {
-            match rx.recv().await.expect("events channel open") {
-                AgentEvent::State(AgentTurnState::RunningTool(_)) => return,
-                _ => continue,
+    impl Recorder {
+        fn new(rx: mpsc::UnboundedReceiver<AgentEvent>) -> Self {
+            Self { rx, seen: Vec::new() }
+        }
+
+        /// Wait for the next approval card and return its id (the card
+        /// event is kept in `seen` — the full stream is the record).
+        async fn wait_for_approval(&mut self) -> ApprovalId {
+            loop {
+                let event = self.rx.recv().await.expect("events channel open");
+                if let AgentEvent::ApprovalNeeded { approval_id, .. } = &event {
+                    let approval_id = *approval_id;
+                    self.seen.push(event);
+                    return approval_id;
+                }
+                self.seen.push(event);
             }
         }
-    }
 
-    fn drain_events(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
+        /// Wait for the state event proving the approved tool is in flight.
+        async fn wait_for_running_tool(&mut self) {
+            loop {
+                let event = self.rx.recv().await.expect("events channel open");
+                if matches!(event, AgentEvent::State(AgentTurnState::RunningTool(_))) {
+                    return;
+                }
+                self.seen.push(event);
+            }
         }
-        events
+
+        /// Everything seen so far, plus whatever is still buffered
+        /// (cumulative — safe to call more than once per turn).
+        fn all_events(&mut self) -> Vec<AgentEvent> {
+            while let Ok(event) = self.rx.try_recv() {
+                self.seen.push(event);
+            }
+            self.seen.clone()
+        }
     }
 
     fn count<'a, I>(events: I, predicate: impl Fn(&AgentEvent) -> bool) -> usize
@@ -1420,6 +1390,16 @@ mod tests {
         I: IntoIterator<Item = &'a AgentEvent>,
     {
         events.into_iter().filter(|event| predicate(event)).count()
+    }
+
+    /// Drain whatever is still buffered (for tests that never drive the
+    /// channel while the turn runs).
+    fn drain_remaining(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     /// Run a turn to completion on the current task (tests that never
@@ -1480,7 +1460,8 @@ mod tests {
             ),
         ]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
         let task = tokio::spawn(run_agent_turn(
@@ -1492,7 +1473,7 @@ mod tests {
         ));
 
         // The user approves the write card when it appears.
-        let approval_id = wait_for_approval(&mut events_rx).await;
+        let approval_id = recorder.wait_for_approval().await;
         decision_tx
             .send((approval_id, AgentDecision::Approve))
             .expect("send decision");
@@ -1525,7 +1506,7 @@ mod tests {
         assert_eq!(second[3].tool_call_id.as_deref(), Some("call_list"));
         let third = &requests[2].messages;
         assert_eq!(third.len(), 6); // + assistant(tool_calls×1) + tool×1
-        assert_eq!(third[4].tool_call_id.as_deref(), Some("call_write"));
+        assert_eq!(third[5].tool_call_id.as_deref(), Some("call_write"));
 
         // The report's conversation is the full transcript.
         assert_eq!(report.conversation.len(), 7);
@@ -1535,9 +1516,11 @@ mod tests {
         assert_eq!(state.routed, ["call_read", "call_list", "call_write"]);
         assert_eq!(state.approved_runs, ["call_write"]);
 
-        // The event stream: three tool starts, three results, one card,
-        // one TurnDone, and the final state is Done.
-        let events = drain_events(&mut events_rx);
+        // The event stream (the recorder kept everything, including the
+        // events that arrived before the card): three tool starts, three
+        // results, exactly one card, one TurnDone, and the final state
+        // Done.
+        let events = recorder.all_events();
         assert_eq!(count(&events, |event| matches!(
             event,
             AgentEvent::ToolCallStarted(_)
@@ -1621,7 +1604,7 @@ mod tests {
         // The turn was aborted, not run to the script's end — and the
         // TurnDone event (the shell's toast trigger) still arrived.
         assert_eq!(requests.lock().expect("requests lock").len(), 4);
-        let events = drain_events(&mut events_rx);
+        let events = drain_remaining(&mut events_rx);
         assert_eq!(
             count(&events, |event| matches!(event, AgentEvent::TurnDone(_))),
             1
@@ -1662,7 +1645,8 @@ mod tests {
             },
         )]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
         let task = tokio::spawn(run_agent_turn(
@@ -1673,13 +1657,13 @@ mod tests {
             decision_rx,
         ));
 
-        let approval_id = wait_for_approval(&mut events_rx).await;
+        let approval_id = recorder.wait_for_approval().await;
         decision_tx
             .send((approval_id, AgentDecision::Approve))
             .expect("approve");
         // The state event proves the approved tool is in flight (the
         // child is spawned inside its run future).
-        wait_for_running_tool(&mut events_rx).await;
+        recorder.wait_for_running_tool().await;
         // Stop: the nil approval id — the Stop button names no card.
         decision_tx
             .send((Uuid::nil(), AgentDecision::Stop))
@@ -1733,7 +1717,8 @@ mod tests {
             },
         )]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
         let task = tokio::spawn(run_agent_turn(
@@ -1744,7 +1729,7 @@ mod tests {
             decision_rx,
         ));
 
-        let approval_id = wait_for_approval(&mut events_rx).await;
+        let approval_id = recorder.wait_for_approval().await;
         decision_tx
             .send((approval_id, AgentDecision::Deny))
             .expect("deny");
@@ -1824,7 +1809,8 @@ mod tests {
             write_script("call_next_turn"),
         ]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
         let task = tokio::spawn(run_agent_turn(
@@ -1835,7 +1821,7 @@ mod tests {
             decision_rx,
         ));
 
-        let approval_id = wait_for_approval(&mut events_rx).await;
+        let approval_id = recorder.wait_for_approval().await;
         decision_tx
             .send((approval_id, AgentDecision::ApproveAllThisTurn))
             .expect("approve all");
@@ -1845,8 +1831,9 @@ mod tests {
         assert_eq!(report.summary.approved, 3, "the card + the two pre-approvals");
         assert_eq!(report.summary.denied, 0);
 
-        // Exactly one card was ever shown this turn.
-        let events = drain_events(&mut events_rx);
+        // Exactly one card was ever shown this turn: w2 and w3 were
+        // pre-approved, never parked.
+        let events = recorder.all_events();
         assert_eq!(
             count(&events, |event| matches!(
                 event,
@@ -1874,13 +1861,22 @@ mod tests {
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
         let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
 
-        let approval_id = wait_for_approval(&mut events_rx).await;
+        let approval_id = recorder.wait_for_approval().await;
         decision_tx
             .send((approval_id, AgentDecision::Approve))
             .expect("approve");
         let report = task.await.expect("turn task joins");
         assert_eq!(report.end, TurnEnd::Completed);
         assert_eq!(report.summary.approved, 1);
+        // Two cards total across the two turns: the pre-approval did not
+        // leak into this one.
+        assert_eq!(
+            count(&recorder.all_events(), |event| matches!(
+                event,
+                AgentEvent::ApprovalNeeded { .. }
+            )),
+            2
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1963,7 +1959,7 @@ mod tests {
             delay: Some(Duration::from_secs(5)),
         };
         let (chat, requests) = ScriptedChat::new(vec![round]);
-        let (runner, _state) = MockRunner::new(vec![]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
 
         let time_caps = TurnCaps {
             max_turn_secs: 1,
@@ -1980,7 +1976,7 @@ mod tests {
         // The request was made and then cancelled with the stream future.
         assert_eq!(requests.lock().expect("requests lock").len(), 1);
         assert_eq!(
-            count(&drain_events(&mut events_rx), |event| matches!(
+            count(&drain_remaining(&mut events_rx), |event| matches!(
                 event,
                 AgentEvent::TurnDone(_)
             )),
@@ -1998,7 +1994,7 @@ mod tests {
         // 4000-char user message ≈ 1000 tokens) already exceeds the
         // 320-token budget, so the turn aborts before the first request.
         let (chat, requests) = ScriptedChat::new(vec![]);
-        let (runner, _state) = MockRunner::new(vec![]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
 
         let small_caps = TurnCaps {
             context_window: 400,
