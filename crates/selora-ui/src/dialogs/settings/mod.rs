@@ -210,6 +210,10 @@ pub struct SettingsDialog {
     rust_detect_note: String,
     /// Inline result note for the typescript "Auto-detect" button.
     ts_detect_note: String,
+    /// Whether one of the panes' text fields held keyboard focus this
+    /// frame (re-set by every field as it paints). Read by `show`'s Esc
+    /// handler — egui surrenders focus on Esc before `show` can see it.
+    field_focused: bool,
 }
 
 impl SettingsDialog {
@@ -234,12 +238,21 @@ impl SettingsDialog {
             keybind_capture: None,
             rust_detect_note: String::new(),
             ts_detect_note: String::new(),
+            field_focused: false,
         }
     }
 
     /// The settings the dialog is editing.
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Jump to the Selora section (the status bar's "○ selora disconnected
+    /// · connect" click affordance promises the Connect form, not a
+    /// generic settings page). Cancels any armed keybind capture.
+    pub fn open_selora_section(&mut self) {
+        self.section = Section::Selora;
+        self.keybind_capture = None;
     }
 
     /// Replace the working copy (e.g. when the shell applies a
@@ -268,31 +281,61 @@ impl SettingsDialog {
     /// Paint the modal and return the events emitted this frame.
     pub fn show(&mut self, ctx: &egui::Context) -> Vec<SettingsEvent> {
         // Esc closes the modal (UI_SPEC.md §6) — unless a keybind row is
-        // capturing, in which case Esc cancels the capture first.
+        // capturing (Esc cancels the capture first) or a text field held
+        // keyboard focus last frame. egui's own Esc handling (Focus's
+        // begin_pass) has *already* surrendered the field's focus by the
+        // time this runs, so a fresh `Memory::focused()` read is always
+        // `None` here — the flag is what the fields reported last frame.
+        // The first Esc belongs to the field (keeping the dialog, and a
+        // half-typed API key, alive); the second closes.
+        let field_was_focused = self.field_focused;
+        self.field_focused = false;
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.keybind_capture.is_some() {
                 self.keybind_capture = None;
-            } else {
+            } else if !field_was_focused {
                 self.events.push(SettingsEvent::Close);
             }
         }
 
-        // The modal: --ink-mid fill, 1px --ink-hi hairline, --radius-2,
-        // --space-5 inner margin, no shadow (DESIGN_TOKENS.md §4–§6).
+        // The modal (UI_SPEC.md §6): `egui::Modal` — Foreground order with
+        // an input-blocking backdrop. A plain `egui::Window` (the old
+        // paint) let every click and keystroke around the dialog fall
+        // through to the workbench behind it: the file tree opened files,
+        // the editor took typing, the status bar toggled — the dialog
+        // looked "fully bugged". The Modal confines pointer and keyboard
+        // focus to itself. Toasts still show above the scrim: they are
+        // Foreground-order Areas painted after this in the frame, and egui
+        // stacks same-order layers by paint order.
+        //
+        // The panel: --ink-mid fill, 1px --ink-hi hairline, --radius-2,
+        // --space-5 inner margin, no shadow (DESIGN_TOKENS.md §4–§6). The
+        // backdrop keeps egui's default black-alpha scrim (no token
+        // exists — the design-token gap is noted in DESIGN_TOKENS.md §12
+        // follow-ups).
         let frame = egui::Frame::default()
             .fill(color::INK_MID)
             .stroke(egui::Stroke::new(1.0, color::INK_HI))
             .corner_radius(radius::R2)
             .inner_margin(egui::Margin::same(space::S5 as i8));
 
-        egui::Window::new("SETTINGS")
-            .id(egui::Id::new("selora-settings-dialog"))
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([WIDTH, HEIGHT])
-            .resizable(false)
-            .collapsible(false)
+        let modal = egui::Modal::new(egui::Id::new("selora-settings-dialog"))
             .frame(frame)
-            .show(ctx, |ui| self.body(ui));
+            .show(ctx, |ui| {
+                // Pin both ends: the modal sizes to content, and the body
+                // was built for a fixed 720×520 pane (its ScrollArea and
+                // text edits size to `available_*`). With only a min, the
+                // available-size feedback loop makes the layout drift
+                // frame to frame; min == max makes it deterministic —
+                // the exact geometry the old fixed-size Window gave.
+                ui.set_min_size(egui::vec2(WIDTH, HEIGHT));
+                ui.set_max_size(egui::vec2(WIDTH, HEIGHT));
+                self.body(ui);
+            });
+        // A backdrop click dismisses — Esc's mouse twin.
+        if modal.backdrop_response.clicked() {
+            self.events.push(SettingsEvent::Close);
+        }
 
         std::mem::take(&mut self.events)
     }
@@ -554,7 +597,11 @@ impl SettingsDialog {
 
     /// Text fields save on blur (UI_SPEC.md §6): when the field loses focus
     /// and the settings differ from the last written snapshot.
+    ///
+    /// This is also where the fields report focus for `show`'s Esc handler
+    /// (see [`SettingsDialog::field_focused`]).
     fn commit_text_on_blur(&mut self, resp: &egui::Response) {
+        self.field_focused |= resp.has_focus();
         if resp.lost_focus() && self.settings != self.snapshot {
             self.save_now();
         }
@@ -642,6 +689,20 @@ mod tests {
             std::process::id(),
             n
         ))
+    }
+
+    #[test]
+    fn open_selora_section_jumps_from_any_section_and_cancels_capture() {
+        let dir = temp_dir();
+        let mut dialog = SettingsDialog::with_save_dir(Settings::default(), Some(dir.clone()));
+        dialog.section = Section::Keybinds;
+        dialog.keybind_capture = Some(KeybindField::Save);
+
+        dialog.open_selora_section();
+        assert_eq!(dialog.section, Section::Selora);
+        assert_eq!(dialog.keybind_capture, None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

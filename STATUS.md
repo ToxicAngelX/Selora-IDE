@@ -1,4 +1,4 @@
-# Status — 2026-10-05 (Phase 4 complete)
+# Status — 2026-10-06 (Phase 4 complete; smoke-test bugfix round 1 landed)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
@@ -28,13 +28,17 @@ Credential Manager (persist_key flag / throwaway service names).
 ## Next
 
 **Owner smoke test of Phase 4** (ROADMAP.md Phase 4 acceptance list) —
-the one gate that needs a human and a real sk-gw- key:
+the one gate that needs a human and a real sk-gw- key. The owner started
+it 2026-10-06 and found bugs; the fixes below are merged — **re-run from
+step 1 on a fresh build** (`cargo run -p selora-app`):
 
 1. `cargo run -p selora-app` — status bar right shows `○ selora
    disconnected · connect`
-2. Click it → Settings → Selora → paste key → Connect → status flips to
-   `● selora connected` within 2s; reload the app — still connected
-   (keyring restore)
+2. Click it → Settings opens ON the Selora section (Connect form) → paste
+   key → Connect (or press Enter in the field) → status flips to
+   `● selora connected` within 2s AND STAYS connected (the 30s ping no
+   longer flips it back); reload the app — still connected (keyring
+   restore)
 3. Ctrl+L → chat sidebar → "list 3 prime numbers" → Enter → streams in;
    code blocks have hover Copy; ⋯ menu clear/copy-transcript
 4. Model picker in the chat header: filter, select, refresh; next chat
@@ -42,6 +46,28 @@ the one gate that needs a human and a real sk-gw- key:
 5. Open a Rust file, stop typing 500ms → ghost text in --fg-faint;
    Tab accepts; cost meter reads nonzero
 6. Reload — last 20 chat turns + sidebar visibility restored
+
+## Smoke-test bugfix round 1 (2026-10-06, all tested + gate green)
+
+Seven fixes, all found by the owner smoke-testing the connect flow:
+
+| Bug | Fix | Where |
+|---|---|---|
+| Manual Connect never set the dispatcher's session key — 30s later the ping flipped the status back to Disconnected; chat/ghost said "no API key" | `Effect::SeloraConnect` adopts the key immediately (AutoConnect idiom); regression test against a wiremock 401 gateway (never writes the real keyring) | `wiring.rs` |
+| Editing Base URL in Settings never reached the dispatcher — Connect/chat/ping kept the boot URL until restart | new `Effect::SettingsSynced { base_url }` (no disk write, no reply; empty → DEFAULT_BASE_URL) sent when the shell adopts dialog settings | `app_state.rs`, `wiring.rs`, `shell.rs` |
+| Esc while typing in a field closed the dialog and threw away the pasted key | first Esc leaves the focused field (dialog tracks `field_focused` per frame — egui's begin_pass surrenders focus on Esc before `show` can see it), second Esc closes | `dialogs/settings/mod.rs` |
+| Enter in the masked key field did nothing | Enter submits Connect (inert while Connecting); the input got an explicit id for focus-driving tests | `dialogs/settings/selora_section.rs` |
+| The "modal" was a plain egui::Window — clicks and keystrokes around it fell through to the workbench (file tree opened files, editor took typing; the dialog seemed "fully bugged") | real `egui::Modal` (0.36): input-blocking backdrop, keyboard focus confinement, backdrop-click dismisses; geometry pinned min==max (Modal sizes to content, and the body's available-size feedback loop made layout drift frame-to-frame — clicks missed buttons by 20px until pinned) | `dialogs/settings/mod.rs` |
+| Status-bar "○ selora disconnected · connect" opened Settings on the EDITOR section instead of the Connect form | `SettingsDialog::open_selora_section()` + shell `open_settings_to_selora()` for `StatusEvent::OpenConnect` | `dialogs/settings/mod.rs`, `shell.rs` |
+| `Effect::SeloraKeyringSet` was dead code (nothing sent it — the session-key path that never ran) | left in place (tests' seam); its doc comment is accurate now | `app_state.rs` |
+
+Gate after the fixes: build, 20 test targets (~230 tests incl. 8 new
+settings/connect tests), fmt, `clippy --workspace --all-targets --
+-D warnings`, app boots and stays alive. The one cosmetic gap knowingly
+left: after Connect the status line says "no model" until the picker runs
+(`spawn_connect` reports `model: None`); also the Modal's backdrop scrim
+has no design token (egui default black-alpha — token gap to note in a
+DESIGN_TOKENS follow-up).
 
 Then **Phase 5 (Agent Mode)** — five subagents (5a–5e), interface-first
 (5a lands `ToolSpec`/`ToolCallDelta`/tool-result types first), briefs in

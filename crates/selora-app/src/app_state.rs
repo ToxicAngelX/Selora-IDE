@@ -72,6 +72,13 @@ pub enum Effect {
     /// Persist [`Settings`] (ARCHITECTURE.md §2.2) — the runtime calls
     /// `Settings::save` off the frame path.
     SettingsSave(Settings),
+    /// Adopt new settings that are *already on disk* (the Settings dialog
+    /// writes the file itself): refresh the dispatcher's Selora base URL
+    /// without another write and without a reply. Without this, every
+    /// Selora effect keeps the boot-time base URL until the app restarts.
+    SettingsSynced {
+        base_url: String,
+    },
 
     // Selora (the Phase 1c network half — live until the Phase 4 chat UI
     // constructs them; the dispatcher and the wiremock tests exercise them).

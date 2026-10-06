@@ -662,7 +662,25 @@ pub fn spawn_dispatcher(
                     base_url = settings.selora.base_url.clone();
                     spawn_settings_save(&dispatch_handle, &notify, &msg_tx, settings);
                 }
+                Effect::SettingsSynced { base_url: url } => {
+                    // The dialog already wrote the file — this only
+                    // refreshes the dispatcher's view. An empty URL means
+                    // the field was cleared: fall back to the default (the
+                    // `SeloraConnect` arm's rule, so ping/chat don't build
+                    // requests against an empty origin).
+                    base_url = if url.is_empty() {
+                        DEFAULT_BASE_URL.to_owned()
+                    } else {
+                        url
+                    };
+                }
                 Effect::SeloraConnect(key) => {
+                    // The key becomes the session key immediately (the
+                    // `SeloraAutoConnect` idiom): the ping loop, chat, and
+                    // ghost text must all see it — otherwise the next
+                    // `SeloraPing` (30s) answers "no key" and flips a just-
+                    // connected status line back to `Disconnected`.
+                    api_key = Some(key.clone());
                     base_url = if base_url.is_empty() {
                         DEFAULT_BASE_URL.to_owned()
                     } else {
@@ -1167,6 +1185,55 @@ mod tests {
             }
             other => panic!("expected ChatError, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn manual_connect_makes_the_session_key_visible_to_the_ping_loop() {
+        // The mock rejects every request: validation fails (so the real OS
+        // keyring is never written — a failed connect persists nothing),
+        // but the ping that follows must still *reach* the gateway with
+        // the just-connected key. Before the fix the dispatcher never
+        // adopted the key, so the ping answered `Disconnected` without a
+        // network call and the status line flipped back 30s after a
+        // successful connect.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let handle = Handle::current();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            server.uri(),
+            lsp_effect_tx(),
+        );
+
+        let _ = effect_tx.send(Effect::SeloraConnect("sk-gw-rejected".into()));
+        let message = recv_until(&mut msg_rx, |m| matches!(m, AppMessage::SeloraStatus(_))).await;
+        match &message {
+            AppMessage::SeloraStatus(selora_ai::SeloraStatus::Error(_)) => {}
+            other => panic!("validation must fail against the 401 mock, got {other:?}"),
+        }
+
+        let _ = effect_tx.send(Effect::SeloraPing);
+        let message = recv_until(&mut msg_rx, |m| matches!(m, AppMessage::SeloraStatus(_))).await;
+        match &message {
+            // The ping reached the gateway carrying the session key (the
+            // second 401) — not the keyless `Disconnected` reply.
+            AppMessage::SeloraStatus(selora_ai::SeloraStatus::Error(_)) => {}
+            other => panic!("ping must use the just-connected key, got {other:?}"),
+        }
+
+        // Both requests (connect + ping) hit the mock.
+        server.verify().await;
     }
 
     // --- the Phase 1c network half, against a mock gateway -------------------

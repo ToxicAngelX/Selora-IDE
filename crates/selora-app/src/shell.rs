@@ -1151,7 +1151,7 @@ impl SeloraApp {
                 for event in status_events {
                     match event {
                         selora_ui::status_bar::selora_status::StatusEvent::OpenConnect => {
-                            self.open_settings();
+                            self.open_settings_to_selora();
                         }
                     }
                 }
@@ -1473,6 +1473,20 @@ impl SeloraApp {
         }
     }
 
+    /// The status bar's "○ selora disconnected · connect" affordance
+    /// (UI_SPEC.md §1.2): the click must land on the Connect form, not a
+    /// generic settings page — jump to (or open on) the Selora section.
+    fn open_settings_to_selora(&mut self) {
+        match self.settings_dialog.as_mut() {
+            Some(dialog) => dialog.open_selora_section(),
+            None => {
+                let mut dialog = SettingsDialog::new(self.state.settings.clone());
+                dialog.open_selora_section();
+                self.settings_dialog = Some(dialog);
+            }
+        }
+    }
+
     fn settings_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.settings_dialog.as_mut() else {
             return;
@@ -1511,6 +1525,12 @@ impl SeloraApp {
             }
         }
         if let Some(settings) = adopt {
+            // The dialog wrote the file itself; this only refreshes the
+            // dispatcher's Selora base URL (without it, every Selora
+            // effect keeps the boot-time URL until the app restarts).
+            let _ = self.effect_tx.send(Effect::SettingsSynced {
+                base_url: settings.selora.base_url.clone(),
+            });
             self.state.settings = settings;
         }
         if close {

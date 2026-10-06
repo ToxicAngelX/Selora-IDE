@@ -29,6 +29,10 @@ const CONNECT_ID: &str = "selora-settings-connect";
 /// Absolute widget id of the "Disconnect" button.
 const DISCONNECT_ID: &str = "selora-settings-disconnect";
 
+/// Absolute widget id of the masked API key input. Explicit (not auto) so
+/// its focus behavior is deterministic and the tests can drive it.
+const API_KEY_INPUT_ID: &str = "selora-settings-api-key";
+
 /// Button height — the settings row height (comfortable on the 4px grid).
 const BUTTON_HEIGHT: f32 = 28.0;
 
@@ -75,11 +79,20 @@ pub(super) fn pane_selora(dialog: &mut SettingsDialog, ui: &mut egui::Ui) {
     let resp = ui.add(
         egui::TextEdit::singleline(&mut dialog.api_key)
             .password(true)
-            .hint_text("sk-gw-…"),
+            .hint_text("sk-gw-…")
+            .id(egui::Id::new(API_KEY_INPUT_ID)),
     );
     if resp.changed() && dialog.api_key.contains(char::is_whitespace) {
         dialog.api_key.retain(|c| !c.is_whitespace());
     }
+    // The masked input isn't a settings field (no blur-save); report its
+    // focus for `show`'s Esc handler like `commit_text_on_blur` does.
+    dialog.field_focused |= resp.has_focus();
+    // Enter submits (the egui singleline idiom: a singleline TextEdit
+    // defocuses on Enter, and the key press is visible to `input` in the
+    // same frame — `resp.lost_focus()` alone would also fire on a plain
+    // focus move, which must not connect).
+    let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
     // While validation is in flight the Connect button goes display-only
     // (the status line carries the "connecting…" feedback).
@@ -100,7 +113,7 @@ pub(super) fn pane_selora(dialog: &mut SettingsDialog, ui: &mut egui::Ui) {
             disconnect_clicked = paint_disconnect_button(ui);
         }
     });
-    if connect_clicked && !key_empty {
+    if (connect_clicked || (enter_pressed && !connecting)) && !key_empty {
         // The key leaves the dialog here and lives only in the event;
         // the buffer is emptied so no copy lingers in widget state.
         let key = std::mem::take(&mut dialog.api_key);
@@ -399,6 +412,141 @@ mod tests {
 
         let events = click_id(&mut dialog, &ctx, CONNECT_ID);
         assert!(events.is_empty(), "events: {events:?}");
+    }
+
+    /// A `RawInput` carrying one key press, for driving the dialog
+    /// headlessly (the parent module's `key_input` shape).
+    fn key_event(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enter_in_the_key_field_submits_connect() {
+        let mut dialog = selora_dialog();
+        dialog.api_key = "sk-gw-enter-1234".into();
+        let ctx = settle(&mut dialog);
+
+        // Focus the masked input (a click would do this in a real
+        // session), let the focus land for a frame, then press Enter.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(API_KEY_INPUT_ID)));
+        let events = paint(
+            &mut dialog,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen()),
+                ..Default::default()
+            },
+        );
+        assert!(events.is_empty(), "focus frame emitted {events:?}");
+
+        let events = paint(&mut dialog, &ctx, key_event(egui::Key::Enter));
+        assert_eq!(
+            events,
+            vec![SettingsEvent::Connect("sk-gw-enter-1234".into())]
+        );
+        // The key left the buffer with the event.
+        assert!(dialog.api_key.is_empty());
+    }
+
+    #[test]
+    fn clicking_the_backdrop_closes_the_dialog() {
+        // The input-blocking scrim: a click far outside the panel (the
+        // screen's top-left corner, nowhere near the 720×520 modal) must
+        // not fall through to the workbench behind — it dismisses the
+        // dialog, the mouse twin of the Esc rule.
+        let mut dialog = selora_dialog();
+        let ctx = settle(&mut dialog);
+
+        let corner = egui::Pos2::new(10.0, 10.0);
+        let press = egui::RawInput {
+            screen_rect: Some(screen()),
+            events: vec![
+                egui::Event::PointerMoved(corner),
+                egui::Event::PointerButton {
+                    pos: corner,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let events = paint(&mut dialog, &ctx, press);
+        assert!(events.is_empty(), "press pass emitted {events:?}");
+
+        let release = egui::RawInput {
+            screen_rect: Some(screen()),
+            events: vec![egui::Event::PointerButton {
+                pos: corner,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let events = paint(&mut dialog, &ctx, release);
+        assert_eq!(events, vec![SettingsEvent::Close]);
+    }
+
+    #[test]
+    fn enter_is_inert_while_connecting() {
+        let mut dialog = selora_dialog();
+        dialog.api_key = "sk-gw-enter-1234".into();
+        dialog.set_selora_status(SeloraStatus::Connecting);
+        let ctx = settle(&mut dialog);
+
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(API_KEY_INPUT_ID)));
+        let _ = paint(
+            &mut dialog,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen()),
+                ..Default::default()
+            },
+        );
+        let events = paint(&mut dialog, &ctx, key_event(egui::Key::Enter));
+        assert!(events.is_empty(), "events: {events:?}");
+    }
+
+    #[test]
+    fn esc_while_the_key_field_is_focused_keeps_the_dialog_open() {
+        let mut dialog = selora_dialog();
+        dialog.api_key = "sk-gw-esc".into();
+        let ctx = settle(&mut dialog);
+
+        // The masked input holds focus (the user is mid-typing): the
+        // first Esc leaves the field; the dialog — and the typed key —
+        // survive.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(API_KEY_INPUT_ID)));
+        let _ = paint(
+            &mut dialog,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen()),
+                ..Default::default()
+            },
+        );
+
+        let events = paint(&mut dialog, &ctx, key_event(egui::Key::Escape));
+        assert!(
+            !events.contains(&SettingsEvent::Close),
+            "Esc with focus must not close: {events:?}"
+        );
+        assert_eq!(dialog.api_key, "sk-gw-esc", "the typed key survives");
+
+        // The second Esc (nothing focused now) closes.
+        let events = paint(&mut dialog, &ctx, key_event(egui::Key::Escape));
+        assert_eq!(events, vec![SettingsEvent::Close]);
     }
 
     #[test]
