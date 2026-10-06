@@ -26,8 +26,11 @@ pub mod turn;
 // repo's `Effect` enum marks its pre-consumption seams the same way).
 #[allow(unused_imports)]
 pub use router::{execute_tool, tool_manifest, ToolOutcome};
-#[allow(unused_imports)]
-pub use turn::{AgentSummary, AgentTurn, AgentTurnState};
+pub use turn::{
+    run_agent_turn, spawn_agent_turn, AgentEvent, AgentSummary, AgentTurn, AgentTurnReport,
+    AgentTurnState, ChatStream, ClientChatStream, RouterToolRunner, ToolRunner, TurnCaps,
+    TurnDecision, TurnEnd, TurnInput,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

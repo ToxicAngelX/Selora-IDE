@@ -17,3 +17,8 @@ futures-util.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
+# Test-only: proving the `agent.*` settings drive the loop caps
+# (TurnCaps). A dev-dependency keeps selora-ai's runtime contract
+# "selora-core + the networking stack" (lib.rs docs) unchanged; the
+# production settings → TurnCaps mapping lives in the app shell.
+selora-settings.workspace = true
