@@ -504,8 +504,7 @@ where
 {
     let mut fut = fut;
     let mut decisions_open = true;
-    let sleep =
-        tokio::time::sleep_until(deadline.unwrap_or_else(|| far_future()));
+    let sleep = tokio::time::sleep_until(deadline.unwrap_or_else(far_future));
     tokio::pin!(sleep);
 
     let reason = loop {
@@ -555,8 +554,7 @@ async fn park_for_decision(
     approval_id: ApprovalId,
     deadline: Option<tokio::time::Instant>,
 ) -> Parked {
-    let sleep =
-        tokio::time::sleep_until(deadline.unwrap_or_else(|| far_future()));
+    let sleep = tokio::time::sleep_until(deadline.unwrap_or_else(far_future));
     tokio::pin!(sleep);
 
     loop {
@@ -643,8 +641,7 @@ async fn stream_round_gated<C: ChatStream>(
     let mut rx_open = true;
     let mut decisions_open = true;
     let mut ui_gone = false;
-    let sleep =
-        tokio::time::sleep_until(deadline.unwrap_or_else(|| far_future()));
+    let sleep = tokio::time::sleep_until(deadline.unwrap_or_else(far_future));
     tokio::pin!(sleep);
 
     let end = loop {
@@ -865,13 +862,7 @@ where
                         let approval_id = Uuid::new_v4();
                         turn.state = AgentTurnState::AwaitingApproval(approval_id);
                         if !emit(&events, AgentEvent::State(turn.state.clone()))
-                            || !emit(
-                                &events,
-                                AgentEvent::ApprovalNeeded {
-                                    approval_id,
-                                    card,
-                                },
-                            )
+                            || !emit(&events, AgentEvent::ApprovalNeeded { approval_id, card })
                         {
                             end = Some(TurnEnd::Failed("agent event receiver dropped".into()));
                             break 'turn;
@@ -888,9 +879,7 @@ where
                                 break 'turn;
                             }
                             Parked::ChannelClosed => {
-                                end = Some(TurnEnd::Failed(
-                                    "agent decision channel closed".into(),
-                                ));
+                                end = Some(TurnEnd::Failed("agent decision channel closed".into()));
                                 break 'turn;
                             }
                             Parked::Decided(AgentDecision::Approve) => turn.approved += 1,
@@ -1033,8 +1022,16 @@ mod tests {
 
     fn manifest() -> Vec<ToolSpec> {
         vec![
-            ToolSpec::new("read_file", "Read a workspace file", serde_json::json!({"type": "object"})),
-            ToolSpec::new("bash", "Run a shell command", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "read_file",
+                "Read a workspace file",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "bash",
+                "Run a shell command",
+                serde_json::json!({"type": "object"}),
+            ),
         ]
     }
 
@@ -1085,7 +1082,12 @@ mod tests {
         ChatEvent::Delta(text.into())
     }
 
-    fn tool_delta(index: usize, id: Option<&str>, name: Option<&str>, arguments: &str) -> ChatEvent {
+    fn tool_delta(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: &str,
+    ) -> ChatEvent {
         ChatEvent::ToolCallDelta {
             index,
             id: id.map(str::to_owned),
@@ -1340,7 +1342,10 @@ mod tests {
 
     impl Recorder {
         fn new(rx: mpsc::UnboundedReceiver<AgentEvent>) -> Self {
-            Self { rx, seen: Vec::new() }
+            Self {
+                rx,
+                seen: Vec::new(),
+            }
         }
 
         /// Wait for the next approval card and return its id (the card
@@ -1457,13 +1462,7 @@ mod tests {
         let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
-        let task = tokio::spawn(run_agent_turn(
-            input,
-            chat,
-            runner,
-            events_tx,
-            decision_rx,
-        ));
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
 
         // The user approves the write card when it appears.
         let approval_id = recorder.wait_for_approval().await;
@@ -1473,7 +1472,10 @@ mod tests {
 
         let report = task.await.expect("turn task joins");
         assert_eq!(report.end, TurnEnd::Completed);
-        assert_eq!(report.final_message, "Fixed: src/main.rs now has the comment.");
+        assert_eq!(
+            report.final_message,
+            "Fixed: src/main.rs now has the comment."
+        );
         assert!(report.summary.completed);
         assert_eq!(report.summary.iterations, 3);
         assert_eq!(report.summary.tools_used, 3);
@@ -1514,14 +1516,17 @@ mod tests {
         // results, exactly one card, one TurnDone, and the final state
         // Done.
         let events = recorder.all_events();
-        assert_eq!(count(&events, |event| matches!(
-            event,
-            AgentEvent::ToolCallStarted(_)
-        )), 3);
-        assert_eq!(count(&events, |event| matches!(
-            event,
-            AgentEvent::ToolResult(_)
-        )), 3);
+        assert_eq!(
+            count(&events, |event| matches!(
+                event,
+                AgentEvent::ToolCallStarted(_)
+            )),
+            3
+        );
+        assert_eq!(
+            count(&events, |event| matches!(event, AgentEvent::ToolResult(_))),
+            3
+        );
         assert_eq!(
             count(&events, |event| matches!(
                 event,
@@ -1533,8 +1538,11 @@ mod tests {
             count(&events, |event| matches!(event, AgentEvent::TurnDone(_))),
             1
         );
-        assert_eq!(count(&events, |event| *event
-            == AgentEvent::State(AgentTurnState::Done)), 1);
+        assert_eq!(
+            count(&events, |event| *event
+                == AgentEvent::State(AgentTurnState::Done)),
+            1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1544,8 +1552,10 @@ mod tests {
     #[tokio::test]
     async fn iteration_cap_from_settings_aborts_the_turn() {
         // The model never stops asking for tools; the settings cap is 3.
-        let mut settings = AgentSettings::default();
-        settings.max_iterations = 3;
+        let settings = AgentSettings {
+            max_iterations: 3,
+            ..AgentSettings::default()
+        };
         // The shell's mapping: settings.agent.* + the model's window.
         let caps = TurnCaps {
             max_tool_iterations: settings.max_iterations,
@@ -1562,10 +1572,7 @@ mod tests {
         for n in 0..10 {
             let id = format!("call_{n}");
             let arguments = format!(r#"{{"n":{n}}}"#);
-            script.push((
-                id.clone(),
-                ready_result(&id, &format!("file {n}")),
-            ));
+            script.push((id.clone(), ready_result(&id, &format!("file {n}"))));
             let split = arguments.len() / 2;
             rounds.push(ScriptedRound {
                 events: vec![
@@ -1591,7 +1598,10 @@ mod tests {
         );
         assert!(!report.summary.completed);
         assert_eq!(report.summary.tools_used, 3);
-        assert_eq!(report.summary.iterations, 4, "the 4th round is the one capped");
+        assert_eq!(
+            report.summary.iterations, 4,
+            "the 4th round is the one capped"
+        );
         assert!(report.end.toast().contains("iteration cap"));
 
         // The turn was aborted, not run to the script's end — and the
@@ -1616,11 +1626,7 @@ mod tests {
         // real, and the turn ends "stopped by user" (within the grace
         // period, not the child's 60s).
         let (chat, _requests) = ScriptedChat::new(vec![tool_round(
-            &[(
-                "call_bash",
-                "bash",
-                r#"{"command":"ping -n 60 127.0.0.1"}"#,
-            )],
+            &[("call_bash", "bash", r#"{"command":"ping -n 60 127.0.0.1"}"#)],
             "Running it.",
             0.10,
         )]);
@@ -1642,13 +1648,7 @@ mod tests {
         let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
-        let task = tokio::spawn(run_agent_turn(
-            input,
-            chat,
-            runner,
-            events_tx,
-            decision_rx,
-        ));
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
 
         let approval_id = recorder.wait_for_approval().await;
         decision_tx
@@ -1714,13 +1714,7 @@ mod tests {
         let mut recorder = Recorder::new(events_rx);
         let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
         let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
-        let task = tokio::spawn(run_agent_turn(
-            input,
-            chat,
-            runner,
-            events_tx,
-            decision_rx,
-        ));
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
 
         let approval_id = recorder.wait_for_approval().await;
         decision_tx
@@ -1731,7 +1725,10 @@ mod tests {
         assert_eq!(report.end, TurnEnd::Completed);
         assert_eq!(report.summary.denied, 1);
         assert_eq!(report.summary.approved, 0);
-        assert_eq!(report.summary.tools_used, 1, "the denied call was still a tool step");
+        assert_eq!(
+            report.summary.tools_used, 1,
+            "the denied call was still a tool step"
+        );
         assert_eq!(report.final_message, "Alright, I left the file alone.");
 
         // §17.4: the denial went back as a tool result the model adapted to.
@@ -1744,13 +1741,11 @@ mod tests {
 
         // The write never executed: the router was never asked for the
         // approved side effect.
-        assert!(
-            runner_state
-                .lock()
-                .expect("state lock")
-                .approved_runs
-                .is_empty()
-        );
+        assert!(runner_state
+            .lock()
+            .expect("state lock")
+            .approved_runs
+            .is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1821,7 +1816,10 @@ mod tests {
 
         let report = task.await.expect("turn task joins");
         assert_eq!(report.end, TurnEnd::Completed);
-        assert_eq!(report.summary.approved, 3, "the card + the two pre-approvals");
+        assert_eq!(
+            report.summary.approved, 3,
+            "the card + the two pre-approvals"
+        );
         assert_eq!(report.summary.denied, 0);
 
         // Exactly one card was ever shown this turn: w2 and w3 were
@@ -1922,7 +1920,11 @@ mod tests {
         // No cost on the receipts: the estimate comes from the model's
         // prices (100 prompt + 50 completion tokens per round).
         let (chat, _requests) = ScriptedChat::new(vec![
-            tool_round(&[("call_r1", "read_file", r#"{"path":"a.rs"}"#)], "text", 0.0),
+            tool_round(
+                &[("call_r1", "read_file", r#"{"path":"a.rs"}"#)],
+                "text",
+                0.0,
+            ),
             answer_round("done", 0.0),
         ]);
         let (runner, _state) = MockRunner::new(vec![("call_r1", ready_result("call_r1", "a"))]);
@@ -2026,7 +2028,12 @@ mod tests {
     fn tool_call_accumulator_merges_fragments_in_index_order() {
         let mut accumulator = ToolCallAccumulator::default();
         accumulator.push(1, Some("call_b".into()), Some("bash".into()), r#"{"comm"#);
-        accumulator.push(0, Some("call_a".into()), Some("read_file".into()), r#"{"pa"#);
+        accumulator.push(
+            0,
+            Some("call_a".into()),
+            Some("read_file".into()),
+            r#"{"pa"#,
+        );
         accumulator.push(1, None, None, r#"and":"ls"}"#);
         accumulator.push(0, None, None, r#"th":"x"}"#);
 
@@ -2051,10 +2058,12 @@ mod tests {
 
     #[test]
     fn the_loop_caps_come_from_settings_and_the_model() {
-        let mut settings = AgentSettings::default();
-        settings.max_iterations = 3;
-        settings.max_turn_secs = 12;
-        settings.max_cost_usd = 0.25;
+        let settings = AgentSettings {
+            max_iterations: 3,
+            max_turn_secs: 12,
+            max_cost_usd: 0.25,
+            ..AgentSettings::default()
+        };
 
         // The shell's mapping (wiring): settings.agent.* + the model's
         // context window → TurnCaps.
@@ -2132,9 +2141,7 @@ mod tests {
 
         // Plan: a write tool comes back as a card (nothing on disk yet).
         let write_args = r#"{"path":"b.rs","content":"approved text"}"#;
-        let outcome = runner
-            .run(call("call_w", "write_file", write_args))
-            .await;
+        let outcome = runner.run(call("call_w", "write_file", write_args)).await;
         assert!(
             matches!(outcome, ToolOutcome::NeedsApproval(_)),
             "write_file must produce a diff card"
@@ -2142,7 +2149,9 @@ mod tests {
         assert!(!root.join("b.rs").exists(), "planning must not write");
 
         // Apply: the approved call executes — the card is the save moment.
-        let result = runner.run_approved(call("call_w", "write_file", write_args)).await;
+        let result = runner
+            .run_approved(call("call_w", "write_file", write_args))
+            .await;
         assert!(result.ok, "approved write must succeed: {}", result.content);
         assert_eq!(
             std::fs::read_to_string(root.join("b.rs")).expect("b.rs on disk"),
