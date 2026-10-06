@@ -18,6 +18,36 @@
 | 5e web tools | `phase5e-web-tools` @ `a44b1f2` | **merged** (ff) | 20 targets, clippy, fmt — green |
 | 5a tool plumbing | `phase5a-tool-plumbing` @ `3493677` | **merged** (`51de58b`) | 20 targets, clippy, fmt — green |
 | 5b tool router | `phase5b-tool-router` @ `461cf98` | **merged** (ff) | 20 targets, clippy, fmt — green |
+| 5c agent loop | `phase5c-agent-loop` @ `ec746e4` | **merged** (ff) | 20 targets, clippy, fmt — green |
+
+5c review notes (orchestrator, decision core read in full): the loop is
+trait-injected (`ChatStream`/`ToolRunner` — no HTTP, no execution inside
+turn.rs; production backends are thin adapters over 5a/5b); Deny feeds
+`router::denied_result` back to the model; ApproveAllThisTurn is a
+turn-local flag with a no-carryover test; Stop is honored at every phase
+(gated select wrapper), abort kills the sticky BashAbortHandle + 500ms
+grace before dropping the future; caps (25/600s/$1/context−20%) each
+abort with a partial answer + `TurnEnd::toast()`. 31 tests, including a
+Stop mid-tool killing a real `ping -n 60` child.
+
+**5c deviations accepted:**
+- `AgentEvent`/`TurnDecision`/`TurnCaps`/`TurnEnd` vocabulary in turn.rs
+  (the shell reduces AgentEvent onto the §17.6 AppMessages).
+- Context reserve fixed at 0.20 (no settings field — add
+  `agent.context_reserve` only if the owner wants it tunable).
+- tokio `test-util` + a dev-dep on selora-settings in selora-ai
+  (test-only; the settings→TurnCaps mapping is proven in tests).
+
+**Wiring owed when 5d lands (orchestrator's final Phase 5 pass):**
+- `Effect::AgentSend` → `spawn_agent_turn` with `TurnCaps` from
+  settings + the active model's context window; `Effect::AgentDecision`
+  → the turn's decision channel; `AgentEvent` → AppMessage reduction +
+  the per-event notify() (the repaint seam).
+- `agent.brave_search_api_key` → `AgentToolSettings` (5b's
+  skip_serializing field).
+- §17.7 open-buffer routing: approved edits to open editors go to the
+  in-memory buffer (the card is the save moment).
+- 5d's cards into `sidebar/chat/mod.rs`.
 
 5b review notes (orchestrator, guard core read line-by-line — §10's
 heaviest-review rule): path rooting double-checks (lexical `..` fold +
