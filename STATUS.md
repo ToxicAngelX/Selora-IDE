@@ -17,6 +17,41 @@
 |---|---|---|---|
 | 5e web tools | `phase5e-web-tools` @ `a44b1f2` | **merged** (ff) | 20 targets, clippy, fmt — green |
 | 5a tool plumbing | `phase5a-tool-plumbing` @ `3493677` | **merged** (`51de58b`) | 20 targets, clippy, fmt — green |
+| 5b tool router | `phase5b-tool-router` @ `461cf98` | **merged** (ff) | 20 targets, clippy, fmt — green |
+
+5b review notes (orchestrator, guard core read line-by-line — §10's
+heaviest-review rule): path rooting double-checks (lexical `..` fold +
+canonicalized-ancestor symlink/junction containment, case-insensitive
+on Windows); env is a fixed ALLOWLIST (`env_clear` + explicit set — the
+Selora key is structurally absent, verified in a real child); bash
+allowlist matches on word boundaries (`cargo testx` ≠ `cargo test`);
+plan/apply separation — `execute_tool` never writes, `execute_approved`
+re-parses and re-validates against current file contents (stale-approval
+replay tested); bash children: `-NoProfile -NonInteractive`,
+`CREATE_NO_WINDOW`, stdin null, capped pipes, `start_kill` + bounded
+reap on Stop/timeout (tokio's async `Child::kill` never-fires bug found
+and fixed). 33 tests.
+
+**5b deviations accepted:**
+- `execute_tool(ctx: &ToolContext, call)` reworked; `ToolContext { root,
+  settings: AgentToolSettings, abort: BashAbortHandle }` in router.rs.
+- selora-fs added as a selora-ai dependency (§17.6 composition).
+- `AgentToolSettings` mirrors the §17.5 settings slice + a
+  `skip_serializing` brave_api_key (the app maps its settings in — the
+  router never reads settings/keyring).
+
+**5b open items for the 5c merge + final wiring:**
+- §17.7 open-buffer routing is the app seam: `apply_write`/`apply_edit`
+  are the on-disk half; an approved edit to an open editor must also go
+  to the in-memory buffer (undoable, the card is the save moment).
+- `execute_approved("bash")` runs unconditionally — 5c must only hand
+  it calls that produced a card (an allowlisted call re-passed would
+  run twice; documented in router.rs).
+- ENV_ALLOWLIST may need app-level additions (CARGO_HOME, proxies) —
+  one-line changes in tools/bash.rs.
+- 5c loop caps (25/10min/$1) read from settings `agent.*` —
+  `AgentSettings` already has them (max_iterations/max_turn_secs/
+  max_cost_usd).
 
 5a review notes (orchestrator): OpenAI wire shapes are custom serde in
 chat_types.rs (tools `{"type":"function","function":{…}}`, calls with
