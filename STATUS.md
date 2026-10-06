@@ -11,6 +11,47 @@
   final acceptance (it exercises the same chat path the agent loop
   builds on).
 
+## Phase 5 merge log
+
+| Subagent | Branch/commit | State | Gate |
+|---|---|---|---|
+| 5e web tools | `phase5e-web-tools` @ `a44b1f2` | **merged** (ff) | 20 targets, clippy, fmt — green |
+| 5a tool plumbing | `phase5a-tool-plumbing` @ `3493677` | **merged** (`51de58b`) | 20 targets, clippy, fmt — green |
+
+5a review notes (orchestrator): OpenAI wire shapes are custom serde in
+chat_types.rs (tools `{"type":"function","function":{…}}`, calls with
+tolerant `arguments` folding — string/object/null); stream parsing is
+defensive (missing index → slot 0, empty fragments skipped); the
+scripted 3-turn mock test asserts exact request bodies per turn.
+Deliverables verified: 61 tests in selora-ai.
+
+**5a deviations accepted:**
+- `finish_reason` is NOT surfaced as data — the loop distinguishes
+  tool_calls-vs-stop via `accumulator.finish()` (non-empty ⇔ tools);
+  5c was told (see below).
+- `ToolCallAccumulator` re-exported from lib.rs (one line, additive).
+- New public `SeloraClient::complete_chat` (non-streaming half).
+
+
+5e review notes (orchestrator, guard read line-by-line): the §17.2 SSRF
+guard covers every listed range plus 0/8, CGNAT, TEST-NETs,
+benchmarking, IPv6 ULA/link-local/multicast/documentation, and
+IPv4-mapped IPv6; `resolve_and_check` checks EVERY resolved address;
+redirects are manual (policy: none) so each hop re-enters the guard;
+fetch output capped 256 KiB (raw buffer 1 MiB), search key never in
+results/logs. Known accepted limitation: DNS is resolved at
+guard-time and again at connect-time, so a fast DNS rebind can race the
+check (check-then-fetch, no IP pinning) — read-only tool, output-capped,
+approval-gated writes; fine for Lite.
+
+**5e wiring owed by later merges:**
+- 5b's router: call `web_search(query, brave_api_key)` (two-arg) and
+  `web_fetch(url)`; route URLs through `resolve_and_check` (not just
+  the pure `is_url_allowed`); stamp `result.id = call.id` (web results
+  carry an empty id).
+- Orchestrator (post-merge): add `agent.brave_search_api_key` to
+  selora-settings and pass it through; empty/absent → DuckDuckGo.
+
 ## Phase 5 prep (landed this session, gate green)
 
 The interface skeletons all five subagents build against

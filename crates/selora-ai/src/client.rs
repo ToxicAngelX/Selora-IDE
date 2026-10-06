@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::chat_types::ToolCall;
 use crate::types::{ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model, SeloraStatus};
 
 /// 60s to establish the connection (ARCHITECTURE.md §6.1).
@@ -187,15 +188,44 @@ impl SeloraClient {
                         if let Some(chunk_usage) = chunk.usage {
                             usage = Some(chunk_usage);
                         }
-                        let delta = chunk
+                        let Some(delta) = chunk
                             .choices
                             .first()
                             .and_then(|choice| choice.delta.as_ref())
-                            .and_then(|delta| delta.content.as_deref());
-                        if let Some(content) = delta {
+                        else {
+                            continue;
+                        };
+                        if let Some(content) = delta.content.as_deref() {
                             if !content.is_empty() {
                                 completion_chars += content.chars().count();
                                 send_event(&tx, ChatEvent::Delta(content.to_owned()))?;
+                            }
+                        }
+                        if let Some(fragments) = delta.tool_calls.as_deref() {
+                            for fragment in fragments {
+                                let function = fragment.function.as_ref();
+                                let arguments = function
+                                    .and_then(|function| function.arguments.as_deref())
+                                    .unwrap_or_default();
+                                let name = function.and_then(|function| function.name.clone());
+                                let meaningful =
+                                    fragment.id.as_deref().is_some_and(|id| !id.is_empty())
+                                        || name.as_deref().is_some_and(|name| !name.is_empty())
+                                        || !arguments.is_empty();
+                                if !meaningful {
+                                    continue; // empty trailing fragment
+                                }
+                                send_event(
+                                    &tx,
+                                    ChatEvent::ToolCallDelta {
+                                        // Gateways that omit `index` (single-call
+                                        // responses) land in slot 0.
+                                        index: fragment.index.unwrap_or(0),
+                                        id: fragment.id.clone(),
+                                        name,
+                                        arguments: arguments.to_owned(),
+                                    },
+                                )?;
                             }
                         }
                     }
@@ -254,6 +284,45 @@ impl SeloraClient {
             .map(|message| message.content.unwrap_or_default())
             .map(|content| content.trim().to_owned())
             .filter(|content| !content.is_empty()))
+    }
+
+    /// `POST {base_url}/v1/chat/completions` with `stream: false` — the
+    /// whole assistant reply in one piece: the content plus, when the
+    /// model invoked tools, the complete `tool_calls` of the message
+    /// (ARCHITECTURE.md §17.6 non-streaming shape). `Ok(None)` when the
+    /// gateway returns no choices.
+    ///
+    /// The agent loop itself streams (§17.3 — it needs live deltas for
+    /// the chat bubble); this is the non-streaming seam for callers that
+    /// want a finished message in one shot. `req.stream` is forced off
+    /// regardless of what the caller left in it. Tool arguments stay raw
+    /// JSON strings — the router (Phase 5b) parses them against the
+    /// schema, never this layer.
+    pub async fn complete_chat(
+        &self,
+        req: ChatRequest,
+    ) -> Result<Option<ChatMessage>, SeloraError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let body = req.with_stream(false);
+
+        let response = self
+            .send_with_retry(|| self.http.post(&url).bearer_auth(&self.api_key).json(&body))
+            .await?;
+        let reply: CompletionResponse = response
+            .json()
+            .await
+            .map_err(|err| SeloraError::Ai(format!("invalid completion response: {err}")))?;
+
+        Ok(reply
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message)
+            .map(|message| {
+                let mut reply = ChatMessage::assistant(message.content.unwrap_or_default());
+                reply.tool_calls = message.tool_calls;
+                reply
+            }))
     }
 
     /// A cheap reachability ping (ARCHITECTURE.md §10.6): `HEAD {base_url}`,
@@ -445,6 +514,11 @@ struct CompletionChoice {
 struct CompletionMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Complete tool calls on a non-streaming assistant message
+    /// (ARCHITECTURE.md §17.6) — parsed by [`ToolCall`]'s tolerant
+    /// deserializer in the OpenAI nested shape.
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,6 +531,33 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Streaming tool-call fragments (the OpenAI `delta.tool_calls[]`
+    /// array) — emitted as [`ChatEvent::ToolCallDelta`] for the caller's
+    /// [`crate::ToolCallAccumulator`] to reassemble.
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallFragment>>,
+}
+
+/// One `delta.tool_calls[]` fragment: `{index?, id?, function:{name?,
+/// arguments?}}`. Every field may be absent — the gateway sends the id
+/// and name on the first fragment of a call and the arguments across
+/// many. An absent `index` (single-call gateway quirk) resolves to 0.
+#[derive(Debug, Deserialize)]
+struct ToolCallFragment {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FragmentFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FragmentFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// Usage block on the final chunk. Absent → chars/4 estimate (RISKS.md §3).
@@ -473,10 +574,11 @@ struct Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_types::{ToolCall, ToolCallAccumulator, ToolSpec};
     use crate::sse::MAX_DATA_FIELD_BYTES;
-    use crate::types::ChatMessage;
+    use crate::types::{ChatMessage, Role};
 
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_KEY: &str = "sk-gw-test-key-000000000000";
@@ -924,5 +1026,501 @@ mod tests {
         assert!(!rendered.contains(TEST_KEY), "key leaked: {rendered}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(rendered.contains("http://example.test")); // trailing / trimmed
+    }
+
+    // ---- Phase 5a: tool-call request plumbing (ARCHITECTURE.md §17.6) ----
+
+    /// The two-tool manifest the scripted agent conversation arms.
+    fn agent_manifest() -> Vec<ToolSpec> {
+        vec![
+            ToolSpec::new(
+                "read_file",
+                "Read a workspace file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            ),
+            ToolSpec::new(
+                "write_file",
+                "Write a workspace file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+        ]
+    }
+
+    /// One streamed SSE chunk carrying a content delta.
+    fn content_chunk(text: &str) -> serde_json::Value {
+        serde_json::json!({ "choices": [ { "delta": { "content": text } } ] })
+    }
+
+    /// One streamed SSE chunk carrying a single `delta.tool_calls[]`
+    /// fragment. Absent fields are sent as JSON `null` — the parser also
+    /// handles fully omitted keys.
+    fn fragment_chunk(
+        index: Option<usize>,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [ {
+                "delta": { "tool_calls": [ {
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                } ] }
+            } ]
+        })
+    }
+
+    /// The terminal chunk: the gateway's `finish_reason`.
+    fn finish_chunk(reason: &str) -> serde_json::Value {
+        serde_json::json!({ "choices": [ { "delta": {}, "finish_reason": reason } ] })
+    }
+
+    /// Wrap streamed chunks into an SSE body terminated by `[DONE]`.
+    fn sse_body(chunks: &[serde_json::Value]) -> String {
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str("data: ");
+            body.push_str(&chunk.to_string());
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// Stream one armed agent turn and return `(text, tool_calls)` —
+    /// exactly what the Phase 5c loop does per iteration: relay events,
+    /// accumulate tool-call fragments, drain at `Done`.
+    async fn run_agent_turn(
+        client: &SeloraClient,
+        conversation: Vec<ChatMessage>,
+    ) -> (String, Vec<ToolCall>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let receipt = client
+            .stream_chat(
+                ChatRequest::new("test-model", conversation).with_tools(agent_manifest()),
+                tx,
+            )
+            .await
+            .expect("turn streams successfully");
+
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Error(_))),
+            "no error events expected: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Done(done)) if *done == receipt),
+            "the stream must end with the returned receipt"
+        );
+
+        let mut accumulator = ToolCallAccumulator::new();
+        for event in &events {
+            accumulator.feed(event);
+        }
+        (deltas(&events).concat(), accumulator.finish())
+    }
+
+    /// The scripted 3-turn agent conversation (deliverable): turn 1 asks
+    /// for a read, turn 2 for a write (arguments split mid-JSON across
+    /// chunks), turn 3 answers with plain text. Every request body is
+    /// exact-matched against the hand-written OpenAI wire shape — tools
+    /// armed, assistant `tool_calls` replayed, tool results appended.
+    #[tokio::test]
+    async fn agent_three_turn_conversation_read_write_then_answer() {
+        let server = MockServer::start().await;
+
+        let user_prompt = "Read src/main.rs and add an entry-point comment.";
+        let read_args = r#"{"path":"src/main.rs"}"#;
+        let write_args = r#"{"path":"src/lib.rs","content":"// entry point\n"}"#;
+        let read_result = "fn main() { println!(\"hello, selora\"); }";
+        let write_result = "wrote 25 bytes to src/lib.rs";
+
+        let read_call = ToolCall {
+            id: "call_read_1".into(),
+            name: "read_file".into(),
+            arguments: read_args.into(),
+        };
+        let write_call = ToolCall {
+            id: "call_write_1".into(),
+            name: "write_file".into(),
+            arguments: write_args.into(),
+        };
+
+        // The expected wire bodies, hand-written (not produced by the
+        // serializer under test): the OpenAI `tools` array shape, the
+        // assistant message's nested `tool_calls`, the tool-result
+        // messages.
+        let expected_tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a workspace file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a workspace file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }
+        ]);
+        let assistant_read = serde_json::json!({
+            "role": "assistant",
+            "content": "Let me read that.",
+            "tool_calls": [
+                { "id": "call_read_1", "type": "function",
+                  "function": { "name": "read_file", "arguments": read_args } }
+            ]
+        });
+        let assistant_write = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                { "id": "call_write_1", "type": "function",
+                  "function": { "name": "write_file", "arguments": write_args } }
+            ]
+        });
+        let turn_bodies = [
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [ { "role": "user", "content": user_prompt } ],
+                "temperature": 0.7,
+                "stream": true,
+                "tools": expected_tools
+            }),
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    { "role": "user", "content": user_prompt },
+                    assistant_read.clone(),
+                    { "role": "tool", "tool_call_id": "call_read_1", "content": read_result }
+                ],
+                "temperature": 0.7,
+                "stream": true,
+                "tools": expected_tools.clone()
+            }),
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    { "role": "user", "content": user_prompt },
+                    assistant_read,
+                    { "role": "tool", "tool_call_id": "call_read_1", "content": read_result },
+                    assistant_write,
+                    { "role": "tool", "tool_call_id": "call_write_1", "content": write_result }
+                ],
+                "temperature": 0.7,
+                "stream": true,
+                "tools": expected_tools
+            }),
+        ];
+
+        // Turn 1: text commentary, then a read_file call whose arguments
+        // stream in three pieces (id+name first, then two argument
+        // fragments), finish_reason "tool_calls".
+        let turn1_sse = sse_body(&[
+            content_chunk("Let me read that."),
+            fragment_chunk(Some(0), Some("call_read_1"), Some("read_file"), ""),
+            fragment_chunk(Some(0), None, None, "{\"path\""),
+            fragment_chunk(Some(0), None, None, ":\"src/main.rs\"}"),
+            finish_chunk("tool_calls"),
+        ]);
+        // Turn 2: a write_file call with arguments split mid-JSON, one
+        // fragment missing its `index` (single-call gateway quirk), one
+        // empty trailing fragment.
+        let turn2_sse = sse_body(&[
+            fragment_chunk(Some(0), Some("call_write_1"), Some("write_file"), ""),
+            fragment_chunk(None, None, None, "{\"path\":\"src/lib.rs\",\"co"),
+            fragment_chunk(Some(0), None, None, "ntent\":\"// entry point\\n\"}"),
+            fragment_chunk(Some(0), None, None, ""),
+            finish_chunk("tool_calls"),
+        ]);
+        // Turn 3: the final answer, finish_reason "stop", with usage.
+        let turn3_sse = sse_body(&[
+            content_chunk("Done — src/lib.rs now opens "),
+            content_chunk("with `// entry point`."),
+            serde_json::json!({
+                "choices": [ { "delta": {}, "finish_reason": "stop" } ],
+                "usage": { "prompt_tokens": 42, "completion_tokens": 9, "cost_usd": 0.0021 }
+            }),
+        ]);
+
+        // Scoped guards live to the end of the test (each verifies its
+        // expect(1) on drop — one exact-body hit per turn).
+        let mut guards = Vec::new();
+        for (body, sse) in std::iter::zip(turn_bodies, [turn1_sse, turn2_sse, turn3_sse]) {
+            guards.push(
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .and(body_json(body))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+                    .expect(1)
+                    .mount_as_scoped(&server)
+                    .await,
+            );
+        }
+
+        let client = test_client(&server.uri());
+        let mut conversation = vec![ChatMessage::user(user_prompt)];
+
+        // Turn 1 — the model asks for a read (finish_reason: tool_calls).
+        let (text, calls) = run_agent_turn(&client, conversation.clone()).await;
+        assert_eq!(text, "Let me read that.");
+        assert_eq!(calls, vec![read_call]);
+        let mut assistant = ChatMessage::assistant(text);
+        assistant.tool_calls = Some(calls);
+        conversation.push(assistant);
+        conversation.push(ChatMessage::tool_result("call_read_1", read_result));
+
+        // Turn 2 — the model asks for a write (arguments reassembled).
+        let (text, calls) = run_agent_turn(&client, conversation.clone()).await;
+        assert_eq!(text, "");
+        assert_eq!(calls, vec![write_call]);
+        let mut assistant = ChatMessage::assistant(text);
+        assistant.tool_calls = Some(calls);
+        conversation.push(assistant);
+        conversation.push(ChatMessage::tool_result("call_write_1", write_result));
+
+        // Turn 3 — the final answer (finish_reason: stop, no tool calls).
+        let (text, calls) = run_agent_turn(&client, conversation).await;
+        assert!(
+            calls.is_empty(),
+            "a stop turn must drain no tool calls: {calls:?}"
+        );
+        assert_eq!(text, "Done — src/lib.rs now opens with `// entry point`.");
+    }
+
+    /// Plain chat never arms tools: an exact body match with no `tools`
+    /// key (any `tools` field on the wire would miss the mock and fail).
+    #[tokio::test]
+    async fn plain_chat_request_carries_no_tools_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "test-model",
+                "messages": [ { "role": "user", "content": "1234" } ],
+                "temperature": 0.7,
+                "stream": true
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body(&[content_chunk("hi"), finish_chunk("stop")])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let receipt = client
+            .stream_chat(chat_request(), tx)
+            .await
+            .expect("plain chat streams");
+        assert_eq!(deltas(&drain(&mut rx)), ["hi"]);
+        assert!(!receipt.request_id.is_nil());
+    }
+
+    /// The loop's tool_calls-vs-stop seam: `finish_reason: "tool_calls"`
+    /// streams drain into calls (and at most commentary text);
+    /// `finish_reason: "stop"` streams drain nothing and the text is the
+    /// final answer.
+    #[tokio::test]
+    async fn finish_reason_distinguishes_tool_calls_from_stop() {
+        let tool_calls_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                fragment_chunk(
+                    Some(0),
+                    Some("call_1"),
+                    Some("read_file"),
+                    r#"{"path":"a.rs"}"#,
+                ),
+                finish_chunk("tool_calls"),
+            ])))
+            .expect(1)
+            .mount(&tool_calls_server)
+            .await;
+        let client = test_client(&tool_calls_server.uri());
+        let (text, calls) = run_agent_turn(&client, vec![ChatMessage::user("read a.rs")]).await;
+        assert_eq!(text, "");
+        assert_eq!(
+            calls,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            }]
+        );
+
+        let stop_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                content_chunk("The answer is 42."),
+                finish_chunk("stop"),
+            ])))
+            .expect(1)
+            .mount(&stop_server)
+            .await;
+        let client = test_client(&stop_server.uri());
+        let (text, calls) = run_agent_turn(&client, vec![ChatMessage::user("the answer?")]).await;
+        assert!(calls.is_empty(), "stop drains no calls: {calls:?}");
+        assert_eq!(text, "The answer is 42.");
+    }
+
+    /// Gateway quirk: single-call responses that omit `index` on every
+    /// fragment still reassemble into one call.
+    #[tokio::test]
+    async fn stream_fragments_without_index_reassemble_into_the_first_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                fragment_chunk(None, Some("call_9"), Some("list_dir"), ""),
+                fragment_chunk(None, None, None, "{\"path\""),
+                fragment_chunk(None, None, None, ":\".\"}"),
+                finish_chunk("tool_calls"),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let (_, calls) = run_agent_turn(&client, vec![ChatMessage::user("list")]).await;
+        assert_eq!(
+            calls,
+            vec![ToolCall {
+                id: "call_9".into(),
+                name: "list_dir".into(),
+                arguments: "{\"path\":\".\"}".into(),
+            }]
+        );
+    }
+
+    /// Non-streaming replies carry complete `tool_calls` on the assistant
+    /// message (ARCHITECTURE.md §17.6) — including the gateway quirk of
+    /// arguments already parsed into a JSON object.
+    #[tokio::test]
+    async fn complete_chat_parses_tool_calls_from_the_assistant_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "test-model", "stream": false }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [ {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"src/main.rs\"}"
+                                }
+                            },
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": { "name": "list_dir", "arguments": { "path": "." } }
+                            }
+                        ]
+                    }
+                } ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let message = client
+            .complete_chat(chat_request())
+            .await
+            .expect("complete_chat succeeds")
+            .expect("a message");
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content, "");
+        let calls = message.tool_calls.expect("two tool calls");
+        assert_eq!(
+            calls[0],
+            ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/main.rs"}"#.into(),
+            }
+        );
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(calls[1].arguments, "{\"path\":\".\"}");
+    }
+
+    /// Non-streaming plain replies come back as ordinary assistant
+    /// messages; no choices is `Ok(None)`, not an error.
+    #[tokio::test]
+    async fn complete_chat_returns_plain_replies_and_none_without_choices() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [ { "message": { "role": "assistant", "content": "hello there" } } ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri());
+        let message = client
+            .complete_chat(chat_request())
+            .await
+            .expect("complete_chat succeeds")
+            .expect("a message");
+        assert_eq!(message, ChatMessage::assistant("hello there"));
+
+        let empty = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "choices": [] })),
+            )
+            .expect(1)
+            .mount(&empty)
+            .await;
+        let client = test_client(&empty.uri());
+        assert!(
+            matches!(client.complete_chat(chat_request()).await, Ok(None)),
+            "no choices is Ok(None)"
+        );
     }
 }

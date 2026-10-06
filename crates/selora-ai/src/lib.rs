@@ -25,7 +25,7 @@ pub use agent::{
     AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId, ChatStream, ClientChatStream,
     RouterToolRunner, ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput,
 };
-pub use chat_types::{ToolCall, ToolCallId, ToolResult, ToolSpec};
+pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;
 pub use sse::{parse_sse_event, SseEvent, MAX_DATA_FIELD_BYTES};
 pub use types::{
