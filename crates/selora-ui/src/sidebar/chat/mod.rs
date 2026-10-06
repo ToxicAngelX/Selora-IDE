@@ -51,6 +51,9 @@ use selora_ai::{ChatMessage, Model, ModelId, Role};
 use crate::sidebar::icons;
 use crate::theme::{color, font, radius, space, type_scale};
 
+/// Agent Mode cards (UI_SPEC.md §4.2) — Phase 5d's file.
+pub mod agent_cards;
+
 /// Header bar height (UI_SPEC.md §4: "Header bar (40px tall)").
 pub const HEADER_HEIGHT: f32 = 40.0;
 /// The panel's sidebar label (UI_SPEC.md §4).
@@ -548,6 +551,11 @@ impl ChatPanel {
             .map(|message| ChatMessage {
                 role: message.role,
                 content: message.content.clone(),
+                // Panel turns are plain bubbles; agent tool calls and
+                // results are the loop's business (Phase 5c), never
+                // re-derived from the transcript.
+                tool_calls: None,
+                tool_call_id: None,
             })
             .collect()
     }
@@ -1180,6 +1188,9 @@ fn role_label(role: Role) -> &'static str {
         Role::User => "You",
         Role::Assistant => "Selora",
         Role::System => "System",
+        // Tool results render as cards (Phase 5d), never as bubbles —
+        // this label never appears for them.
+        Role::Tool => "Tool",
     }
 }
 

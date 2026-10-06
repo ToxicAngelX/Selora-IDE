@@ -584,6 +584,10 @@ pub fn spawn_chat(
             terminal_seen |= matches!(event, ChatEvent::Done(_) | ChatEvent::Error(_));
             let message = match event {
                 ChatEvent::Delta(text) => AppMessage::ChatDelta(chat_id, text),
+                // Plain chat never arms tools (`ChatRequest::tools` is
+                // `None`), so a tool-call delta cannot arrive here — the
+                // agent loop (Phase 5c) owns its own relay.
+                ChatEvent::ToolCallDelta { .. } => continue,
                 ChatEvent::Done(receipt) => AppMessage::ChatDone(chat_id, receipt),
                 ChatEvent::Error(error) => AppMessage::ChatError(chat_id, error),
             };
@@ -821,6 +825,11 @@ pub fn spawn_dispatcher(
                     // the key lives only in this dispatcher's memory.
                     api_key = Some(key);
                 }
+                // Agent Mode (Phase 5): skeleton arms — the loop task and
+                // router land with 5b/5c. Unreachable until the chat
+                // sidebar's agent toggle sends them.
+                Effect::AgentSend(_, _) => {}
+                Effect::AgentDecision(_, _, _) => {}
                 Effect::GitStatus(root) => {
                     spawn_git_status(&dispatch_handle, &notify, &msg_tx, root);
                 }

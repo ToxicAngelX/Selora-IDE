@@ -78,6 +78,9 @@ async fn main() {
                 println!();
                 println!("--- stream error: {error}");
             }
+            // The smoke example never arms tools (plain chat): a tool
+            // call fragment cannot arrive here.
+            selora_ai::ChatEvent::ToolCallDelta { .. } => {}
         }
     }
 

@@ -1,7 +1,35 @@
-# Status — 2026-10-06 (Phase 4 complete; smoke-test bugfix round 1 landed)
+# Status — 2026-10-06 (Phase 4 complete; smoke-test fixes landed; Phase 5 prep landed)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
+
+## Owner decisions (2026-10-06)
+
+- **Phase 4 smoke test deferred** by owner decision: Phase 5 spawn prep
+  started instead. The six-step list below stays the standing gate
+  before "DONE" can be claimed on Phase 4 — run it before Phase 5's
+  final acceptance (it exercises the same chat path the agent loop
+  builds on).
+
+## Phase 5 prep (landed this session, gate green)
+
+The interface skeletons all five subagents build against
+(AGENT_ORCHESTRATION.md §10 file ownership; the Phase 4 lesson — push
+prep BEFORE spawning so worktrees branch from it):
+
+| Piece | File | Owner |
+|---|---|---|
+| `ToolSpec`/`ToolCall`/`ToolResult` + round-trip tests | `crates/selora-ai/src/chat_types.rs` (new) | 5a |
+| `ChatRequest.tools`, `ChatMessage.tool_calls/tool_call_id` + `Role::Tool`, `ChatEvent::ToolCallDelta` (additive; old JSON unchanged — tested) | `crates/selora-ai/src/types.rs` | orchestrator (applied) |
+| `agent` module: `ApprovalId`/`AgentDecision`/`ApprovalCard`/`AgentSummary`; `router.rs` (`ToolOutcome`, `tool_manifest`, `execute_tool` stubs); `turn.rs` (`AgentTurnState`/`AgentTurn`); `tools/web.rs` stubs | `crates/selora-ai/src/agent/` (new) | 5b/5c/5e |
+| `Effect::AgentSend`/`AgentDecision` + `AppMessage::ToolCallStarted`/`ToolResult`/`ApprovalNeeded`/`AgentTurnDone` (§17.6 shapes, Uuid-keyed like `SeloraChat`; apply()/dispatcher arms are no-op stubs) | `crates/selora-app/src/app_state.rs`, `wiring.rs` | orchestrator (shared file) |
+| `agent.*` settings (§17.3 caps + §17.5 shell/allowlist, serde-defaulted; pre-Phase-5 files load — tested). **`Settings.agent` is `Box<AgentSettings>`** — the unboxed section pushed `Settings` past clippy's large-enum-variant threshold; field access auto-derefs, JSON identical | `crates/selora-settings/src/settings.rs` | orchestrator |
+| chat panel moved `sidebar/chat.rs` → `sidebar/chat/mod.rs`; `agent_cards.rs` stub | `crates/selora-ui/src/sidebar/chat/` | 5d |
+
+Deviations from ARCHITECTURE.md §17.6 (deliberate, both noted in code):
+worker messages key by the per-request `Uuid` + `chat_ids` map (the
+existing `SeloraChat` pattern), not a bare `ChatId`; `AppMessage::ToolResult`
+carries the call id inside `ToolResult` instead of repeating it in the tuple.
 
 ## Last completed
 

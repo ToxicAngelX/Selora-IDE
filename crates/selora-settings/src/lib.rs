@@ -29,6 +29,6 @@ mod settings;
 pub use detect::{find_in_dirs, find_on_path};
 pub use keybind::{keybind_matches, Keybind};
 pub use settings::{
-    EditorSettings, KeybindsSettings, LspSettings, SeloraSettings, Settings, UiSettings,
-    CONFIG_DIR, SCHEMA_VERSION, SETTINGS_DIR_ENV, SETTINGS_FILE_NAME,
+    AgentSettings, EditorSettings, KeybindsSettings, LspSettings, SeloraSettings, Settings,
+    UiSettings, CONFIG_DIR, SCHEMA_VERSION, SETTINGS_DIR_ENV, SETTINGS_FILE_NAME,
 };

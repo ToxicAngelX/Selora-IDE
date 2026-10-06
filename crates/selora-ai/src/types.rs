@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use selora_core::SeloraError;
 
+use crate::chat_types::{ToolCall, ToolSpec};
+
 /// Identifier of a model on the gateway (e.g. `"claude-opus-5-5"`).
 pub type ModelId = String;
 
@@ -38,19 +40,34 @@ fn default_true() -> bool {
 }
 
 /// A chat role (wire names are lowercase, OpenAI-compatible).
+///
+/// `Tool` is the tool-result role (ARCHITECTURE.md §17.6): a message with
+/// this role carries `tool_call_id` and the tool's output content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 /// One message in a chat conversation.
+///
+/// The agent loop grows this additively (ARCHITECTURE.md §17.6): an
+/// assistant message may carry `tool_calls` (the model's tool invocations),
+/// and a tool-result message carries `tool_call_id`. Both are `None` for
+/// every pre-agent message, so old transcripts deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Assistant-side tool invocations (`None` on plain messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// The call this tool-result message answers (tool role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -58,6 +75,8 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -65,6 +84,8 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -72,6 +93,20 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool-result message (ARCHITECTURE.md §17.3: results are appended
+    /// as `{ role: "tool", tool_call_id, content }` and fed back into the
+    /// next request).
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -85,6 +120,10 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
+    /// The tool manifest (ARCHITECTURE.md §17.3: every agent request arms
+    /// the full fixed manifest; plain chat sends `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolSpec>>,
 }
 
 impl ChatRequest {
@@ -97,12 +136,19 @@ impl ChatRequest {
             temperature: 0.7,
             max_tokens: None,
             stream: false,
+            tools: None,
         }
     }
 
     /// Builder-style override of the `stream` flag.
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = stream;
+        self
+    }
+
+    /// Builder-style override of the tool manifest (agent mode).
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = Some(tools);
         self
     }
 }
@@ -112,6 +158,20 @@ impl ChatRequest {
 pub enum ChatEvent {
     /// One content delta from the model.
     Delta(String),
+    /// A streaming fragment of a tool call (ARCHITECTURE.md §17.6: the
+    /// same accumulate-then-parse pattern as content deltas — the
+    /// arguments arrive as partial JSON across many deltas). `index`
+    /// identifies which call of the response is growing.
+    ToolCallDelta {
+        /// The call's position in the response's `tool_calls` array.
+        index: usize,
+        /// The call id, present only on the first fragment of a call.
+        id: Option<String>,
+        /// The tool name, present only on the first fragment of a call.
+        name: Option<String>,
+        /// The partial `arguments` JSON fragment.
+        arguments: String,
+    },
     /// The stream completed; carries the receipt for the cost meter.
     Done(ChatReceipt),
     /// The stream failed; the same error is returned by `stream_chat`.
@@ -170,6 +230,48 @@ mod tests {
         let req = req.with_stream(false);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream"], false);
+    }
+
+    #[test]
+    fn agent_fields_round_trip_and_stay_absent_on_plain_messages() {
+        // A plain pre-agent request carries no tool fields on the wire.
+        let plain = ChatRequest::new("m", vec![ChatMessage::user("hi")]);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("tools").is_none());
+        let first_message = &json["messages"][0];
+        assert!(first_message.get("tool_calls").is_none());
+        assert!(first_message.get("tool_call_id").is_none());
+        // And deserializes back (old transcripts keep working).
+        let back: ChatRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain);
+
+        // An agent request: manifest armed, an assistant tool_call
+        // message, and a tool-result message.
+        let manifest = vec![ToolSpec::new(
+            "read_file",
+            "Read a workspace file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        };
+        let mut message = ChatMessage::assistant("I'll read it.");
+        message.tool_calls = Some(vec![call]);
+        let request = ChatRequest::new(
+            "m",
+            vec![message, ChatMessage::tool_result("call_1", "fn main() {}")],
+        )
+        .with_tools(manifest);
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["tools"].is_array());
+        assert!(json["messages"][0]["tool_calls"].is_array());
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call_1");
+
+        let back: ChatRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, request);
     }
 
     #[test]

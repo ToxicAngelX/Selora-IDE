@@ -121,6 +121,17 @@ pub enum Effect {
     #[allow(dead_code)]
     SeloraKeyringSet(String),
 
+    // Agent Mode (ARCHITECTURE.md §17.6 — additive; 5b/5c/5d consume,
+    // the orchestrator owns this shared file). The request `Uuid` keys
+    // the reply messages, the same `chat_ids` pattern as `SeloraChat`.
+    /// Start an agent turn: the user's message with the tool manifest
+    /// armed (the dispatcher builds the ChatRequest; the loop is 5c's).
+    #[allow(dead_code)] // skeleton — sent when the 5d agent toggle lands
+    AgentSend(Uuid, String),
+    /// The user's answer to an approval card (§17.4).
+    #[allow(dead_code)] // skeleton — sent when the 5d cards land
+    AgentDecision(Uuid, selora_ai::ApprovalId, selora_ai::AgentDecision),
+
     // Git (Phase 3b)
     /// Snapshot the status of the repo containing `root` (git2 discover;
     /// resolves to [`AppMessage::GitNoRepo`] when there is no repo).
@@ -170,6 +181,28 @@ pub enum AppMessage {
         request_caret: Position,
         suggestion: Option<String>,
     },
+
+    // Agent Mode (ARCHITECTURE.md §17.6 — additive; the request `Uuid`
+    // keys the turn, the same `chat_ids` pattern as the chat messages.
+    // `ToolResult` carries its own `tool_call_id`, so the variant does
+    // not repeat it).
+    /// The loop started executing one tool call (a read-type card opens
+    /// immediately; 5d renders the collapsed card).
+    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
+    ToolCallStarted(Uuid, selora_ai::ToolCall),
+    /// One tool call finished (approved-and-executed, auto-run, or
+    /// denied → `ok: false`).
+    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
+    ToolResult(Uuid, selora_ai::ToolResult),
+    /// The loop parked on an approval card (§17.4): the UI renders the
+    /// diff/command/delete card; the user's answer returns as
+    /// [`Effect::AgentDecision`].
+    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
+    ApprovalNeeded(Uuid, selora_ai::ApprovalId, selora_ai::ApprovalCard),
+    /// The turn ended: the final receipt feeds the cost meter; the
+    /// summary paints the footer (UI_SPEC.md §4.2).
+    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
+    AgentTurnDone(Uuid, ChatReceipt, selora_ai::AgentSummary),
 
     // File system
     FolderOpened(PathBuf),
@@ -462,6 +495,17 @@ impl AppState {
                     }
                 }
             }
+
+            // -- Agent Mode (Phase 5) -------------------------------------------
+            // Skeleton arms (the prep commit): the real reductions land
+            // with 5c (loop) and 5d (cards) — these only keep the enum
+            // exhaustive so the tree stays green while the five
+            // subagents build. Unreachable until the shell sends
+            // `Effect::AgentSend`.
+            AppMessage::ToolCallStarted(_, _) => {}
+            AppMessage::ToolResult(_, _) => {}
+            AppMessage::ApprovalNeeded(_, _, _) => {}
+            AppMessage::AgentTurnDone(_, _, _) => {}
 
             // -- File system ---------------------------------------------------
             AppMessage::FolderOpened(root) => {
@@ -869,6 +913,9 @@ impl AppState {
                         Role::User => "user".to_owned(),
                         Role::Assistant => "assistant".to_owned(),
                         Role::System => "system".to_owned(),
+                        // Tool-result turns are loop artifacts, not chat
+                        // bubbles — `restore_chat` drops them below.
+                        Role::Tool => "tool".to_owned(),
                     },
                     content: turn.content,
                 })

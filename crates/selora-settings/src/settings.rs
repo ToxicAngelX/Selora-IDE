@@ -110,6 +110,18 @@ pub struct Settings {
 
     #[serde(default)]
     pub keybinds: KeybindsSettings,
+
+    /// `agent.*` (ARCHITECTURE.md §17.3, §17.5) — the loop caps and the
+    /// bash tool's shell/allowlist. Defaults are the spec's; every field
+    /// is serde-defaulted so pre-Phase-5 settings.json loads unchanged.
+    ///
+    /// Boxed: `Settings` is cloned per effect-send and per dialog frame,
+    /// and the unboxed section pushed `Settings` past clippy's
+    /// large-enum-variant threshold for `Effect::SettingsSave` /
+    /// `AppMessage::SettingsLoaded` (serde treats the box as
+    /// transparent — the JSON is identical).
+    #[serde(default)]
+    pub agent: Box<AgentSettings>,
 }
 
 /// `editor.*` (ARCHITECTURE.md §8.1).
@@ -185,6 +197,76 @@ pub struct KeybindsSettings {
     pub save: String,
 }
 
+/// `agent.*` (ARCHITECTURE.md §17.3, §17.5) — the agent-loop caps and
+/// the bash tool's shell + auto-run allowlist. 5c reads the caps, 5b
+/// reads the shell/allowlist; both land in Phase 5.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// Max tool iterations per turn (§17.3: default 25).
+    #[serde(default = "default_agent_max_iterations")]
+    pub max_iterations: u32,
+
+    /// Max wall-clock seconds per turn (§17.3: default 600 = 10 min).
+    #[serde(default = "default_agent_max_turn_secs")]
+    pub max_turn_secs: u64,
+
+    /// Max estimated USD cost per turn (§17.3: default 1.00).
+    #[serde(default = "default_agent_max_cost_usd")]
+    pub max_cost_usd: f64,
+
+    /// The bash shell (§17.5: `pwsh` if installed, else `powershell` —
+    /// the default here is resolved to `pwsh` when present).
+    #[serde(default = "default_agent_shell")]
+    pub shell: String,
+
+    /// Read-only commands that auto-run without a card (§17.5's list;
+    /// prefix match, user-editable).
+    #[serde(default = "default_agent_auto_approve_commands")]
+    pub auto_approve_commands: Vec<String>,
+}
+
+fn default_agent_max_iterations() -> u32 {
+    25
+}
+
+fn default_agent_max_turn_secs() -> u64 {
+    600
+}
+
+fn default_agent_max_cost_usd() -> f64 {
+    1.0
+}
+
+fn default_agent_shell() -> String {
+    "powershell".into()
+}
+
+fn default_agent_auto_approve_commands() -> Vec<String> {
+    [
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "ls",
+        "dir",
+        "cat",
+        "type",
+        "Get-Content",
+        "Get-ChildItem",
+        "cargo check",
+        "cargo build",
+        "cargo test",
+        "cargo clippy",
+        "cargo tree",
+        "node --version",
+        "rustc --version",
+        "where",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -194,6 +276,7 @@ impl Default for Settings {
             lsp: LspSettings::default(),
             selora: SeloraSettings::default(),
             keybinds: KeybindsSettings::default(),
+            agent: Box::new(AgentSettings::default()),
         }
     }
 }
@@ -237,6 +320,18 @@ impl Default for KeybindsSettings {
             fuzzy_find: default_fuzzy_find(),
             toggle_chat: default_toggle_chat(),
             save: default_save(),
+        }
+    }
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_agent_max_iterations(),
+            max_turn_secs: default_agent_max_turn_secs(),
+            max_cost_usd: default_agent_max_cost_usd(),
+            shell: default_agent_shell(),
+            auto_approve_commands: default_agent_auto_approve_commands(),
         }
     }
 }
@@ -571,6 +666,34 @@ pub(crate) mod tests {
         assert!(matches!(err, SeloraError::Config(_)), "got: {err:?}");
         // The garbage file is left in place (it is not a version mismatch).
         assert!(path.is_file());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pre_phase5_file_loads_with_agent_defaults() {
+        // A Phase 4 settings.json has no `agent` key — it must load with
+        // the §17.3/§17.5 defaults, not error.
+        let dir = temp_settings_dir("pre-phase5");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let json = serde_json::json!({
+            "_v": SCHEMA_VERSION,
+            "editor": { "font_size": 15 },
+            "selora": { "base_url": "https://api.selora.lol" }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write");
+
+        let settings = Settings::load_from(&path).expect("load");
+        assert_eq!(settings.editor.font_size, 15);
+        assert_eq!(settings.agent.max_iterations, 25);
+        assert_eq!(settings.agent.max_turn_secs, 600);
+        assert!((settings.agent.max_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(settings.agent.shell, "powershell");
+        assert!(settings
+            .agent
+            .auto_approve_commands
+            .contains(&"cargo check".to_owned()));
 
         let _ = std::fs::remove_dir_all(dir);
     }
