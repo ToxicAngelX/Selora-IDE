@@ -55,6 +55,25 @@ Credential Manager (persist_key flag / throwaway service names).
 
 ## Next
 
+**Phase 5 subagents 5a–5e are SPAWNED and running** (parallel
+worktree-isolated branches from the pushed prep `57ffcab`). The
+orchestrator's duties while they run:
+- Merge in arrival order, gate after each: build + test + fmt + clippy
+  (the shared-file rule — apply Effect/AppMessage/chat-panel changes
+  centrally, never let two branches collide).
+- Line-by-line review of every 5b guard (path rooting, SSRF, env
+  stripping, output caps).
+- 5d's integration into `sidebar/chat/mod.rs` is the orchestrator's
+  (5d delivers standalone widgets + a call surface).
+- Deviations any agent reports (settings fields to wire, shape changes)
+  land as orchestrator commits.
+- If an agent dies on a transient error, resume it via SendMessage
+  before re-spawning (the Phase 4 lesson: cheaper than restarting).
+
+After all five merge: the Phase 5 acceptance list in ROADMAP.md (real
+key, real workspace), then the deferred Phase 4 smoke test list below,
+then Phase 6.
+
 **Owner smoke test of Phase 4** (ROADMAP.md Phase 4 acceptance list) —
 the one gate that needs a human and a real sk-gw- key. The owner started
 it 2026-10-06 and found bugs; the fixes below are merged — **re-run from
