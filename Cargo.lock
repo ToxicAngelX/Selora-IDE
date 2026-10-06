@@ -3361,6 +3361,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "selora-core",
+ "selora-fs",
  "selora-settings",
  "serde",
  "serde_json",

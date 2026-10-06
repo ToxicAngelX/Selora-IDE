@@ -14,22 +14,26 @@
 //! result, message, bash environment, or log; reads ≤4MB and fetch/bash
 //! output ≤256KB (truncated with a notice).
 //!
-//! This skeleton (the prep commit) fixes only the shared types so the
-//! five Phase 5 subagents build in parallel; implementations land with
-//! their phases.
+//! Phase 5b (router + tools) has landed: the ten §17.1 tools, every
+//! guard, and the approval split. 5c's loop controller and 5e's web
+//! implementations build on these seams.
 
 pub mod router;
 pub mod tools;
 pub mod turn;
 
-// Skeleton re-exports: unused until the Phase 5b/5c loop lands (the
-// repo's `Effect` enum marks its pre-consumption seams the same way).
-#[allow(unused_imports)]
-pub use router::{execute_tool, tool_manifest, ToolOutcome};
+// Re-exports of the Phase 5 surfaces (5c/5d consume these): the router
+// (5b), the loop (5c), the bash abort handle. The shared types' shapes
+// are unchanged from the prep commit — these are additive.
+pub use router::{
+    denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
+    ToolOutcome,
+};
+pub use tools::bash::BashAbortHandle;
 pub use turn::{
     run_agent_turn, spawn_agent_turn, AgentEvent, AgentSummary, AgentTurn, AgentTurnReport,
-    AgentTurnState, ChatStream, ClientChatStream, RouterToolRunner, ToolRunner, TurnCaps,
-    TurnDecision, TurnEnd, TurnInput,
+    AgentTurnState, ChatStream, ClientChatStream, DENIED_MESSAGE, RouterToolRunner, ToolRunner,
+    TurnCaps, TurnDecision, TurnEnd, TurnInput,
 };
 
 use serde::{Deserialize, Serialize};

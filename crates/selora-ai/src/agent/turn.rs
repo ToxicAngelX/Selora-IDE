@@ -19,7 +19,6 @@
 //! `Effect::AgentDecision` onto it).
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::router::{self, ToolOutcome};
+use super::router::{self, ToolContext, ToolOutcome};
 use super::{AgentDecision, ApprovalCard, ApprovalId};
 use crate::chat_types::{ToolCall, ToolCallAccumulator, ToolResult, ToolSpec};
 use crate::types::{compute_cost_usd, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model};
@@ -353,46 +352,40 @@ pub trait ToolRunner: Send {
 /// Production tool backend: 5b's router. A thin adapter — the single
 /// merge point for whatever entry points 5b lands.
 pub struct RouterToolRunner {
-    root: PathBuf,
+    ctx: ToolContext,
 }
 
 impl RouterToolRunner {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    /// One runner per turn, over one [`ToolContext`] — the context's
+    /// [`BashAbortHandle`] is turn-scoped and sticky (§17.3 Stop).
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
     }
 }
 
 impl ToolRunner for RouterToolRunner {
     fn run(&mut self, call: ToolCall) -> ToolRunFuture {
-        let root = self.root.clone();
-        Box::pin(async move { router::execute_tool(&root, call).await })
+        // 5b's plan half: read tools resolve, side-effecting tools come
+        // back as cards. `ToolContext` is `Clone` and the abort handle is
+        // shared (Arc) — the clone keeps the Stop button wired to any
+        // bash child this round spawns.
+        let ctx = self.ctx.clone();
+        Box::pin(async move { router::execute_tool(&ctx, call).await })
     }
 
-    // SEAM(5b): the prep skeleton's router is stateless — it has neither
-    // an approved-execution entry point nor a bash abort handle. This
-    // adapter is where they plug in at merge time: `run_approved` calls
-    // the router's approved path (the loop already collected the user's
-    // decision), and `abort` forwards to its abort handle. Until then
-    // both routes go through `execute_tool` (failing visibly, never
-    // silently) and the loop's cancellation — dropping the in-flight run
-    // future — is the stop mechanism.
     fn run_approved(&mut self, call: ToolCall) -> ToolApprovedFuture {
-        let root = self.root.clone();
-        Box::pin(async move {
-            let id = call.id.clone();
-            match router::execute_tool(&root, call).await {
-                ToolOutcome::Ready(result) => result,
-                ToolOutcome::NeedsApproval(_) => ToolResult::error(
-                    id,
-                    "router did not execute the approved call (Phase 5b seam not yet wired)",
-                ),
-            }
-        })
+        // 5b's apply half — the ONLY executing path, and it re-validates.
+        // The loop only routes card-producing calls here (routing a
+        // Ready/allowlisted call would execute it a second time).
+        let ctx = self.ctx.clone();
+        Box::pin(async move { router::execute_approved(&ctx, call).await })
     }
 
     fn abort(&mut self) {
-        // SEAM(5b): no abort handle exists yet — see `run_approved`. The
-        // loop additionally drops any in-flight run future on Stop.
+        // §17.3 Stop: sticky for the rest of the turn — a stopped turn
+        // must not run further bash commands even if a straggler future
+        // resolves.
+        self.ctx.abort.kill();
     }
 }
 
@@ -907,8 +900,7 @@ where
                             }
                             Parked::Decided(AgentDecision::Deny) => {
                                 turn.denied += 1;
-                                result =
-                                    Some(ToolResult::error(call.id.clone(), DENIED_MESSAGE));
+                                result = Some(router::denied_result(&call));
                             }
                             // Defensive: park never returns Stop here (it
                             // is handled before the id match) — but if it
@@ -1012,6 +1004,7 @@ mod tests {
     use super::*;
 
     use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use selora_settings::AgentSettings;
@@ -2099,30 +2092,86 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The production adapters compile and fail visibly against 5b's stub
+    // The production adapter against 5b's real router (real fs, no network)
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn router_adapter_routes_through_5b_and_marks_the_approval_seam() {
-        // Against 5b's skeleton router every call resolves to an error
-        // result — the loop's adapter must surface that, never fake
-        // success. When 5b lands its approved-execution entry point, this
-        // is the single seam that changes (see RouterToolRunner docs).
-        let mut runner = RouterToolRunner::new("C:/definitely/not/a/workspace");
+    fn unique_temp_root(label: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "selora-ai-agent-turn-{label}-{}-{n}",
+            std::process::id()
+        ))
+    }
 
-        let outcome = runner.run(call("call_x", "read_file", "{}")).await;
+    #[tokio::test]
+    async fn router_adapter_plans_applies_and_aborts_through_5b() {
+        // Plan (run) resolves read tools; apply (run_approved) executes
+        // cards and refuses non-card calls (the double-run guard);
+        // abort kills the turn's bash handle — all through the same
+        // ToolContext clone the loop hands to each round.
+        let root = unique_temp_root("adapter");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.rs"), b"fn main() {}").expect("write a.rs");
+
+        let ctx = ToolContext::new(&root, router::AgentToolSettings::default());
+        let abort_handle = ctx.abort.clone();
+        let mut runner = RouterToolRunner::new(ctx);
+
+        // Plan: a read tool resolves straight to a ready result.
+        let outcome = runner
+            .run(call("call_x", "read_file", r#"{"path":"a.rs"}"#))
+            .await;
         match outcome {
             ToolOutcome::Ready(result) => {
-                assert!(!result.ok, "the stub router's error must surface");
-                assert!(result.content.contains("Phase 5b"));
+                assert!(result.ok, "read must succeed: {}", result.content);
+                assert!(result.content.contains("fn main()"));
             }
-            ToolOutcome::NeedsApproval(_) => panic!("the stub router never builds cards"),
+            ToolOutcome::NeedsApproval(_) => panic!("read_file never produces a card"),
         }
 
-        let result = runner.run_approved(call("call_x", "read_file", "{}")).await;
-        assert!(!result.ok, "no fake success through the seam");
+        // Plan: a write tool comes back as a card (nothing on disk yet).
+        let write_args = r#"{"path":"b.rs","content":"approved text"}"#;
+        let outcome = runner
+            .run(call("call_w", "write_file", write_args))
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::NeedsApproval(_)),
+            "write_file must produce a diff card"
+        );
+        assert!(!root.join("b.rs").exists(), "planning must not write");
 
-        // Must not panic even with no abort handle to forward to yet.
+        // Apply: the approved call executes — the card is the save moment.
+        let result = runner.run_approved(call("call_w", "write_file", write_args)).await;
+        assert!(result.ok, "approved write must succeed: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).expect("b.rs on disk"),
+            "approved text"
+        );
+
+        // Apply refuses non-card calls (routing a Ready call here would
+        // execute it a second time — 5b's guard).
+        let result = runner
+            .run_approved(call("call_x", "read_file", r#"{"path":"a.rs"}"#))
+            .await;
+        assert!(!result.ok, "read_file is not an approved-execution tool");
+        assert!(result.content.contains("nothing to approve"));
+
+        // Stop: the handle the runner shares with every cloned context
+        // goes sticky.
         runner.abort();
+        assert!(abort_handle.is_killed(), "the turn's bash handle is killed");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn denied_wording_cannot_drift_between_the_loop_and_the_router() {
+        // §17.4's exact words: the loop feeds the router's
+        // `denied_result` to the conversation, so both must agree.
+        let denied = router::denied_result(&call("call_d", "bash", "{}"));
+        assert_eq!(denied.content, DENIED_MESSAGE);
+        assert!(!denied.ok);
+        assert_eq!(denied.id, "call_d");
     }
 }

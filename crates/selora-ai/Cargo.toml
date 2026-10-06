@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 selora-core.workspace = true
+# The agent module composes selora-fs (ARCHITECTURE.md §17.6): list_dir
+# (tree node), fuzzy_find, and search_files run over its implementations.
+selora-fs.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 serde.workspace = true
