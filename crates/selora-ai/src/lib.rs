@@ -20,7 +20,11 @@ mod client;
 mod sse;
 mod types;
 
-pub use agent::{AgentDecision, AgentSummary, AgentTurn, AgentTurnState, ApprovalCard, ApprovalId};
+pub use agent::{
+    denied_result, execute_approved, execute_tool, tool_manifest, AgentDecision, AgentSummary,
+    AgentToolSettings, AgentTurn, AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle,
+    ToolContext, ToolOutcome,
+};
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;
 pub use sse::{parse_sse_event, SseEvent, MAX_DATA_FIELD_BYTES};
