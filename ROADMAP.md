@@ -631,6 +631,66 @@ ACCEPTANCE:
 
 ---
 
+## Phase 9 — Agent Workbench (the full ZCode/DSH-class agent experience)
+
+**Goal:** Upgrade Agent Mode from "chat with tool cards" to a real agent workbench: a dedicated agent session window with **plan mode** (nothing writes until you approve the plan), a **live todo list** as the session's spine, **structured escalation questions**, **subagents** (spawn, steer, run in background, get notified), **resumable sessions with context compaction**, and session-scoped permission modes. This plus Phase 8 is what "agent mode like ZCode / VS Code's agent window / Claude Code ultracode-class runs" actually means.
+
+**Why its own phase:** Phase 5 delivered the loop; this delivers the *experience layer* around it — all interaction model, no new trust primitives (plan-gating rides 5b's existing plan/apply split; questions park on the §17.4 channel; subagent writes still card). Reference studied: the ZCode app itself (its resource bundle + observable behavior; no source repo exists on disk — noted honestly), the DSH/VS Code agent-window pattern, and the Claude Code orchestration style.
+
+**The reference inventory, mapped to Selora seams:**
+
+| ZCode-class feature | Selora seam |
+|---|---|
+| Agent window: transcript + tool cards + thinking states | region ③ "Agent" activity; 5d's cards generalize |
+| Plan mode — explore, propose, approve, *then* execute | 5b's plan/apply split: `execute_tool` never writes; writes during planning return a "plan first" tool error the model sees |
+| Live todo list (read/write by the agent, rendered as the spine) | `todo_read`/`todo_write` tools + a todo widget; state rides the session |
+| Structured escalation questions (options + free text) | the §17.4 park channel, generalized: a second card type parks the turn the same way approvals do |
+| Subagents: typed policies, background, steering, notifications | the shared subagent runtime (§19.3) — one runtime, consumed by the `spawn_subagent` tool *and* Phase 8's engine |
+| Resumable sessions, context compaction | `.selora/agent-sessions/{id}/` (transcript JSONL + todos), a resume picker, a summarize round at the context budget |
+| Permission modes (incl. a session "auto-approve" flag) | session-scoped ApproveAll that dies with the session — never persisted (the §17.4 rule verbatim) |
+
+**Decisions and tradeoffs:**
+
+| Decision | Choice | Rejected alternative, and why |
+|---|---|---|
+| Where it lives | **A dedicated "Agent" activity (region ③) with session tabs**; the chat sidebar stays plain chat | One sidebar doing both: mode confusion — "is this my chat or a run?" and transcript formats fight each other. The cards code is shared either way. |
+| Plan-gating mechanism | **Ride 5b's plan/apply split** — planning mode makes `execute_tool` return a "plan approved first" error for writes; approving a plan flips the session to execution | A separate plan-approval tool the model must remember to call: relies on the model's discipline; the split enforces it structurally. |
+| Escalation vs. approval | **One generalized park channel** — question cards park the turn exactly like approval cards (same decision route, richer payload) | A second, parallel waiting mechanism: two park paths through the loop for one concept. |
+| Subagent policies | **Two built-in tool policies** (`read-only`, `full` — full still cards) + a freeform mission prompt | Freeform-only policies: "don't edit" as prose is a convention, not a constraint; the read-only policy makes it structural (the router simply has no write tools). |
+| Compaction | **A summarize round when the conversation hits ~80% of the context budget** (gateway call; summary + open todos + last N messages carry forward) | Hard truncation: silently forgets the mission mid-run. No compaction: sessions die at the window. |
+| Session auto-approve flag | **Session-scoped, off by default, dies with the session** — exactly ApproveAllThisTurn's persistence rule | Persisted trust: one flag silently whitelists future sessions' writes — the §17.4 non-goal. |
+| Session storage | `.selora/agent-sessions/` in the workspace, gitignored (matches the workflow journal) | AppData: sessions belong to the project. In-memory: a crash kills a 2-hour run. |
+
+**Tasks (five subagents; 9b+9c are runtime-side and wiremock-testable with no UI):**
+
+- **9a — Agent window:** the region ③ "Agent" activity: session tabs (new / resume picker), transcript rendering (5d's cards + thinking states), the todo widget, question cards, the composer's mode row (ask / agent / plan), session badge + Stop. Headless paint tests; all tokens from theme.rs.
+- **9b — Plan mode + todos + gating (manifest v3, part 1):** `enter_plan_mode`/`exit_plan_mode(plan)` and `todo_read`/`todo_write`; the plan card (approve / revise); writes-during-planning structural rejection; todo state with the session. Loop changes are additive events only.
+- **9c — Subagent runtime + escalations (manifest v3, part 2):** the §19.3 runtime (scoped policies, completion notifications, background execution, `send_message` steering); `spawn_subagent` and `ask_user_question` tools; the question card. **This is the same runtime Phase 8's engine consumes — whichever phase lands first owns `crates/selora-ai/src/agent/subagent.rs` (additive; the other reuses it).**
+- **9d — Sessions + compaction:** session persistence (JSONL + todos + open parks), the resume picker wired to 9a, compaction at the context budget, session-scoped auto-approve flag (never persisted).
+- **9e — Background runs + notifications:** background subagents survive across the user's editing; toast + panel badge on completion; a blocking `wait` tool the main agent can call.
+
+**v1.x (named, not v1):** skills/hooks library, computer use, subagent worktree isolation, cross-session agent memory.
+
+**Acceptance tests (owner, real key + a real workspace):**
+```bash
+# 1. Agent activity → new session → "plan a fix for the TODO in src/main.rs"
+#    → the agent explores read-only (read cards only), proposes a plan card
+# 2. Approve the plan → a diff card appears → approve → the file changes; Ctrl+Z reverts
+# 3. During the run the todo list updates live as steps complete
+# 4. The agent asks a structured question (escalation card); answering continues the run
+# 5. "Spawn two read-only subagents to review the diff" → both run; their cards group in the transcript
+# 6. Close the app mid-run → relaunch → Resume picker → the session continues with its todos
+# 7. A long session past 80% of context → compaction round → the run continues coherently
+# 8. Session auto-approve flag on → writes skip cards; kill the app → the flag is gone (never persisted)
+# 9. A background subagent completes while editing a file → toast; click → its result is in the session
+```
+
+**Estimated complexity:** XL — the largest single phase in the project (~4-5 sessions; 9a is UI-heavy, 9b–9e runtime-heavy).
+
+**DONE means:** Open the Agent window, give it a mission, watch it plan → get your approval → execute with live todos, spawn subagents, ask you structured questions mid-run, survive an app restart, and never write a byte you didn't approve — the ZCode-class experience, in Selora's ink.
+
+---
+
 ## Total effort framing
 
 - **Phase 0:** ~1 session (4-6 hours of agent time).
@@ -642,6 +702,7 @@ ACCEPTANCE:
 - **Phase 6:** ~1-2 sessions. Mostly sequential.
 - **Phase 7:** ~1-2 client sessions (three subagents), gated on the gateway's account endpoints for acceptance only — the code is wiremock-buildable anytime.
 - **Phase 8:** ~3-4 sessions. Workflows — the largest phase since 5; 8a/8b engine-side and UI-free.
+- **Phase 9:** ~4-5 sessions. The Agent Workbench — the largest phase in the project; 9b–9e runtime-side.
 
 **Total: ~10-16 overnight sessions for one owner + one orchestrating agent running subagents.** Realistic for a single motivated owner who runs the orchestrator each evening.
 

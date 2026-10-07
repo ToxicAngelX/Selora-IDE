@@ -949,3 +949,77 @@ Workflows panel (region ④ activity) renders the phase graph, live steps, the
 run log, artifacts, and the same approval cards as the chat. `run_workflow`
 joins the tool manifest as v2 — the first exercise of §17.1's "versioned with
 the app" clause.
+
+---
+
+## 19. Agent Workbench (Phase 9) — the interactive orchestration layer
+
+Phase 9 is the experience layer around the §17 loop: a dedicated agent window
+with plan mode, live todos, escalations, subagents, and resumable sessions.
+The plan (decisions, tradeoffs, task split) is ROADMAP.md Phase 9; this
+section is the contract. Design rule throughout: **no new trust primitives** —
+plan gating rides 5b's plan/apply split, questions park on the §17.4 channel,
+subagent writes still card, and nothing approval-shaped ever persists.
+
+### 19.1 Sessions and the window
+
+An agent session is the unit: a transcript, a todo list, a mode (ask / agent /
+plan), a permission flag, parked cards, and the grown conversation. Sessions
+persist to `.selora/agent-sessions/{session_id}/` (gitignored): `transcript.jsonl`
+(user/assistant/tool events, the 5d card stream), `todos.json`, `state.json`
+(mode, open parks, compaction cursor). The "Agent" activity in region ³ hosts
+session tabs (new + a resume picker); the chat sidebar stays plain chat. All
+session state is main-thread `AppState`; the runtime side holds only the loop
+tasks, per §1/§2.
+
+### 19.2 Plan mode — structurally gated, not prompted
+
+Plan mode is a session mode, enforced at the router's plan/apply seam: while
+planning, `execute_tool` on `write_file`/`edit_file`/`delete_file`/`bash`
+(non-allowlisted) returns a tool error — "plan approved first; propose the
+plan" — which the model sees and adapts to, exactly like a path-guard
+rejection. The plan itself is a `exit_plan_mode(plan)` tool call that parks
+the turn on a **plan card** (the §4.2 approval-card family: Approve starts
+execution mode, Revise sends the edit back as a tool result). No writes are
+possible before approval *by construction*, because the write path is
+`execute_approved` and nothing calls it yet.
+
+### 19.3 The subagent runtime (shared with Phase 8)
+
+One runtime, two consumers: the `spawn_subagent` tool (interactive) and the
+workflow engine's `agent()` (scripted). A subagent is a conversation with a
+**tool policy**:
+
+- `read-only` — the router is constructed without write/bash tools (structural,
+  not conventional; "don't edit" as prose is a promise, an absent tool is a fact);
+- `full` — the §17.1 manifest, writes still parking on approval cards (the
+  parent session's window renders them).
+
+`spawn_subagent(policy, mission, background?)` returns a subagent id and a
+first result; `send_message(id, text)` steers or resumes it; completion of a
+background subagent lands as a notification (toast + session badge), never
+as a silent drop. Subagents share the workspace root and the §17.2 guards;
+each ask runs under its own `TurnCaps`; receipts roll into the session's cost
+the way any turn's do. The runtime lives at
+`crates/selora-ai/src/agent/subagent.rs` (additive; Phase 8's engine consumes
+the same module).
+
+### 19.4 Escalations and the generalized park channel
+
+§17.4 parks a turn on an approval card; a **question card** parks it the same
+way: `ask_user_question(questions)` (each: text, 2–4 options with
+descriptions, free-text always available) produces an id on the same decision
+route, and the answer returns as a tool result the model consumes verbatim.
+One waiting mechanism, two card types. Three-escalation cap per ask (guard
+against chatter), then the model proceeds on its own judgment — the reference
+behavior.
+
+### 19.5 Compaction and session-scoped trust
+
+When the session's conversation reaches ~80% of the model's context budget
+(`TurnCaps::context_budget_tokens`), the runtime runs one summarize round
+(gateway call: summary + open todos + last N messages carry forward), records
+the compaction cursor in the journal, and continues — sessions survive their
+window. The session's auto-approve flag is `ApproveAllThisTurn` generalized
+to the session lifetime: it dies with the session, never touches settings or
+disk, and the window always shows it as armed.

@@ -76,6 +76,16 @@ run's "Phase 5d completion report" artifact for the long form).
   engine contract: the "no eval" exception narrowed structurally, the facade,
   subagent/gate/journal semantics, process-model wiring). Largest phase since
   5; 8a/8b are engine-side and wiremock-testable with no UI.
+- **Phase 9 — Agent Workbench is planned** (2026-10-07, owner clarification:
+  "proper agent mode like ZCode / DSH VS Code agent window / Claude Code
+  ultracode"): ROADMAP.md Phase 9 (dedicated Agent activity window, plan mode
+  riding 5b's plan/apply split, live todos, structured escalation questions,
+  subagents with read-only/full policies shared with Phase 8's engine,
+  resumable sessions + context compaction, session-scoped auto-approve that
+  never persists; 9a–9e subagent split, XL effort) + ARCHITECTURE.md §19 (the
+  contract: session model, plan gating, the shared subagent runtime, the
+  generalized park channel, compaction). Manifest v3. Phases 8 + 9 together
+  are the full ZCode-class experience; order after 6h is the owner's call.
 
 ## Owner decisions (2026-10-06)
 
