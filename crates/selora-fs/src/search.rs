@@ -206,7 +206,11 @@ fn run_rg(root: &Path, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchErro
     command
         .arg("--json") // line-delimited JSON events
         .arg("--fixed-strings") // the pattern is literal (UI_SPEC.md §9)
-        .arg("--no-config"); // never surprising RIPGREP_CONFIG_PATH behavior
+        .arg("--no-config") // never surprising RIPGREP_CONFIG_PATH behavior
+        // rg ≥14 only applies .gitignore inside a git repo; the builtin
+        // scanner applies it unconditionally, so without this flag the two
+        // engines disagree in non-repo folders (parity test catches it).
+        .arg("--no-require-git");
     if !query.case_sensitive {
         command.arg("--ignore-case");
     }

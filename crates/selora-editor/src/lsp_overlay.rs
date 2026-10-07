@@ -305,7 +305,7 @@ impl CompletionPopup {
 pub fn completion_word_start(line: &str, caret_col: usize) -> usize {
     let chars: Vec<char> = line.chars().collect();
     let mut start = caret_col.min(chars.len());
-    while start > 0 && chars[start - 1].is_alphanumeric() || start > 0 && chars[start - 1] == '_' {
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
         start -= 1;
     }
     start

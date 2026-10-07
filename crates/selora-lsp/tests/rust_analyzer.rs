@@ -117,23 +117,41 @@ async fn real_rust_analyzer_diagnoses_a_broken_file_and_answers_hover() {
 
     // Hover over `Vec` in good.rs (line 0, character 11 — ASCII, so UTF-16
     // equals code points): the typed API returns the type's signature.
+    // Like the definition below, hover can answer `null` or be cancelled
+    // with -32801 (ContentModified) while the sysroot index is still
+    // building (the whole point of the shared target/ cache is that later
+    // runs are fast; a loaded machine makes even warm runs slow) — poll
+    // until it has contents or the window closes.
     let good = workspace.join("src").join("good.rs");
     let good_text = std::fs::read_to_string(&good).expect("read back");
     client
         .did_open(&path_to_uri(&good), "rust", &good_text, 0)
         .await
         .expect("did_open");
-    // Let rust-analyzer notice the file before asking.
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let hover = tokio::time::timeout(
-        Duration::from_secs(60),
-        client.hover(&path_to_uri(&good), lsp_types::Position::new(0, 11)),
-    )
-    .await
-    .expect("hover answered within 60s")
-    .expect("hover ok")
-    .expect("hover has contents");
+    let hover_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let hover = loop {
+        let answered = tokio::time::timeout(
+            Duration::from_secs(60),
+            client.hover(&path_to_uri(&good), lsp_types::Position::new(0, 11)),
+        )
+        .await
+        .expect("hover answered within 60s");
+        match answered {
+            Ok(Some(hover)) => break hover,
+            Ok(None) => {} // index still building — retry
+            Err(error) => {
+                // cancelled by a state change — retry
+                let transient = format!("{error:?}").contains("-32801");
+                assert!(transient, "hover failed: {error}");
+            }
+        }
+        assert!(
+            std::time::Instant::now() < hover_deadline,
+            "hover over Vec never answered within 120s"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
     let contents = format!("{:?}", hover.contents);
     assert!(
         contents.contains("Vec") || contents.contains("alloc"),
@@ -141,14 +159,34 @@ async fn real_rust_analyzer_diagnoses_a_broken_file_and_answers_hover() {
     );
 
     // And a definition lookup: `new` (line 1, character 10) resolves to a
-    // location in the sysroot sources.
-    let definitions = tokio::time::timeout(
-        Duration::from_secs(60),
-        client.definition(&path_to_uri(&good), lsp_types::Position::new(1, 10)),
-    )
-    .await
-    .expect("definition answered within 60s")
-    .expect("definition ok");
+    // location in the sysroot sources. rust-analyzer answers `[]` while the
+    // sysroot index is still building, and cancels in-flight requests with
+    // -32801 (ContentModified) while its file watcher re-reads the fixture —
+    // both mean "not ready yet", not "no definition", so poll until it
+    // resolves or the window closes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let definitions = loop {
+        let answered = tokio::time::timeout(
+            Duration::from_secs(60),
+            client.definition(&path_to_uri(&good), lsp_types::Position::new(1, 10)),
+        )
+        .await
+        .expect("definition answered within 60s");
+        match answered {
+            Ok(definitions) if !definitions.is_empty() => break definitions,
+            Ok(_) => {} // index still building — retry
+            Err(error) => {
+                // cancelled by a state change — retry
+                let transient = format!("{error:?}").contains("-32801");
+                assert!(transient, "definition failed: {error}");
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "definition of Vec::new never resolved within 120s"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
     assert!(
         !definitions.is_empty(),
         "definition of Vec::new resolved to a location: {definitions:?}"
