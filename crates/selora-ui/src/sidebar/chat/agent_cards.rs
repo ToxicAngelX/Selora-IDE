@@ -49,9 +49,10 @@ use egui::{pos2, vec2, Align2, Color32, Pos2, Rect, Sense, Ui, Vec2};
 
 use selora_ai::{AgentDecision, AgentSummary, ApprovalCard, ApprovalId, ToolCall, ToolResult};
 
-use super::{code_font, with_alpha};
+use super::code_font;
 use crate::presence::avatar::{AgentAvatar, AvatarState, AVATAR_INLINE};
 use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
+use crate::presence::{request_anim_frame, with_alpha};
 use crate::theme::{color, font, motion, radius, space, type_scale};
 
 // -----------------------------------------------------------------------------
@@ -86,7 +87,6 @@ const WEB_URL_ROW: f32 = 16.0;
 const CARD_PAD: f32 = space::S2;
 /// How far the spin/pulse animations request the next frame (one
 /// `--dur-loop` sixtieth ≈ 20ms, smooth without busy-looping).
-const ANIM_FRAME_MS: u64 = motion::DUR_LOOP_MS as u64 / 60;
 /// The status glyph's reserved slot at the right edge of a card header.
 const GLYPH_SLOT: f32 = 16.0;
 /// Phase 6h: the avatar's reserved slot at the LEFT edge of a card
@@ -616,7 +616,7 @@ fn paint_collapsed_card(
     }
     if card.result.is_none() && !reduce_motion && turn_live {
         // The running spin in the header's glyph slot.
-        request_animation_frame(ui.ctx());
+        request_anim_frame(ui.ctx());
     }
     outcome
 }
@@ -945,7 +945,7 @@ fn paint_bash_card(
         }
     }
     if running && !reduce_motion {
-        request_animation_frame(ui.ctx());
+        request_anim_frame(ui.ctx());
     }
     outcome
 }
@@ -1103,7 +1103,7 @@ fn paint_web_search_card(
         outcome.body_rect = Some(body_rect);
     }
     if card.result.is_none() && !reduce_motion && turn_live {
-        request_animation_frame(ui.ctx());
+        request_anim_frame(ui.ctx());
     }
     outcome
 }
@@ -1167,7 +1167,7 @@ fn paint_web_fetch_card(
         outcome.body_rect = Some(body_rect);
     }
     if card.result.is_none() && !reduce_motion && turn_live {
-        request_animation_frame(ui.ctx());
+        request_anim_frame(ui.ctx());
     }
     outcome
 }
@@ -1648,7 +1648,7 @@ fn paint_web_rows(
 /// affordance), so no flag here.
 pub fn fade_alpha(elapsed: Duration) -> f32 {
     let t = (elapsed.as_secs_f32() * 1000.0 / motion::DUR_QUICK_MS as f32).clamp(0.0, 1.0);
-    cubic_bezier_y(motion::EASE_FADE, t)
+    motion::ease_bezier(motion::EASE_FADE, t)
 }
 
 /// The `pulse` glyph's opacity (§7.3: 1.0 → 0.7 → 1.0 over `--dur-loop`
@@ -1657,7 +1657,7 @@ pub fn pulse_alpha(elapsed_ms: u64, reduce_motion: bool) -> f32 {
     if reduce_motion {
         return 1.0;
     }
-    1.0 - 0.3 * pulse_eased(elapsed_ms)
+    1.0 - 0.3 * crate::presence::pulse_eased(loop_phase(elapsed_ms))
 }
 
 /// The `pulse` glyph's scale (§7.3: 1.0 → 1.08 → 1.0). A static 1.0
@@ -1666,7 +1666,7 @@ pub fn pulse_scale(elapsed_ms: u64, reduce_motion: bool) -> f32 {
     if reduce_motion {
         return 1.0;
     }
-    1.0 + 0.08 * pulse_eased(elapsed_ms)
+    1.0 + 0.08 * crate::presence::pulse_eased(loop_phase(elapsed_ms))
 }
 
 /// The `spin` glyph's leading angle (§7.3: 360° per `--dur-loop`,
@@ -1676,30 +1676,14 @@ pub fn spin_angle(elapsed_ms: u64, reduce_motion: bool) -> Option<f32> {
     if reduce_motion {
         None
     } else {
-        Some(
-            (elapsed_ms % motion::DUR_LOOP_MS as u64) as f32 / motion::DUR_LOOP_MS as f32
-                * std::f32::consts::TAU,
-        )
+        Some(loop_phase(elapsed_ms) * std::f32::consts::TAU)
     }
 }
 
-/// The pulse keyframes' easing position: a symmetric triangle wave (the
-/// 0%↔100% and 50% keyframes) through `--ease-orbital`.
-fn pulse_eased(elapsed_ms: u64) -> f32 {
-    let t = (elapsed_ms % motion::DUR_LOOP_MS as u64) as f32 / motion::DUR_LOOP_MS as f32;
-    let triangle = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
-    cubic_bezier_y(motion::EASE_ORBITAL, triangle)
-}
-
-/// The y component of a `cubic-bezier(x1, y1, x2, y2)` curve at parameter
-/// `t` (DESIGN_TOKENS.md §7.1). The curves parametrize by `t` directly
-/// rather than solving for `x` — indistinguishable for these symmetric
-/// loops and entrances, and pure/testable.
-fn cubic_bezier_y(curve: (f32, f32, f32, f32), t: f32) -> f32 {
-    let (_, y1, _, y2) = curve;
-    let t = t.clamp(0.0, 1.0);
-    let u = 1.0 - t;
-    3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t
+/// The position within one `--dur-loop` (0..1) — the phase the shared
+/// [`crate::presence::pulse_eased`] and the spin's angle take.
+fn loop_phase(elapsed_ms: u64) -> f32 {
+    (elapsed_ms % motion::DUR_LOOP_MS as u64) as f32 / motion::DUR_LOOP_MS as f32
 }
 
 /// The `spin` glyph: a 270° arc turning 360° per `--dur-loop`; under
@@ -1722,11 +1706,6 @@ fn paint_spin(painter: &egui::Painter, center: Pos2, elapsed_ms: u64, reduce_mot
             ));
         }
     }
-}
-
-/// Ask for the next animation frame while a pulse/spin is live.
-fn request_animation_frame(ctx: &egui::Context) {
-    ctx.request_repaint_after(Duration::from_millis(ANIM_FRAME_MS));
 }
 
 // -----------------------------------------------------------------------------
@@ -2472,12 +2451,13 @@ mod tests {
 
     #[test]
     fn fade_ramps_over_dur_quick() {
-        assert_eq!(fade_alpha(Duration::ZERO), 0.0);
-        assert_eq!(
-            fade_alpha(Duration::from_millis(motion::DUR_QUICK_MS as u64)),
-            1.0
+        // The token bezier evaluator (bisection) pins the endpoints to
+        // within float noise, not exact equality.
+        assert!(fade_alpha(Duration::ZERO).abs() < 1e-6);
+        assert!(
+            (fade_alpha(Duration::from_millis(motion::DUR_QUICK_MS as u64)) - 1.0).abs() < 1e-6
         );
-        assert_eq!(fade_alpha(Duration::from_secs(10)), 1.0);
+        assert!((fade_alpha(Duration::from_secs(10)) - 1.0).abs() < 1e-6);
         let mid = fade_alpha(Duration::from_millis(motion::DUR_QUICK_MS as u64 / 2));
         assert!(mid > 0.0 && mid < 1.0, "mid-fade: {mid}");
     }

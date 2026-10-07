@@ -28,6 +28,20 @@ All notable changes to Selora IDE are documented here. The format follows
   StreamGlow composer edge-glow driven by streaming activity; the LiquidPill
   melt on the agent-mode toggle; and the flag-gated MetalMark splash sheen
   (off by default — owner decision).
+- The `--scrim` overlay token (true black @ 60%): the one sanctioned modal
+  backdrop value (Phase R0; DESIGN_TOKENS.md §1.7).
+
+### Changed
+
+- Architecture seams ahead of the UI revamp (Phase R0): the title strip, the
+  status bar's workbench zones (git/LSP left, cursor center), the toast
+  stack, and both workbench empty states moved from the app shell into
+  `selora-ui` widgets (`title_bar`, `status_bar::workbench_zone`, `toasts`,
+  `empty_state`); `Toast`/`Severity` moved with them.
+- The chat header now hosts the canonical model picker (Phase 4b's
+  `picker::ModelPicker`, previously dead code): display names, a filter
+  input, and Enter-to-select while the filter owns the keyboard — the
+  header's parallel inline dropdown was deleted (~400 lines).
 
 ### Fixed
 
@@ -39,3 +53,7 @@ All notable changes to Selora IDE are documented here. The format follows
 - The chat header read "no model" and sends were blocked until a manual
   picker pick, even with a persisted `active_model`; the panel now adopts it
   at boot.
+- The "no folder open" empty state's button pair painted at the panel's
+  left edge instead of centered (UI_SPEC §12) — a `ui.horizontal` inside
+  `ui.vertical_centered` resets to left-aligned layout; the row is now
+  measured and centered.

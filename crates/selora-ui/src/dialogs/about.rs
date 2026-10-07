@@ -11,7 +11,7 @@
 //! (DESIGN_TOKENS.md §12). The version string is handed in at construction
 //! (the app's `CARGO_PKG_VERSION` — RELEASE.md §5).
 
-use selora_tokens::{color, font, radius, space, type_scale};
+use crate::theme::{color, font, radius, space, type_scale};
 
 use crate::brand;
 

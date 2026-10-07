@@ -27,14 +27,13 @@
 //! [`ChatPanel::complete_stream`] / [`ChatPanel::fail_stream`], keyed by
 //! [`ChatId`] (stale replies are dropped).
 //!
-//! The model picker dropdown is Phase 4b's widget
-//! (`crate::picker::model_picker`, built in parallel); this module holds
-//! a trait-free seam with the same event vocabulary
-//! (`Select` / `Refresh` / close-on-outside-click) so the orchestrator
-//! can swap the canonical picker in at merge. Persistence of the last 20
-//! turns and of panel visibility lives in `selora-app`
-//! (`workspace.json`); this module exposes the data via
-//! [`ChatPanel::snapshot_turns`] and [`ChatPanel::restore_turns`].
+//! The model picker is Phase 4b's canonical widget
+//! ([`crate::picker::model_picker`]) — Phase R0 wired it into the header
+//! (the parallel-build inline dropdown was deleted), gaining its filter
+//! input and keyboard navigation. Persistence of the last 20 turns and of
+//! panel visibility lives in `selora-app` (`workspace.json`); this module
+//! exposes the data via [`ChatPanel::snapshot_turns`] and
+//! [`ChatPanel::restore_turns`].
 //!
 //! Every color, font, and spacing value comes from [`crate::theme`] (the
 //! typed DESIGN_TOKENS.md contract); nothing is hardcoded here
@@ -64,11 +63,11 @@ use selora_ai::{
     ToolCall, ToolResult,
 };
 
+use crate::picker::model_picker::{self, ModelPicker, ModelPickerEvent};
 use crate::presence::liquid::LiquidPill;
 use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
 use crate::presence::stream_glow::StreamGlow;
-use crate::presence::AgentAvatar;
-use crate::sidebar::icons;
+use crate::presence::{with_alpha, AgentAvatar};
 use crate::theme::{color, font, radius, space, type_scale};
 
 /// Agent Mode cards (UI_SPEC.md §4.2) — Phase 5d's file.
@@ -91,14 +90,6 @@ pub const BUBBLE_PADDING: f32 = space::S3;
 pub const BUBBLE_GAP: f32 = space::S2;
 /// How many turns persist to `workspace.json` (Phase 4 brief, item 7).
 pub const MAX_PERSISTED_TURNS: usize = 20;
-/// Model picker dropdown width (UI_SPEC.md §4.1: 320px).
-pub const MODEL_PICKER_WIDTH: f32 = 320.0;
-/// Model picker row height (UI_SPEC.md §4.1: 32px).
-pub const MODEL_ROW_HEIGHT: f32 = 32.0;
-/// Model picker footer height (UI_SPEC.md §4.1: 24px).
-pub const MODEL_FOOTER_HEIGHT: f32 = 24.0;
-/// Model picker visible-row cap (UI_SPEC.md §4.1: scroll after 8).
-pub const MODEL_PICKER_MAX_ROWS: usize = 8;
 /// The composer input's placeholder (UI_SPEC.md §4).
 const COMPOSER_HINT: &str = "Ask anything…";
 /// The keyboard hint under the composer input (UI_SPEC.md §4 wireframe).
@@ -508,13 +499,14 @@ pub struct ChatPanel {
     /// The in-flight (or just-finished) request's id.
     in_flight: Option<ChatId>,
     /// The active model id (the header's label; set by the shell from
-    /// settings and re-set when the picker selects).
+    /// settings and re-set when the picker selects). The picker mirrors
+    /// this for its active row.
     model: Option<ModelId>,
-    /// The model catalog, fed by the shell from
-    /// `AppMessage::ModelsLoaded`.
-    models: Vec<Model>,
-    /// Whether the model picker dropdown is open.
-    picker_open: bool,
+    /// The canonical model picker (Phase R0): owns the model list, the
+    /// active row, the dropdown's open state and filter. This panel
+    /// forwards `set_models`/`set_model` into it and maps its events to
+    /// [`ChatPanelEvent::SelectModel`] / [`RefreshModels`].
+    picker: ModelPicker,
     /// Whether the `⋯` overflow menu is open.
     menu_open: bool,
     /// Agent Mode (the header pill, UI_SPEC.md §4.2): submits start agent
@@ -564,8 +556,7 @@ impl ChatPanel {
             want_focus: false,
             in_flight: None,
             model: None,
-            models: Vec::new(),
-            picker_open: false,
+            picker: ModelPicker::new(None),
             menu_open: false,
             agent_mode: false,
             reduce_motion: false,
@@ -591,18 +582,20 @@ impl ChatPanel {
     /// `settings.selora.active_model` on boot, and status-bar /
     /// command-palette model switches).
     pub fn set_model(&mut self, model: impl Into<ModelId>) {
-        self.model = Some(model.into());
+        let model = model.into();
+        self.picker.set_active_model(Some(&model));
+        self.model = Some(model);
     }
 
     /// The model catalog (fed from `AppMessage::ModelsLoaded`; the
     /// picker renders it).
     pub fn models(&self) -> &[Model] {
-        &self.models
+        self.picker.models()
     }
 
     /// Install the model catalog.
     pub fn set_models(&mut self, models: Vec<Model>) {
-        self.models = models;
+        self.picker.set_models(&models);
     }
 
     /// Whether Agent Mode is on (the header pill; UI_SPEC.md §4.2). The
@@ -656,12 +649,19 @@ impl ChatPanel {
     /// Open the model picker dropdown (the command palette's
     /// "Selora: Switch Model…" command lands here).
     pub fn open_model_picker(&mut self) {
-        self.picker_open = true;
+        self.picker.open();
     }
 
     /// Whether the model picker dropdown is open.
     pub fn is_picker_open(&self) -> bool {
-        self.picker_open
+        self.picker.is_open()
+    }
+
+    /// The picker dropdown's refresh-button rect, while it is open (the
+    /// headless-test seam — the same role `model_row_rects` in
+    /// [`ChatPanelOutcome`] plays for the rows).
+    pub fn picker_refresh_rect(&self) -> Option<Rect> {
+        self.picker.last_geometry().refresh
     }
 
     /// Whether a request is in flight (the composer is gated on this).
@@ -1056,49 +1056,14 @@ impl ChatPanel {
         );
 
         // -- model picker trigger (center) ---------------------------------
-        let label = self.model.clone().unwrap_or_else(|| "no model".to_owned());
-        let model_font = egui::FontId::new(type_scale::MD, font::FAMILY_SANS);
-        let label_width = painter
-            .layout_no_wrap(label.clone(), model_font.clone(), color::FG_DEFAULT)
-            .size()
-            .x;
-        let chevron_slot = 16.0;
-        let button_width = label_width + chevron_slot + space::S2;
+        // Phase R0: the canonical picker's closed button, pinned to the
+        // header's center slot (the widget's `show_at` placement — its
+        // own filter + keyboard navigation come along).
+        let button_width = self.picker.closed_button_width(painter);
         let button_rect = Rect::from_min_size(
             pos2(rect.center().x - button_width / 2.0, rect.top() + 8.0),
-            vec2(button_width, 24.0),
+            vec2(button_width, model_picker::CLOSED_BUTTON_HEIGHT),
         );
-        let model_response = ui.interact(
-            button_rect,
-            egui::Id::new("selora_chat_model_button"),
-            Sense::click(),
-        );
-        if model_response.hovered() {
-            painter.rect_filled(button_rect, radius::R1, color::INK_FAINT);
-        }
-        painter.text(
-            pos2(button_rect.left(), button_rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            model_font,
-            color::FG_DEFAULT,
-        );
-        icons::paint_chevron(
-            painter,
-            Rect::from_min_size(
-                pos2(
-                    button_rect.right() - chevron_slot,
-                    button_rect.center().y - 8.0,
-                ),
-                vec2(chevron_slot, 16.0),
-            ),
-            color::FG_FAINT,
-            self.picker_open,
-        );
-        if model_response.clicked() {
-            self.picker_open = !self.picker_open;
-            self.menu_open = false;
-        }
 
         // -- overflow trigger (right) ---------------------------------------
         let overflow_rect = Rect::from_min_size(
@@ -1120,9 +1085,10 @@ impl ChatPanel {
             egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
             color::FG_MUTED,
         );
+        let picker_was_open = self.picker.is_open();
         if overflow_response.clicked() {
             self.menu_open = !self.menu_open;
-            self.picker_open = false;
+            self.picker.close();
         }
 
         // -- agent-mode pill (UI_SPEC.md §4.2), left of the overflow ------
@@ -1142,136 +1108,30 @@ impl ChatPanel {
         }
         frame.agent_pill_rect = pill.rect;
 
-        self.paint_model_picker(&model_response, frame);
+        // The picker itself (after the header's absolute zones): the
+        // closed trigger at `button_rect`, the dropdown anchored below it.
+        // Selecting a model flips the panel's label and the picker's row
+        // immediately; the shell persists the id.
+        for event in self.picker.show_at(ui, button_rect) {
+            match event {
+                ModelPickerEvent::Select(id) => {
+                    self.model = Some(id.clone());
+                    frame.events.push(ChatPanelEvent::SelectModel(id));
+                }
+                ModelPickerEvent::Refresh => {
+                    frame.events.push(ChatPanelEvent::RefreshModels);
+                }
+                ModelPickerEvent::Close => {}
+            }
+        }
+        // Opening the picker closes the overflow menu (the header's
+        // mutual exclusion, preserved from the inline dropdown).
+        if self.picker.is_open() && !picker_was_open {
+            self.menu_open = false;
+        }
+        frame.model_row_rects = self.picker.last_geometry().rows;
+
         self.paint_overflow_menu(ui, &overflow_response, frame);
-    }
-
-    /// The model picker dropdown (UI_SPEC.md §4.1): 320px wide, 32px rows
-    /// with the selected row on `--ink-low` plus an `--ok` dot, and a
-    /// 24px "live from gateway" footer that doubles as the refresh
-    /// affordance (the picker seam's `Refresh` event). Anchored overlay
-    /// via [`egui::Popup`] so it floats over the conversation instead of
-    /// pushing it down.
-    fn paint_model_picker(&mut self, anchor: &egui::Response, frame: &mut FrameArtifacts) {
-        let mut open = self.picker_open;
-        let models = self.models.clone();
-        let selected = self.model.clone();
-        let mut picked: Option<ModelId> = None;
-        let mut refresh = false;
-
-        let popup = egui::Popup::from_response(anchor)
-            .open_bool(&mut open)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .width(MODEL_PICKER_WIDTH);
-        let _ = popup.show(|popup_ui| {
-            popup_ui.set_min_width(MODEL_PICKER_WIDTH);
-            if models.is_empty() {
-                let (empty_rect, _) = popup_ui.allocate_exact_size(
-                    vec2(popup_ui.available_width(), MODEL_ROW_HEIGHT),
-                    Sense::hover(),
-                );
-                popup_ui.painter().text(
-                    pos2(empty_rect.left() + space::S3, empty_rect.center().y),
-                    Align2::LEFT_CENTER,
-                    "no models — connect to load the catalog",
-                    egui::FontId::new(type_scale::SM, font::FAMILY_SANS),
-                    color::FG_FAINT,
-                );
-            } else {
-                let max_height = MODEL_ROW_HEIGHT * MODEL_PICKER_MAX_ROWS as f32;
-                egui::ScrollArea::vertical()
-                    .id_salt("selora_chat_model_rows")
-                    .auto_shrink([false, true])
-                    .max_height(max_height)
-                    .show(popup_ui, |scroll| {
-                        for model in &models {
-                            let (row_rect, response) = scroll.allocate_exact_size(
-                                vec2(scroll.available_width(), MODEL_ROW_HEIGHT),
-                                Sense::click(),
-                            );
-                            let is_selected = selected.as_deref() == Some(model.id.as_str());
-                            if is_selected {
-                                scroll
-                                    .painter()
-                                    .rect_filled(row_rect, radius::R0, color::INK_LOW);
-                            } else if response.hovered() {
-                                scroll.painter().rect_filled(
-                                    row_rect,
-                                    radius::R0,
-                                    color::INK_FAINT,
-                                );
-                            }
-                            let text_color = if is_selected || response.hovered() {
-                                color::FG_DEFAULT
-                            } else {
-                                color::FG_MUTED
-                            };
-                            scroll.painter().text(
-                                pos2(row_rect.left() + space::S3, row_rect.center().y),
-                                Align2::LEFT_CENTER,
-                                model.id.as_str(),
-                                egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
-                                text_color,
-                            );
-                            // Family tag on the right (XS, faint); the
-                            // --ok selected dot sits just left of it.
-                            let tag_width = family_tag_width(scroll.painter(), model);
-                            if tag_width > 0.0 {
-                                scroll.painter().text(
-                                    pos2(row_rect.right() - space::S3, row_rect.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    model.family.as_str(),
-                                    egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-                                    color::FG_FAINT,
-                                );
-                            }
-                            if is_selected {
-                                scroll.painter().circle_filled(
-                                    pos2(
-                                        row_rect.right() - space::S3 - tag_width - space::S2,
-                                        row_rect.center().y,
-                                    ),
-                                    3.0,
-                                    color::OK,
-                                );
-                            }
-                            if response.clicked() {
-                                picked = Some(model.id.clone());
-                            }
-                            frame.model_row_rects.push((model.id.clone(), row_rect));
-                        }
-                    });
-            }
-
-            // Footer: "N models · live from gateway" (the refresh
-            // trigger — the picker seam's Refresh event).
-            let (footer_rect, footer_response) = popup_ui.allocate_exact_size(
-                vec2(popup_ui.available_width(), MODEL_FOOTER_HEIGHT),
-                Sense::click(),
-            );
-            let count = models.len();
-            let footer_text = format!("{count} model{} · live from gateway", plural(count));
-            popup_ui.painter().text(
-                pos2(footer_rect.left() + space::S3, footer_rect.center().y),
-                Align2::LEFT_CENTER,
-                footer_text,
-                egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-                color::FG_FAINT,
-            );
-            if footer_response.clicked() {
-                refresh = true;
-            }
-        });
-
-        if let Some(model) = picked {
-            self.model = Some(model.clone());
-            frame.events.push(ChatPanelEvent::SelectModel(model));
-            open = false;
-        }
-        if refresh {
-            frame.events.push(ChatPanelEvent::RefreshModels);
-        }
-        self.picker_open = open;
     }
 
     /// The `⋯` overflow menu (UI_SPEC.md §4: clear conversation, copy
@@ -1348,7 +1208,7 @@ impl ChatPanel {
                 open = false;
             }
             Some(OverflowAction::SwitchModel) => {
-                self.picker_open = true;
+                self.picker.open();
                 open = false;
             }
             None => {}
@@ -1697,29 +1557,12 @@ fn orb_state_for(
     }
 }
 
-/// `""` for 1, `"s"` otherwise.
-fn plural(count: usize) -> &'static str {
+/// `""` for 1, `"s"` otherwise (the summary footer's wording).
+pub(crate) fn plural(count: usize) -> &'static str {
     if count == 1 {
         ""
     } else {
         "s"
-    }
-}
-
-/// The family tag's measured width (for placing the selected `--ok` dot
-/// left of it without overlap).
-fn family_tag_width(painter: &egui::Painter, model: &Model) -> f32 {
-    if model.family.is_empty() {
-        0.0
-    } else {
-        painter
-            .layout_no_wrap(
-                model.family.clone(),
-                egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-                color::FG_FAINT,
-            )
-            .size()
-            .x
     }
 }
 
@@ -1982,17 +1825,6 @@ fn prose_font() -> egui::FontId {
 /// Code font: `--type-sm` in `--font-mono` (JetBrains Mono).
 fn code_font() -> egui::FontId {
     egui::FontId::new(type_scale::SM, font::FAMILY_MONO)
-}
-
-/// A color with its opacity scaled (the fade-in).
-fn with_alpha(color: egui::Color32, alpha: f32) -> egui::Color32 {
-    let alpha = alpha.clamp(0.0, 1.0);
-    egui::Color32::from_rgba_unmultiplied(
-        color.r(),
-        color.g(),
-        color.b(),
-        (alpha * 255.0).round() as u8,
-    )
 }
 
 // -----------------------------------------------------------------------------
@@ -2601,22 +2433,21 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_footer_refresh_passes_through() {
+    fn model_picker_refresh_passes_through() {
         let mut panel = ChatPanel::new();
         panel.set_models(vec![model("glm-5.3")]);
         panel.open_model_picker();
 
         let ctx = egui::Context::default();
         frame(&ctx, egui::RawInput::default(), &mut panel);
-        // The footer sits below the rows: click the picker column in the
-        // 24px band under the last row.
+        // The dropdown's header row carries the refresh button (its rect
+        // reports through the picker-geometry seam).
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
-        let last_row = outcome.model_row_rects.last().expect("row").1;
-        let footer_click = pos2(
-            last_row.center().x,
-            last_row.bottom() + MODEL_FOOTER_HEIGHT / 2.0,
-        );
-        let outcome = frame(&ctx, raw_input_with(click_at(footer_click)), &mut panel);
+        let _ = outcome;
+        let refresh = panel
+            .picker_refresh_rect()
+            .expect("the refresh button painted");
+        let outcome = frame(&ctx, raw_input_with(click_at(refresh.center())), &mut panel);
 
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         assert!(matches!(outcome.events[0], ChatPanelEvent::RefreshModels));

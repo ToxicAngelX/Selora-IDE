@@ -36,6 +36,15 @@ pub mod color {
     pub const ERR: Color32 = Color32::from_rgb(220, 38, 38);
     pub const INFO: Color32 = Color32::from_rgb(107, 114, 128);
 
+    /// The modal-backdrop scrim (UI_SPEC.md §6/§11: "a dimmed backdrop"):
+    /// true black at 60% alpha. The one sanctioned scrim value in the app —
+    /// every `egui::Modal` backdrop paints this instead of the egui default
+    /// (the token gap STATUS.md 6g noted; Phase R0 closed it).
+    ///
+    /// Stored premultiplied (the const constructor); for pure black the
+    /// premultiplied and unmultiplied encodings are identical.
+    pub const SCRIM: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 153);
+
     // Syntax (DESIGN_TOKENS.md §1.5)
     pub const SYN_DEFAULT: Color32 = FG_DEFAULT;
     pub const SYN_KEYWORD: Color32 = Color32::from_rgb(207, 207, 207);

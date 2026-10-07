@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use selora_editor::{Editor, Language};
+use selora_editor::Editor;
 use selora_settings::{Keybind, KeybindsSettings};
 use selora_ui::dialogs::about::{AboutDialog, AboutEvent};
 use selora_ui::dialogs::settings::{SettingsDialog, SettingsEvent};
@@ -44,24 +44,16 @@ use selora_ui::panel::git::GitAction;
 use selora_ui::panel::search::SearchEvent;
 use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, ChatPanelEvent, TreeEvent};
 use selora_ui::splash::{Splash, SplashEvent};
-use selora_ui::{brand, theme};
+use selora_ui::status_bar::{self, workbench_zone};
+use selora_ui::{empty_state, theme, title_bar, toasts};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::app_state::{AppMessage, AppState, BufferShape, Effect, Severity};
+use crate::app_state::{AppMessage, AppState, BufferShape, Effect};
 use crate::persistence::{self, WorkspaceState};
 use crate::wiring;
+use selora_ui::toasts::Severity;
 
-/// Status bar height (UI_SPEC.md §1.2).
-const STATUS_BAR_HEIGHT: f32 = 24.0;
-/// Title bar height (UI_SPEC.md §1.1).
-const TITLE_BAR_HEIGHT: f32 = 32.0;
-/// Brand mark size in the title bar (UI_SPEC.md §1.1: 16px).
-const MARK_SIZE: f32 = 16.0;
-/// Brand mark inset from the window edge (UI_SPEC.md §1.1: 8px).
-const EDGE_PADDING: f32 = 8.0;
-/// Gap between the mark and the app title (UI_SPEC.md §1.1: 8px).
-const TITLE_GAP: f32 = 8.0;
 /// File-tree panel bounds (UI_SPEC.md §2: 240px default, 160–480 resizable).
 const TREE_MIN_WIDTH: f32 = 160.0;
 const TREE_MAX_WIDTH: f32 = 480.0;
@@ -73,9 +65,6 @@ const WORKSPACE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const PANEL_HEIGHT: f32 = 200.0;
 const PANEL_MIN_HEIGHT: f32 = 0.0;
 const PANEL_MAX_HEIGHT_FRAC: f32 = 0.5;
-/// Toast anchoring (UI_SPEC.md §13): 12px from each edge, above the 24px
-/// status bar.
-const TOAST_EDGE: f32 = 12.0;
 /// How long the first stroke of `Ctrl+K …` stays armed (UI_SPEC.md §15
 /// chords).
 const CHORD_WINDOW: Duration = Duration::from_millis(500);
@@ -1039,181 +1028,72 @@ impl SeloraApp {
         }
     }
 
-    /// The 24px status bar (UI_SPEC.md §1.2, Phase 2 subset): workspace root
-    /// name (or "no folder") left, cursor line:col + language center, a
-    /// muted "○ selora disconnected" right (live status is Phase 4).
+    /// The 24px status bar (UI_SPEC.md §1.2): the workbench zones (left:
+    /// git branch + per-server LSP status; center: cursor + language +
+    /// progress — the `workbench_zone` widget, Phase R0) and the right
+    /// zone (the cost meter + Selora status widgets).
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar")
-            .exact_size(STATUS_BAR_HEIGHT)
+            .exact_size(status_bar::HEIGHT)
             .resizable(false)
             .show_separator_line(true)
             .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
             .show(ui, |ui| {
-                let rect = ui.max_rect();
-                let painter = ui.painter_at(rect);
-                let sans = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS);
-                let mono = || egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_MONO);
-
-                // Left: the git branch + "●" + change count (UI_SPEC.md §1.2,
-                // the Phase 3b subset — ahead/behind need remotes, out of
-                // Lite). Outside a repository: the workspace root's name.
-                let left = match self.state.git_status.as_ref() {
-                    Some(status) => {
-                        let branch = status.branch.clone().unwrap_or_default();
-                        format!("{branch} ● {}", status.changed_count())
-                    }
-                    None => self
-                        .state
-                        .workspace
-                        .as_ref()
-                        .and_then(|workspace| workspace.root.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "no folder".to_owned()),
-                };
-                let left_font = sans();
-                // In a repo with changes, the dot runs hot (--warn); the
-                // rest of the run stays --fg-muted. Painted as one text run
-                // in --fg-muted plus a warn-colored "●" glyph over it at the
-                // branch-name offset (measured with the same font).
-                let dirty = self
-                    .state
-                    .git_status
-                    .as_ref()
-                    .is_some_and(|status| status.changed_count() > 0);
-                let dot_pos = if dirty {
-                    let branch = self
-                        .state
-                        .git_status
-                        .as_ref()
-                        .and_then(|status| status.branch.clone())
-                        .unwrap_or_default();
-                    let galley = painter.layout_no_wrap(
-                        format!("{branch} "),
-                        left_font.clone(),
-                        theme::color::FG_MUTED,
-                    );
-                    Some(egui::pos2(
-                        rect.left() + theme::space::S3 + galley.size().x,
-                        rect.center().y,
-                    ))
-                } else {
-                    None
-                };
-                painter.text(
-                    egui::pos2(rect.left() + theme::space::S3, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    left.clone(),
-                    left_font.clone(),
-                    theme::color::FG_MUTED,
-                );
-                if let Some(pos) = dot_pos {
-                    // Same font as the run it overlays, so the x offset
-                    // measured above lands exactly on the dot.
-                    painter.text(
-                        pos,
-                        egui::Align2::LEFT_CENTER,
-                        "●",
-                        left_font,
-                        theme::color::WARN,
-                    );
-                }
-
-                // Left, after the git run: per-server LSP status
-                // ("rust-analyzer: ready", Phase 3a). A dead server is a
-                // click target for `Effect::Lsp(Restart)` (§5.6).
-                let mut status_x = painter
-                    .layout_no_wrap(
-                        format!("{left}  "),
-                        egui::FontId::new(theme::type_scale::XS, theme::font::FAMILY_SANS),
-                        theme::color::FG_MUTED,
-                    )
-                    .size()
-                    .x
-                    + rect.left()
-                    + theme::space::S3;
-                let servers: Vec<(selora_lsp::LanguageId, selora_lsp::ServerStatus)> = self
-                    .state
-                    .lsp
-                    .status
-                    .iter()
-                    .map(|(language, status)| (*language, status.clone()))
-                    .collect();
-                for (language, status) in servers {
-                    let label = match &status {
-                        selora_lsp::ServerStatus::Starting => "starting".to_owned(),
-                        selora_lsp::ServerStatus::Ready => "ready".to_owned(),
-                        selora_lsp::ServerStatus::Dead(_) => "dead — click to restart".to_owned(),
+                // Left + center zones: a state snapshot in, restart
+                // events out (a dead server's run is a click target).
+                let pane = self.state.editor_area.active_pane_id();
+                let input =
+                    workbench_zone::WorkbenchInput {
+                        git: self.state.git_status.as_ref().map(|status| {
+                            workbench_zone::GitSummary {
+                                branch: status.branch.clone().unwrap_or_default(),
+                                changed_count: status.changed_count(),
+                            }
+                        }),
+                        workspace_name: self
+                            .state
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| workspace.root.file_name())
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "no folder".to_owned()),
+                        lsp_servers: self
+                            .state
+                            .lsp
+                            .status
+                            .iter()
+                            .map(|(language, status)| (*language, status.clone()))
+                            .collect(),
+                        cursor: self
+                            .state
+                            .active_path()
+                            .and_then(|path| self.state.editors.get(&(pane, path.clone())))
+                            .map(|editor| {
+                                let cursor = editor.cursor();
+                                workbench_zone::CursorSummary {
+                                    line: cursor.line + 1,
+                                    col: cursor.col + 1,
+                                    language: workbench_zone::language_name(editor.language()),
+                                }
+                            }),
+                        lsp_progress: self.state.lsp.progress.clone(),
                     };
-                    let text = format!("{}: {label}", language.server_name());
-                    let color = match &status {
-                        selora_lsp::ServerStatus::Dead(_) => theme::color::ERR,
-                        _ => theme::color::FG_MUTED,
-                    };
-                    let font = sans();
-                    let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
-                    let text_rect = egui::Rect::from_min_size(
-                        egui::pos2(status_x, rect.top()),
-                        egui::vec2(galley.size().x + theme::space::S3, rect.height()),
-                    );
-                    painter.galley(
-                        egui::pos2(status_x, rect.center().y - galley.size().y / 2.0),
-                        galley,
-                        color,
-                    );
-                    if matches!(status, selora_lsp::ServerStatus::Dead(_)) {
-                        let response = ui.interact(
-                            text_rect,
-                            egui::Id::new(("lsp_restart", language)),
-                            egui::Sense::click(),
-                        );
-                        if response.clicked() {
+                for event in workbench_zone::show(ui, &input) {
+                    match event {
+                        workbench_zone::WorkbenchEvent::RestartServer(language) => {
                             let _ = self
                                 .effect_tx
                                 .send(Effect::Lsp(selora_lsp::LspEffect::Restart(language)));
                         }
                     }
-                    status_x = text_rect.right() + theme::space::S3;
-                }
-
-                // Center: cursor line:col + language of the active tab, and
-                // the LSP work-done progress line while a server indexes
-                // ("rust-analyzer: Indexing 42%", Phase 3a).
-                let pane = self.state.editor_area.active_pane_id();
-                let mut center = self
-                    .state
-                    .active_path()
-                    .and_then(|path| self.state.editors.get(&(pane, path)))
-                    .map(|editor| {
-                        let cursor = editor.cursor();
-                        format!(
-                            "Ln {}, Col {}   {}",
-                            cursor.line + 1,
-                            cursor.col + 1,
-                            language_name(editor.language()),
-                        )
-                    })
-                    .unwrap_or_default();
-                if let Some(progress) = self.state.lsp.progress.clone() {
-                    if !center.is_empty() {
-                        center.push_str("   ");
-                    }
-                    center.push_str(&progress);
-                }
-                if !center.is_empty() {
-                    let center_font = mono();
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        center,
-                        center_font,
-                        theme::color::FG_MUTED,
-                    );
                 }
 
                 // Right: the live Selora connection (Phase 4f) at the very
                 // edge, the `Σ today` cost meter (Phase 4e) left of it.
                 // The active model from settings wins over the ping's own
                 // (the ping cannot see the picker's choice).
+                let rect = ui.max_rect();
+                let painter = ui.painter_at(rect);
                 let active_model = self.state.settings.selora.active_model.clone();
                 let status_events = selora_ui::status_bar::selora_status::show(
                     ui,
@@ -1387,7 +1267,14 @@ impl SeloraApp {
             .show(ui, |ui| {
                 *workbench = ui.max_rect();
                 if self.state.workspace.is_none() {
-                    self.empty_no_folder(ui);
+                    match empty_state::no_folder(ui) {
+                        Some(empty_state::EmptyStateEvent::OpenFolder) => self.pick_folder(),
+                        Some(empty_state::EmptyStateEvent::CloneRepo) => {
+                            self.state
+                                .toast("Clone Repo is coming soon", Severity::Info);
+                        }
+                        None => {}
+                    }
                     return;
                 }
 
@@ -1425,7 +1312,9 @@ impl SeloraApp {
             .pane(view.pane)
             .and_then(|tabs| tabs.active_path().map(Path::to_path_buf))
         else {
-            self.empty_folder_no_file(ui, view.content);
+            let fuzzy_key = self.state.settings.keybinds.fuzzy_find.clone();
+            let palette_key = self.state.settings.keybinds.command_palette.clone();
+            empty_state::pane_no_tabs(ui, view.content, &fuzzy_key, &palette_key);
             return;
         };
         let Some(buffer) = self.state.buffers.get(&path).cloned() else {
@@ -1509,87 +1398,6 @@ impl SeloraApp {
                     position,
                 }));
         }
-    }
-
-    /// Empty state: no folder open (UI_SPEC.md §12).
-    fn empty_no_folder(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.35);
-            ui.label(
-                egui::RichText::new("No folder open")
-                    .color(theme::color::FG_DEFAULT)
-                    .font(egui::FontId::new(
-                        theme::type_scale::LG,
-                        theme::font::FAMILY_SANS,
-                    )),
-            );
-            ui.add_space(theme::space::S2);
-            ui.label(
-                egui::RichText::new("Open a folder to start editing.")
-                    .italics()
-                    .color(theme::color::FG_MUTED)
-                    .font(egui::FontId::new(
-                        theme::type_scale::MD,
-                        theme::font::FAMILY_SANS,
-                    )),
-            );
-            ui.add_space(theme::space::S3);
-            ui.horizontal(|ui| {
-                let button = egui::Button::new(
-                    egui::RichText::new("Open Folder").color(theme::color::FG_DEFAULT),
-                )
-                .fill(theme::color::INK_MID)
-                .corner_radius(theme::radius::R1 as u8);
-                if ui.add(button).clicked() {
-                    self.pick_folder();
-                }
-                ui.add_space(theme::space::S1);
-                let button = egui::Button::new(
-                    egui::RichText::new("Clone Repo").color(theme::color::FG_DEFAULT),
-                )
-                .fill(theme::color::INK_MID)
-                .corner_radius(theme::radius::R1 as u8);
-                if ui.add(button).clicked() {
-                    self.state
-                        .toast("Clone Repo is coming soon", Severity::Info);
-                }
-            });
-        });
-    }
-
-    /// Empty state: a folder is open but this pane has no tab (UI_SPEC.md
-    /// §12) — the keybind hint line, with chips from the live settings.
-    fn empty_folder_no_file(&mut self, ui: &mut egui::Ui, content: egui::Rect) {
-        let fuzzy_key = self.state.settings.keybinds.fuzzy_find.clone();
-        let palette_key = self.state.settings.keybinds.command_palette.clone();
-        ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.4);
-                ui.horizontal(|ui| {
-                    keybind_chip(ui, &fuzzy_key);
-                    ui.label(
-                        egui::RichText::new("to find a file")
-                            .italics()
-                            .color(theme::color::FG_MUTED)
-                            .font(egui::FontId::new(
-                                theme::type_scale::MD,
-                                theme::font::FAMILY_SANS,
-                            )),
-                    );
-                    ui.add_space(theme::space::S2);
-                    keybind_chip(ui, &palette_key);
-                    ui.label(
-                        egui::RichText::new("for commands")
-                            .italics()
-                            .color(theme::color::FG_MUTED)
-                            .font(egui::FontId::new(
-                                theme::type_scale::MD,
-                                theme::font::FAMILY_SANS,
-                            )),
-                    );
-                });
-            });
-        });
     }
 
     // -----------------------------------------------------------------------
@@ -1807,81 +1615,14 @@ impl SeloraApp {
             .and_then(|editor| editor.caret_screen_pos())
     }
 
-    /// Toasts (UI_SPEC.md §13): bottom-right above the status bar, `--ink-mid`
-    /// fill, 1px `--ink-hi` hairline, radius-1, 12px padding, max 3.
+    /// Toasts (UI_SPEC.md §13): the stack painter is the `toasts` widget
+    /// (Phase R0); this owns the expiry clock and the repaint scheduling.
     fn toasts(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         if let Some(next) = self.state.expire_toasts(now) {
             ctx.request_repaint_after(next.saturating_duration_since(now));
         }
-        if self.state.toasts.is_empty() {
-            return;
-        }
-
-        let toasts = std::mem::take(&mut self.state.toasts);
-        let mut dismissed = None;
-        egui::Area::new(egui::Id::new("selora_toasts"))
-            .order(egui::Order::Foreground)
-            .anchor(
-                egui::Align2::RIGHT_BOTTOM,
-                egui::vec2(-TOAST_EDGE, -(TOAST_EDGE + STATUS_BAR_HEIGHT)),
-            )
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.spacing_mut().item_spacing.y = theme::space::S2;
-                for (index, toast) in toasts.iter().enumerate() {
-                    let (glyph, color) = match toast.severity {
-                        Severity::Info => ("i", theme::color::INFO),
-                        Severity::Error => ("!", theme::color::ERR),
-                    };
-                    egui::Frame::default()
-                        .fill(theme::color::INK_MID)
-                        .stroke(egui::Stroke::new(1.0, theme::color::INK_HI))
-                        .corner_radius(theme::radius::R1 as u8)
-                        .inner_margin(egui::Margin::same(theme::space::S3 as i8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(glyph).color(color).font(
-                                    egui::FontId::new(
-                                        theme::type_scale::XS,
-                                        theme::font::FAMILY_MONO,
-                                    ),
-                                ));
-                                ui.label(
-                                    egui::RichText::new(toast.text.as_str())
-                                        .color(theme::color::FG_DEFAULT)
-                                        .font(egui::FontId::new(
-                                            theme::type_scale::SM,
-                                            theme::font::FAMILY_SANS,
-                                        )),
-                                );
-                                // The optional action link (Phase 6b:
-                                // "download" on the update-available toast).
-                                if let Some((label, url)) = &toast.link {
-                                    ui.hyperlink_to(
-                                        egui::RichText::new(label.as_str())
-                                            .color(theme::color::FG_MUTED)
-                                            .font(egui::FontId::new(
-                                                theme::type_scale::SM,
-                                                theme::font::FAMILY_SANS,
-                                            )),
-                                        url.as_str(),
-                                    );
-                                }
-                                if ui
-                                    .button(egui::RichText::new("×").color(theme::color::FG_FAINT))
-                                    .clicked()
-                                {
-                                    dismissed = Some(index);
-                                }
-                            });
-                        });
-                }
-            });
-        self.state.toasts = toasts;
-        if let Some(index) = dismissed {
-            self.state.toasts.remove(index);
-        }
+        toasts::show(ctx, &mut self.state.toasts);
     }
 
     // -----------------------------------------------------------------------
@@ -2062,8 +1803,9 @@ impl SeloraApp {
         // Keybinds run only when no overlay owns the keyboard.
         self.handle_keybinds(ui.ctx());
 
-        // Stages 4–6: layout, chrome, editor.
-        title_strip(ui);
+        // Stages 4–6: layout, chrome, editor. The title strip is the
+        // `title_bar` widget (Phase R0).
+        title_bar::show(ui);
         self.status_bar(ui);
         self.bottom_panel(ui);
         self.left_region(ui);
@@ -2124,7 +1866,7 @@ impl SeloraApp {
         splash.set_status(self.state.selora_status.clone());
         let screen = ctx.content_rect();
         let rect = egui::Rect::from_min_max(
-            egui::pos2(screen.min.x, screen.min.y + TITLE_BAR_HEIGHT),
+            egui::pos2(screen.min.x, screen.min.y + title_bar::HEIGHT),
             screen.max,
         );
         let events = splash.show(ctx, rect);
@@ -2136,32 +1878,6 @@ impl SeloraApp {
             self.splash = SplashState::Dismissed;
         }
     }
-}
-
-/// The title strip: brand mark on the left, 8px from the window edge, then
-/// an 8px gap, then "Selora IDE" in `--type-xl` / `--weight-semibold`
-/// (UI_SPEC.md §1.1). The OS draws the native window chrome above this.
-fn title_strip(ui: &mut egui::Ui) {
-    egui::Panel::top("title_strip")
-        .exact_size(TITLE_BAR_HEIGHT)
-        .show_separator_line(false)
-        .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
-        .show(ui, |ui| {
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add_space(EDGE_PADDING);
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(MARK_SIZE, MARK_SIZE), egui::Sense::hover());
-                brand::paint_mark(ui.painter(), rect);
-                ui.add_space(TITLE_GAP);
-                let title = egui::RichText::new("Selora IDE")
-                    .color(theme::color::FG_DEFAULT)
-                    .font(egui::FontId::new(
-                        theme::type_scale::XL,
-                        theme::font::family_sans_semibold(),
-                    ));
-                ui.add(egui::Label::new(title));
-            });
-        });
 }
 
 /// Whether edit-capable keyboard input arrived this frame: printable text or
@@ -2180,42 +1896,6 @@ fn edit_typed_this_frame(ctx: &egui::Context) -> bool {
             _ => false,
         })
     })
-}
-
-/// The display name of the active highlighting language (status bar).
-fn language_name(language: Option<Language>) -> &'static str {
-    match language {
-        None => "Plain Text",
-        Some(Language::Rust) => "Rust",
-        Some(Language::TypeScript) => "TypeScript",
-        Some(Language::Tsx) => "TSX",
-        Some(Language::JavaScript) => "JavaScript",
-        Some(Language::Python) => "Python",
-        Some(Language::Json) => "JSON",
-        Some(Language::Toml) => "TOML",
-        Some(Language::Markdown) => "Markdown",
-        Some(Language::Html) => "HTML",
-        Some(Language::Css) => "CSS",
-    }
-}
-
-/// A keybind chip for the empty-state hint (UI_SPEC.md §12): `--ink-mid`
-/// background, radius-1, `--type-xs` mono.
-fn keybind_chip(ui: &mut egui::Ui, key: &str) {
-    egui::Frame::default()
-        .fill(theme::color::INK_MID)
-        .corner_radius(theme::radius::R1 as u8)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(key)
-                    .color(theme::color::FG_DEFAULT)
-                    .font(egui::FontId::new(
-                        theme::type_scale::XS,
-                        theme::font::FAMILY_MONO,
-                    )),
-            );
-        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2333,6 +2013,7 @@ fn key_action(keybinds: &KeybindsSettings, shortcut: &egui::KeyboardShortcut) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selora_editor::Language;
     use selora_fs::tree::FileTreeNode;
     use selora_settings::Settings;
 
@@ -2818,13 +2499,6 @@ mod tests {
             modifiers: Default::default(),
         }]));
         assert!(!run(vec![egui::Event::PointerMoved(egui::Pos2::ZERO)]));
-    }
-
-    #[test]
-    fn language_names_are_stable() {
-        assert_eq!(language_name(None), "Plain Text");
-        assert_eq!(language_name(Some(Language::Rust)), "Rust");
-        assert_eq!(language_name(Some(Language::Markdown)), "Markdown");
     }
 
     // --- Agent Mode (Phase 5d) ------------------------------------------------

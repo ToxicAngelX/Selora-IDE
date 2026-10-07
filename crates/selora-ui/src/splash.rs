@@ -18,8 +18,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::theme::{color, font, motion, radius, space, type_scale};
 use selora_ai::SeloraStatus;
-use selora_tokens::{color, font, motion, radius, space, type_scale};
 
 use crate::brand;
 use crate::presence::metal;

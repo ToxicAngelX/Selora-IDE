@@ -77,6 +77,16 @@ The 13-color syntax palette is on the low end (VS Code uses 20+). This is intent
 
 Diagnostics are the one place saturated red/yellow are allowed because they are meaningful, not decorative.
 
+### 1.7 Overlay scrim
+
+One token for the modal-backdrop dim — every `egui::Modal` backdrop (settings,
+about, and the palette-class overlays) paints it; no ad-hoc alphas anywhere
+(the token gap STATUS.md 6g noted, closed in Phase R0).
+
+| Token | Value | Use |
+|---|---|---|
+| `--scrim` | `#000000` @ 60% alpha | Modal backdrops |
+
 ---
 
 ## 2. Typography

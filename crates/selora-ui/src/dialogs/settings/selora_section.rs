@@ -15,8 +15,8 @@
 //! `selora-tokens`; the only saturated uses are `--ok` (connected) and
 //! `--err` (error), both semantic (DESIGN_TOKENS.md §12).
 
+use crate::theme::{color, font, radius, space, type_scale};
 use selora_ai::SeloraStatus;
-use selora_tokens::{color, font, radius, space, type_scale};
 
 use super::{field_gap, label_style, note_style, value_style, SettingsDialog, SettingsEvent};
 

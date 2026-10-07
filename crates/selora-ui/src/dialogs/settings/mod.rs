@@ -24,9 +24,9 @@
 
 use std::path::PathBuf;
 
+use crate::theme::{color, font, radius, space, type_scale};
 use selora_ai::SeloraStatus;
 use selora_settings::{find_on_path, Keybind, Settings, SETTINGS_FILE_NAME};
-use selora_tokens::{color, font, radius, space, type_scale};
 
 /// The Selora section's pane — Phase 4a's file (`selora_section.rs`).
 mod selora_section;

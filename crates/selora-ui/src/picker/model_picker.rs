@@ -238,6 +238,23 @@ impl ModelPicker {
     /// Paint the picker (closed button, plus the dropdown while open) and
     /// return the frame's events.
     pub fn show(&mut self, ui: &mut Ui) -> Vec<ModelPickerEvent> {
+        let toggle = self.paint_closed_button(ui);
+        self.show_from_toggle(ui, toggle)
+    }
+
+    /// Paint the picker with the closed-state button pinned to `zone`
+    /// instead of flowing at the ui cursor — the chat header's
+    /// absolutely-positioned center slot (UI_SPEC.md §4) hosts the picker
+    /// this way. The dropdown anchors below the button either way.
+    pub fn show_at(&mut self, ui: &mut Ui, zone: Rect) -> Vec<ModelPickerEvent> {
+        let toggle = self.paint_toggle_in(ui, zone);
+        self.show_from_toggle(ui, toggle)
+    }
+
+    /// The shared body of [`Self::show`] / [`Self::show_at`]: keyboard
+    /// handling (before the filter's own `TextEdit` reacts), the toggle's
+    /// click, the dropdown, and the click-outside dismissal.
+    fn show_from_toggle(&mut self, ui: &mut Ui, toggle: egui::Response) -> Vec<ModelPickerEvent> {
         let mut events = Vec::new();
 
         // 1. Keyboard (read before painting — the command-palette pattern,
@@ -266,7 +283,6 @@ impl ModelPicker {
         }
 
         // 2. The closed-state button (also the dropdown's anchor).
-        let toggle = self.paint_closed_button(ui);
         let toggle_clicked = toggle.clicked();
         if toggle_clicked {
             if self.open {
@@ -316,8 +332,20 @@ impl ModelPicker {
         events
     }
 
+    /// The closed-state header button's width — the same measurement
+    /// [`Self::show`] allocates (callers that pin the trigger with
+    /// [`Self::show_at`] size their zone with this so the button never
+    /// clips its own label).
+    pub fn closed_button_width(&self, painter: &egui::Painter) -> f32 {
+        let (label, _) = self.closed_label();
+        let font = egui::FontId::new(type_scale::MD, font::FAMILY_SANS);
+        let galley = painter.layout_no_wrap(label, font, color::FG_DEFAULT);
+        (galley.size().x + 2.0 * space::S1 + space::S1 + CHEVRON_WIDTH).max(64.0)
+    }
+
     /// The closed-state header button: display name + `▾`
-    /// (UI_SPEC.md §4 center slot). Returns its response (the toggle).
+    /// (UI_SPEC.md §4 center slot), flowing at the ui cursor. Returns its
+    /// response (the toggle).
     fn paint_closed_button(&mut self, ui: &mut Ui) -> egui::Response {
         let (label, text_color) = self.closed_label();
         let font = egui::FontId::new(type_scale::MD, font::FAMILY_SANS);
@@ -325,7 +353,29 @@ impl ModelPicker {
         let width = galley.size().x + 2.0 * space::S1 + space::S1 + CHEVRON_WIDTH;
         let (rect, response) =
             ui.allocate_exact_size(vec2(width.max(64.0), CLOSED_BUTTON_HEIGHT), Sense::click());
+        self.paint_toggle(ui, rect, response, galley, text_color)
+    }
 
+    /// The closed-state button pinned to `zone` (see [`Self::show_at`]).
+    fn paint_toggle_in(&mut self, ui: &mut Ui, zone: Rect) -> egui::Response {
+        let (label, text_color) = self.closed_label();
+        let font = egui::FontId::new(type_scale::MD, font::FAMILY_SANS);
+        let galley = ui.painter().layout_no_wrap(label, font, text_color);
+        let rect = zone;
+        let response = ui.allocate_rect(rect, Sense::click());
+        self.paint_toggle(ui, rect, response, galley, text_color)
+    }
+
+    /// Paint the closed-state trigger's visuals into `rect` (both
+    /// placements share this).
+    fn paint_toggle(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        response: egui::Response,
+        galley: std::sync::Arc<egui::Galley>,
+        text_color: egui::Color32,
+    ) -> egui::Response {
         // Open = --ink-low (the open state of the token state matrix),
         // hover = --ink-faint; --radius-1, no border.
         let background = if self.open {

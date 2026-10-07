@@ -1,7 +1,56 @@
-# Status — 2026-10-07 (Phase 6 merged — Polish & Ship is code-complete; release is the owner's gate)
+# Status — 2026-10-07 (Phase R in flight — Premium UX Revamp; Phase 6 remains code-complete, release still the owner's gate)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
+
+## 2026-10-07 — Phase R (Premium UX Revamp): the plan + R0 merged
+
+**The track** (owner-approved plan, benchmark: a ZCode-class coding agent,
+strictly inside the ink design language — §12 still rules):
+
+| Item | State |
+|---|---|
+| R0 architecture seams | **merged** (see below) |
+| R1 the composer | next (multi-line auto-grow, Enter/Shift+Enter at the caret, ↑ history recall, Stop for plain streams + true cancel via `Effect::SeloraChatAbort`) |
+| R2 transcript rendering | planned (markdown-lite + syntax-highlighted code blocks, message Copy/Retry, stream footer metadata, chat empty state) |
+| R3 multi-session + restore | planned (serde on the tool cards, `sessions.json`, header switcher) |
+| R4 cards & diffs | planned (shared DiffView, syntax + word-level diff emphasis, open-at-line, bash ANSI, orb reserved arms in the status bar) |
+| R5 settings completion | planned (Agent section, keyring Brave key, real General) |
+| R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
+| R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
+
+**R0 details** (no intended visual change except the two fixes below):
+
+- `shell.rs` chrome extracted into `selora-ui` widgets: `title_bar`,
+  `status_bar::workbench_zone` (git + LSP servers left, cursor center —
+  state-in/events-out, restart click target preserved), `toasts` (the
+  `Toast`/`Severity` types moved too), `empty_state` (no-folder + pane
+  hint). The shell now composes widgets; it no longer hand-paints chrome.
+- The canonical `picker::ModelPicker` (Phase 4b's orphaned, fully-tested
+  widget) is wired into the chat header via a new `show_at` placement (the
+  header's absolutely-positioned center slot) — display names, filter
+  input, Enter-to-select, Esc/outside-click dismissal. The parallel inline
+  dropdown (~400 lines in `sidebar/chat/mod.rs`) is deleted. Tests adapted
+  (`picker_refresh_rect` seam replaces the old footer-click).
+- Animation helpers deduped into `presence`: `with_alpha` (was 3× in
+  selora-ui), `pulse_eased` (agent_cards' ms-based variant now converts to
+  phase and shares the presence easing), `request_anim_frame` replaces
+  agent_cards' local `ANIM_FRAME_MS` pair. The `fade` entrance now uses the
+  token bezier evaluator (`motion::ease_bezier`) instead of a t-parametrized
+  approximation — same §7.1 curve, one implementation.
+- Token imports unified: `splash.rs`, `dialogs/about.rs`,
+  `dialogs/settings/*` read `crate::theme` (the documented §11 path), not
+  raw `selora_tokens`.
+- `--scrim` token added (DESIGN_TOKENS.md §1.7) — closes the 6g-noted
+  backdrop token gap; applied to modals in R7.
+- **Fixed while extracting**: the no-folder empty state's button pair was
+  left-aligned (egui: `ui.horizontal` inside `vertical_centered` resets the
+  alignment) — now centered per UI_SPEC §12; the model picker's trigger
+  now sizes via the widget's own `closed_button_width`.
+- shell.rs: 3,867 → 3,541 lines (non-test code ≈ 1,890; the file is
+  test-heavy by design — the chrome's tests moved out with the widgets).
+- Gate: `cargo test --workspace` green (733 tests passing across all crates, +9 new for the extracted widgets), `cargo clippy
+  --all-targets` clean, `cargo fmt` applied.
 
 ## 2026-10-07 — Phase 6 (Polish & Ship): 6a–6g merged on main; 6h in flight
 

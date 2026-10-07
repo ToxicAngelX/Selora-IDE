@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use selora_ai::{ChatReceipt, ChatRequest, Model, Role, SeloraStatus};
 use selora_core::{Buffer, Position, SeloraError, Workspace};
@@ -46,6 +46,7 @@ use selora_ui::panel::git::GitPanel;
 use selora_ui::panel::search::SearchPanel;
 use selora_ui::sidebar::{ChatId, ChatPanel, ChatTurn, FileTreePanel};
 use selora_ui::status_bar::cost_meter::CostMeterState;
+use selora_ui::toasts::{Severity, Toast};
 use uuid::Uuid;
 
 use crate::persistence::WorkspaceState;
@@ -312,34 +313,6 @@ pub enum AppMessage {
     /// A language-server event (status, diagnostics, hover, definition,
     /// completions, progress) — reduced by [`AppState::apply_lsp`].
     Lsp(selora_lsp::LspEvent),
-}
-
-/// Toast severity (UI_SPEC.md §13): info dismisses after 4s, error after 8s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Info,
-    Error,
-}
-
-impl Severity {
-    fn lifetime(self) -> Duration {
-        match self {
-            Self::Info => Duration::from_secs(4),
-            Self::Error => Duration::from_secs(8),
-        }
-    }
-}
-
-/// One toast notification (UI_SPEC.md §13).
-#[derive(Debug, Clone)]
-pub struct Toast {
-    pub text: String,
-    pub severity: Severity,
-    pub expires_at: Instant,
-    /// An optional action link, painted as a trailing hyperlink (Phase 6b:
-    /// the update-available toast's "download"). eframe opens it in the
-    /// system browser.
-    pub link: Option<(String, String)>,
 }
 
 /// The cheap shape signature used for dirty derivation: a buffer's char and
@@ -1324,6 +1297,7 @@ fn collect_files(node: &FileTreeNode, out: &mut Vec<(PathBuf, String)>) {
 mod tests {
     use super::*;
     use selora_ui::editor::split::PaneId;
+    use std::time::Duration;
 
     fn path(name: &str) -> PathBuf {
         PathBuf::from(name)
