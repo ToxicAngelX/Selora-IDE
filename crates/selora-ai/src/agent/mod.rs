@@ -61,7 +61,10 @@ pub enum AgentDecision {
 /// What a side-effecting tool needs the user to approve before the
 /// router executes it (§17.4, UI_SPEC.md §4.2). The card is the *only*
 /// moment a write reaches disk: approving it is the save.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// (Serialize/Deserialize: Phase R3's session persistence stores parked
+/// cards so a restored session keeps its timeline.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ApprovalCard {
     /// `write_file` / `edit_file` — a unified diff (create = all
     /// additions) against the workspace file.

@@ -54,7 +54,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use egui::{pos2, vec2, Align2, Key, Rect, Sense, Ui, Vec2};
 
@@ -68,6 +70,7 @@ use crate::presence::liquid::LiquidPill;
 use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
 use crate::presence::stream_glow::StreamGlow;
 use crate::presence::{with_alpha, AgentAvatar};
+use crate::sidebar::icons;
 use crate::theme::{color, font, radius, space, type_scale};
 
 /// Agent Mode cards (UI_SPEC.md §4.2) — Phase 5d's file.
@@ -77,8 +80,6 @@ pub mod markdown;
 
 /// Header bar height (UI_SPEC.md §4: "Header bar (40px tall)").
 pub const HEADER_HEIGHT: f32 = 40.0;
-/// The panel's sidebar label (UI_SPEC.md §4).
-pub const HEADER_LABEL: &str = "CHAT";
 /// Composer height (UI_SPEC.md §4: "Composer (60px tall)").
 pub const COMPOSER_HEIGHT: f32 = 60.0;
 /// Conversation-area padding (UI_SPEC.md §4: "12px padding").
@@ -185,6 +186,150 @@ impl ChatTurn {
 }
 
 // -----------------------------------------------------------------------------
+// Sessions (Phase R3): the persisted conversation units
+// -----------------------------------------------------------------------------
+
+/// How many sessions persist (oldest evicted).
+pub const MAX_SESSIONS: usize = 20;
+/// How many entries one persisted session keeps (newest kept).
+pub const MAX_SESSION_ENTRIES: usize = 100;
+/// The auto-title's length cap.
+const TITLE_MAX_CHARS: usize = 32;
+/// The sessions dropdown's width.
+const SESSIONS_MENU_WIDTH: f32 = 280.0;
+/// One row of the sessions dropdown.
+const SESSION_ROW_HEIGHT: f32 = 30.0;
+/// Rows visible before the sessions list scrolls.
+const SESSION_MAX_VISIBLE_ROWS: usize = 8;
+
+/// One persisted conversation (Phase R3): the serde mirror of a
+/// timeline. Paint state (layout caches, animation clocks, avatars) is
+/// rebuilt on restore — only the durable content persists.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatSession {
+    pub id: uuid::Uuid,
+    /// The auto-title (the first user message, truncated) — `""` while
+    /// the session has no user turn yet.
+    pub title: String,
+    /// Unix epoch seconds.
+    pub created_at: u64,
+    pub entries: Vec<SessionEntry>,
+}
+
+/// One persisted timeline entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SessionEntry {
+    Bubble {
+        role: Role,
+        content: String,
+        error: Option<String>,
+    },
+    Card(SessionCard),
+    Summary(AgentSummary),
+}
+
+/// The persisted mirror of [`agent_cards::ToolCard`] — the call, its
+/// approval state, its result, and the latch/expanded flags. Restoring
+/// rebuilds the card's animation state fresh.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCard {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub approval: Option<(ApprovalId, ApprovalCard, u32)>,
+    pub result: Option<ToolResult>,
+    pub decided: Option<AgentDecision>,
+    pub expanded: bool,
+}
+
+/// Why a session action refused: a turn is running (Phase R3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionBusy;
+
+/// The auto-title of a session: its first user message, truncated.
+fn truncate_title(text: &str) -> String {
+    let mut title: String = text.trim().chars().take(TITLE_MAX_CHARS).collect();
+    if text.trim().chars().count() > TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    title
+}
+
+/// `now` in Unix epoch seconds.
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// `now` / `4m` / `2h` / `3d` — the session rows' relative age.
+fn relative_time(epoch: u64) -> String {
+    let now = epoch_now();
+    let delta = now.saturating_sub(epoch);
+    match delta {
+        0..=59 => "now".to_owned(),
+        60..=3599 => format!("{}m", delta / 60),
+        3600..=86399 => format!("{}h", delta / 3600),
+        _ => format!("{}d", delta / 86_400),
+    }
+}
+
+/// The persisted form of one timeline entry.
+fn session_entry_of(entry: &TimelineEntry) -> SessionEntry {
+    match entry {
+        TimelineEntry::Bubble(message) => SessionEntry::Bubble {
+            role: message.role,
+            content: message.content.clone(),
+            error: message.error.clone(),
+        },
+        TimelineEntry::Card(card) => SessionEntry::Card(SessionCard {
+            id: card.call.id.clone(),
+            name: card.call.name.clone(),
+            arguments: card.call.arguments.clone(),
+            approval: card.approval.clone(),
+            result: card.result.clone(),
+            decided: card.decided,
+            expanded: card.expanded,
+        }),
+        TimelineEntry::Summary(summary) => SessionEntry::Summary(summary.clone()),
+    }
+}
+
+/// The live form of one persisted entry.
+fn timeline_entry_of(entry: SessionEntry) -> TimelineEntry {
+    match entry {
+        SessionEntry::Bubble {
+            role,
+            content,
+            error,
+        } => TimelineEntry::Bubble(Message {
+            role,
+            content,
+            streaming: false,
+            stream_started: None,
+            last_delta: None,
+            error,
+            layout: None,
+            finished_at: None,
+        }),
+        SessionEntry::Card(card) => {
+            let mut restored = agent_cards::ToolCard::new(ToolCall {
+                id: card.id,
+                name: card.name,
+                arguments: card.arguments,
+            });
+            restored.approval = card.approval;
+            restored.result = card.result;
+            restored.decided = card.decided;
+            restored.expanded = card.expanded;
+            TimelineEntry::Card(restored)
+        }
+        SessionEntry::Summary(summary) => TimelineEntry::Summary(summary),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Events
 // -----------------------------------------------------------------------------
 
@@ -232,6 +377,9 @@ pub enum ChatPanelEvent {
     /// (`Effect::SeloraChatAbort`) — the stream's late deltas are
     /// stale-dropped.
     StopStream { id: ChatId },
+    /// A session action (switch / new) was refused while a turn runs
+    /// (Phase R3) — the shell toasts the reason.
+    SessionBlocked,
     /// A model was selected in the header's model picker. The panel has
     /// already switched its own header label; the shell persists the
     /// active model (next chat uses it).
@@ -527,6 +675,18 @@ pub struct ChatPanel {
     /// The live buffer stashed when the recall first walks back (restored
     /// when it walks forward off the end).
     history_draft: Option<String>,
+    /// Stored sessions (Phase R3), oldest first — the live timeline is
+    /// separate; switching stashes it here and loads the target.
+    sessions: Vec<ChatSession>,
+    /// The live session's identity (its id survives stashing; a new
+    /// session gets a fresh one).
+    live_id: uuid::Uuid,
+    /// The live session's auto-title ("" until its first user message).
+    live_title: String,
+    /// The live session's creation time (epoch seconds).
+    live_created: u64,
+    /// Whether the sessions dropdown is open.
+    sessions_open: bool,
 }
 
 impl Default for ChatPanel {
@@ -558,6 +718,11 @@ impl ChatPanel {
             history: Vec::new(),
             history_index: None,
             history_draft: None,
+            sessions: Vec::new(),
+            live_id: uuid::Uuid::new_v4(),
+            live_title: String::new(),
+            live_created: epoch_now(),
+            sessions_open: false,
         }
     }
 
@@ -773,11 +938,138 @@ impl ChatPanel {
             .join("\n\n")
     }
 
+    // -- sessions (Phase R3) -----------------------------------------------------
+
+    /// The stored sessions, oldest first (the live timeline is not in
+    /// here — `snapshot_sessions` stitches it in).
+    pub fn sessions(&self) -> &[ChatSession] {
+        &self.sessions
+    }
+
+    /// The live session's title (`""` until its first user message).
+    pub fn session_title(&self) -> &str {
+        &self.live_title
+    }
+
+    /// Stash the live timeline into the stored sessions (skipped when
+    /// empty), then start a fresh live session. [`SessionBusy`] — the
+    /// shell toasts — while a turn runs.
+    pub fn new_session(&mut self) -> Result<(), SessionBusy> {
+        if self.in_flight.is_some() {
+            return Err(SessionBusy);
+        }
+        self.stash_live();
+        self.entries.clear();
+        self.in_flight = None;
+        self.agent_in_flight = false;
+        self.turn_approvals = 0;
+        self.turn_cards_start = 0;
+        self.live_id = uuid::Uuid::new_v4();
+        self.live_title = String::new();
+        self.live_created = epoch_now();
+        Ok(())
+    }
+
+    /// Switch to stored session `index` (storage order, oldest first):
+    /// the live timeline is stashed, the target's becomes live.
+    /// [`SessionBusy`] while a turn runs.
+    pub fn switch_session(&mut self, index: usize) -> Result<(), SessionBusy> {
+        if self.in_flight.is_some() {
+            return Err(SessionBusy);
+        }
+        if index >= self.sessions.len() {
+            return Err(SessionBusy);
+        }
+        self.stash_live();
+        let session = self.sessions.remove(index);
+        self.load_session(session);
+        Ok(())
+    }
+
+    /// Every session for `sessions.json`: the stored ones plus the live
+    /// timeline last (an empty, untitled live session is skipped — it
+    /// would restore as noise).
+    pub fn snapshot_sessions(&self) -> Vec<ChatSession> {
+        let mut all = self.sessions.clone();
+        if !self.entries.is_empty() {
+            let mut entries: Vec<SessionEntry> =
+                self.entries.iter().map(session_entry_of).collect();
+            if entries.len() > MAX_SESSION_ENTRIES {
+                let excess = entries.len() - MAX_SESSION_ENTRIES;
+                entries.drain(0..excess);
+            }
+            all.push(ChatSession {
+                id: self.live_id,
+                title: self.live_title.clone(),
+                created_at: self.live_created,
+                entries,
+            });
+        }
+        if all.len() > MAX_SESSIONS {
+            let excess = all.len() - MAX_SESSIONS;
+            all.drain(0..excess);
+        }
+        all
+    }
+
+    /// Restore persisted sessions (app boot): the last becomes live, the
+    /// rest stored.
+    pub fn restore_sessions(&mut self, mut sessions: Vec<ChatSession>) {
+        match sessions.pop() {
+            Some(live) => {
+                self.sessions = sessions;
+                self.load_session(live);
+            }
+            None => {
+                self.sessions = Vec::new();
+            }
+        }
+    }
+
+    /// Stash the live timeline as a stored session (kept even when only
+    /// titled — an empty live timeline is dropped).
+    fn stash_live(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let mut entries: Vec<SessionEntry> = self.entries.iter().map(session_entry_of).collect();
+        if entries.len() > MAX_SESSION_ENTRIES {
+            let excess = entries.len() - MAX_SESSION_ENTRIES;
+            entries.drain(0..excess);
+        }
+        self.sessions.push(ChatSession {
+            id: self.live_id,
+            title: self.live_title.clone(),
+            created_at: self.live_created,
+            entries,
+        });
+        if self.sessions.len() > MAX_SESSIONS {
+            self.sessions.remove(0);
+        }
+    }
+
+    /// Make `session` the live timeline (a restored session never
+    /// streams; the turn state resets).
+    fn load_session(&mut self, session: ChatSession) {
+        self.entries = session.entries.into_iter().map(timeline_entry_of).collect();
+        self.live_id = session.id;
+        self.live_title = session.title;
+        self.live_created = session.created_at;
+        self.in_flight = None;
+        self.agent_in_flight = false;
+        self.turn_approvals = 0;
+        self.turn_cards_start = 0;
+    }
+
     // -- streaming lifecycle (the shell drives these) --------------------------
 
     /// Append a user bubble (programmatic injection — the Enter path
-    /// already echoes its own; do not call both for one message).
+    /// already echoes its own; do not call both for one message). The
+    /// session's auto-title latches on the first one (Phase R3).
     pub fn push_user(&mut self, text: &str) {
+        if self.live_title.is_empty() {
+            self.live_title = truncate_title(text);
+        }
         self.entries
             .push(TimelineEntry::Bubble(Message::user(text)));
     }
@@ -1047,13 +1339,72 @@ impl ChatPanel {
             rect.bottom(),
             egui::Stroke::new(1.0, color::INK_HI),
         );
-        painter.text(
-            pos2(rect.left() + space::S3, rect.center().y),
-            Align2::LEFT_CENTER,
-            HEADER_LABEL,
-            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-            color::FG_FAINT,
+
+        // -- session switcher (left) -------------------------------------------
+        // Phase R3: the session's title IS the header label (the static
+        // "CHAT" went with it) — click for the sessions dropdown.
+        let title = if self.live_title.is_empty() {
+            "new chat".to_owned()
+        } else {
+            self.live_title.clone()
+        };
+        let title_font = egui::FontId::new(type_scale::SM, font::FAMILY_SANS);
+        let mut label = title.clone();
+        let title_galley = loop {
+            let galley = painter.layout_no_wrap(label.clone(), title_font.clone(), color::FG_MUTED);
+            if galley.size().x <= 140.0 || label.chars().count() <= 4 {
+                break galley;
+            }
+            // Truncate to fit the left zone (the model picker owns the
+            // center).
+            let keep = label.chars().count() - 1;
+            let mut shortened: String = label.chars().take(keep.saturating_sub(1)).collect();
+            shortened.push('…');
+            label = shortened;
+        };
+        let session_chevron = 12.0;
+        let session_width = title_galley.size().x + session_chevron + 2.0 * space::S1;
+        let session_rect = Rect::from_min_size(
+            pos2(rect.left() + space::S3, rect.top() + 8.0),
+            vec2(session_width, 24.0),
         );
+        let session_response = ui.interact(
+            session_rect,
+            egui::Id::new("selora_chat_session_button"),
+            Sense::click(),
+        );
+        if session_response.hovered() {
+            painter.rect_filled(session_rect, radius::R1, color::INK_FAINT);
+        }
+        painter.galley(
+            pos2(
+                session_rect.left() + space::S1,
+                session_rect.center().y - title_galley.size().y / 2.0,
+            ),
+            title_galley,
+            if session_response.hovered() {
+                color::FG_DEFAULT
+            } else {
+                color::FG_MUTED
+            },
+        );
+        icons::paint_chevron(
+            painter,
+            Rect::from_min_size(
+                pos2(
+                    session_rect.right() - session_chevron,
+                    session_rect.center().y - 8.0,
+                ),
+                vec2(session_chevron, 16.0),
+            ),
+            color::FG_FAINT,
+            self.sessions_open,
+        );
+        if session_response.clicked() {
+            self.sessions_open = !self.sessions_open;
+            self.menu_open = false;
+            self.picker.close();
+        }
 
         // -- model picker trigger (center) ---------------------------------
         // Phase R0: the canonical picker's closed button, pinned to the
@@ -1089,6 +1440,7 @@ impl ChatPanel {
         if overflow_response.clicked() {
             self.menu_open = !self.menu_open;
             self.picker.close();
+            self.sessions_open = false;
         }
 
         // -- agent-mode pill (UI_SPEC.md §4.2), left of the overflow ------
@@ -1124,14 +1476,195 @@ impl ChatPanel {
                 ModelPickerEvent::Close => {}
             }
         }
-        // Opening the picker closes the overflow menu (the header's
-        // mutual exclusion, preserved from the inline dropdown).
+        // Opening the picker closes the other header dropdowns (the
+        // header's mutual exclusion, preserved from the inline dropdown).
         if self.picker.is_open() && !picker_was_open {
             self.menu_open = false;
+            self.sessions_open = false;
         }
         frame.model_row_rects = self.picker.last_geometry().rows;
 
         self.paint_overflow_menu(ui, &overflow_response, frame);
+        self.paint_sessions_menu(ui, &session_rect, frame);
+    }
+
+    /// The sessions dropdown (Phase R3): "New session" on top, the live
+    /// session (marked), then the stored ones newest-first. A click
+    /// stashes + loads (or starts fresh); anything mid-turn refuses with
+    /// [`ChatPanelEvent::SessionBlocked`] (the shell toasts).
+    fn paint_sessions_menu(&mut self, ui: &mut Ui, anchor: &Rect, frame: &mut FrameArtifacts) {
+        let mut open = self.sessions_open;
+        let mut open_new = false;
+        let mut switch_to: Option<usize> = None;
+        let mut blocked = false;
+
+        if open {
+            // Esc dismisses (the picker's keyboard rule).
+            if ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
+                open = false;
+            }
+        }
+        if open {
+            let screen = ui.ctx().input(egui::InputState::viewport_rect);
+            let pos = pos2(anchor.left(), anchor.bottom() + space::S1);
+            let _ = screen; // the menu opens downward from the header; short lists fit
+            let area = egui::Area::new(egui::Id::new("selora_chat_sessions_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .interactable(true)
+                .movable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(SESSIONS_MENU_WIDTH);
+                    ui.set_max_width(SESSIONS_MENU_WIDTH);
+                    egui::Frame::default()
+                        .fill(color::INK_MID)
+                        .stroke(egui::Stroke::new(1.0, color::INK_HI))
+                        .corner_radius(radius::R2)
+                        .inner_margin(egui::Margin::same(space::S2 as i8))
+                        .show(ui, |ui| {
+                            // New session.
+                            let (rect, response) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 28.0),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.painter().rect_filled(rect, radius::R0, color::INK_FAINT);
+                            }
+                            ui.painter().text(
+                                pos2(rect.left() + space::S3, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "+ new session",
+                                egui::FontId::new(type_scale::SM, font::FAMILY_SANS),
+                                if response.hovered() {
+                                    color::FG_DEFAULT
+                                } else {
+                                    color::FG_MUTED
+                                },
+                            );
+                            if response.clicked() {
+                                open_new = true;
+                            }
+
+                            // The live session (marked), then stored,
+                            // newest first.
+                            let stored = self.sessions.clone();
+                            let rows: Vec<(bool, String, String, usize)> = std::iter::once((
+                                true,
+                                if self.live_title.is_empty() {
+                                    "new chat".to_owned()
+                                } else {
+                                    self.live_title.clone()
+                                },
+                                format!("{} turns", self.entries.len()),
+                                usize::MAX, // the live row: never a switch target
+                            ))
+                            .chain(stored.iter().rev().enumerate().map(|(display, session)| {
+                                (
+                                    false,
+                                    if session.title.is_empty() {
+                                        "untitled".to_owned()
+                                    } else {
+                                        session.title.clone()
+                                    },
+                                    format!(
+                                        "{} turns · {}",
+                                        session.entries.len(),
+                                        relative_time(session.created_at)
+                                    ),
+                                    stored.len() - 1 - display, // storage index
+                                )
+                            }))
+                            .collect();
+                            egui::ScrollArea::vertical()
+                                .id_salt("selora_chat_sessions_rows")
+                                .max_height(SESSION_ROW_HEIGHT * SESSION_MAX_VISIBLE_ROWS as f32)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    for (is_live, title, meta, storage_index) in rows {
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            vec2(ui.available_width(), SESSION_ROW_HEIGHT),
+                                            Sense::click(),
+                                        );
+                                        if is_live {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                radius::R0,
+                                                color::INK_LOW,
+                                            );
+                                        } else if response.hovered() {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                radius::R0,
+                                                color::INK_FAINT,
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            pos2(rect.left() + space::S3, rect.top() + 13.0),
+                                            Align2::LEFT_CENTER,
+                                            title,
+                                            egui::FontId::new(type_scale::SM, font::FAMILY_SANS),
+                                            if is_live || response.hovered() {
+                                                color::FG_DEFAULT
+                                            } else {
+                                                color::FG_MUTED
+                                            },
+                                        );
+                                        ui.painter().text(
+                                            pos2(rect.right() - space::S3, rect.top() + 13.0),
+                                            Align2::RIGHT_CENTER,
+                                            meta,
+                                            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+                                            color::FG_FAINT,
+                                        );
+                                        if is_live {
+                                            // The live row's `--ok` marker
+                                            // (liveness semantics only).
+                                            ui.painter().circle_filled(
+                                                pos2(
+                                                    rect.right() - space::S3 - 44.0,
+                                                    rect.top() + 13.0,
+                                                ),
+                                                3.0,
+                                                color::OK,
+                                            );
+                                        } else if response.clicked() {
+                                            switch_to = Some(storage_index);
+                                        }
+                                    }
+                                });
+                        });
+                });
+            let menu_rect = area.response.rect;
+            // Click-outside dismissal (the picker's rule).
+            let clicked_outside = ui.ctx().input(|i| {
+                i.pointer.any_click()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !menu_rect.contains(pos) && !anchor.contains(pos))
+            });
+            if clicked_outside {
+                open = false;
+            }
+        }
+
+        if open_new {
+            if self.new_session().is_err() {
+                blocked = true;
+            }
+            open = false;
+        }
+        if let Some(index) = switch_to {
+            if self.switch_session(index).is_err() {
+                blocked = true;
+            } else {
+                open = false;
+            }
+        }
+        if blocked {
+            frame.events.push(ChatPanelEvent::SessionBlocked);
+        }
+        self.sessions_open = open;
     }
 
     /// The `⋯` overflow menu (UI_SPEC.md §4: clear conversation, copy
@@ -3030,6 +3563,135 @@ mod tests {
         ));
         assert!(panel.is_streaming());
         assert_eq!(panel.turn_count(), 1); // the failed bubble went; the user turn stays
+    }
+
+    // -- sessions (Phase R3) ------------------------------------------------------
+
+    #[test]
+    fn new_session_stashes_titled_timelines() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("first question");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "an answer");
+        panel.complete_stream(id);
+        assert_eq!(panel.session_title(), "first question");
+
+        panel.new_session().expect("new session");
+        assert_eq!(panel.turn_count(), 0, "the live timeline cleared");
+        assert_eq!(panel.session_title(), "", "a fresh session is untitled");
+        assert_eq!(panel.sessions().len(), 1);
+        assert_eq!(panel.sessions()[0].title, "first question");
+        assert_eq!(panel.sessions()[0].entries.len(), 2);
+
+        // An empty live session never stashes (no noise).
+        panel.new_session().expect("new session again");
+        assert_eq!(
+            panel.sessions().len(),
+            1,
+            "the empty live session was skipped"
+        );
+
+        // A second conversation stashes beside the first.
+        panel.set_composer_text("second question");
+        let id = send(&mut panel).expect("send");
+        panel.complete_stream(id);
+        panel.new_session().expect("stash");
+        assert_eq!(panel.sessions().len(), 2);
+        assert_eq!(panel.sessions()[1].title, "second question");
+    }
+
+    #[test]
+    fn switch_session_restores_the_timeline_with_cards() {
+        let mut panel = ChatPanel::new();
+        // A turn with a parked diff card.
+        panel.set_agent_mode(true);
+        panel.set_composer_text("edit the file");
+        let mut events = Vec::new();
+        panel.submit(&mut events);
+        let id = match events.pop() {
+            Some(ChatPanelEvent::AgentSend { id, .. }) => id,
+            other => panic!("expected AgentSend, got {other:?}"),
+        };
+        panel.tool_call_started(
+            id,
+            ToolCall {
+                id: "call_1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"main.rs"}"#.into(),
+            },
+        );
+        let approval_id = ApprovalId::nil();
+        panel.approval_needed(
+            id,
+            approval_id,
+            ApprovalCard::Diff {
+                path: "main.rs".into(),
+                diff: "@@ -1 +1 @@".into(),
+            },
+        );
+        assert_eq!(panel.turn_count(), 2); // user bubble + card
+                                           // End the turn the Stop way — the parked card stays pending
+                                           // (agent_turn_done would latch it).
+        panel.abort_stream(id);
+        assert!(
+            panel.pending_approval_id().is_some(),
+            "the card is still parked"
+        );
+
+        // Stash, start fresh, then switch back (index 0, the only
+        // stored session).
+        panel.new_session().expect("new session");
+        assert_eq!(panel.turn_count(), 0);
+        assert_eq!(panel.sessions().len(), 1);
+        panel.switch_session(0).expect("switch back");
+
+        assert_eq!(panel.turn_count(), 2, "the timeline restored");
+        assert_eq!(panel.session_title(), "edit the file");
+        assert_eq!(
+            panel.pending_approval_id(),
+            Some(approval_id),
+            "the parked card restored with its approval"
+        );
+        // The card's tool identity survived the serde mirror.
+        assert!(panel.entries.iter().any(
+            |entry| matches!(entry, TimelineEntry::Card(card) if card.call.name == "edit_file")
+        ));
+    }
+
+    #[test]
+    fn session_actions_refuse_while_a_turn_runs() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("busy");
+        let id = send(&mut panel).expect("send");
+        assert!(panel.is_streaming());
+        assert!(panel.new_session().is_err(), "new session refused mid-turn");
+        assert!(panel.switch_session(0).is_err(), "switch refused mid-turn");
+        assert_eq!(panel.turn_count(), 1, "nothing was stashed or dropped");
+
+        panel.complete_stream(id);
+        assert!(panel.new_session().is_ok(), "unlocked after the turn");
+    }
+
+    #[test]
+    fn sessions_snapshot_and_restore_round_trip() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("persisted conversation");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "with an answer");
+        panel.complete_stream(id);
+        panel.new_session().expect("stash the live one");
+
+        let snapshot = panel.snapshot_sessions();
+        assert_eq!(snapshot.len(), 1);
+
+        // A fresh panel restores the same history (the last becomes
+        // live).
+        let mut restored = ChatPanel::new();
+        restored.restore_sessions(snapshot);
+        assert_eq!(restored.session_title(), "persisted conversation");
+        assert_eq!(restored.turn_count(), 2);
+        assert_eq!(restored.sessions().len(), 0, "only the live one came back");
+        assert_eq!(restored.snapshot_sessions().len(), 1);
     }
 
     #[test]

@@ -51,6 +51,13 @@ All notable changes to Selora IDE are documented here. The format follows
   bubble and re-sends its user message.
 - The empty transcript renders a welcome state (Phase R2): the brand mark,
   a prompt, and three suggestion chips that prefill the composer.
+- Multi-session chat with restore (Phase R3): the header's label is now
+  the session's auto-titled name with a dropdown (the live session marked,
+  stored ones newest-first, "+ new session" on top). Sessions persist to
+  `sessions.json` beside `workspace.json` — the full timeline including
+  agent tool cards (serde-mirrored) survives restart; the legacy
+  `chat_turns` remain the fallback for pre-R3 files. Switching or starting
+  new mid-turn refuses with a toast; 20 sessions / 100 entries each.
 - The chat's rendered layout is cached per message (Phase R2): re-laid out
   only when the content or the panel width changes — a settled message
   costs no per-frame re-layout.

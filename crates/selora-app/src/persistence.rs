@@ -7,15 +7,26 @@
 //! (temp file + rename in the same directory). On boot the state is restored
 //! if the recorded root still exists on disk; a stale or unparsable file is
 //! ignored (first-run semantics), never fatal.
+//!
+//! `sessions.json` (Phase R3) sits beside it with the chat's full session
+//! history — timeline entries including agent tool cards, serde-mirrored in
+//! `selora_ui::sidebar::chat`. Same atomic write, same 5s cadence; the
+//! legacy `chat_turns` remain workspace.json's fallback for pre-R3 files.
 
 use std::path::{Path, PathBuf};
 
 use selora_core::SeloraError;
 use selora_settings::Settings;
+use selora_ui::sidebar::chat::ChatSession;
 use serde::{Deserialize, Serialize};
 
 /// The file name inside the settings directory (ARCHITECTURE.md §8.2).
 pub const WORKSPACE_FILE_NAME: &str = "workspace.json";
+/// The sessions file's name (Phase R3).
+pub const SESSIONS_FILE_NAME: &str = "sessions.json";
+/// The sessions file's schema version — a bump refuses to load (the
+/// legacy `chat_turns` fallback covers the boot).
+pub const SESSIONS_SCHEMA: u32 = 1;
 
 /// One persisted chat turn (Phase 4c): the role tag ("user" /
 /// "assistant") and the content. `workspace.json`'s chat unit — the shell
@@ -51,6 +62,57 @@ pub struct WorkspaceState {
 /// `workspace.json`'s path inside the settings directory `dir`.
 pub fn workspace_path(dir: &Path) -> PathBuf {
     dir.join(WORKSPACE_FILE_NAME)
+}
+
+/// `sessions.json` (Phase R3): the chat panel's session history with a
+/// schema gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionsState {
+    pub schema: u32,
+    pub sessions: Vec<ChatSession>,
+}
+
+/// `sessions.json`'s path inside the settings directory `dir`.
+pub fn sessions_path(dir: &Path) -> PathBuf {
+    dir.join(SESSIONS_FILE_NAME)
+}
+
+/// Save the session history atomically (temp + rename, the
+/// workspace.json pattern).
+pub fn save_sessions(dir: &Path, sessions: &[ChatSession]) -> Result<(), SeloraError> {
+    let state = SessionsState {
+        schema: SESSIONS_SCHEMA,
+        sessions: sessions.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|error| SeloraError::Config(format!("failed to serialize sessions: {error}")))?;
+
+    std::fs::create_dir_all(dir)?;
+    let target = sessions_path(dir);
+    let mut tmp = target.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    std::fs::write(&tmp, json.as_bytes())?;
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(SeloraError::Io(error))
+        }
+    }
+}
+
+/// Load the persisted sessions. `None` when the file is missing,
+/// unparsable, or schema-mismatched — callers fall back to the legacy
+/// `chat_turns` (never fatal).
+pub fn load_sessions(dir: &Path) -> Option<Vec<ChatSession>> {
+    let text = std::fs::read_to_string(sessions_path(dir)).ok()?;
+    let state: SessionsState = serde_json::from_str(&text).ok()?;
+    if state.schema != SESSIONS_SCHEMA {
+        return None;
+    }
+    Some(state.sessions)
 }
 
 /// Resolve the settings directory for workspace persistence: the
@@ -301,6 +363,72 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(outside_dir);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Phase R3: sessions round-trip including an agent tool card; a
+    /// garbage or schema-mismatched file loads `None` (the legacy
+    /// fallback), never an error.
+    #[test]
+    fn sessions_round_trip_with_cards_and_refuse_garbage() {
+        use selora_ai::{AgentDecision, AgentSummary, ApprovalCard, ApprovalId, ToolResult};
+        use selora_ui::sidebar::chat::{ChatSession, SessionCard, SessionEntry};
+
+        let dir = temp_dir();
+        let mut card = SessionCard {
+            id: "call_1".into(),
+            name: "edit_file".into(),
+            arguments: r#"{"path":"main.rs"}"#.into(),
+            approval: Some((
+                ApprovalId::nil(),
+                ApprovalCard::Diff {
+                    path: "main.rs".into(),
+                    diff: "@@ -1 +1 @@\n-fn main() {}\n+// entry\nfn main() {}".into(),
+                },
+                1,
+            )),
+            result: Some(ToolResult {
+                id: "call_1".into(),
+                ok: true,
+                content: "edited".into(),
+            }),
+            decided: Some(AgentDecision::Approve),
+            expanded: true,
+        };
+        let _ = &mut card;
+        let sessions = vec![ChatSession {
+            id: uuid::Uuid::new_v4(),
+            title: "fix the build".into(),
+            created_at: 1_700_000_000,
+            entries: vec![
+                SessionEntry::Bubble {
+                    role: selora_ai::Role::User,
+                    content: "fix the build".into(),
+                    error: None,
+                },
+                SessionEntry::Card(card),
+                SessionEntry::Summary(AgentSummary {
+                    iterations: 2,
+                    tools_used: 1,
+                    approved: 1,
+                    denied: 0,
+                    tokens: 500,
+                    cost_usd: 0.01,
+                    completed: true,
+                }),
+            ],
+        }];
+        save_sessions(&dir, &sessions).expect("save sessions");
+        assert!(sessions_path(&dir).is_file());
+        assert_eq!(load_sessions(&dir).as_ref(), Some(&sessions));
+
+        // Garbage and schema mismatch both load None (the fallback).
+        std::fs::write(sessions_path(&dir), b"{ nope").expect("garbage");
+        assert_eq!(load_sessions(&dir), None);
+        let wrong_schema = serde_json::json!({ "schema": 99, "sessions": [] });
+        std::fs::write(sessions_path(&dir), wrong_schema.to_string()).expect("wrong schema");
+        assert_eq!(load_sessions(&dir), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

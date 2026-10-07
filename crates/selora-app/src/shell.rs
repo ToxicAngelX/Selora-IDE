@@ -163,6 +163,8 @@ pub struct SeloraApp {
     last_workspace_save: Instant,
     /// The last persisted snapshot (skip no-op writes).
     last_workspace_snapshot: Option<WorkspaceState>,
+    /// The last persisted sessions snapshot (Phase R3; skip no-op writes).
+    last_sessions_snapshot: Option<Vec<selora_ui::sidebar::chat::ChatSession>>,
     /// Files to reopen on restore, in tab order. Opens are issued one at a
     /// time — unbounded-channel ordering is only guaranteed per sender, and
     /// tab order *is* the restore contract (ARCHITECTURE.md §8.2).
@@ -201,6 +203,15 @@ impl SeloraApp {
     /// `workspace_dir`.
     fn restore_session(&mut self) {
         if let Some(dir) = self.workspace_dir.clone() {
+            // Phase R3: the full session history (timeline + cards),
+            // independent of the workspace root. The legacy `chat_turns`
+            // cover pre-R3 files (bubbles only) when sessions.json is
+            // absent or refuses to load.
+            let mut sessions_restored = false;
+            if let Some(sessions) = persistence::load_sessions(&dir) {
+                self.state.chat_panel.restore_sessions(sessions);
+                sessions_restored = true;
+            }
             if let Some(saved) = persistence::load(&dir) {
                 let saved = persistence::restorable(&saved);
                 if let Some(root) = saved.root {
@@ -210,10 +221,12 @@ impl SeloraApp {
                 }
                 // Region ③ restores with the session (Phase 4c): the
                 // sidebar's visibility, the agent pill (Phase 5d), and the
-                // last 20 turns.
+                // legacy turns when sessions.json did not cover it.
                 self.show_chat = saved.chat_open;
                 self.state.chat_panel.set_agent_mode(saved.agent_mode);
-                self.state.restore_chat(saved.chat_turns);
+                if !sessions_restored {
+                    self.state.restore_chat(saved.chat_turns);
+                }
             }
         }
     }
@@ -271,6 +284,7 @@ impl SeloraApp {
             workspace_dir: persistence::state_dir(),
             last_workspace_save: Instant::now(),
             last_workspace_snapshot: None,
+            last_sessions_snapshot: None,
             restore_queue: VecDeque::new(),
             restore_in_flight: None,
             last_tree_width: None,
@@ -402,7 +416,13 @@ impl SeloraApp {
             return;
         };
         let snapshot = self.state.workspace_snapshot(self.show_chat);
-        if self.last_workspace_snapshot.as_ref() == Some(&snapshot) {
+        // Phase R3: the session history rides the same cadence (its own
+        // no-op check — the layout-only snapshot below does not move when
+        // a chat does).
+        let sessions = self.state.chat_panel.snapshot_sessions();
+        if self.last_workspace_snapshot.as_ref() == Some(&snapshot)
+            && self.last_sessions_snapshot.as_ref() == Some(&sessions)
+        {
             return;
         }
         if let Err(error) = persistence::save(&dir, &snapshot) {
@@ -412,6 +432,13 @@ impl SeloraApp {
             );
         }
         self.last_workspace_snapshot = Some(snapshot);
+        if self.last_sessions_snapshot.as_ref() != Some(&sessions) {
+            if let Err(error) = persistence::save_sessions(&dir, &sessions) {
+                self.state
+                    .toast(format!("sessions not saved: {error}"), Severity::Error);
+            }
+        }
+        self.last_sessions_snapshot = Some(sessions);
     }
 
     /// §2 stage 3 (restore half): issue the queued opens one at a time so
@@ -1251,6 +1278,12 @@ impl SeloraApp {
                     self.state.chat_ids.remove(&uuid);
                     let _ = self.effect_tx.send(Effect::SeloraChatAbort(uuid));
                 }
+            }
+            // A session switch/new was refused while a turn runs
+            // (Phase R3).
+            ChatPanelEvent::SessionBlocked => {
+                self.state
+                    .toast("finish or stop the current turn first", Severity::Info);
             }
             // The panel emptied the transcript itself; an in-flight stream
             // (if any) lands into a stale id and is dropped.

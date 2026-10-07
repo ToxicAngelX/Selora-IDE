@@ -13,7 +13,7 @@ strictly inside the ink design language — §12 still rules):
 | R0 architecture seams | **merged** (see below) |
 | R1 the composer | **merged** (see below) |
 | R2 transcript rendering | **merged** (see below) |
-| R3 multi-session + restore | planned (serde on the tool cards, `sessions.json`, header switcher) |
+| R3 multi-session + restore | **merged** (see below) |
 | R4 cards & diffs | planned (shared DiffView, syntax + word-level diff emphasis, open-at-line, bash ANSI, orb reserved arms in the status bar) |
 | R5 settings completion | planned (Agent section, keyring Brave key, real General) |
 | R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
@@ -115,7 +115,33 @@ trace back to these two.
   copy — the click ones via a four-frame grid sweep, the
   hover-revealed-affordance pattern). selora-ui 305 passing; the chat
   test helpers now register the bundled fonts (the headings use the
-  named SemiBold family)., `cargo clippy
+  named SemiBold family).
+
+**R3 details** (sessions — the conversation survives restart):
+
+- `ChatSession { id, title, created_at, entries }` + `SessionEntry`
+  (bubble / card / summary) + `SessionCard` (the serde mirror of
+  `ToolCard` — the call, approval tuple, result, latch, expanded; paint
+  state rebuilds fresh on restore). `ApprovalCard` gained serde derives
+  in `selora-ai`; selora-ui gained `serde` + `uuid` deps.
+- The panel owns the model: stored sessions (oldest first) + the live
+  timeline; `new_session`/`switch_session` stash + load (refused with
+  `SessionBusy` while a turn runs → the shell toasts via the new
+  `ChatPanelEvent::SessionBlocked`). Auto-title: the first user message
+  truncated to 32 chars. Caps: 20 sessions / 100 entries.
+- `sessions.json` (persistence.rs, schema-gated at 1) rides the 5s
+  workspace cadence with its own no-op snapshot check; boot restores the
+  last session live, falling back to the legacy `chat_turns` when the
+  file is missing/garbage/schema-mismatched.
+- The header: the session's title (truncated to the left zone) + chevron
+  IS the label — the static "CHAT" went away. The dropdown: "+ new
+  session", the live row (`--ok` marker, turn count), stored rows
+  (title, N turns · relative age), 8 rows then scroll, Esc/outside-click
+  dismissal, mutual exclusivity with the picker and overflow menus.
+- Tests: +4 panel (stash/titles, switch restores a parked diff card,
+  busy refusal, snapshot/restore round trip), +1 persistence
+  (serde round trip incl. a card; garbage/schema refuse), +1 shell
+  (boot restore)., `cargo clippy
   --all-targets` clean, `cargo fmt` applied.
 
 ## 2026-10-07 — Phase 6 (Polish & Ship): 6a–6g merged on main; 6h in flight
