@@ -5,6 +5,25 @@
 
 ## 2026-10-07 — Phase 5d landed in the working tree (uncommitted; review then merge)
 
+**Update (later same day): MERGED on main** — `682e88f` (pre-flight), `bdbed3d`
+(5d feature), `7e81a54` (real-gateway smoke test + bash ENV_ALLOWLIST). Full
+gate green after the commits (637 tests, clippy `-D warnings`, fmt).
+
+**Real-key smoke test: scripted, blocked on a valid key.** The 11-step ROADMAP
+acceptance substance is automated in
+`crates/selora-ai/tests/agent_real_gateway.rs` (#[ignore], needs
+`SELORA_API_KEY` + network). **Both sk-gw keys on this machine are dead**: the
+`SELORA_API_KEY` env var / HKCU\Environment value is the key revoked
+2026-10-02 (the gateway's chat endpoint says so; list_models does NOT check
+revocation — a 200 there proves nothing), and the copy in
+`~/.codex/auth.json` is rejected as invalid. To finish the smoke: put the
+current key in the env (`setx SELORA_API_KEY sk-gw-…` or `$env:SELORA_API_KEY`
+for the session), then `cargo test -p selora-ai --test agent_real_gateway --
+--ignored --nocapture`. The pixel-level half of the 11 steps (card rendering,
+button clicks, Ctrl+Z) is covered by the selora-ui paint tests + the selora-app
+wiremock e2e; the app has never been booted on this machine (no keyring entry
+yet — first Connect persists it).
+
 Phase 5d (Agent Mode cards UI) + the final Phase 5 wiring are implemented in the
 working tree — **not yet committed**. Full gate green on top: `cargo build
 --workspace`, `cargo test --workspace` (637 passed / 0 failed, up from the 554
