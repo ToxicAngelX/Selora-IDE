@@ -39,6 +39,22 @@ All notable changes to Selora IDE are documented here. The format follows
   never reporting a user stop as an error. The partial reply stays in the
   transcript and re-enters the next request's context.
 
+- Markdown-lite rendering for assistant messages (Phase R2): `###`/`####`
+  headings, bullet and ordered lists, block quotes with a left rule, `---`
+  rules, `**strong**` (SemiBold — 700-weight bold stays banned), `*emphasis*`
+  (Medium — italics stay banned), `` `inline code` `` chips, and
+  `[text](url)` links that open in the browser on click. Fenced code blocks
+  are now tree-sitter-highlighted in the §1.5 mono palette with a header row
+  (language label + Copy); the whole message carries a Copy action.
+- Message footers (Phase R2): elapsed time + a token estimate while and
+  after streaming; a failed stream offers Retry, which drops the failed
+  bubble and re-sends its user message.
+- The empty transcript renders a welcome state (Phase R2): the brand mark,
+  a prompt, and three suggestion chips that prefill the composer.
+- The chat's rendered layout is cached per message (Phase R2): re-laid out
+  only when the content or the panel width changes — a settled message
+  costs no per-frame re-layout.
+
 ### Changed
 
 - Architecture seams ahead of the UI revamp (Phase R0): the title strip, the

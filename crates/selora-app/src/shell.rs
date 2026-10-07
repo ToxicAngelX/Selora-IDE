@@ -1257,7 +1257,9 @@ impl SeloraApp {
             ChatPanelEvent::Clear => {}
             // The text is already on the clipboard (the panel put it
             // there); these are the toast hooks.
-            ChatPanelEvent::CopyCode(_) => self.state.toast("code copied", Severity::Info),
+            // Code blocks and whole messages both flow through here
+            // (Phase R2 added the message-level Copy).
+            ChatPanelEvent::CopyCode(_) => self.state.toast("copied to clipboard", Severity::Info),
             ChatPanelEvent::CopyTranscript(_) => {
                 self.state.toast("transcript copied", Severity::Info)
             }

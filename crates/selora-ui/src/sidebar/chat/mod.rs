@@ -72,6 +72,8 @@ use crate::theme::{color, font, radius, space, type_scale};
 
 /// Agent Mode cards (UI_SPEC.md §4.2) — Phase 5d's file.
 pub mod agent_cards;
+/// Markdown-lite parsing for assistant messages (Phase R2).
+pub mod markdown;
 
 /// Header bar height (UI_SPEC.md §4: "Header bar (40px tall)").
 pub const HEADER_HEIGHT: f32 = 40.0;
@@ -107,6 +109,18 @@ const HISTORY_LEN: usize = 10;
 /// The Stop button's square edge (Phase R1 — painted, not a glyph, so
 /// no font carries the requirement).
 const STOP_SQUARE: f32 = 8.0;
+/// The code block's header row (Phase R2): the language label left, the
+/// Copy affordance right.
+const CODE_HEADER_HEIGHT: f32 = 22.0;
+/// The list items' inter-item gap (Phase R2).
+const LIST_ITEM_GAP: f32 = 4.0;
+/// The empty transcript's suggested prompts (Phase R2) — a click prefills
+/// the composer.
+const SUGGESTIONS: [&str; 3] = [
+    "Explain this workspace's structure",
+    "Find the TODOs and unfinished work",
+    "Review the active file for bugs",
+];
 /// Send button size (width × height; a `--radius-1` chip).
 const SEND_BUTTON_SIZE: Vec2 = Vec2::new(28.0, 20.0);
 /// The overflow menu's glyph (UI_SPEC.md §4: "⋯ overflow menu").
@@ -308,6 +322,9 @@ struct FrameArtifacts {
     summary_footer_rect: Option<Rect>,
     /// Code copied this frame (applied by `show`: clipboard + event).
     copies: Vec<String>,
+    /// A failed stream's Retry was clicked (applied by the paint loop:
+    /// `ChatPanel::retry_failed`).
+    retry_clicked: bool,
 }
 
 impl Default for FrameArtifacts {
@@ -328,6 +345,7 @@ impl Default for FrameArtifacts {
             agent_pill_rect: Rect::ZERO,
             summary_footer_rect: None,
             copies: Vec::new(),
+            retry_clicked: false,
         }
     }
 }
@@ -351,6 +369,13 @@ struct Message {
     last_delta: Option<Instant>,
     /// Why the stream failed, if it did.
     error: Option<String>,
+    /// The rendered parts (Phase R2): rebuilt when the content or the
+    /// wrap width changes — never per frame (the streaming bubble
+    /// re-lays out per delta; settled bubbles once).
+    layout: Option<CachedLayout>,
+    /// When the stream ended (the footer's elapsed metadata freezes at
+    /// it). `None` while streaming or for restored turns.
+    finished_at: Option<Instant>,
 }
 
 impl Message {
@@ -362,6 +387,8 @@ impl Message {
             stream_started: None,
             last_delta: None,
             error: None,
+            layout: None,
+            finished_at: None,
         }
     }
 
@@ -384,119 +411,54 @@ enum TimelineEntry {
     Summary(AgentSummary),
 }
 
-/// One rendered piece of an assistant message: prose between fences, or
-/// a fenced code block.
-#[derive(Clone, Debug, PartialEq)]
-enum Segment<'a> {
-    /// Prose run between code fences.
-    Prose(&'a str),
-    /// A fenced code block. `complete` is `false` while the closing
-    /// fence has not arrived yet (mid-stream).
-    Code {
-        lang: Option<String>,
-        body: String,
-        complete: bool,
-    },
-}
-
-/// A code block accumulated line by line.
-struct CodeAccumulator {
-    lang: Option<String>,
-    body: String,
-}
-
-/// Split an assistant message into prose and fenced code-block segments
-/// (UI_SPEC.md §4: blocks are delimited by ``` fences; the language tag
-/// after the opening fence is captured but not rendered). An open fence
-/// at the end of the text yields an incomplete `Code` segment, which is
-/// how a mid-stream block renders as it arrives.
-fn parse_segments(content: &str) -> Vec<Segment<'_>> {
-    let mut segments = Vec::new();
-    let mut prose_start: Option<usize> = None;
-    let mut prose_end = 0usize;
-    let mut code: Option<CodeAccumulator> = None;
-
-    let mut offset = 0usize;
-    for line in content.split_inclusive('\n') {
-        let next = offset + line.len();
-        let bare = line.strip_suffix('\n').unwrap_or(line);
-        match bare.trim_start().strip_prefix("```") {
-            // A fence: closes an open block, or opens a new one.
-            Some(rest) => match code.take() {
-                Some(acc) => {
-                    segments.push(Segment::Code {
-                        lang: acc.lang,
-                        body: acc.body,
-                        complete: true,
-                    });
-                }
-                None => {
-                    if let Some(start) = prose_start.take() {
-                        push_prose(&mut segments, &content[start..prose_end]);
-                    }
-                    let lang = rest.trim();
-                    code = Some(CodeAccumulator {
-                        lang: if lang.is_empty() {
-                            None
-                        } else {
-                            Some(lang.to_owned())
-                        },
-                        body: String::new(),
-                    });
-                }
-            },
-            None => match code.as_mut() {
-                Some(acc) => {
-                    acc.body.push_str(bare);
-                    acc.body.push('\n');
-                }
-                None => {
-                    if prose_start.is_none() {
-                        prose_start = Some(offset);
-                    }
-                    prose_end = next;
-                }
-            },
-        }
-        offset = next;
-    }
-
-    match code {
-        // Still inside a fence (streaming): an incomplete block.
-        Some(acc) => segments.push(Segment::Code {
-            lang: acc.lang,
-            body: acc.body,
-            complete: false,
-        }),
-        None => {
-            if let Some(start) = prose_start {
-                push_prose(&mut segments, &content[start..prose_end]);
-            }
-        }
-    }
-    segments
-}
-
-/// Push a prose segment unless it is entirely whitespace.
-fn push_prose<'a>(segments: &mut Vec<Segment<'a>>, text: &'a str) {
-    if !text.trim().is_empty() {
-        segments.push(Segment::Prose(text));
-    }
-}
-
-/// One laid-out piece of a bubble.
+/// One laid-out piece of an assistant message (Phase R2): the markdown
+/// blocks' rendered form, produced by [`build_parts`] and cached on
+/// [`Message`] (rebuilt only when the content or the wrap width moves).
+#[derive(Clone, Debug)]
 enum Part {
-    /// A wrapped prose galley.
-    Prose { galley: Arc<egui::Galley> },
-    /// A code block: its source (for Copy), the wrapped galley, the
-    /// block height (with its 12px padding), and whether the fence
-    /// closed (Copy only appears on closed blocks).
+    /// A prose-ish block (paragraph, heading, list item, quote): the
+    /// styled layout-job galley plus the char ranges of its links (the
+    /// click targets).
+    Prose {
+        galley: Arc<egui::Galley>,
+        links: Vec<LinkSpan>,
+        /// A quote block paints a left rule and indents.
+        quote: bool,
+    },
+    /// A `---` hairline.
+    Rule,
+    /// A fenced code block, syntax-highlighted: its source (for Copy),
+    /// the highlighted galley, the block height (header + body +
+    /// padding), whether the fence closed (Copy only appears on closed
+    /// blocks), and the language tag for the header label.
     Code {
         body: String,
         galley: Arc<egui::Galley>,
         block_height: f32,
         complete: bool,
+        lang: Option<String>,
     },
+}
+
+/// One clickable link inside a prose galley: its char range in the
+/// galley's job and the target (a click opens the browser).
+#[derive(Clone, Debug)]
+struct LinkSpan {
+    /// Char range within the layout job's text.
+    range: std::ops::Range<usize>,
+    url: String,
+}
+
+/// The cached rendered form of an assistant message (Phase R2): the
+/// parts and their total height, valid while the content length and the
+/// wrap width hold. The streaming fade's first 240ms rebuilds per frame
+/// (the fade bakes into the section colors).
+#[derive(Clone, Debug)]
+struct CachedLayout {
+    content_len: usize,
+    wrap: f32,
+    parts: Vec<Part>,
+    height: f32,
 }
 
 // -----------------------------------------------------------------------------
@@ -845,6 +807,8 @@ impl ChatPanel {
                 stream_started: Some(now),
                 last_delta: Some(now),
                 error: None,
+                layout: None,
+                finished_at: None,
             }));
             return;
         }
@@ -868,6 +832,7 @@ impl ChatPanel {
         self.in_flight = None;
         if let Some(TimelineEntry::Bubble(message)) = self.entries.last_mut() {
             message.streaming = false;
+            message.finished_at = Some(Instant::now());
         }
         let is_empty_assistant = matches!(
             self.entries.last(),
@@ -889,6 +854,7 @@ impl ChatPanel {
             Some(TimelineEntry::Bubble(message)) if message.role == Role::Assistant => {
                 message.streaming = false;
                 message.error = Some(error.to_owned());
+                message.finished_at = Some(Instant::now());
             }
             _ => self.entries.push(TimelineEntry::Bubble(Message {
                 role: Role::Assistant,
@@ -897,6 +863,8 @@ impl ChatPanel {
                 stream_started: None,
                 last_delta: None,
                 error: Some(error.to_owned()),
+                layout: None,
+                finished_at: Some(Instant::now()),
             })),
         }
     }
@@ -1261,6 +1229,75 @@ impl ChatPanel {
             .show(ui, |scroll| {
                 scroll.add_space(AREA_PADDING);
                 let content_width = scroll.available_width();
+                // The empty transcript's welcome (Phase R2): the mark, a
+                // prompt, and suggestions that prefill the composer.
+                if self.entries.is_empty() {
+                    let mut prefill: Option<&'static str> = None;
+                    scroll.vertical_centered(|ui| {
+                        ui.add_space(AREA_PADDING);
+                        let (mark_rect, _) =
+                            ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                        crate::brand::paint_mark(ui.painter(), mark_rect);
+                        ui.add_space(space::S3);
+                        ui.label(
+                            egui::RichText::new("Ask anything")
+                                .color(color::FG_DEFAULT)
+                                .font(egui::FontId::new(
+                                    type_scale::LG,
+                                    font::family_sans_semibold(),
+                                )),
+                        );
+                        ui.add_space(space::S1);
+                        ui.label(
+                            egui::RichText::new(
+                                "Ask about this workspace — or pick a start below.",
+                            )
+                            .italics()
+                            .color(color::FG_MUTED)
+                            .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS)),
+                        );
+                        ui.add_space(space::S3);
+                        for suggestion in SUGGESTIONS {
+                            let galley = ui.painter().layout_no_wrap(
+                                (*suggestion).to_owned(),
+                                egui::FontId::new(type_scale::SM, font::FAMILY_SANS),
+                                color::FG_DEFAULT,
+                            );
+                            let chip = galley.size() + vec2(2.0 * space::S3, 0.0);
+                            let (chip_rect, response) = ui.allocate_exact_size(
+                                vec2(chip.x, (28.0_f32).max(chip.y + 2.0 * space::S1)),
+                                Sense::click(),
+                            );
+                            let fill = if response.hovered() {
+                                color::INK_MID
+                            } else {
+                                color::INK_LOW
+                            };
+                            ui.painter().rect_filled(chip_rect, radius::R1, fill);
+                            ui.painter().galley(
+                                pos2(
+                                    chip_rect.left() + space::S3,
+                                    chip_rect.center().y - galley.size().y / 2.0,
+                                ),
+                                galley,
+                                if response.hovered() {
+                                    color::FG_DEFAULT
+                                } else {
+                                    color::FG_MUTED
+                                },
+                            );
+                            if response.clicked() {
+                                prefill = Some(suggestion);
+                            }
+                            ui.add_space(space::S1);
+                        }
+                    });
+                    if let Some(suggestion) = prefill {
+                        self.set_composer_text(suggestion);
+                        self.focus_composer();
+                    }
+                    scroll.add_space(AREA_PADDING);
+                }
                 for index in 0..self.entries.len() {
                     match &mut self.entries[index] {
                         TimelineEntry::Bubble(message) => {
@@ -1355,6 +1392,11 @@ impl ChatPanel {
                             });
                         }
                     }
+                }
+                // A failed stream's Retry (applied after the loop — the
+                // panel methods need the borrows back).
+                if frame.retry_clicked {
+                    self.retry_failed(&mut frame.events);
                 }
                 scroll.add_space(AREA_PADDING);
             });
@@ -1673,6 +1715,37 @@ impl ChatPanel {
         COMPOSER_HEIGHT + (rows - 1.0) * COMPOSER_LINE_HEIGHT
     }
 
+    /// Retry a failed stream (Phase R2, the failed bubble's footer
+    /// button): the failed bubble is dropped and its user message
+    /// re-sent — a fresh [`ChatPanelEvent::Send`] whose request is built
+    /// from the conversation (the user turn is still there). A no-op
+    /// while anything is in flight or when the last entry isn't the
+    /// failed bubble (the button only paints there).
+    fn retry_failed(&mut self, events: &mut Vec<ChatPanelEvent>) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        let failed_is_last = matches!(
+            self.entries.last(),
+            Some(TimelineEntry::Bubble(message)) if message.error.is_some()
+        );
+        if !failed_is_last {
+            return;
+        }
+        let last_user = self.entries.iter().rev().find_map(|entry| match entry {
+            TimelineEntry::Bubble(message) if message.role == Role::User => {
+                Some(message.content.clone())
+            }
+            _ => None,
+        });
+        if let Some(text) = last_user {
+            self.entries.pop(); // the failed bubble goes; the user turn stays
+            let id = ChatId::next();
+            self.in_flight = Some(id);
+            events.push(ChatPanelEvent::Send { id, text });
+        }
+    }
+
     /// The user stopped a plain stream (the composer's Stop button,
     /// Phase R1): the bubble keeps whatever streamed, stops streaming,
     /// and the composer unlocks. Late deltas for the id are
@@ -1716,6 +1789,8 @@ fn turn_into_message(turn: ChatTurn) -> Message {
         stream_started: None,
         last_delta: None,
         error: None,
+        layout: None,
+        finished_at: None,
     }
 }
 
@@ -1772,13 +1847,250 @@ pub(crate) fn plural(count: usize) -> &'static str {
 // immutably while click targets are collected for later application)
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Layout builders (Phase R2): markdown blocks -> egui layout jobs
+// -----------------------------------------------------------------------------
+
+/// Build the layout job for one prose block's runs: each run carries its
+/// style's font/color (`**strong**` SemiBold, `*emphasis*` Medium, `` `code` ``
+/// mono on `--ink-canvas`, links underlined); links record their char
+/// ranges for click hit-testing. `fade` bakes into the colors (the
+/// streaming entrance — job galleys ignore the paint-time fallback).
+fn prose_job(
+    runs: &[markdown::Run],
+    wrap: f32,
+    fade: f32,
+    heading: Option<u8>,
+    quote: bool,
+) -> (egui::text::LayoutJob, Vec<LinkSpan>) {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let mut links = Vec::new();
+    let base = if quote {
+        color::FG_MUTED
+    } else {
+        color::FG_DEFAULT
+    };
+    let faded = with_alpha(base, fade);
+    let heading_size = |default: f32| match heading {
+        Some(3) => type_scale::XL,
+        Some(4) => type_scale::LG,
+        _ => default,
+    };
+    for run in runs {
+        let format = match run.style {
+            markdown::RunStyle::Plain => egui::TextFormat::simple(
+                egui::FontId::new(heading_size(type_scale::MD), font::FAMILY_SANS),
+                faded,
+            ),
+            markdown::RunStyle::Strong => egui::TextFormat::simple(
+                egui::FontId::new(heading_size(type_scale::MD), font::family_sans_semibold()),
+                faded,
+            ),
+            markdown::RunStyle::Emphasis => egui::TextFormat::simple(
+                egui::FontId::new(heading_size(type_scale::MD), font::family_sans_medium()),
+                faded,
+            ),
+            markdown::RunStyle::Code => egui::TextFormat {
+                font_id: code_font(),
+                color: with_alpha(color::FG_DEFAULT, fade),
+                background: with_alpha(color::INK_CANVAS, fade),
+                ..Default::default()
+            },
+            markdown::RunStyle::Link => egui::TextFormat {
+                font_id: prose_font(),
+                color: faded,
+                underline: egui::Stroke::new(1.0, faded),
+                ..Default::default()
+            },
+        };
+        let char_start = job.text.chars().count();
+        job.append(&run.text, 0.0, format);
+        let char_end = job.text.chars().count();
+        if let Some(url) = &run.url {
+            links.push(LinkSpan {
+                range: char_start..char_end,
+                url: url.clone(),
+            });
+        }
+    }
+    (job, links)
+}
+
+/// Build the layout job for a fenced code block: tree-sitter sections in
+/// the §1.5 mono-tinted palette (`--syn-*`), the gaps in `--syn-default`
+/// (§2.5's comment italics are the editor's; chat code paints color only
+/// — the SM mono has no italic face).
+fn code_job(
+    body: &str,
+    language: Option<selora_editor::Language>,
+    wrap: f32,
+    fade: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let mono = code_font();
+    let append_plain = |job: &mut egui::text::LayoutJob, text: &str| {
+        if !text.is_empty() {
+            job.append(
+                text,
+                0.0,
+                egui::TextFormat::simple(mono.clone(), with_alpha(color::SYN_DEFAULT, fade)),
+            );
+        }
+    };
+    let spans = language
+        .and_then(selora_editor::SyntaxLayer::new)
+        .map(|mut layer| {
+            layer.set_source(body);
+            layer.spans().to_vec()
+        })
+        .unwrap_or_default();
+    let mut pos = 0usize;
+    for span in spans {
+        if span.start as usize > pos {
+            append_plain(&mut job, &body[pos..span.start as usize]);
+        }
+        let format = egui::TextFormat::simple(mono.clone(), with_alpha(span.kind.color(), fade));
+        job.append(&body[span.start as usize..span.end as usize], 0.0, format);
+        pos = span.end as usize;
+    }
+    if pos < body.len() {
+        append_plain(&mut job, &body[pos..]);
+    }
+    job
+}
+
+/// Parse and lay out a message's blocks at the wrap widths (the cache's
+/// builder): the parts plus their total height, gaps included.
+fn build_parts(
+    content: &str,
+    wrap: f32,
+    code_wrap: f32,
+    fade: f32,
+    painter: &egui::Painter,
+) -> (Vec<Part>, f32) {
+    let mut parts = Vec::new();
+    let mut height = 0.0f32;
+    for block in markdown::parse(content) {
+        match block {
+            markdown::Block::Paragraph { runs } => {
+                let (job, links) = prose_job(&runs, wrap, fade, None, false);
+                let galley = painter.layout_job(job);
+                if height > 0.0 {
+                    height += BUBBLE_GAP;
+                }
+                height += galley.size().y;
+                parts.push(Part::Prose {
+                    galley,
+                    links,
+                    quote: false,
+                });
+            }
+            markdown::Block::Heading { level, runs } => {
+                let (job, links) = prose_job(&runs, wrap, fade, Some(level), false);
+                let galley = painter.layout_job(job);
+                if height > 0.0 {
+                    height += BUBBLE_GAP;
+                }
+                height += galley.size().y;
+                parts.push(Part::Prose {
+                    galley,
+                    links,
+                    quote: false,
+                });
+            }
+            markdown::Block::Quote { runs } => {
+                // The quote indents past its left rule.
+                let quote_wrap = (wrap - space::S2).max(20.0);
+                let (job, links) = prose_job(&runs, quote_wrap, fade, None, true);
+                let galley = painter.layout_job(job);
+                if height > 0.0 {
+                    height += BUBBLE_GAP;
+                }
+                height += galley.size().y;
+                parts.push(Part::Prose {
+                    galley,
+                    links,
+                    quote: true,
+                });
+            }
+            markdown::Block::List { items, ordered } => {
+                for (index, item) in items.iter().enumerate() {
+                    if height > 0.0 || index > 0 {
+                        height += if index > 0 { LIST_ITEM_GAP } else { BUBBLE_GAP };
+                    }
+                    let marker = if ordered {
+                        format!("{}. ", index + 1)
+                    } else {
+                        "- ".to_owned()
+                    };
+                    let mut runs = vec![markdown::Run::plain(marker)];
+                    runs.extend(item.iter().cloned());
+                    let (job, links) = prose_job(&runs, wrap, fade, None, false);
+                    let galley = painter.layout_job(job);
+                    height += galley.size().y;
+                    parts.push(Part::Prose {
+                        galley,
+                        links,
+                        quote: false,
+                    });
+                }
+            }
+            markdown::Block::Rule => {
+                if height > 0.0 {
+                    height += BUBBLE_GAP;
+                }
+                height += 9.0; // 4px above, the 1px line, 4px below
+                parts.push(Part::Rule);
+            }
+            markdown::Block::Code {
+                lang,
+                body,
+                complete,
+            } => {
+                let language = lang.as_deref().and_then(markdown::fence_language);
+                let job = code_job(&body, language, code_wrap, fade);
+                let galley = painter.layout_job(job);
+                let block_height = CODE_HEADER_HEIGHT + galley.size().y + 2.0 * BUBBLE_PADDING;
+                if height > 0.0 {
+                    height += BUBBLE_GAP;
+                }
+                height += block_height;
+                parts.push(Part::Code {
+                    body,
+                    galley,
+                    block_height,
+                    complete,
+                    lang,
+                });
+            }
+        }
+    }
+    (parts, height)
+}
+
+/// `1.2s` / `12s` / `1m 03s` — the footer's elapsed form.
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs_f32();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{secs:.0}s")
+    } else {
+        let whole = duration.as_secs();
+        format!("{}m {:02}s", whole / 60, whole % 60)
+    }
+}
+
 /// Paint one bubble. User bubbles are fitted and right-aligned on
 /// `--ink-mid`; assistant (and system) bubbles span the full width minus
-/// the insets on `--ink-low`, with fenced code blocks inside and the
-/// streaming fade / wave indicators when mid-stream.
+/// the insets on `--ink-low`, rendering the markdown blocks (headings,
+/// lists, quotes, rules, highlighted code, inline runs — Phase R2) with
+/// the streaming fade and the ThinkingOrb indicator when mid-stream.
 fn paint_message(
     ui: &mut Ui,
-    message: &Message,
+    message: &mut Message,
     message_index: usize,
     content_width: f32,
     frame: &mut FrameArtifacts,
@@ -1837,45 +2149,29 @@ fn paint_message(
         return;
     }
 
-    // Assistant: lay out the segments, then paint.
+    // Assistant: parse + lay out the markdown blocks (Phase R2), cached
+    // on the message — rebuilt when the content or the wrap width moves
+    // (a streaming bubble re-lays out per delta, a settled one once);
+    // the fade's first 240ms rebuilds per frame (it bakes into the
+    // section colors).
     let wrap = (max_bubble_width - 2.0 * BUBBLE_PADDING).max(20.0);
     let code_wrap = (wrap - 2.0 * BUBBLE_PADDING).max(20.0);
-    let mut parts: Vec<Part> = Vec::new();
-    let mut content_height = 0.0;
-    for segment in parse_segments(&message.content) {
-        if content_height > 0.0 {
-            content_height += BUBBLE_GAP; // gap between prose and blocks
-        }
-        match segment {
-            Segment::Prose(text) => {
-                let galley = ui.painter().layout(
-                    text.to_owned(),
-                    prose_font(),
-                    with_alpha(color::FG_DEFAULT, fade),
-                    wrap,
-                );
-                content_height += galley.size().y;
-                parts.push(Part::Prose { galley });
-            }
-            Segment::Code { body, complete, .. } => {
-                let galley = ui.painter().layout(
-                    body.clone(),
-                    code_font(),
-                    with_alpha(color::FG_DEFAULT, fade),
-                    code_wrap,
-                );
-                let block_height = galley.size().y + 2.0 * BUBBLE_PADDING;
-                content_height += block_height;
-                parts.push(Part::Code {
-                    body,
-                    galley,
-                    block_height,
-                    complete,
-                });
-                frame.code_blocks_painted += 1;
-            }
-        }
+    let stale = message
+        .layout
+        .as_ref()
+        .is_none_or(|cached| cached.content_len != message.content.len() || cached.wrap != wrap);
+    if stale || fade < 1.0 {
+        let (parts, parts_height) =
+            build_parts(&message.content, wrap, code_wrap, fade, ui.painter());
+        message.layout = Some(CachedLayout {
+            content_len: message.content.len(),
+            wrap,
+            parts,
+            height: parts_height,
+        });
     }
+    let cached = message.layout.as_ref().expect("built above");
+    let mut content_height = cached.height;
 
     // The thinking indicator: after 800ms without a delta, or while
     // waiting for the first one (UI_SPEC.md §4's trigger). Phase 6h: the
@@ -1901,21 +2197,68 @@ fn paint_message(
 
     let mut cursor = bubble_rect.top() + BUBBLE_PADDING;
     let mut block_index = 0usize;
-    for part in &parts {
+    for part in &cached.parts {
         match part {
-            Part::Prose { galley } => {
-                ui.painter().galley(
-                    pos2(bubble_rect.left() + BUBBLE_PADDING, cursor),
-                    galley.clone(),
-                    with_alpha(color::FG_DEFAULT, fade),
-                );
+            Part::Prose {
+                galley,
+                links,
+                quote,
+            } => {
+                let indent = if *quote { space::S2 } else { 0.0 };
+                if *quote {
+                    // The quote's left rule.
+                    ui.painter().vline(
+                        bubble_rect.left() + BUBBLE_PADDING,
+                        egui::Rangef::new(cursor, cursor + galley.size().y),
+                        egui::Stroke::new(1.0, with_alpha(color::INK_RULE, fade)),
+                    );
+                }
+                let galley_pos = pos2(bubble_rect.left() + BUBBLE_PADDING + indent, cursor);
+                ui.painter()
+                    .galley(galley_pos, galley.clone(), color::FG_DEFAULT);
+                // Link clicks: hit-test the pointer against the galley's
+                // char ranges (job galleys keep their baked colors; the
+                // fallback is inert).
+                if !links.is_empty() {
+                    let galley_rect = Rect::from_min_size(galley_pos, galley.size());
+                    if ui.rect_contains_pointer(galley_rect) {
+                        if let Some(local) = ui
+                            .input(|i| i.pointer.interact_pos())
+                            .map(|pos| pos - galley_pos)
+                        {
+                            let hit = galley.cursor_from_pos(local);
+                            for link in links {
+                                if link.range.contains(&hit.index.0)
+                                    && ui.input(|i| i.pointer.primary_clicked())
+                                {
+                                    ui.ctx().open_url(egui::OpenUrl {
+                                        url: link.url.clone(),
+                                        new_tab: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 cursor += galley.size().y;
+            }
+            Part::Rule => {
+                ui.painter().hline(
+                    egui::Rangef::new(
+                        bubble_rect.left() + BUBBLE_PADDING,
+                        bubble_rect.right() - BUBBLE_PADDING,
+                    ),
+                    cursor + 4.0,
+                    egui::Stroke::new(1.0, with_alpha(color::INK_RULE, fade)),
+                );
+                cursor += 9.0;
             }
             Part::Code {
                 body,
                 galley,
                 block_height,
                 complete,
+                lang,
             } => {
                 let block_rect = Rect::from_min_size(
                     pos2(bubble_rect.left() + BUBBLE_PADDING, cursor),
@@ -1935,22 +2278,21 @@ fn paint_message(
                     egui::Stroke::new(1.0, with_alpha(color::INK_HI, fade)),
                     egui::StrokeKind::Inside,
                 );
-                ui.painter().galley(
-                    pos2(
-                        block_rect.left() + BUBBLE_PADDING,
-                        block_rect.top() + BUBBLE_PADDING,
-                    ),
-                    galley.clone(),
-                    with_alpha(color::FG_DEFAULT, fade),
+                // The header row: the language label left, Copy right
+                // (on hover of the block, closed blocks only — Phase
+                // R2's header; the label falls back to "text").
+                let header_center = block_rect.top() + CODE_HEADER_HEIGHT / 2.0;
+                ui.painter().text(
+                    pos2(block_rect.left() + BUBBLE_PADDING, header_center),
+                    Align2::LEFT_CENTER,
+                    lang.as_deref().unwrap_or("text"),
+                    egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+                    with_alpha(color::FG_FAINT, fade),
                 );
-                frame.code_block_rects.push(block_rect);
-
-                // Copy button (top-right, only on hover of the block,
-                // only on closed blocks).
                 let block_hovered = ui.rect_contains_pointer(block_rect);
                 if block_hovered && *complete {
                     let copy_rect = Rect::from_min_size(
-                        pos2(block_rect.right() - 4.0 - 40.0, block_rect.top() + 4.0),
+                        pos2(block_rect.right() - 4.0 - 40.0, block_rect.top() + 3.0),
                         vec2(40.0, 16.0),
                     );
                     let copy_response = ui.interact(
@@ -1975,6 +2317,16 @@ fn paint_message(
                         frame.copies.push(body.clone());
                     }
                 }
+                ui.painter().galley(
+                    pos2(
+                        block_rect.left() + BUBBLE_PADDING,
+                        block_rect.top() + CODE_HEADER_HEIGHT,
+                    ),
+                    galley.clone(),
+                    color::FG_DEFAULT,
+                );
+                frame.code_block_rects.push(block_rect);
+                frame.code_blocks_painted += 1;
                 cursor += *block_height;
             }
         }
@@ -1995,10 +2347,15 @@ fn paint_message(
             .paint(ui, orb_rect);
     }
 
-    // A failed stream renders its note under the bubble (the only red
-    // outside diagnostics: --err, per the phase's color discipline).
-    if let Some(error) = &message.error {
-        let note = format!("stream failed: {error}");
+    // The footer row (Phase R2): a failed stream renders its note and a
+    // Retry (the only red outside diagnostics: --err, per the phase's
+    // color discipline); a successful one renders the elapsed/token
+    // metadata and the message-level Copy.
+    if message.error.is_some() {
+        let note = format!(
+            "stream failed: {}",
+            message.error.as_deref().unwrap_or_default()
+        );
         let galley = ui.painter().layout_no_wrap(
             note,
             egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
@@ -2013,6 +2370,79 @@ fn paint_message(
             galley,
             color::ERR,
         );
+        // Retry: re-send the failed turn's user message (the panel's
+        // `retry_failed`, applied by the paint loop).
+        let retry_rect = Rect::from_min_size(
+            pos2(note_rect.right() - BUBBLE_INSET - 40.0, note_rect.top()),
+            vec2(40.0, 16.0),
+        );
+        let retry_response = ui.interact(
+            retry_rect,
+            egui::Id::new(("selora_chat_retry", message_index)),
+            Sense::click(),
+        );
+        let retry_color = if retry_response.hovered() {
+            color::FG_DEFAULT
+        } else {
+            color::FG_MUTED
+        };
+        ui.painter().text(
+            retry_rect.center(),
+            Align2::CENTER_CENTER,
+            "retry",
+            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+            retry_color,
+        );
+        if retry_response.clicked() {
+            frame.retry_clicked = true;
+        }
+    } else if message.stream_started.is_some() {
+        // The metadata clock ticks while streaming: keep frames coming.
+        if message.streaming {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        let elapsed = match (message.stream_started, message.finished_at) {
+            (Some(started), Some(finished)) => finished.duration_since(started),
+            (Some(started), None) => started.elapsed(),
+            _ => Duration::ZERO,
+        };
+        let tokens = message.content.chars().count() / 4;
+        let meta = format!("{} · ~{} tok", format_elapsed(elapsed), tokens);
+        let (meta_rect, _) = ui.allocate_exact_size(vec2(content_width, 16.0), Sense::hover());
+        ui.painter().text(
+            pos2(meta_rect.left() + BUBBLE_INSET, meta_rect.center().y),
+            Align2::LEFT_CENTER,
+            meta,
+            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+            color::FG_FAINT,
+        );
+        // The message-level Copy (the code blocks keep their own).
+        if !message.content.trim().is_empty() {
+            let copy_rect = Rect::from_min_size(
+                pos2(meta_rect.right() - BUBBLE_INSET - 44.0, meta_rect.top()),
+                vec2(44.0, 16.0),
+            );
+            let copy_response = ui.interact(
+                copy_rect,
+                egui::Id::new(("selora_chat_message_copy", message_index)),
+                Sense::click(),
+            );
+            let copy_color = if copy_response.hovered() {
+                color::FG_DEFAULT
+            } else {
+                color::FG_FAINT
+            };
+            ui.painter().text(
+                copy_rect.center(),
+                Align2::CENTER_CENTER,
+                "copy",
+                egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+                copy_color,
+            );
+            if copy_response.clicked() {
+                frame.copies.push(message.content.clone());
+            }
+        }
     }
 
     frame.bubbles_painted += 1;
@@ -2065,11 +2495,15 @@ mod tests {
     }
 
     /// One headless frame over a shared context; returns the outcome.
+    /// The bundled fonts are registered per frame (Phase R2's headings
+    /// use the named SemiBold family; `set_fonts` is idempotent and the
+    /// handful of test frames re-shaping galleys costs nothing).
     fn frame(
         ctx: &egui::Context,
         input: egui::RawInput,
         panel: &mut ChatPanel,
     ) -> ChatPanelOutcome {
+        crate::theme::set_fonts(ctx);
         let mut input = input;
         if input.screen_rect.is_none() {
             input.screen_rect = Some(test_screen());
@@ -2081,6 +2515,59 @@ mod tests {
         });
         output.textures_delta.clear();
         outcome
+    }
+
+    /// Sweep a click grid (the four-frame move/move/press/release pattern
+    /// per point) over the panel, returning the release-frame's outcome
+    /// for the first point where `want` holds (Phase R2's probe for
+    /// hover-revealed affordances whose rects the outcome does not
+    /// report).
+    fn click_sweep(
+        ctx: &egui::Context,
+        panel: &mut ChatPanel,
+        xs: std::ops::Range<usize>,
+        ys: std::ops::Range<usize>,
+        step: usize,
+        want: impl Fn(&ChatPanelOutcome, &ChatPanel) -> bool,
+    ) -> Option<ChatPanelOutcome> {
+        for y in ys.step_by(step) {
+            for x in xs.clone().step_by(step) {
+                let pos = egui::pos2(x as f32, y as f32);
+                let press = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ];
+                let release = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ];
+                let mut last = None;
+                for events in [
+                    vec![egui::Event::PointerMoved(pos)],
+                    vec![egui::Event::PointerMoved(pos)],
+                    press,
+                    release,
+                ] {
+                    last = Some(frame(ctx, raw_input_with(events), panel));
+                }
+                if let Some(outcome) = last {
+                    if want(&outcome, panel) {
+                        return Some(outcome);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Click at `pos` (move, press, release in one frame's events).
@@ -2369,6 +2856,207 @@ mod tests {
         assert_eq!(panel.turn_count(), 2);
     }
 
+    // -- Phase R2: markdown rendering, actions, the empty state ---------------
+
+    #[test]
+    fn markdown_message_paints_blocks_and_code() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("go");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(
+            id,
+            "### Title\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n\nplain tail",
+        );
+        panel.complete_stream(id);
+        let ctx = egui::Context::default();
+        let _ = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        // The user bubble + the markdown bubble.
+        assert_eq!(outcome.bubbles_painted, 2);
+        assert_eq!(outcome.code_blocks_painted, 1);
+        assert_eq!(panel.turn_count(), 2);
+    }
+
+    #[test]
+    fn the_layout_cache_holds_across_frames() {
+        // A settled bubble re-lays out only when the content or the wrap
+        // width moves: the cache object survives frames (observable via
+        // the stale-check — same content, same width, no rebuild).
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("go");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "answer body");
+        panel.complete_stream(id);
+        let ctx = egui::Context::default();
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let cached = panel
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TimelineEntry::Bubble(message) => message.layout.as_ref(),
+                _ => None,
+            })
+            .expect("the bubble built its layout");
+        assert_eq!(cached.content_len, "answer body".len());
+        assert!(!cached.parts.is_empty());
+    }
+
+    #[test]
+    fn link_click_opens_the_url() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("go");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "see [docs](https://selora.dev) now");
+        panel.complete_stream(id);
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(raw_input_with(vec![]), |ui| {
+                ui.set_min_size(vec2(360.0, 600.0));
+                panel.show(ui);
+            });
+            output.textures_delta.clear();
+        }
+        // Sweep the bubble's area; the release frame that opened the url
+        // carries it in its FullOutput.
+        let mut opened = None;
+        'probe: for y in (48..=160).step_by(6) {
+            for x in (12..=340).step_by(6) {
+                let pos = egui::pos2(x as f32, y as f32);
+                let mut last_output = None;
+                for events in [
+                    vec![egui::Event::PointerMoved(pos)],
+                    vec![egui::Event::PointerMoved(pos)],
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                ] {
+                    let mut output = ctx.run_ui(raw_input_with(events), |ui| {
+                        ui.set_min_size(vec2(360.0, 600.0));
+                        panel.show(ui);
+                    });
+                    output.textures_delta.clear();
+                    last_output = Some(output);
+                }
+                if let Some(output) = last_output {
+                    let url =
+                        output
+                            .platform_output
+                            .commands
+                            .iter()
+                            .find_map(|command| match command {
+                                egui::OutputCommand::OpenUrl(url) => Some(url.url.clone()),
+                                _ => None,
+                            });
+                    if let Some(url) = url {
+                        opened = Some(url);
+                        break 'probe;
+                    }
+                }
+            }
+        }
+        assert_eq!(opened.as_deref(), Some("https://selora.dev"));
+    }
+
+    #[test]
+    fn empty_state_suggestion_prefills_the_composer() {
+        let mut panel = ChatPanel::new();
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&ctx, egui::RawInput::default(), &mut panel);
+        }
+        assert_eq!(panel.composer_text(), "");
+
+        // The chips sit centered in the welcome; a click prefills.
+        let _swept = click_sweep(&ctx, &mut panel, 40..320, 120..500, 8, |_, panel| {
+            !panel.composer_text().is_empty()
+        });
+        assert!(
+            sweep_hit(&panel),
+            "a chip was clicked: {}",
+            panel.composer_text()
+        );
+        assert!(SUGGESTIONS.contains(&panel.composer_text()));
+    }
+
+    /// Whether the composer holds one of the suggestions (the empty-state
+    /// test's sweep detector — a tiny indirection so the closure borrows
+    /// stay clean).
+    fn sweep_hit(panel: &ChatPanel) -> bool {
+        SUGGESTIONS.contains(&panel.composer_text())
+    }
+
+    #[test]
+    fn retry_resends_the_failed_turns_user_message() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("hello");
+        let id = send(&mut panel).expect("send");
+        panel.fail_stream(id, "boom");
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&ctx, egui::RawInput::default(), &mut panel);
+        }
+        assert_eq!(panel.turn_count(), 2); // user bubble + failed bubble
+
+        // The retry button sits right-aligned on the error row under the
+        // bubble.
+        let outcome = click_sweep(&ctx, &mut panel, 200..330, 60..260, 8, |outcome, _| {
+            outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, ChatPanelEvent::Send { .. }))
+        })
+        .expect("the retry button was clicked");
+        assert!(matches!(
+            &outcome.events[0],
+            ChatPanelEvent::Send { text, .. } if text == "hello"
+        ));
+        assert!(panel.is_streaming());
+        assert_eq!(panel.turn_count(), 1); // the failed bubble went; the user turn stays
+    }
+
+    #[test]
+    fn message_copy_copies_the_whole_content() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("go");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "the whole answer");
+        panel.complete_stream(id);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&ctx, egui::RawInput::default(), &mut panel);
+        }
+
+        let outcome = click_sweep(&ctx, &mut panel, 200..330, 60..260, 8, |outcome, _| {
+            outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, ChatPanelEvent::CopyCode(_)))
+        })
+        .expect("the copy button was clicked");
+        assert!(matches!(
+            &outcome.events[0],
+            ChatPanelEvent::CopyCode(text) if text == "the whole answer"
+        ));
+    }
+
     // -- streaming lifecycle ----------------------------------------------------
 
     #[test]
@@ -2527,15 +3215,11 @@ mod tests {
 
     #[test]
     fn empty_panel_paints_nothing() {
+        // Phase R2: an empty transcript paints the welcome state — but
+        // no bubbles, cards, or code blocks.
         let mut panel = ChatPanel::new();
-        let outcome = {
-            let mut outcome = ChatPanelOutcome::default();
-            egui::__run_test_ui(|ui| {
-                ui.set_min_size(vec2(360.0, 600.0));
-                outcome = panel.show(ui);
-            });
-            outcome
-        };
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         assert_eq!(outcome.bubbles_painted, 0);
         assert!(outcome.events.is_empty());
     }
@@ -2839,93 +3523,9 @@ mod tests {
         assert_eq!(turns[0], ChatTurn::user("hello"));
     }
 
-    // -- parse_segments -----------------------------------------------------------------
-
-    #[test]
-    fn parse_segments_splits_prose_and_code() {
-        let text = "before\n```rust\nfn main() {}\n```\nafter";
-        assert_eq!(
-            parse_segments(text),
-            vec![
-                Segment::Prose("before\n"),
-                Segment::Code {
-                    lang: Some("rust".to_owned()),
-                    body: "fn main() {}\n".to_owned(),
-                    complete: true
-                },
-                Segment::Prose("after"),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_segments_tolerates_a_space_after_the_fence() {
-        // The phase brief writes fences as ``` rust; the language tag is
-        // trimmed.
-        let text = "``` rust\nlet x = 1;\n```";
-        assert_eq!(
-            parse_segments(text),
-            vec![Segment::Code {
-                lang: Some("rust".to_owned()),
-                body: "let x = 1;\n".to_owned(),
-                complete: true
-            }]
-        );
-    }
-
-    #[test]
-    fn parse_segments_unclosed_fence_is_incomplete() {
-        let text = "answer:\n```\nfn partial(";
-        assert_eq!(
-            parse_segments(text),
-            vec![
-                Segment::Prose("answer:\n"),
-                Segment::Code {
-                    lang: None,
-                    body: "fn partial(\n".to_owned(),
-                    complete: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_segments_multiple_blocks_and_plain_text() {
-        assert_eq!(
-            parse_segments("just prose"),
-            vec![Segment::Prose("just prose")]
-        );
-        let text = "```a\n1\n```\nmiddle\n```b\n2\n```";
-        assert_eq!(
-            parse_segments(text),
-            vec![
-                Segment::Code {
-                    lang: Some("a".to_owned()),
-                    body: "1\n".to_owned(),
-                    complete: true
-                },
-                Segment::Prose("middle\n"),
-                Segment::Code {
-                    lang: Some("b".to_owned()),
-                    body: "2\n".to_owned(),
-                    complete: true
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_segments_skips_whitespace_only_prose() {
-        let text = "```rust\nx\n```";
-        assert_eq!(
-            parse_segments(text),
-            vec![Segment::Code {
-                lang: Some("rust".to_owned()),
-                body: "x\n".to_owned(),
-                complete: true
-            }]
-        );
-    }
+    // (The old `parse_segments` parser tests moved to `markdown`'s test
+    // suite with the Phase R2 parser — fences, prose splitting, and the
+    // incomplete-block case are covered there.)
 
     // -- misc ---------------------------------------------------------------------------
 
@@ -2942,6 +3542,7 @@ mod tests {
     /// One panel frame with its `FullOutput` kept (the presence tests
     /// inspect painted shapes; the shared `frame` helper drops them).
     fn paint_panel(ctx: &egui::Context, panel: &mut ChatPanel) -> egui::FullOutput {
+        crate::theme::set_fonts(ctx);
         let mut output = ctx.run_ui(raw_input_with(vec![]), |ui| {
             ui.set_min_size(vec2(360.0, 600.0));
             panel.show(ui);

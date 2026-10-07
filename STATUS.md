@@ -12,12 +12,20 @@ strictly inside the ink design language — §12 still rules):
 |---|---|
 | R0 architecture seams | **merged** (see below) |
 | R1 the composer | **merged** (see below) |
-| R2 transcript rendering | planned (markdown-lite + syntax-highlighted code blocks, message Copy/Retry, stream footer metadata, chat empty state) |
+| R2 transcript rendering | **merged** (see below) |
 | R3 multi-session + restore | planned (serde on the tool cards, `sessions.json`, header switcher) |
 | R4 cards & diffs | planned (shared DiffView, syntax + word-level diff emphasis, open-at-line, bash ANSI, orb reserved arms in the status bar) |
 | R5 settings completion | planned (Agent section, keyring Brave key, real General) |
 | R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
 | R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
+
+**Standing references (owner directive, 2026-10-07):** ZCode
+(https://github.com/zai-org/ZCode — the UI/UX + agent-window benchmark) and
+Zed (https://github.com/zed-industries/zed — the fast/light engine reference)
+are now recorded in ROADMAP.md's "Reference repositories" section (top of the
+doc, with the phase mapping). Ideas, never code — Zed is GPL-3.0, Selora is
+MIT. Many already-shipped features (agent cards, composer, workflows plan)
+trace back to these two.
 
 **R0 details** (no intended visual change except the two fixes below):
 
@@ -74,7 +82,40 @@ strictly inside the ink design language — §12 still rules):
 - Tests: composer (multiline submit, recall walk, abort semantics,
   send-blocked-now-stops), wiring (`chat_cancel_ends_the_stream_silently`
   — a stalled mock response, the channel closes with no terminal
-  message), shell (the StopStream route + late-delta drop)., `cargo clippy
+  message), shell (the StopStream route + late-delta drop).
+
+**R2 details** (the transcript — structure, not walls of prose):
+
+- `sidebar/chat/markdown.rs` (new, 12 unit tests): the markdown-lite
+  parser — blocks (paragraph/heading/list/quote/rule/fenced-code) and
+  inline runs (`**strong**` SemiBold, `*emphasis*` Medium, `` `code` ``
+  mono chip, `[text](url)`). Malformed input degrades to plain prose,
+  never a panic; an unterminated fence is an incomplete block (mid-
+  stream). The old `parse_segments` and its tests were deleted.
+- The paint path lays blocks out as `LayoutJob`s (per-run fonts/colors,
+  links underlined with recorded char ranges; a click hit-tests via
+  `Galley::cursor_from_pos` and `ctx.open_url`). Code blocks build the
+  job from `SyntaxLayer` spans in the SYN palette, with a 22px header
+  (language label via `fence_language`, Copy on hover). The streaming
+  fade bakes into the section colors (job galleys ignore the
+  paint-time fallback).
+- **The layout cache**: `Message.layout: Option<CachedLayout>`, rebuilt
+  only when the content length or wrap width moves (the fade's first
+  240ms rebuilds per frame). A settled message costs no per-frame
+  re-layout.
+- Footers: elapsed + `~N tok` (XS faint, ticking while streaming at
+  500ms repaints), message-level Copy, and Retry on failed streams
+  (drops the failed bubble, re-Sends the user's message — the
+  conversation keeps the user turn). The CopyCode toast became "copied
+  to clipboard" (both copy paths flow through it).
+- The empty transcript: brand mark, "Ask anything", and 3 suggestion
+  chips that prefill the composer.
+- Tests: +6 (markdown paints, cache holds, link click via the
+  FullOutput's OpenUrl command, suggestion prefill, retry, message
+  copy — the click ones via a four-frame grid sweep, the
+  hover-revealed-affordance pattern). selora-ui 305 passing; the chat
+  test helpers now register the bundled fonts (the headings use the
+  named SemiBold family)., `cargo clippy
   --all-targets` clean, `cargo fmt` applied.
 
 ## 2026-10-07 — Phase 6 (Polish & Ship): 6a–6g merged on main; 6h in flight
