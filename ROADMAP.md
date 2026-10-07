@@ -526,6 +526,51 @@ ACCEPTANCE:
 
 ---
 
+## Phase 7 — Account sign-in (post-Lite; client ready anytime, acceptance gated on the gateway)
+
+**Goal:** "Log in with your Selora account" replaces key-pasting for humans: the browser opens, the user consents once, and every Selora model is live immediately — with account usage/limits auto-syncing into the IDE. The raw-key path stays forever (automation, CI, power users).
+
+**Why its own phase:** it is the biggest *trust-surface* change since Agent Mode (token lifecycle in a desktop app) and it has a hard **cross-repo dependency**: the gateway must speak OAuth + usage. The client work is fully buildable and wiremock-testable before the gateway ships; only the real-key acceptance waits.
+
+**The two-sided dependency (owner's gateway work, not this repo):** the contract the client codes against — `POST /oauth/token`, `POST /oauth/revoke`, `GET /v1/usage`, a browser consent page at `/oauth/authorize`, and rotating refresh tokens — is specified in ARCHITECTURE.md §7.3. `sk-gw-` keys keep working unchanged during and after (both flows end in the same `Authorization: Bearer` the client already sends).
+
+**Decisions and tradeoffs (the shape of the phase):**
+
+| Decision | Choice | Rejected alternative, and why |
+|---|---|---|
+| Primary auth flow | **Authorization Code + PKCE over a 127.0.0.1 loopback listener** (RFC 8252, the native-app BCP) | Password field in the app: never — the app must not see account credentials. Device-code (RFC 8628): kept as a documented *fallback* for RDP/locked-down browsers, not the primary (code-typing UX, slower, more phishable). |
+| Fallback flows | Device-code grant (post-7 follow-up) + raw key paste (always) | Key-paste-only: no server-side identity, no refresh, no usage feed — that is exactly today's gap. |
+| Token storage | Access token **memory only**; refresh token + account in the existing keyring service under a new `auth-session` entry | File-based storage (settings.json): contradicts §7.1's invariant. |
+| Refresh strategy | Proactive (refresh when < 60 s to expiry, before any request) + one retry on a 401, then "sign in again" | On-401-only: an SSE stream killed mid-flight by expiry cannot be resumed — proactive refresh makes that rare instead of routine. |
+| Usage sync cadence | Piggyback the existing 30 s status ping (fetch `/v1/usage` when signed in) + once after connect/turn-end | Per-receipt fetch: an agent turn emits dozens of receipts — chatty and pointless; per-launch only: stale within minutes. |
+| Sign-out | Server-side revocation first, then keyring delete; offline sign-out deletes locally and revokes on next contact | Local-delete-only: leaves a live session on the server after "Disconnect" — a real dangling credential. |
+| Active credentials | **One auth mode at a time** — signing in clears the `api-key` entry; pasting a key clears `auth-session` | Both live: two sources of truth for who is billed and which limit applies; confusion, not capability. |
+
+**Tasks (three subagents, 7a can start the moment this phase is approved — wiremock needs no gateway):**
+
+- **7a — Auth runtime:** the `auth-session` keyring slot (JSON: refresh token, account, expiry — never the access token); token exchange/refresh/revoke against §7.3's endpoints; rotating-refresh persistence (persist the new token *before* first use; a rejected refresh drops to Disconnected, never a retry loop); the `SeloraClient` seam (proactive refresh + one 401 retry); §7.1-style redaction for every token in Debug/logs. Wiremock tests: exchange, rotation, rejected-refresh, 401-then-retry, revoke, key/token mutual exclusion.
+- **7b — Sign-in UX:** splash "Sign in with Selora" (primary) + "paste an API key instead" (secondary, today's flow verbatim); browser handoff via `webbrowser` (system browser, never an embedded view — the app never touches the password page); the loopback listener (ephemeral 127.0.0.1 port, `state` validation, exactly one request accepted, 5-minute hard timeout); Settings Selora section shows account email + plan + usage when signed in; Disconnect = revoke-then-delete. Headless paint tests + a scripted callback test (the test acts as the browser).
+- **7c — Usage feed:** `/v1/usage` client type; piggyback on the 30 s ping; a status-bar chip and the Settings usage bar (`--type-xs`, ink only — no new saturated colors, DESIGN_TOKENS §12); period-reset handling. Wiremock tests for the feed + rollover.
+
+**Acceptance tests (owner, real account):**
+```bash
+# 1. Fresh install, no keyring entries → splash shows "Sign in with Selora"
+# 2. Click it → browser opens at the consent page → approve → IDE is connected (no code typed anywhere)
+# 3. Status bar: connected; every model in the picker (unchanged behavior)
+# 4. Settings → Selora: account email, plan, live usage vs limit
+# 5. Kill the app, relaunch → still connected (silent refresh on boot)
+# 6. Revoke the session from the gateway side → next request flips the IDE to "sign in again" cleanly
+# 7. Disconnect in Settings → server session gone (gateway confirms), keyring empty
+# 8. Paste an sk-gw key on the same install → works; signing in afterwards replaces it (one active mode)
+# 9. Chat + a full agent turn run on the signed-in session; usage numbers move
+```
+
+**Estimated complexity:** Medium client-side (~1-2 sessions, three subagents). The gateway account system it depends on is the larger half and lives outside this repo.
+
+**DONE means:** A user with a Selora account clicks "Sign in with Selora", approves once in their browser, and is connected forever after across relaunches — every model available, their usage and limits visible and auto-syncing — while an `sk-gw-` key still works the day an account doesn't exist.
+
+---
+
 ## Total effort framing
 
 - **Phase 0:** ~1 session (4-6 hours of agent time).
@@ -535,6 +580,7 @@ ACCEPTANCE:
 - **Phase 4:** ~2-3 sessions. Six parallel subagents, then merge.
 - **Phase 5:** ~2-3 sessions. Agent Mode. Five parallel subagents, then merge.
 - **Phase 6:** ~1-2 sessions. Mostly sequential.
+- **Phase 7:** ~1-2 client sessions (three subagents), gated on the gateway's account endpoints for acceptance only — the code is wiremock-buildable anytime.
 
 **Total: ~10-16 overnight sessions for one owner + one orchestrating agent running subagents.** Realistic for a single motivated owner who runs the orchestrator each evening.
 

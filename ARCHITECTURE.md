@@ -434,6 +434,82 @@ When the user pastes a key, the runtime fires:
 3. If `200 OK` → status = `Connected`, drop the in-memory copy
 4. If error → status = `Error("invalid key")`, leave the key in the keyring (so user can fix the gateway, not retype)
 
+### 7.3 Account sign-in (Phase 7) — the gateway contract
+
+Phase 7 replaces key-pasting for humans with an OAuth-style login; the
+client-side spec lives in ROADMAP.md Phase 7 (decision table included). This
+section is the wire contract the gateway must implement — the client codes
+against it and wiremock-tests it before the gateway ships. Both auth modes end
+in the same `Authorization: Bearer` header `SeloraClient` already sends, so
+`sk-gw-` keys and account tokens are interchangeable below the auth layer.
+
+**Keyring layout (extends §7.1):** the key stays under entry `api-key`; the
+session lives under a second entry, `auth-session`, holding one JSON blob
+`{ "refresh_token": …, "account": { "id", "email", "plan" }, "expires_at": … }`.
+The **access token is never persisted anywhere** — memory only, and its
+`Debug`/log rendering is redacted exactly like the key's. One auth mode is
+active at a time: a successful sign-in clears `api-key`, a key paste clears
+`auth-session`.
+
+**The flow (Authorization Code + PKCE, RFC 8252 native-app BCP):**
+
+1. The client generates a 43–128-char random `code_verifier` (memory only) and
+   its S256 `code_challenge`, plus a random `state`; binds a loopback listener
+   on `127.0.0.1:{ephemeral_port}`; and opens the **system browser** (the app
+   never renders the login page — it must never see the account password) at:
+
+   `GET {base}/oauth/authorize?response_type=code&client_id=selora-ide&redirect_uri=http://127.0.0.1:{port}/callback&state={state}&code_challenge={challenge}&code_challenge_method=S256&scope=chat+models+usage`
+
+2. The gateway shows its consent page and redirects the browser to the
+   loopback URI with `?code=…&state=…`. The listener accepts **exactly one
+   request** (validating `state`), answers with a plain "you can close this
+   tab" page, and closes — hard 5-minute timeout either way.
+
+3. The client exchanges the code:
+
+   `POST {base}/oauth/token` (form-encoded) —
+   `grant_type=authorization_code&code=…&redirect_uri=…&client_id=selora-ide&code_verifier=…`
+
+   ```json
+   { "access_token": "…", "token_type": "Bearer", "expires_in": 3600,
+     "refresh_token": "…", "scope": "chat models usage",
+     "account": { "id": "…", "email": "…", "plan": "…" } }
+   ```
+
+4. **Refresh (rotating):** `POST {base}/oauth/token` with
+   `grant_type=refresh_token&refresh_token=…&client_id=selora-ide` returns a
+   *new* refresh token and invalidates the old one (single-use). The client
+   persists the new token to the keyring **before** first use of the new
+   access token; a rejected refresh drops the session to `Disconnected`
+   ("sign in again") — never a retry loop. Refresh fires proactively when a
+   token is < 60 s from expiry; a 401 triggers one refresh-and-retry, then the
+   same signed-out path.
+
+5. **Sign-out:** `POST {base}/oauth/revoke` (Bearer) with the refresh token,
+   then the keyring entry is deleted. Offline sign-out deletes locally and
+   revokes on next contact.
+
+6. **Usage feed:** `GET {base}/v1/usage` (Bearer) →
+
+   ```json
+   { "plan": "…", "spent_usd": 12.40, "limit_usd": 50.0, "period_reset": "2026-11-01" }
+   ```
+
+   Fetched on the existing 30s status-ping cadence when signed in, plus once
+   after connect and after each chat/agent turn. The limit is **advisory
+   display only** — enforcement stays server-side; client-side caps
+   (`agent.*`) remain the user's own local guardrails.
+
+**Fallbacks:** the device-code grant (RFC 8628) is a documented post-7
+addition for RDP/locked-down environments; raw key paste (§7.1–7.2) remains
+supported permanently and is the automation/CI path.
+
+**Invariants (extend §7.1):** verifier, state, and access token are memory
+only; the refresh token exists only in the keyring; none of them ever appear
+in `settings.json`, `workspace.json`, logs, tool results, or the bash child
+environment (the ENV_ALLOWLIST keeps them structurally absent); the loopback
+listener binds 127.0.0.1 only and lives at most 5 minutes.
+
 ---
 
 ## 8. Persistence

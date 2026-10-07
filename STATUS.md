@@ -63,6 +63,12 @@ run's "Phase 5d completion report" artifact for the long form).
   ENV_ALLOWLIST additions (CARGO_HOME, proxies) if the real-key run hits them.
 - **Phase 6h (KIMI_UI_PROMPT.md) can start** once 5d is merged and the owner's
   real-key smoke test passes.
+- **Phase 7 — account sign-in ("login with Selora") is now planned** (2026-10-07,
+  owner request): ROADMAP.md Phase 7 (decisions + tradeoffs + 7a/7b/7c subagent
+  split) and ARCHITECTURE.md §7.3 (the gateway wire contract: PKCE loopback,
+  rotating refresh tokens, revoke, /v1/usage). Client-side is wiremock-buildable
+  anytime; real-account acceptance is gated on the gateway shipping those
+  endpoints. Key-paste stays supported permanently.
 
 ## Owner decisions (2026-10-06)
 
