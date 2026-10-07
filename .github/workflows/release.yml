@@ -1,0 +1,94 @@
+# Selora IDE — release pipeline (RELEASE.md §4.2).
+#
+# Trigger: push a tag matching v*.*.* (RELEASE.md §4.3). Produces a DRAFT
+# GitHub Release with the Inno Setup installer attached; the owner
+# smoke-tests the installer on a clean VM and publishes manually (the draft
+# step is deliberate — no auto-publish).
+#
+# Code signing (RELEASE.md §3): optional and off until the owner provides a
+# certificate. Add two repository secrets to enable it:
+#   SIGNING_CERT_BASE64   — the Authenticode PFX, base64-encoded
+#   SIGNING_CERT_PASSWORD — its password
+# (RELEASE.md §3.2's "path" model assumed the cert materialized somewhere;
+# CI has no cert file unless a secret provides one — base64 is the standard
+# carrier. The steps are no-ops while the secret is unset.)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version from the tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the tag matches the workspace version
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          if ($cargo -ne "${{ steps.version.outputs.VERSION }}") {
+            Write-Error "tag v${{ steps.version.outputs.VERSION }} but Cargo.toml is $cargo — bump the version before tagging (RELEASE.md §4.3)"
+            exit 1
+          }
+
+      - name: Build release binary
+        run: cargo build --workspace --release --locked
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Restore signing certificate (optional)
+        if: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\signing.pfx", [Convert]::FromBase64String("${{ secrets.SIGNING_CERT_BASE64 }}"))
+          "SIGNING_PFX=$env:RUNNER_TEMP\signing.pfx" >> $env:GITHUB_ENV
+
+      - name: Sign binary (optional)
+        if: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          signtool.exe sign /f "$env:SIGNING_PFX" /p "${{ secrets.SIGNING_CERT_PASSWORD }}" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            /d "Selora IDE" /du "https://github.com/ToxicAngelX/Selora-IDE" `
+            target\release\selora-app.exe
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ steps.version.outputs.VERSION }} installer\selora-ide.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Sign installer (optional)
+        if: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          signtool.exe sign /f "$env:SIGNING_PFX" /p "${{ secrets.SIGNING_CERT_PASSWORD }}" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            /d "Selora IDE Installer" /du "https://github.com/ToxicAngelX/Selora-IDE" `
+            "installer\output\Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe"
+
+      - name: Publish draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/output/Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe
+          generate_release_notes: true
+          draft: true # owner smoke-tests the installer, then publishes (RELEASE.md §4.3)

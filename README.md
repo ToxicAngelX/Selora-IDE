@@ -2,8 +2,11 @@
 
 **The editor born connected to Selora.**
 
+[![CI](https://github.com/ToxicAngelX/Selora-IDE/actions/workflows/ci.yml/badge.svg)](https://github.com/ToxicAngelX/Selora-IDE/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Selora IDE is an open-source, native-feel code editor written in Rust. Its
-chat, completions, and model switching are billed through
+chat, inline completions, and agent mode are billed through
 [api.selora.lol](https://api.selora.lol) — a first-class AI gateway, not an
 afterthought. No API key pasted into a third-party panel, no extension
 marketplace between you and the models.
@@ -12,24 +15,37 @@ The design language is the Selora brand: monochrome dark, hairline borders,
 calm motion, functional green only. The editor pane is custom-rendered on top
 of [egui](https://github.com/emilk/egui) — pure Rust, no webview.
 
-> This repository currently contains the **Lite Edition** plan and its
-> foundation (Phase 0). The full roadmap — editor core, LSP, git, Selora AI
-> integration, installer — is in [`PLAN.md`](PLAN.md) and
-> [`ROADMAP.md`](ROADMAP.md).
+![Selora IDE — main window](assets/screenshots/main-window.png)
 
-## Status
+## Features
 
-Phase 0 (foundation) is complete:
+- **Editor** — multi-tab, split panes, syntax highlighting (tree-sitter:
+  Rust, TypeScript, JavaScript, Python, JSON, TOML, Markdown, HTML, CSS),
+  fuzzy file finder (`Ctrl+P`), command palette (`Ctrl+Shift+P`).
+- **Language intelligence** — rust-analyzer and typescript-language-server
+  over a thin in-house LSP client: hover, go-to-definition, completion,
+  diagnostics.
+- **Git** — status decorations in the file tree, stage/unstage, commit from
+  the panel (`Ctrl+Enter`).
+- **Selora AI** — streaming chat sidebar (`Ctrl+L`), model picker with live
+  catalog, ghost-text inline completions (Tab to accept), per-model cost
+  meter in the status bar.
+- **Agent Mode** — the model reads, creates, edits, and deletes workspace
+  files, runs shell commands, and searches/fetches the web — every
+  side-effecting action gated behind an approval card (diffs in-chat, Deny
+  leaves disk untouched). Loop caps: 25 iterations / 10 minutes / $1, all
+  configurable.
+- **Search** — workspace-wide search (`Ctrl+Shift+F`) over ripgrep when
+  available, with a built-in fallback.
 
-- Cargo workspace with all 9 crates (`crates/`).
-- Design tokens implemented in code (`crates/selora-ui/src/theme.rs`, the
-  typed mirror of `DESIGN_TOKENS.md`).
-- `cargo run -p selora-app` opens a 1280x800 dark window titled "Selora IDE"
-  with the brand mark on the left and an empty ink-canvas workbench.
+## Install
 
-Later phases arrive per [`ROADMAP.md`](ROADMAP.md).
+Download `Selora-IDE-Setup-X.Y.Z.exe` from the latest
+[GitHub Release](https://github.com/ToxicAngelX/Selora-IDE/releases) and run
+it — per-user install, no admin required. First launch shows the splash:
+paste your `sk-gw-…` key (or Skip and connect later from the status bar).
 
-## Building
+## Building from source
 
 Requires Rust stable (MSVC toolchain on Windows). See
 [rustup](https://rustup.rs/).
@@ -44,24 +60,29 @@ Before committing, also run:
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Bundled fonts (Space Grotesk and JetBrains Mono, both SIL OFL 1.1) live in
-`assets/fonts/` — nothing is downloaded at runtime.
+Bundled fonts (Space Grotesk and JetBrains Mono, both SIL OFL 1.1) are
+embedded in the binary — nothing is downloaded at runtime.
 
-## Project layout
+To build the Windows installer (Inno Setup 6 required):
 
-| Path | What |
-|---|---|
-| `PLAN.md` | Master plan (read this first) |
-| `ARCHITECTURE.md` | Technical contract |
-| `DESIGN_TOKENS.md` | Visual contract (colors, type, spacing, motion) |
-| `UI_SPEC.md` | Screen-by-screen layout contract |
-| `ROADMAP.md` | Phase breakdown and exit gates |
-| `AGENT_ORCHESTRATION.md` | Instructions for AI-agent contributors |
-| `crates/` | The 9 workspace crates (see `PLAN.md` §5) |
-| `assets/` | Bundled fonts and the brand mark source |
+```bat
+installer\prebuild.bat
+```
+
+## Documentation
+
+- [`docs/`](docs/) — the MkDocs sources for the user documentation site.
+- [`PLAN.md`](PLAN.md) — the master plan (read this first if contributing).
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — the technical contract.
+- [`DESIGN_TOKENS.md`](DESIGN_TOKENS.md) — the visual contract.
+- [`UI_SPEC.md`](UI_SPEC.md) — the screen-by-screen layout contract.
+- [`ROADMAP.md`](ROADMAP.md) — the phase breakdown and exit gates.
+- [`RELEASE.md`](RELEASE.md) — the release runbook.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (humans and AI
+  agents alike; see also [`AGENT_ORCHESTRATION.md`](AGENT_ORCHESTRATION.md)).
 
 ## License
 
