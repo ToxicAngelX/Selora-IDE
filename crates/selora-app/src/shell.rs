@@ -176,6 +176,9 @@ pub struct SeloraApp {
     last_tree_width: Option<f32>,
     /// The first-run splash (Phase 6a).
     splash: SplashState,
+    /// Phase R6b: the open read-only git diff (the path + unified text);
+    /// the workbench overlay over the editor area.
+    git_diff: Option<(std::path::PathBuf, String)>,
     /// Phase R4: the status-bar orb's reserved-arm signals — set when the
     /// effect leaves, cleared when the reply lands.
     ghost_in_flight: bool,
@@ -291,6 +294,7 @@ impl SeloraApp {
             last_workspace_save: Instant::now(),
             last_workspace_snapshot: None,
             last_sessions_snapshot: None,
+            git_diff: None,
             ghost_in_flight: false,
             search_in_flight: false,
             tree_in_flight: false,
@@ -315,6 +319,11 @@ impl SeloraApp {
             // Phase R4: the reserved-arm signals clear when their replies
             // land (the observation lives here, ahead of `apply`).
             let ghost_ready = matches!(message, AppMessage::GhostTextReady { .. });
+            // Phase R6b: the diff view's payload.
+            let git_diff = match &message {
+                AppMessage::GitDiffReady { path, diff } => Some((path.clone(), diff.clone())),
+                _ => None,
+            };
             let search_ready = matches!(message, AppMessage::SearchResults { .. });
             let tree_ready = matches!(message, AppMessage::FileTreeUpdated { .. });
             // Phase 6a: the boot keyring read resolved empty — the splash's
@@ -350,6 +359,9 @@ impl SeloraApp {
             self.state.apply(message);
             if ghost_ready {
                 self.ghost_in_flight = false;
+            }
+            if let Some(diff) = git_diff {
+                self.git_diff = Some(diff);
             }
             if search_ready {
                 self.search_in_flight = false;
@@ -1100,9 +1112,15 @@ impl SeloraApp {
                 }
             }
             GitAction::OpenDiff(path) => {
-                // Open the file itself for now (Lite Phase 3); the
-                // read-only diff view is a v1.x refinement (UI_SPEC.md §8).
-                self.open_path(path);
+                // Phase R6b: the read-only diff view (UI_SPEC.md §8's
+                // refinement, at last) — the worker diffs the working
+                // tree against the index; the overlay paints on the
+                // reply. No root open: nothing to diff against.
+                if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    let _ = self.effect_tx.send(Effect::GitDiff { root, path });
+                } else {
+                    self.state.toast("open a folder to diff", Severity::Info);
+                }
             }
         }
     }
@@ -1463,6 +1481,82 @@ impl SeloraApp {
                 // The Ctrl+P overlay is scoped to the workbench (UI_SPEC §5.1).
                 if let Some(path) = self.state.fuzzy.show_ui(ui) {
                     self.open_path(path);
+                }
+
+                // The read-only git diff overlay (Phase R6b): covers the
+                // editor area — a header (path · working tree, close ×)
+                // and the shared DiffView in a scroll. Esc closes.
+                if let Some((path, diff)) = self.git_diff.clone() {
+                    let rect = ui.max_rect();
+                    ui.painter()
+                        .rect_filled(rect, 0.0, theme::color::INK_CANVAS);
+                    // A one-line header + the scroll body.
+                    let header =
+                        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 32.0));
+                    ui.painter().hline(
+                        header.x_range(),
+                        header.bottom(),
+                        egui::Stroke::new(1.0, theme::color::INK_HI),
+                    );
+                    let title = format!(
+                        "{} (working tree)",
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+                    );
+                    ui.painter().text(
+                        egui::pos2(header.left() + theme::space::S3, header.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        title,
+                        egui::FontId::new(
+                            theme::type_scale::SM,
+                            selora_ui::theme::font::family_sans_semibold(),
+                        ),
+                        theme::color::FG_DEFAULT,
+                    );
+                    let close = egui::Rect::from_min_size(
+                        egui::pos2(header.right() - 32.0, header.top()),
+                        egui::vec2(32.0, 32.0),
+                    );
+                    let close_response = ui.interact(
+                        close,
+                        egui::Id::new("selora_git_diff_close"),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().text(
+                        close.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "x",
+                        egui::FontId::new(theme::type_scale::SM, theme::font::FAMILY_SANS),
+                        if close_response.hovered() {
+                            theme::color::FG_DEFAULT
+                        } else {
+                            theme::color::FG_MUTED
+                        },
+                    );
+                    if close_response.clicked()
+                        || ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    {
+                        self.git_diff = None;
+                    }
+                    // The body: parse + paint through the shared widget.
+                    let lines = selora_ui::diff_view::parse_unified_diff(&diff);
+                    let language = selora_ui::diff_view::language_for_diff(&lines);
+                    let view = selora_ui::diff_view::DiffView::new(&lines, language);
+                    let body = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), header.bottom()),
+                        rect.max,
+                    );
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body.shrink2(egui::vec2(0.0, theme::space::S2))),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("selora_git_diff_body")
+                        .auto_shrink([false, false])
+                        .show(&mut child, |ui| {
+                            view.paint(ui, ui.available_width(), 1.0);
+                        });
                 }
             });
     }
@@ -3096,6 +3190,54 @@ mod tests {
             )),
             "the agent-touched didChange reached the manager: {effects:?}"
         );
+    }
+
+    /// Phase R6b: the git diff view — OpenDiff sends the effect, the
+    /// ready message opens the overlay, Esc closes it.
+    #[tokio::test]
+    async fn git_diff_overlay_lifecycle() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        app.state
+            .apply(AppMessage::FolderOpened(PathBuf::from("/repo")));
+        app.state
+            .apply(AppMessage::GitStatusChanged(selora_git::GitStatus {
+                branch: Some("main".into()),
+                entries: vec![selora_git::FileStatus {
+                    abs_path: PathBuf::from("/repo/src/main.rs"),
+                    path: PathBuf::from("src/main.rs"),
+                    staged: selora_git::Slot::Unmodified,
+                    worktree: selora_git::Slot::Modified,
+                }],
+            }));
+        assert!(app.git_diff.is_none());
+
+        // The panel action: routes the effect (the dispatcher is real but
+        // no repo exists at /repo — the synthetic reply below covers the
+        // shell's observation half).
+        app.route_git_action(GitAction::OpenDiff(PathBuf::from("/repo/src/main.rs")));
+        app.msg_tx
+            .send(AppMessage::GitDiffReady {
+                path: PathBuf::from("/repo/src/main.rs"),
+                diff: "--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new"
+                    .into(),
+            })
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.git_diff.is_some(), "the overlay opened");
+
+        // It paints (with the DiffView) and Esc closes it.
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.git_diff.is_some(), "painting alone keeps it open");
+        agent_frame(&ctx, &mut app, agent_key_event(egui::Key::Escape));
+        assert!(app.git_diff.is_none(), "Esc closed the overlay");
     }
 
     /// Phase R4: the status-bar orb's reserved-arm signals — an effect

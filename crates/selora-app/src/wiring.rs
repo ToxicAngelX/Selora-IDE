@@ -261,6 +261,33 @@ pub fn spawn_git_status(
 
 /// Effect (§2.2): stage one file, then re-snapshot so the panel and the
 /// tree badges refresh in one round trip.
+/// Effect (Phase R6b): the working-tree diff of one file, as unified
+/// text for the git panel's read-only diff view.
+pub fn spawn_git_diff(
+    handle: &Handle,
+    notify: &Notify,
+    tx: &UnboundedSender<AppMessage>,
+    root: PathBuf,
+    path: PathBuf,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    handle.spawn_blocking(move || {
+        let message = match open_repo(&root) {
+            Ok(repo) => match repo.diff_workdir(&path) {
+                Ok(diff) => AppMessage::GitDiffReady {
+                    path,
+                    diff: diff.to_unified(),
+                },
+                Err(error) => AppMessage::GitError(git_error(error)),
+            },
+            Err(_) => AppMessage::GitNoRepo,
+        };
+        let _ = tx.send(message);
+        notify();
+    });
+}
+
 pub fn spawn_git_stage(
     handle: &Handle,
     notify: &Notify,
@@ -1125,6 +1152,9 @@ pub fn spawn_dispatcher(
                 }
                 Effect::GitStatus(root) => {
                     spawn_git_status(&dispatch_handle, &notify, &msg_tx, root);
+                }
+                Effect::GitDiff { root, path } => {
+                    spawn_git_diff(&dispatch_handle, &notify, &msg_tx, root, path);
                 }
                 Effect::GitStage(path) => {
                     spawn_git_stage(&dispatch_handle, &notify, &msg_tx, path);

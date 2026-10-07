@@ -97,6 +97,11 @@ All notable changes to Selora IDE are documented here. The format follows
   diagnostics grouped by file with severity glyphs (`✕` err / `!` warn /
   `i` info / `·` hint), a row click opening the buffer at the diagnostic's
   line, and a problems count badge on the activity bar's warning icon.
+- The git diff view (Phase R6b): clicking a changed file in the git panel
+  opens a read-only overlay over the editor area — "path (working tree)"
+  header, the working-tree-vs-index unified diff through the shared
+  DiffView (syntax highlighted), Esc/× to close. `FileDiff::to_unified` is
+  new in selora-git.
 
 ### Changed
 

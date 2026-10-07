@@ -169,6 +169,13 @@ pub enum Effect {
     /// resolves to [`AppMessage::GitNoRepo`] when there is no repo).
     GitStatus(PathBuf),
     /// Stage one file (absolute path — a `GitStatus` entry's `abs_path`).
+    /// Compute the working-tree diff for one file (Phase R6b): the
+    /// worker opens the repo at `root`, diffs `path` against the index,
+    /// and replies [`AppMessage::GitDiffReady`] with the unified text.
+    GitDiff {
+        root: PathBuf,
+        path: PathBuf,
+    },
     GitStage(PathBuf),
     /// Unstage one file (absolute path).
     GitUnstage(PathBuf),
@@ -305,6 +312,12 @@ pub enum AppMessage {
     GitCommitted(String),
     /// A git effect failed — toast (PLAN.md §8).
     GitError(SeloraError),
+    /// The working-tree diff for one file (Phase R6b: the git panel's
+    /// read-only diff view). Empty diff text = no unstaged changes.
+    GitDiffReady {
+        path: PathBuf,
+        diff: String,
+    },
 
     // Search (Phase 3c)
     /// The results of search `id` — `Ok` installs them in the panel
@@ -731,6 +744,9 @@ impl AppState {
             AppMessage::GitError(error) => {
                 self.toast(format!("git: {error}"), Severity::Error);
             }
+            // The diff view's payload — the shell observes it in the
+            // drain loop (Phase R6b); the state reduction is a no-op.
+            AppMessage::GitDiffReady { .. } => {}
 
             // -- Search (Phase 3c) ----------------------------------------------
             AppMessage::SearchResults { id, results } => match results {
