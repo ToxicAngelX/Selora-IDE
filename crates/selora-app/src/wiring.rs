@@ -37,6 +37,7 @@ use selora_git::{open_repo, GitError};
 use selora_settings::Settings;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::app_state::{AgentTurnRequest, AppMessage, Effect};
@@ -576,6 +577,7 @@ fn spawn_ghost(
 /// message). The relay stops at the first terminal event (`Done`/`Error`);
 /// the stream's return value is then joined only to surface an error that
 /// never reached the channel — no silent failures (PLAN.md §8).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_chat(
     handle: &Handle,
     notify: &Notify,
@@ -584,6 +586,7 @@ pub fn spawn_chat(
     api_key: String,
     chat_id: Uuid,
     request: selora_ai::ChatRequest,
+    mut cancel: watch::Receiver<bool>,
 ) {
     let notify = notify.clone();
     let stream_handle = handle.clone();
@@ -591,8 +594,15 @@ pub fn spawn_chat(
         let client = SeloraClient::new(&base_url, &api_key);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ChatEvent>();
 
-        let stream =
-            stream_handle.spawn(async move { client.stream_chat(request, events_tx).await });
+        // Phase R1: the cancel watch — a user Stop flips it, the request
+        // future is dropped (the SSE connection closes), and the task
+        // resolves `None` so the relay stays silent about a cancel.
+        let stream = stream_handle.spawn(async move {
+            tokio::select! {
+                _ = cancel.changed() => None,
+                result = client.stream_chat(request, events_tx) => Some(result),
+            }
+        });
 
         let mut terminal_seen = false;
         while let Some(event) = events_rx.recv().await {
@@ -619,10 +629,12 @@ pub fn spawn_chat(
         }
 
         // Always join the stream task. When it resolved normally its terminal
-        // event was already relayed; anything else is an error to surface.
+        // event was already relayed; a cancel resolved `None` (silent by
+        // design); anything else is an error to surface.
         match stream.await {
-            Ok(Ok(_receipt)) => {}
-            Ok(Err(error)) => {
+            Ok(None) => {} // cancelled (Phase R1)
+            Ok(Some(Ok(_receipt))) => {}
+            Ok(Some(Err(error))) => {
                 if !terminal_seen {
                     let _ = tx.send(AppMessage::ChatError(chat_id, error));
                     notify();
@@ -849,6 +861,11 @@ pub fn spawn_dispatcher(
             Uuid,
             UnboundedSender<selora_ai::TurnDecision>,
         > = std::collections::HashMap::new();
+        // Phase R1: in-flight plain chats' cancel watches (the composer's
+        // Stop → `Effect::SeloraChatAbort`). A finished chat's stream task
+        // drops its receiver; `receiver_count()` prunes those.
+        let mut chat_cancels: std::collections::HashMap<Uuid, watch::Sender<bool>> =
+            std::collections::HashMap::new();
         while let Some(effect) = effect_rx.recv().await {
             match effect {
                 Effect::OpenFile(path) => {
@@ -965,6 +982,9 @@ pub fn spawn_dispatcher(
                 },
                 Effect::SeloraChat(chat_id, request) => match api_key.clone() {
                     Some(key) => {
+                        // Prune finished chats' dead senders first.
+                        chat_cancels.retain(|_, cancel| cancel.receiver_count() > 0);
+                        let (cancel_tx, cancel_rx) = watch::channel(false);
                         spawn_chat(
                             &dispatch_handle,
                             &notify,
@@ -973,7 +993,9 @@ pub fn spawn_dispatcher(
                             key,
                             chat_id,
                             request,
+                            cancel_rx,
                         );
+                        chat_cancels.insert(chat_id, cancel_tx);
                     }
                     None => {
                         let _ = msg_tx.send(AppMessage::ChatError(
@@ -985,6 +1007,15 @@ pub fn spawn_dispatcher(
                         notify();
                     }
                 },
+                Effect::SeloraChatAbort(chat_id) => {
+                    // A true cancel (Phase R1): the watch flip drops the
+                    // SSE request future (the connection closes) and the
+                    // relay ends silently — a user Stop is never an
+                    // error. Unknown/ended ids are no-ops.
+                    if let Some(cancel) = chat_cancels.remove(&chat_id) {
+                        let _ = cancel.send(true);
+                    }
+                }
                 Effect::SeloraPing => match api_key.clone() {
                     Some(key) => {
                         spawn_selora_ping(
@@ -1620,6 +1651,16 @@ mod tests {
         }
     }
 
+    /// A cancel pair whose sender stays alive for the test's duration
+    /// (a dropped sender would read as a cancel in the stream task's
+    /// select — the dispatcher holds the sender in production).
+    fn watch_keepalive() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        static KEEP: std::sync::Mutex<Vec<watch::Sender<bool>>> = std::sync::Mutex::new(Vec::new());
+        let pair = watch::channel(false);
+        KEEP.lock().expect("lock").push(pair.0.clone());
+        pair
+    }
+
     #[tokio::test]
     async fn chat_streams_deltas_and_receipt_against_a_mock_gateway() {
         let server = MockServer::start().await;
@@ -1642,6 +1683,7 @@ mod tests {
             TEST_KEY.into(),
             chat_id,
             request,
+            watch_keepalive().1,
         );
 
         // Drain exactly like the frame loop: reduce messages in arrival
@@ -1678,6 +1720,59 @@ mod tests {
         assert_eq!(receipt.cost_usd, 0.0013);
     }
 
+    /// Phase R1: the cancel watch is a true abort — the in-flight request
+    /// future is dropped (the connection closes) and the relay ends
+    /// WITHOUT surfacing a terminal message (a user stop is never an
+    /// error). Observable as the message channel closing: the relay owns
+    /// its only sender.
+    #[tokio::test]
+    async fn chat_cancel_ends_the_stream_silently() {
+        let server = MockServer::start().await;
+        // The response stalls server-side: without the cancel the relay
+        // would sit on the request for the whole delay.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(STREAM_SSE)
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let handle = Handle::current();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+        let chat_id = Uuid::new_v4();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        spawn_chat(
+            &handle,
+            &noop_notify(),
+            tx,
+            server.uri(),
+            TEST_KEY.into(),
+            chat_id,
+            selora_ai::ChatRequest::new("test-model", vec![]).with_stream(true),
+            cancel_rx,
+        );
+
+        // The request is in flight (the mock's delay holds it).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing arrived while the response stalls"
+        );
+
+        // The user stops: the channel closes (relay ended) and no
+        // terminal message ever surfaced.
+        cancel_tx.send(true).expect("cancel");
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await,
+            Ok(None)
+        );
+        assert!(closed, "the relay ended silently (no terminal message)");
+    }
+
     #[tokio::test]
     async fn chat_missing_done_surfaces_the_error() {
         let server = MockServer::start().await;
@@ -1701,6 +1796,7 @@ mod tests {
             TEST_KEY.into(),
             chat_id,
             selora_ai::ChatRequest::new("test-model", vec![]).with_stream(true),
+            watch_keepalive().1,
         );
 
         let mut deltas = String::new();

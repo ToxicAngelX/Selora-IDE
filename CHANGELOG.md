@@ -30,6 +30,14 @@ All notable changes to Selora IDE are documented here. The format follows
   (off by default — owner decision).
 - The `--scrim` overlay token (true black @ 60%): the one sanctioned modal
   backdrop value (Phase R0; DESIGN_TOKENS.md §1.7).
+- The ZCode-grade composer (Phase R1): a multiline auto-growing input (6-row
+  cap) where Enter submits and Shift+Enter inserts the newline at the caret;
+  ↑/↓ recall the last 10 submitted prompts on a one-line buffer; and while a
+  plain stream runs the send button becomes a Stop square whose click
+  cancels the request for real — the new `Effect::SeloraChatAbort` drops the
+  in-flight SSE request (the connection closes) and the relay ends silently,
+  never reporting a user stop as an error. The partial reply stays in the
+  transcript and re-enters the next request's context.
 
 ### Changed
 

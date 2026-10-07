@@ -96,6 +96,17 @@ const COMPOSER_HINT: &str = "Ask anything…";
 const COMPOSER_KEY_HINT: &str = "Enter to send, Shift+Enter for newline";
 /// The send button's glyph (UI_SPEC.md §4: "⏎ glyph").
 const SEND_GLYPH: &str = "⏎";
+/// One composer text row's pitch — the `--type-md` line height in the
+/// multiline edit (Phase R1's auto-grow).
+const COMPOSER_LINE_HEIGHT: f32 = 18.0;
+/// The composer's row cap (Phase R1): the bar grows to this many rows,
+/// then the edit scrolls internally.
+const COMPOSER_MAX_ROWS: usize = 6;
+/// How many submitted prompts the ↑/↓ recall keeps (Phase R1).
+const HISTORY_LEN: usize = 10;
+/// The Stop button's square edge (Phase R1 — painted, not a glyph, so
+/// no font carries the requirement).
+const STOP_SQUARE: f32 = 8.0;
 /// Send button size (width × height; a `--radius-1` chip).
 const SEND_BUTTON_SIZE: Vec2 = Vec2::new(28.0, 20.0);
 /// The overflow menu's glyph (UI_SPEC.md §4: "⋯ overflow menu").
@@ -201,6 +212,12 @@ pub enum ChatPanelEvent {
     /// "Copy transcript" was chosen from the overflow menu; the text is
     /// already on the clipboard.
     CopyTranscript(String),
+    /// The composer's Stop button was clicked on a running plain (non-
+    /// agent) stream (Phase R1). The panel has already finalized the
+    /// streaming bubble; the shell cancels the request itself
+    /// (`Effect::SeloraChatAbort`) — the stream's late deltas are
+    /// stale-dropped.
+    StopStream { id: ChatId },
     /// A model was selected in the header's model picker. The panel has
     /// already switched its own header label; the shell persists the
     /// active model (next chat uses it).
@@ -539,6 +556,15 @@ pub struct ChatPanel {
     /// disconnected). Threaded by the shell's `AppMessage::SeloraStatus`
     /// reduction.
     gateway_connected: bool,
+    /// Submitted prompts for the composer's ↑/↓ recall (Phase R1),
+    /// oldest first, capped at [`HISTORY_LEN`].
+    history: Vec<String>,
+    /// Where the recall is parked: `None` = the live buffer, `Some(i)` =
+    /// `history[i]`.
+    history_index: Option<usize>,
+    /// The live buffer stashed when the recall first walks back (restored
+    /// when it walks forward off the end).
+    history_draft: Option<String>,
 }
 
 impl Default for ChatPanel {
@@ -567,6 +593,9 @@ impl ChatPanel {
             agent_pill: LiquidPill::default(),
             status_avatar: AgentAvatar::new(0.0),
             gateway_connected: true,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: None,
         }
     }
 
@@ -1003,9 +1032,12 @@ impl ChatPanel {
     /// remaining space — can never push them off the panel.
     pub fn show(&mut self, ui: &mut Ui) -> ChatPanelOutcome {
         let mut frame = FrameArtifacts::default();
+        // Phase R1: the composer bar grows with its buffer (wrapped rows
+        // counted, capped at COMPOSER_MAX_ROWS) — the transcript yields.
+        let composer_height = self.composer_height(ui);
         egui::Panel::bottom(egui::Id::new("selora_chat_composer_bar"))
             .frame(egui::Frame::default())
-            .exact_size(COMPOSER_HEIGHT)
+            .exact_size(composer_height)
             .show_separator_line(false)
             .show(ui, |ui| self.paint_composer(ui, &mut frame));
         egui::Panel::top(egui::Id::new("selora_chat_header_bar"))
@@ -1328,11 +1360,13 @@ impl ChatPanel {
             });
     }
 
-    /// The 60px composer: single-line input + `⏎` send button, then the
-    /// keyboard hint. Enter sends (the single-line edit surrenders focus
-    /// on Enter; `lost_focus` + the key still down is the documented
-    /// submit signal); Shift+Enter appends a newline to the buffer. The
-    /// Phase 6h StreamGlow rides the bar's bottom edge.
+    /// The composer: a multiline auto-growing input (Phase R1) + the send
+    /// button (Stop while a plain stream runs) + the keyboard hint. While
+    /// the edit has focus it owns the keyboard: a plain Enter is consumed
+    /// here as the submit signal (the edit's return key is Shift+Enter,
+    /// so the newline lands at the caret), and on a one-line buffer the
+    /// arrows walk the history (multi-line buffers keep them as caret
+    /// moves). The Phase 6h StreamGlow rides the bar's bottom edge.
     fn paint_composer(&mut self, ui: &mut Ui, frame: &mut FrameArtifacts) {
         // The bar's rect (captured before any allocation shrinks it) —
         // the StreamGlow's edge.
@@ -1344,54 +1378,97 @@ impl ChatPanel {
             egui::Stroke::new(1.0, color::INK_HI),
         );
         let want_focus = self.want_focus;
-        let mut enter = false;
-        let mut shift_enter = false;
-        let mut send_clicked = false;
+        let mut submit_now = false;
+        let mut stop_clicked = false;
+        // A plain (non-agent) stream: the send button becomes Stop.
+        let streaming_plain = self.in_flight.is_some() && !self.agent_in_flight;
+
+        // The composer owns the keyboard while focused (last frame's
+        // focus — the edit grants it during paint). Events are consumed
+        // here so the multiline edit never sees them: a plain Enter
+        // submits instead of newlineing (the edit's return key is
+        // Shift+Enter), and the arrows recall history on a one-line
+        // buffer.
+        let composer_focused = ui
+            .ctx()
+            .memory(|mem| mem.focused() == Some(egui::Id::new(COMPOSER_ID)));
+        let mut recalled = false;
+        if composer_focused {
+            let mut recall_back = false;
+            let mut recall_forward = false;
+            let one_line = !self.composer.contains('\n');
+            ui.ctx().input_mut(|input| {
+                input.events.retain(|event| match event {
+                    egui::Event::Key {
+                        key: Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt => {
+                        submit_now = true;
+                        false
+                    }
+                    egui::Event::Key {
+                        key: Key::ArrowUp,
+                        pressed: true,
+                        ..
+                    } if one_line => {
+                        recall_back = true;
+                        false
+                    }
+                    egui::Event::Key {
+                        key: Key::ArrowDown,
+                        pressed: true,
+                        ..
+                    } if one_line => {
+                        recall_forward = true;
+                        false
+                    }
+                    _ => true,
+                });
+            });
+            if recall_back || recall_forward {
+                self.recall_history(if recall_back { -1 } else { 1 });
+                recalled = true;
+            }
+        }
 
         ui.add_space(AREA_PADDING);
         ui.horizontal(|row| {
             row.set_min_height(SEND_BUTTON_SIZE.y);
             row.add_space(AREA_PADDING);
+            let rows = self.composer_rows(row.painter(), row.available_width());
             let response = row.add(
-                egui::TextEdit::singleline(&mut self.composer)
+                egui::TextEdit::multiline(&mut self.composer)
                     .id(egui::Id::new(COMPOSER_ID))
                     .hint_text(COMPOSER_HINT)
                     .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS))
                     .desired_width(
                         (row.available_width() - SEND_BUTTON_SIZE.x - 2.0 * AREA_PADDING).max(40.0),
-                    ),
+                    )
+                    .desired_rows(rows)
+                    // Shift+Enter is the newline key (Phase R1): plain
+                    // Enter was consumed above as the submit signal, so
+                    // the caret-accurate newline needs the modifier.
+                    .return_key(egui::KeyboardShortcut::new(
+                        egui::Modifiers::SHIFT,
+                        Key::Enter,
+                    )),
             );
             if want_focus {
                 response.request_focus();
             }
 
-            // Enter (with or without Shift — egui's logical key match
-            // ignores extra modifiers) surrenders the single-line edit's
-            // focus; `lost_focus` with the key still pressed is the
-            // submit signal. Whether that Enter carried Shift is read
-            // off the key event itself (the live modifier state only
-            // tracks held modifier keys, not event modifiers).
-            enter = response.lost_focus() && row.input(|i| i.key_pressed(Key::Enter));
-            shift_enter = enter
-                && row.input(|i| {
-                    i.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                modifiers,
-                                ..
-                            } if modifiers.shift
-                        )
-                    })
-                });
-
-            // [⏎] send button — --ink-faint, hover --ink-low, disabled
-            // (FG_DISABLED, no fill) when empty or mid-stream.
+            // [⏎] send / [■] stop — send: --ink-faint, hover --ink-low,
+            // disabled (FG_DISABLED, no fill) when empty or mid-stream.
+            // While a plain stream runs the button is Stop (Phase R1):
+            // a painted square, `--err` on hover (the agent status
+            // line's Stop precedent).
             let send_enabled = !self.composer.trim().is_empty() && self.in_flight.is_none();
+            let button_enabled = send_enabled || streaming_plain;
             let (send_rect, send_response) =
                 row.allocate_exact_size(SEND_BUTTON_SIZE, Sense::click());
-            if send_enabled {
+            if button_enabled {
                 let fill = if send_response.hovered() {
                     color::INK_LOW
                 } else {
@@ -1399,39 +1476,66 @@ impl ChatPanel {
                 };
                 row.painter().rect_filled(send_rect, radius::R1, fill);
             }
-            row.painter().text(
-                send_rect.center(),
-                Align2::CENTER_CENTER,
-                SEND_GLYPH,
-                egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
-                if send_enabled {
-                    color::FG_DEFAULT
-                } else {
-                    color::FG_DISABLED
-                },
-            );
+            if streaming_plain {
+                row.painter().rect_filled(
+                    egui::Rect::from_center_size(
+                        send_rect.center(),
+                        vec2(STOP_SQUARE, STOP_SQUARE),
+                    ),
+                    radius::R0,
+                    if send_response.hovered() {
+                        color::ERR
+                    } else {
+                        color::FG_DEFAULT
+                    },
+                );
+            } else {
+                row.painter().text(
+                    send_rect.center(),
+                    Align2::CENTER_CENTER,
+                    SEND_GLYPH,
+                    egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
+                    if send_enabled {
+                        color::FG_DEFAULT
+                    } else {
+                        color::FG_DISABLED
+                    },
+                );
+            }
             frame.send_button_rect = send_rect;
-            if send_response.clicked() && send_enabled {
-                send_clicked = true;
+            if send_response.clicked() {
+                if send_enabled {
+                    submit_now = true;
+                } else if streaming_plain {
+                    stop_clicked = true;
+                }
             }
             row.add_space(AREA_PADDING);
         });
         self.want_focus = false;
-
-        if shift_enter {
-            // Appended at the buffer's end: the composer is single-line,
-            // so the cursor sits at the end in normal typing flow.
-            self.composer.push('\n');
-        }
-        // A plain Enter or the send button submits; a Shift+Enter only
-        // inserted the newline above.
-        if (enter && !shift_enter) || send_clicked {
-            self.submit(&mut frame.events);
-        }
-        if enter {
-            // Keep typing after a send (and after a Shift+Enter newline:
-            // the edit surrendered focus on that Enter too).
+        // A recall's external text change can surrender the edit's focus
+        // (egui resets the widget state when the buffer moves under it) —
+        // re-claim it next frame so typing and further recall keys keep
+        // working. (Set after the consumption above, so it survives.)
+        if recalled {
             self.want_focus = true;
+        }
+
+        if submit_now {
+            self.submit(&mut frame.events);
+            // Keep typing after a send: the cleared buffer can surrender
+            // the edit's focus (the single-line composer re-armed focus
+            // the same way).
+            self.want_focus = true;
+        }
+        if stop_clicked {
+            // The panel finalizes the bubble itself; the event is the
+            // shell's cue to cancel the request (the late deltas are
+            // stale-dropped against the cleared in-flight id).
+            if let Some(id) = self.in_flight {
+                self.abort_stream(id);
+                frame.events.push(ChatPanelEvent::StopStream { id });
+            }
         }
 
         ui.add_space(space::S1);
@@ -1474,7 +1578,8 @@ impl ChatPanel {
     /// Submit the composer: assign the id, echo the user bubble, clear
     /// the input, emit [`ChatPanelEvent::Send`] — or, with Agent Mode on,
     /// [`ChatPanelEvent::AgentSend`] (ARCHITECTURE.md §17.3). A no-op
-    /// while empty or mid-stream.
+    /// while empty or mid-stream. The submitted text enters the recall
+    /// history (Phase R1).
     fn submit(&mut self, events: &mut Vec<ChatPanelEvent>) {
         if self.in_flight.is_some() {
             return;
@@ -1483,6 +1588,9 @@ impl ChatPanel {
         if text.is_empty() {
             return;
         }
+        self.push_history(text.clone());
+        self.history_index = None;
+        self.history_draft = None;
         let id = ChatId::next();
         self.in_flight = Some(id);
         self.push_user(&text);
@@ -1494,6 +1602,99 @@ impl ChatPanel {
             events.push(ChatPanelEvent::AgentSend { id, text });
         } else {
             events.push(ChatPanelEvent::Send { id, text });
+        }
+    }
+
+    /// Record a submitted prompt for the ↑/↓ recall (deduplicated against
+    /// the previous entry so a resent prompt doesn't stack; capped at
+    /// [`HISTORY_LEN`], oldest evicted).
+    fn push_history(&mut self, text: String) {
+        if self.history.last().is_some_and(|last| last == &text) {
+            return;
+        }
+        self.history.push(text);
+        if self.history.len() > HISTORY_LEN {
+            self.history.remove(0);
+        }
+    }
+
+    /// Walk the recall history: negative = back in time, positive =
+    /// forward. The live buffer is stashed on the first step back and
+    /// restored stepping off the end. A no-op with no history.
+    fn recall_history(&mut self, direction: i32) {
+        if self.history.is_empty() {
+            return;
+        }
+        match (self.history_index, direction < 0) {
+            (None, true) => {
+                self.history_draft = Some(std::mem::take(&mut self.composer));
+                let last = self.history.len() - 1;
+                self.history_index = Some(last);
+                self.composer.clone_from(&self.history[last]);
+            }
+            (Some(index), true) => {
+                let prev = index.saturating_sub(1);
+                self.history_index = Some(prev);
+                self.composer.clone_from(&self.history[prev]);
+            }
+            (Some(index), false) => {
+                if index + 1 < self.history.len() {
+                    self.history_index = Some(index + 1);
+                    self.composer.clone_from(&self.history[index + 1]);
+                } else {
+                    // Forward off the end: back to the live buffer.
+                    self.history_index = None;
+                    self.composer = self.history_draft.take().unwrap_or_default();
+                }
+            }
+            (None, false) => {}
+        }
+    }
+
+    /// The composer's visible row count for the current buffer, at the
+    /// panel's inner width: wrapped lines counted (the same font the
+    /// edit paints with), capped at [`COMPOSER_MAX_ROWS`].
+    fn composer_rows(&self, painter: &egui::Painter, outer_width: f32) -> usize {
+        let wrap = (outer_width - SEND_BUTTON_SIZE.x - 2.0 * AREA_PADDING).max(40.0);
+        let galley = painter.layout(
+            self.composer.clone(),
+            egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
+            color::FG_DEFAULT,
+            wrap,
+        );
+        let rows = galley.rows.len().max(1);
+        rows.clamp(1, COMPOSER_MAX_ROWS)
+    }
+
+    /// The composer bar's height this frame: the 60px base plus one row
+    /// pitch per wrapped line beyond the first (Phase R1's auto-grow).
+    fn composer_height(&self, ui: &Ui) -> f32 {
+        let rows = self.composer_rows(ui.painter(), ui.available_width()) as f32;
+        COMPOSER_HEIGHT + (rows - 1.0) * COMPOSER_LINE_HEIGHT
+    }
+
+    /// The user stopped a plain stream (the composer's Stop button,
+    /// Phase R1): the bubble keeps whatever streamed, stops streaming,
+    /// and the composer unlocks. Late deltas for the id are
+    /// stale-dropped; the partial text stays in the conversation for the
+    /// next request (the ZCode-class behavior).
+    pub fn abort_stream(&mut self, id: ChatId) {
+        if self.in_flight != Some(id) {
+            return;
+        }
+        self.in_flight = None;
+        if let Some(TimelineEntry::Bubble(message)) = self.entries.last_mut() {
+            message.streaming = false;
+        }
+        // A bubble that never received a delta is dropped (the
+        // complete_stream precedent).
+        let is_empty_assistant = matches!(
+            self.entries.last(),
+            Some(TimelineEntry::Bubble(message))
+                if message.role == Role::Assistant && message.content.is_empty()
+        );
+        if is_empty_assistant {
+            self.entries.pop();
         }
     }
 }
@@ -2059,11 +2260,113 @@ mod tests {
         );
         assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
 
-        // The send button is equally gated.
+        // The send button is equally gated — and while a plain stream
+        // runs the button IS the Stop affordance (Phase R1): the click
+        // aborts the stream instead of sending.
         let center = outcome.send_button_rect.center();
         let outcome = frame(&ctx, raw_input_with(click_at(center)), &mut panel);
-        assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
-        assert_eq!(panel.turn_count(), 2); // user bubble + streaming bubble
+        assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
+        assert!(
+            matches!(
+                &outcome.events[0],
+                ChatPanelEvent::StopStream { id: stop_id } if *stop_id == id
+            ),
+            "the click stops the in-flight stream: {:?}",
+            outcome.events
+        );
+        assert!(!panel.is_streaming(), "the panel unlocked");
+        assert_eq!(panel.turn_count(), 2); // user bubble + the finalized partial bubble
+    }
+
+    #[test]
+    fn enter_submits_a_multiline_buffer() {
+        // The Enter interception works on a multi-line buffer too: plain
+        // Enter submits (never newlines), the panel sends the whole text.
+        let mut panel = ChatPanel::new();
+        panel.focus_composer();
+        panel.set_composer_text("line one\nline two");
+        let ctx = egui::Context::default();
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let outcome = frame(
+            &ctx,
+            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            &mut panel,
+        );
+        assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
+        match &outcome.events[0] {
+            ChatPanelEvent::Send { text, .. } => {
+                assert_eq!(text, "line one\nline two");
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        // The multi-line buffer left the composer (cleared with the send).
+        assert_eq!(panel.composer_text(), "");
+    }
+
+    #[test]
+    fn arrow_recall_walks_the_history_and_restores_the_draft() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("first");
+        let id = send(&mut panel).expect("first");
+        panel.complete_stream(id);
+        panel.set_composer_text("second");
+        let id = send(&mut panel).expect("second");
+        panel.complete_stream(id);
+
+        // The live buffer is empty; recall parks it as the draft.
+        panel.focus_composer();
+        let ctx = egui::Context::default();
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let press = |key: Key| raw_input_with(vec![key_event(key, Default::default())]);
+        let outcome = frame(&ctx, press(Key::ArrowUp), &mut panel);
+        assert!(outcome.events.is_empty());
+        assert_eq!(panel.composer_text(), "second");
+
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let _ = frame(&ctx, press(Key::ArrowUp), &mut panel);
+        assert_eq!(panel.composer_text(), "first");
+
+        // Saturates at the oldest entry.
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let _ = frame(&ctx, press(Key::ArrowUp), &mut panel);
+        assert_eq!(panel.composer_text(), "first");
+
+        // Forward walks back, then off the end restores the live draft.
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let _ = frame(&ctx, press(Key::ArrowDown), &mut panel);
+        assert_eq!(panel.composer_text(), "second");
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        let _ = frame(&ctx, press(Key::ArrowDown), &mut panel);
+        assert_eq!(panel.composer_text(), "");
+    }
+
+    #[test]
+    fn abort_stream_finalizes_the_partial_bubble_and_unlocks() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("question");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "partial answer");
+
+        panel.abort_stream(id);
+        assert!(!panel.is_streaming(), "the composer unlocked");
+        assert_eq!(panel.turn_count(), 2, "user bubble + the partial bubble");
+        // The partial text stays: it re-enters the next request's context.
+        assert!(
+            panel
+                .conversation()
+                .iter()
+                .any(|message| message.content == "partial answer"),
+            "conversation: {:?}",
+            panel.conversation()
+        );
+
+        // Late deltas for the aborted id are stale-dropped.
+        panel.push_assistant_delta(id, "late");
+        assert_eq!(panel.turn_count(), 2);
+
+        // A second abort of the same id is a no-op.
+        panel.abort_stream(id);
+        assert_eq!(panel.turn_count(), 2);
     }
 
     // -- streaming lifecycle ----------------------------------------------------

@@ -11,7 +11,7 @@ strictly inside the ink design language — §12 still rules):
 | Item | State |
 |---|---|
 | R0 architecture seams | **merged** (see below) |
-| R1 the composer | next (multi-line auto-grow, Enter/Shift+Enter at the caret, ↑ history recall, Stop for plain streams + true cancel via `Effect::SeloraChatAbort`) |
+| R1 the composer | **merged** (see below) |
 | R2 transcript rendering | planned (markdown-lite + syntax-highlighted code blocks, message Copy/Retry, stream footer metadata, chat empty state) |
 | R3 multi-session + restore | planned (serde on the tool cards, `sessions.json`, header switcher) |
 | R4 cards & diffs | planned (shared DiffView, syntax + word-level diff emphasis, open-at-line, bash ANSI, orb reserved arms in the status bar) |
@@ -49,7 +49,32 @@ strictly inside the ink design language — §12 still rules):
   now sizes via the widget's own `closed_button_width`.
 - shell.rs: 3,867 → 3,541 lines (non-test code ≈ 1,890; the file is
   test-heavy by design — the chrome's tests moved out with the widgets).
-- Gate: `cargo test --workspace` green (733 tests passing across all crates, +9 new for the extracted widgets), `cargo clippy
+- Gate: `cargo test --workspace` green (733 tests passing across all crates, +9 new for the extracted widgets).
+
+**R1 details** (the composer — ZCode-class input):
+
+- Multiline `TextEdit` with `return_key(SHIFT+Enter)`: plain Enter is
+  consumed by the panel while the edit is focused (the submit signal),
+  so the caret-accurate newline comes via Shift+Enter. The bar grows with
+  the buffer (wrapped rows measured, capped at 6 rows / 60+5×18px), the
+  transcript yields.
+- ↑/↓ recall on a one-line buffer (10 entries, deduped, draft restored
+  walking off the end). A recall's external text change re-arms focus
+  next frame (egui resets the edit's widget state when the buffer moves
+  under it).
+- The Stop button: while a plain (non-agent) stream runs, the send
+  button becomes a painted ■ (hover `--err`, the agent status-line Stop
+  precedent). Click → the panel finalizes the partial bubble (it stays
+  in the conversation) + `ChatPanelEvent::StopStream` → the shell
+  reverse-maps to the request uuid, drops the mapping, and sends the new
+  `Effect::SeloraChatAbort` → the dispatcher flips a per-request
+  `tokio::watch` — the SSE request future is dropped (the connection
+  closes) and the relay ends **silently** (a user stop is never a
+  ChatError toast). Late deltas for the aborted id are stale-dropped.
+- Tests: composer (multiline submit, recall walk, abort semantics,
+  send-blocked-now-stops), wiring (`chat_cancel_ends_the_stream_silently`
+  — a stalled mock response, the channel closes with no terminal
+  message), shell (the StopStream route + late-delta drop)., `cargo clippy
   --all-targets` clean, `cargo fmt` applied.
 
 ## 2026-10-07 — Phase 6 (Polish & Ship): 6a–6g merged on main; 6h in flight

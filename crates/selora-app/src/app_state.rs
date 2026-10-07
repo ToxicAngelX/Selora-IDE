@@ -112,6 +112,11 @@ pub enum Effect {
     SeloraListModels,
     #[allow(dead_code)]
     SeloraChat(Uuid, ChatRequest),
+    /// Cancel an in-flight plain chat (Phase R1: the composer's Stop):
+    /// the dispatcher flips the request's cancel watch — the SSE request
+    /// future is dropped (the connection closes) and the relay ends
+    /// silently. An unknown/ended id is a silent no-op.
+    SeloraChatAbort(Uuid),
     /// Ping the gateway for the status-bar connection indicator (Phase
     /// 4f): the worker calls `SeloraClient::status` and replies with
     /// [`AppMessage::SeloraStatus`]. Without a connected key it replies

@@ -1235,6 +1235,23 @@ impl SeloraApp {
                         .send(Effect::AgentDecision(uuid, approval_id, decision));
                 }
             }
+            ChatPanelEvent::StopStream { id } => {
+                // The panel already finalized the streaming bubble; this
+                // cancels the request itself (Phase R1): the reverse map
+                // gives the dispatcher's uuid, the cancel closes the SSE
+                // connection, and the map entry goes now — the aborted
+                // stream never sends a terminal message.
+                let uuid = self
+                    .state
+                    .chat_ids
+                    .iter()
+                    .find(|(_, chat_id)| **chat_id == id)
+                    .map(|(uuid, _)| *uuid);
+                if let Some(uuid) = uuid {
+                    self.state.chat_ids.remove(&uuid);
+                    let _ = self.effect_tx.send(Effect::SeloraChatAbort(uuid));
+                }
+            }
             // The panel emptied the transcript itself; an in-flight stream
             // (if any) lands into a stale id and is dropped.
             ChatPanelEvent::Clear => {}
@@ -2799,6 +2816,47 @@ mod tests {
         );
         // The summary footer still landed (a failed turn ends the timeline).
         assert_eq!(app.state.chat_panel.turn_count(), 2); // user bubble + summary
+    }
+
+    /// Phase R1: the composer's Stop — the panel half (abort_stream)
+    /// finalizes the bubble; the shell half (StopStream route) cancels
+    /// the mapped request and drops the mapping, so late deltas for the
+    /// aborted id never surface.
+    #[tokio::test]
+    async fn stop_stream_cancels_the_mapped_request() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        app.show_chat = true;
+
+        let chat_id = selora_ui::sidebar::ChatId::next();
+        app.state.chat_panel.begin_stream(chat_id);
+        let uuid = uuid::Uuid::new_v4();
+        app.state.chat_ids.insert(uuid, chat_id);
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.state.chat_panel.is_streaming());
+
+        // The click's two halves, driven directly.
+        app.state.chat_panel.abort_stream(chat_id);
+        app.route_chat_event(ChatPanelEvent::StopStream { id: chat_id });
+        assert!(!app.state.chat_panel.is_streaming(), "the panel unlocked");
+        assert!(
+            app.state.chat_ids.is_empty(),
+            "the mapping went with the cancel"
+        );
+
+        // A delta already in the channel when the Stop landed is
+        // stale-dropped (the panel's in-flight id is cleared). A
+        // ChatError cannot arrive at all — the cancel ends the relay
+        // silently (the wiring test's proof).
+        app.msg_tx
+            .send(AppMessage::ChatDelta(uuid, "late".into()))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert_eq!(app.state.chat_panel.turn_count(), 0, "nothing landed");
+        assert!(app.state.toasts.is_empty(), "nothing errored");
     }
 
     /// §17.7's LSP half: a same-length agent edit is invisible to the
