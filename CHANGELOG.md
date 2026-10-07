@@ -102,6 +102,11 @@ All notable changes to Selora IDE are documented here. The format follows
   header, the working-tree-vs-index unified diff through the shared
   DiffView (syntax highlighted), Esc/× to close. `FileDiff::to_unified` is
   new in selora-git.
+- Final polish (Phase R7): the MetalMark liquid-metal sheen on the splash
+  (owner-enabled — the one permitted specular highlight); the `--scrim`
+  token applied to both modal backdrops; toasts fade in over 240ms and out
+  over their last 400ms; and the keyboard cheat sheet ("Help: Show Keyboard
+  Shortcuts" — a modal of the live keybind table, Esc/backdrop to close).
 - Find/replace in the editor (Phase R6c): Ctrl+F opens the find bar over
   the active pane (query, match count, `Aa` case toggle, ↑/↓, ×); Ctrl+H
   adds the replace row (Replace / Replace All). Every match gets a hairline

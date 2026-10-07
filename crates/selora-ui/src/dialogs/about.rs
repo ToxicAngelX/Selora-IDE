@@ -79,6 +79,7 @@ impl AboutDialog {
             .inner_margin(egui::Margin::same(space::S5 as i8));
 
         let modal = egui::Modal::new(egui::Id::new("selora-about-dialog"))
+            .backdrop_color(color::SCRIM)
             .frame(frame)
             .show(ctx, |ui| {
                 // Pinned both ends: the modal sizes to content, and the

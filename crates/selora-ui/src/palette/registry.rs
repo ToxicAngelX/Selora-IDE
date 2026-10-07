@@ -49,6 +49,9 @@ pub enum CommandId {
 
     // Help (Phase 6b)
     HelpAbout,
+
+    // Help (Phase R7)
+    HelpShowShortcuts,
 }
 
 /// One palette entry. Pure data — see the module docs.
@@ -217,6 +220,20 @@ pub const COMMANDS: &[Command] = &[
         category: "Help",
         keybind_hint: None,
         tags: &["about", "version", "license", "update", "help"],
+    },
+    Command {
+        id: CommandId::HelpShowShortcuts,
+        name: "Help: Show Keyboard Shortcuts",
+        category: "Help",
+        keybind_hint: None,
+        tags: &[
+            "shortcuts",
+            "keybinds",
+            "keyboard",
+            "keys",
+            "cheat sheet",
+            "help",
+        ],
     },
 ];
 

@@ -179,6 +179,9 @@ pub struct SeloraApp {
     /// Phase R6b: the open read-only git diff (the path + unified text);
     /// the workbench overlay over the editor area.
     git_diff: Option<(std::path::PathBuf, String)>,
+    /// Phase R7: the keyboard cheat sheet (the "Show Keyboard Shortcuts"
+    /// palette command).
+    shortcuts_open: bool,
     /// Phase R6c: the find bar over the active pane.
     find_bar: selora_ui::editor::find_bar::FindBar,
     /// The (query, path) last applied to the active editor — re-applied
@@ -300,6 +303,7 @@ impl SeloraApp {
             last_workspace_snapshot: None,
             last_sessions_snapshot: None,
             git_diff: None,
+            shortcuts_open: false,
             find_bar: selora_ui::editor::find_bar::FindBar::default(),
             find_applied: None,
             ghost_in_flight: false,
@@ -665,6 +669,7 @@ impl SeloraApp {
             || self.state.fuzzy.is_open()
             || self.settings_dialog.is_some()
             || self.about_dialog.is_some()
+            || self.shortcuts_open
             || matches!(self.splash, SplashState::Showing(_))
             || ctx.text_edit_focused()
     }
@@ -1686,10 +1691,7 @@ impl SeloraApp {
             let bar = &mut self.find_bar;
             let events = bar.show(ui, view.content, matches, active);
             for event in events {
-                let editor = self
-                    .state
-                    .editors
-                    .get_mut(&(view.pane, path.clone()));
+                let editor = self.state.editors.get_mut(&(view.pane, path.clone()));
                 use selora_ui::editor::find_bar::FindBarEvent;
                 match event {
                     FindBarEvent::Query(text) => {
@@ -1995,6 +1997,7 @@ impl SeloraApp {
                     self.about_dialog = Some(AboutDialog::new(env!("CARGO_PKG_VERSION")));
                 }
             }
+            CommandId::HelpShowShortcuts => self.shortcuts_open = true,
             // Phase 3: LSP, search, bottom panel.
             CommandId::ViewTogglePanel => self.toggle_bottom_panel(),
             CommandId::ViewGoToSymbol => {
@@ -2093,6 +2096,53 @@ impl SeloraApp {
     }
 }
 
+impl SeloraApp {
+    /// The cheat sheet's rows (Phase R7): the rebindable four from the
+    /// live settings, then the fixed table.
+    fn shortcut_rows(&self) -> Vec<selora_ui::dialogs::shortcuts::ShortcutRow> {
+        use selora_ui::dialogs::shortcuts::ShortcutRow;
+        let keybinds = &self.state.settings.keybinds;
+        let mut rows = vec![
+            ShortcutRow {
+                action: "Find a file".into(),
+                binding: keybinds.fuzzy_find.clone(),
+            },
+            ShortcutRow {
+                action: "Command palette".into(),
+                binding: keybinds.command_palette.clone(),
+            },
+            ShortcutRow {
+                action: "Save".into(),
+                binding: keybinds.save.clone(),
+            },
+            ShortcutRow {
+                action: "Toggle chat sidebar".into(),
+                binding: keybinds.toggle_chat.clone(),
+            },
+        ];
+        for (keybind, action) in fixed_keybinds() {
+            rows.push(ShortcutRow {
+                action: key_action_label(*action).to_owned(),
+                binding: keybind.to_string(),
+            });
+        }
+        rows
+    }
+
+    /// The cheat sheet overlay (Phase R7). Esc / the backdrop closes (the
+    /// Modal owns dismissal); the open flag resets when the dialog is
+    /// gone.
+    fn shortcuts_overlay(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let rows = self.shortcut_rows();
+        if selora_ui::dialogs::shortcuts::show(ctx, &rows) {
+            self.shortcuts_open = false;
+        }
+    }
+}
+
 impl eframe::App for SeloraApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ui_body(ui);
@@ -2149,6 +2199,7 @@ impl SeloraApp {
         self.lsp_popups(ui.ctx());
         self.settings_dialog(ui.ctx());
         self.about_dialog(ui.ctx());
+        self.shortcuts_overlay(ui.ctx());
         // Phase 6a: the first-run splash covers everything below the title
         // strip; toasts still paint above it (a connect failure must be
         // visible).
@@ -2318,6 +2369,31 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
             ctrl(egui::Key::H, KeyAction::ReplaceInFile),
         ]
     })
+}
+
+/// The cheat sheet's action label for a fixed-table entry (Phase R7).
+fn key_action_label(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::ToggleFileTree => "Toggle file tree",
+        KeyAction::SplitEditor => "Split editor",
+        KeyAction::CloseEditor => "Close editor",
+        KeyAction::OpenSettings => "Open settings",
+        KeyAction::OpenFile => "Open file",
+        KeyAction::TogglePanel => "Toggle panel",
+        KeyAction::SearchInFiles => "Search in files",
+        KeyAction::GoToDefinition => "Go to definition",
+        KeyAction::Completions => "Completions",
+        KeyAction::Hover => "Hover",
+        KeyAction::UndoAgentEdit => "Undo agent edit",
+        KeyAction::FindInFile => "Find in file",
+        KeyAction::ReplaceInFile => "Replace in file",
+        KeyAction::FuzzyFind
+        | KeyAction::CommandPalette
+        | KeyAction::Save
+        | KeyAction::ToggleChat => {
+            "" // rebindable — the rows carry them from settings instead
+        }
+    }
 }
 
 /// Route one keyboard shortcut to an action: the user-rebindable entries

@@ -68,10 +68,7 @@ fn find_matches(buffer: &Buffer, query: &str, case_sensitive: bool) -> Vec<(Posi
             let byte_col = start + found;
             // Char column: count the chars before the byte offset.
             let char_col = line[..byte_col.min(line.len())].chars().count();
-            matches.push((
-                Position::new(line_index, char_col),
-                query.chars().count(),
-            ));
+            matches.push((Position::new(line_index, char_col), query.chars().count()));
             start = byte_col + needle.len().max(1);
         }
     }
@@ -1344,9 +1341,11 @@ mod tests {
 
     #[test]
     fn find_matches_count_navigate_and_highlight_state() {
-        let mut editor = editor("one banana two
+        let mut editor = editor(
+            "one banana two
 banana split
-no fruit here");
+no fruit here",
+        );
         assert_eq!(editor.find_matches(), 0, "nothing while the bar is closed");
 
         editor.set_find("banana", false);
@@ -1354,7 +1353,11 @@ no fruit here");
         assert_eq!(editor.find_active(), 1, "the first match is active");
 
         editor.find_next();
-        assert_eq!(editor.cursor(), Position::new(1, 0), "the cursor moved to match 2");
+        assert_eq!(
+            editor.cursor(),
+            Position::new(1, 0),
+            "the cursor moved to match 2"
+        );
         editor.find_next(); // wraps
         assert_eq!(editor.cursor(), Position::new(0, 4));
         editor.find_prev();
@@ -1377,9 +1380,11 @@ no fruit here");
 
     #[test]
     fn find_replace_current_and_all() {
-        let mut editor = editor("the quick brown fox
+        let mut editor = editor(
+            "the quick brown fox
 the lazy dog
-the end");
+the end",
+        );
         // Case-sensitive: the capital-THE stay-out keeps the math honest.
         editor.set_find("the", true);
         assert_eq!(editor.find_matches(), 3);

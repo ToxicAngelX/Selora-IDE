@@ -24,7 +24,7 @@ use super::LOOP_S;
 
 /// The owner-decision flag (Phase 6h brief): `false` = the sheen never
 /// paints. Wired in `splash.rs` behind this constant.
-pub const METAL_MARK_ENABLED: bool = false;
+pub const METAL_MARK_ENABLED: bool = true; // the owner enabled it (Phase R7)
 
 /// One sweep every four loops: calm, not a strobe.
 const SWEEP_PERIOD_S: f32 = 4.0 * LOOP_S;
@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)] // the test's point IS the constant's value
-    fn the_flag_ships_off() {
-        assert!(!METAL_MARK_ENABLED, "the owner flips this, nobody else");
+    fn the_owner_enabled_the_flag() {
+        assert!(METAL_MARK_ENABLED, "the owner flipped this (Phase R7)");
     }
 
     #[test]

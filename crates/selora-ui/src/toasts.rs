@@ -61,6 +61,7 @@ pub fn show(ctx: &Context, toasts: &mut Vec<Toast>) {
         return;
     }
 
+    let now = Instant::now();
     let mut dismissed = None;
     egui::Area::new(egui::Id::new("selora_toasts"))
         .order(egui::Order::Foreground)
@@ -72,16 +73,29 @@ pub fn show(ctx: &Context, toasts: &mut Vec<Toast>) {
             ui.set_max_width(MAX_WIDTH);
             ui.spacing_mut().item_spacing.y = space::S2;
             for (index, toast) in toasts.iter().enumerate() {
+                // Phase R7: the fade — in over 240ms on arrival, out over
+                // the last 400ms (fades are the reduce-motion survivors,
+                // §7.4).
+                let total = toast.severity.lifetime().as_secs_f32();
+                let remaining = toast
+                    .expires_at
+                    .saturating_duration_since(now)
+                    .as_secs_f32();
+                let fade_in = ((total - remaining) / 0.24).clamp(0.0, 1.0);
+                let fade_out = (remaining / 0.40).clamp(0.0, 1.0);
+                let opacity = fade_in.min(fade_out);
                 let (glyph, color) = match toast.severity {
                     Severity::Info => ("i", color::INFO),
                     Severity::Error => ("!", color::ERR),
                 };
+                let frame_opacity = opacity;
                 egui::Frame::default()
                     .fill(color::INK_MID)
                     .stroke(egui::Stroke::new(1.0, color::INK_HI))
                     .corner_radius(radius::R1 as u8)
                     .inner_margin(egui::Margin::same(space::S3 as i8))
                     .show(ui, |ui| {
+                        ui.set_opacity(frame_opacity);
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(glyph)

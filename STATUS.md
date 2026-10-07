@@ -17,7 +17,7 @@ strictly inside the ink design language — §12 still rules):
 | R4 cards & diffs | **merged** (see below) |
 | R5 settings completion | **merged** (see below) |
 | R6 IDE gaps | **merged** (see below) |
-| R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
+| R7 final polish + docs | **merged** (see below) |
 
 **Standing references (owner directive, 2026-10-07):** ZCode
 (https://github.com/zai-org/ZCode — the UI/UX + agent-window benchmark) and
@@ -215,6 +215,23 @@ trace back to these two.
   hairline boxes + the active ink-mid fill (the paint loop's x_offsets).
   Ctrl+F/Ctrl+H + the palette commands route here (the "lands in
   Phase 3" toasts are gone).
+
+**R7 details** (the last polish + the owner-decision items):
+
+- MetalMark **enabled** (the splash sheen — the single permitted specular
+  highlight, per the owner's Phase-R decision); the flag test now guards
+  "on".
+- `--scrim` applied to the Settings and About modals (`backdrop_color` —
+  the egui default black-alpha is gone); the cheat sheet uses it too.
+- Toasts fade in over 240ms and out over their last 400ms (§7.4-kept
+  fades).
+- The keyboard cheat sheet ("Help: Show Keyboard Shortcuts" in the
+  palette): a `shortcuts` dialog of the rebindable four (live settings)
+  + the fixed table, binding chips, Esc/backdrop closes; the overlay
+  gate now covers it.
+- **Screenshots need a live refresh** (assets/screenshots/*.png predate
+  the revamp — no automated capture tool exists for native windows; the
+  owner re-captures on their machine, same as 6g).
 
 **§12 bend for owner sign-off (R4)**: the diff emphasis paints a 12%
 alpha tint of the existing `--err`/`--ok` behind changed words (DESIGN

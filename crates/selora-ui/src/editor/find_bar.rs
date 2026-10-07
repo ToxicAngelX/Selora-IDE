@@ -39,8 +39,6 @@ pub struct FindBar {
     want_focus: bool,
 }
 
-
-
 /// What the bar asks the shell for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindBarEvent {
@@ -95,15 +93,25 @@ impl FindBar {
 
         let height = ROW_HEIGHT * if self.replace_mode { 2.0 } else { 1.0 };
         let rect = Rect::from_min_max(
-            pos2(anchor.right() - BAR_WIDTH - space::S1, anchor.top() + space::S1),
-            pos2(anchor.right() - space::S1, anchor.top() + space::S1 + height),
+            pos2(
+                anchor.right() - BAR_WIDTH - space::S1,
+                anchor.top() + space::S1,
+            ),
+            pos2(
+                anchor.right() - space::S1,
+                anchor.top() + space::S1 + height,
+            ),
         );
 
         // The bar owns the keyboard while its query or replace field is
         // focused (the composer pattern): Enter steps forward,
         // Shift+Enter back, Esc closes.
-        let query_focused = ui.ctx().memory(|m| m.focused() == Some(egui::Id::new(QUERY_ID)));
-        let replace_focused = ui.ctx().memory(|m| m.focused() == Some(egui::Id::new(REPLACE_ID)));
+        let query_focused = ui
+            .ctx()
+            .memory(|m| m.focused() == Some(egui::Id::new(QUERY_ID)));
+        let replace_focused = ui
+            .ctx()
+            .memory(|m| m.focused() == Some(egui::Id::new(REPLACE_ID)));
         // Esc closes from anywhere — the bar is an overlay. (egui clears
         // the widget focus on Escape globally, so this must not gate on
         // focus.)
@@ -153,10 +161,7 @@ impl FindBar {
                                 egui::TextEdit::singleline(&mut self.query)
                                     .id(egui::Id::new(QUERY_ID))
                                     .hint_text("Find")
-                                    .font(egui::FontId::new(
-                                        type_scale::SM,
-                                        font::FAMILY_SANS,
-                                    ))
+                                    .font(egui::FontId::new(type_scale::SM, font::FAMILY_SANS))
                                     .desired_width(150.0),
                             );
                             if self.want_focus {
@@ -189,13 +194,17 @@ impl FindBar {
                                 color::FG_DEFAULT,
                             );
                             let (rect, response) = row.allocate_exact_size(
-                                vec2(galley.size().x + 2.0 * space::S1, ROW_HEIGHT - 2.0 * space::S1),
+                                vec2(
+                                    galley.size().x + 2.0 * space::S1,
+                                    ROW_HEIGHT - 2.0 * space::S1,
+                                ),
                                 Sense::click(),
                             );
                             if self.case_sensitive {
                                 row.painter().rect_filled(rect, radius::R1, color::INK_LOW);
                             } else if response.hovered() {
-                                row.painter().rect_filled(rect, radius::R1, color::INK_FAINT);
+                                row.painter()
+                                    .rect_filled(rect, radius::R1, color::INK_FAINT);
                             }
                             row.painter().text(
                                 rect.center(),
@@ -231,18 +240,14 @@ impl FindBar {
                                     egui::TextEdit::singleline(&mut self.replacement)
                                         .id(egui::Id::new(REPLACE_ID))
                                         .hint_text("Replace")
-                                        .font(egui::FontId::new(
-                                            type_scale::SM,
-                                            font::FAMILY_SANS,
-                                        ))
+                                        .font(egui::FontId::new(type_scale::SM, font::FAMILY_SANS))
                                         .desired_width(150.0),
                                 );
                                 if small_button(row, "Replace", "find_replace").clicked() {
                                     events.push(FindBarEvent::Replace(self.replacement.clone()));
                                 }
                                 if small_button(row, "Replace All", "find_replace_all").clicked() {
-                                    events
-                                        .push(FindBarEvent::ReplaceAll(self.replacement.clone()));
+                                    events.push(FindBarEvent::ReplaceAll(self.replacement.clone()));
                                 }
                             });
                         }
@@ -262,10 +267,8 @@ fn small_button(ui: &mut Ui, label: &str, _salt: &str) -> egui::Response {
         color::FG_DEFAULT,
     );
     let width = galley.size().x + 2.0 * space::S1;
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(width, ROW_HEIGHT - 2.0 * space::S1),
-        Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, ROW_HEIGHT - 2.0 * space::S1), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(rect, radius::R1, color::INK_LOW);
     }

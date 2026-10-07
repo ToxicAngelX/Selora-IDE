@@ -332,6 +332,7 @@ impl SettingsDialog {
             .inner_margin(egui::Margin::same(space::S5 as i8));
 
         let modal = egui::Modal::new(egui::Id::new("selora-settings-dialog"))
+            .backdrop_color(color::SCRIM)
             .frame(frame)
             .show(ctx, |ui| {
                 // Pin the geometry with an exact allocation: the Modal
