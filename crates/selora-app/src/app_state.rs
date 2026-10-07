@@ -144,6 +144,10 @@ pub enum Effect {
     #[allow(dead_code)]
     SeloraKeyringSet(String),
 
+    /// "Check for updates" (Phase 6b, UI_SPEC.md §11): the worker GETs the
+    /// repo's latest GitHub Release and replies [`AppMessage::UpdateChecked`].
+    CheckForUpdates,
+
     // Agent Mode (ARCHITECTURE.md §17.6 — additive; 5b/5c/5d consume,
     // the orchestrator owns this shared file). The request `Uuid` keys
     // the reply messages, the same `chat_ids` pattern as `SeloraChat`.
@@ -280,6 +284,10 @@ pub enum AppMessage {
     /// `SeloraAutoConnect` worker — and only by it — so it is never
     /// confused with the ping loop's keyless `Disconnected` replies.
     NoStoredKey,
+    /// The update check resolved (Phase 6b): the toast names the newer tag
+    /// (with the release page as its link), reports "up to date", or
+    /// surfaces the error's words.
+    UpdateChecked(Result<selora_ai::ReleaseInfo, String>),
 
     // Git (Phase 3b)
     /// A fresh status snapshot (also sent after every stage/unstage/commit
@@ -328,6 +336,10 @@ pub struct Toast {
     pub text: String,
     pub severity: Severity,
     pub expires_at: Instant,
+    /// An optional action link, painted as a trailing hyperlink (Phase 6b:
+    /// the update-available toast's "download"). eframe opens it in the
+    /// system browser.
+    pub link: Option<(String, String)>,
 }
 
 /// The cheap shape signature used for dirty derivation: a buffer's char and
@@ -694,6 +706,20 @@ impl AppState {
             // Shell-only signal (Phase 6a first-run splash): no document
             // state follows from it.
             AppMessage::NoStoredKey => {}
+            // Phase 6b (UI_SPEC.md §11): the update check's result is a
+            // toast — the newer tag with its release page as "download",
+            // "up to date", or the error's words.
+            AppMessage::UpdateChecked(result) => match result {
+                Ok(info) if info.newer => {
+                    self.toast_with_link(
+                        format!("{} is available", info.tag),
+                        Severity::Info,
+                        ("download".to_owned(), info.html_url),
+                    );
+                }
+                Ok(_) => self.toast("Selora IDE is up to date", Severity::Info),
+                Err(error) => self.toast(format!("update check failed: {error}"), Severity::Error),
+            },
 
             // -- Git (Phase 3b) -------------------------------------------------
             AppMessage::GitStatusChanged(status) => {
@@ -973,10 +999,25 @@ impl AppState {
             text: text.into(),
             severity,
             expires_at: Instant::now() + severity.lifetime(),
+            link: None,
         };
         self.toasts.push(toast);
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
+        }
+    }
+
+    /// A toast carrying an action link (UI_SPEC.md §13 + §11: the
+    /// update-available toast's "download"). `(label, url)`.
+    pub fn toast_with_link(
+        &mut self,
+        text: impl Into<String>,
+        severity: Severity,
+        link: (String, String),
+    ) {
+        self.toast(text, severity);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.link = Some(link);
         }
     }
 

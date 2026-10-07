@@ -174,7 +174,8 @@ impl Splash {
         // the splash on top of every panel below it in paint order, so
         // clicks land here instead of falling through to the workbench.
         let (cover, _) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
-        ui.painter().rect_filled(cover, radius::R0, color::INK_CANVAS);
+        ui.painter()
+            .rect_filled(cover, radius::R0, color::INK_CANVAS);
 
         // The centered column (UI_SPEC.md §7): mark, wordmark, tagline,
         // input, buttons — vertically centered as a block.
@@ -193,8 +194,10 @@ impl Splash {
         let mut cursor = top;
 
         // Mark (64px, orbiting).
-        let mark_rect =
-            egui::Rect::from_center_size(egui::pos2(rect.center().x, cursor + MARK_SIZE / 2.0), egui::vec2(MARK_SIZE, MARK_SIZE));
+        let mark_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, cursor + MARK_SIZE / 2.0),
+            egui::vec2(MARK_SIZE, MARK_SIZE),
+        );
         brand::paint_mark_orbiting(ui.painter(), mark_rect, theta);
         cursor += MARK_SIZE + space::S5;
 
@@ -233,9 +236,7 @@ impl Splash {
             ui.set_min_width(INPUT_WIDTH - 2.0 * space::S3);
             let edit = egui::TextEdit::singleline(&mut self.api_key)
                 .password(true)
-                .hint_text(
-                    egui::RichText::new("Paste your sk-gw-… API key").color(color::FG_FAINT),
-                )
+                .hint_text(egui::RichText::new("Paste your sk-gw-… API key").color(color::FG_FAINT))
                 .text_color(color::FG_DEFAULT)
                 .font(egui::FontId::new(type_scale::MD, font::FAMILY_MONO))
                 .frame(egui::Frame::default());
@@ -283,7 +284,11 @@ impl Splash {
                 egui::Stroke::new(1.0, color::INK_HI),
                 egui::StrokeKind::Inside,
             );
-            let label = if connecting { "Connecting…" } else { "Connect" };
+            let label = if connecting {
+                "Connecting…"
+            } else {
+                "Connect"
+            };
             ui.painter().text(
                 connect_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -298,10 +303,8 @@ impl Splash {
             ui.add_space(space::S5);
 
             // Skip: text button, --fg-muted (UI_SPEC.md §7).
-            let (skip_rect, skip) = ui.allocate_exact_size(
-                egui::vec2(SKIP_WIDTH, BUTTON_HEIGHT),
-                egui::Sense::click(),
-            );
+            let (skip_rect, skip) =
+                ui.allocate_exact_size(egui::vec2(SKIP_WIDTH, BUTTON_HEIGHT), egui::Sense::click());
             let skip_color = if skip.hovered() {
                 color::FG_DEFAULT
             } else {
@@ -545,8 +548,8 @@ mod tests {
             + space::S3
             + type_scale::SM;
         let top = rect.center().y - column_height / 2.0;
-        let input_y = top + MARK_SIZE + space::S5 + type_scale::XXL + space::S2 + type_scale::MD
-            + space::S6;
+        let input_y =
+            top + MARK_SIZE + space::S5 + type_scale::XXL + space::S2 + type_scale::MD + space::S6;
         let buttons_y = input_y + INPUT_HEIGHT + space::S4;
         let buttons_width = BUTTON_WIDTH + space::S5 + SKIP_WIDTH;
         // The buttons live in a left_to_right child Ui — egui applies one
@@ -555,7 +558,10 @@ mod tests {
         let buttons_left = rect.center().x - buttons_width / 2.0 + indent;
         (
             egui::pos2(rect.center().x, input_y + INPUT_HEIGHT / 2.0),
-            egui::pos2(buttons_left + BUTTON_WIDTH / 2.0, buttons_y + BUTTON_HEIGHT / 2.0),
+            egui::pos2(
+                buttons_left + BUTTON_WIDTH / 2.0,
+                buttons_y + BUTTON_HEIGHT / 2.0,
+            ),
             egui::pos2(
                 buttons_left + BUTTON_WIDTH + space::S5 + SKIP_WIDTH / 2.0,
                 buttons_y + BUTTON_HEIGHT / 2.0,

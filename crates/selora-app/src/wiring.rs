@@ -526,6 +526,20 @@ fn spawn_disconnect(handle: &Handle, notify: &Notify, tx: UnboundedSender<AppMes
     });
 }
 
+/// Effect (Phase 6b): the "Check for updates" GET (UI_SPEC.md §11). The
+/// one non-gateway HTTP call in the app; the comparison against the running
+/// build's version happens in selora-ai (`check_latest_release`).
+fn spawn_update_check(handle: &Handle, notify: &Notify, tx: UnboundedSender<AppMessage>) {
+    let notify = notify.clone();
+    handle.spawn(async move {
+        let result = selora_ai::check_latest_release(env!("CARGO_PKG_VERSION"))
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx.send(AppMessage::UpdateChecked(result));
+        notify();
+    });
+}
+
 /// Effect (Phase 4d): one ghost-text completion. The reply carries the
 /// request's caret back so the editor can stale-drop it; no key → a
 /// `None` suggestion (the ghost simply does not appear).
@@ -925,6 +939,9 @@ pub fn spawn_dispatcher(
                 Effect::SeloraDisconnect => {
                     api_key = None;
                     spawn_disconnect(&dispatch_handle, &notify, msg_tx.clone());
+                }
+                Effect::CheckForUpdates => {
+                    spawn_update_check(&dispatch_handle, &notify, msg_tx.clone());
                 }
                 Effect::SeloraListModels => match api_key.clone() {
                     Some(key) => {

@@ -19,6 +19,7 @@ mod chat_types;
 mod client;
 mod sse;
 mod types;
+mod updates;
 
 pub use agent::{
     denied_result, execute_approved, execute_tool, run_agent_turn, spawn_agent_turn, tool_manifest,
@@ -34,3 +35,4 @@ pub use types::{
     compute_cost_usd, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model, ModelId, Role,
     SeloraStatus,
 };
+pub use updates::{check_latest_release, ReleaseInfo};

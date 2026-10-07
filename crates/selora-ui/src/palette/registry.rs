@@ -46,6 +46,9 @@ pub enum CommandId {
 
     // Settings
     SettingsOpen,
+
+    // Help (Phase 6b)
+    HelpAbout,
 }
 
 /// One palette entry. Pure data — see the module docs.
@@ -207,6 +210,13 @@ pub const COMMANDS: &[Command] = &[
         category: "Settings",
         keybind_hint: Some("Ctrl+,"),
         tags: &["settings", "preferences", "config"],
+    },
+    Command {
+        id: CommandId::HelpAbout,
+        name: "Help: About Selora IDE",
+        category: "Help",
+        keybind_hint: None,
+        tags: &["about", "version", "license", "update", "help"],
     },
 ];
 

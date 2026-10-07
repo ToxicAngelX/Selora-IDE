@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use selora_editor::{Editor, Language};
 use selora_settings::{Keybind, KeybindsSettings};
+use selora_ui::dialogs::about::{AboutDialog, AboutEvent};
 use selora_ui::dialogs::settings::{SettingsDialog, SettingsEvent};
 use selora_ui::editor::split::{self, PaneView};
 use selora_ui::palette::registry::CommandId;
@@ -161,6 +162,12 @@ pub struct SeloraApp {
     settings_loaded: bool,
     /// The Settings dialog, while open (UI_SPEC.md §6).
     settings_dialog: Option<SettingsDialog>,
+    /// The About dialog, while open (Phase 6b, UI_SPEC.md §11).
+    about_dialog: Option<AboutDialog>,
+    /// Whether a "Check for updates" request is in flight (the About
+    /// dialog's button goes display-only until [`AppMessage::UpdateChecked`]
+    /// lands).
+    update_check_in_flight: bool,
     /// Where `workspace.json` is persisted; `None` = no APPDATA (headless).
     workspace_dir: Option<PathBuf>,
     /// When `workspace.json` was last written (the 5s autosave clock).
@@ -270,6 +277,8 @@ impl SeloraApp {
             chord_ctrl_k: None,
             settings_loaded: false,
             settings_dialog: None,
+            about_dialog: None,
+            update_check_in_flight: false,
             workspace_dir: persistence::state_dir(),
             last_workspace_save: Instant::now(),
             last_workspace_snapshot: None,
@@ -294,6 +303,9 @@ impl SeloraApp {
             // Phase 6a: the boot keyring read resolved empty — the splash's
             // cue to show (only ever sent by the SeloraAutoConnect worker).
             let no_stored_key = matches!(message, AppMessage::NoStoredKey);
+            // Phase 6b: the About dialog's button re-arms when the check
+            // resolves (the toast is apply's job).
+            let update_checked = matches!(message, AppMessage::UpdateChecked(_));
             let failed_path = match &message {
                 AppMessage::BufferLoadFailed { path, .. } => Some(path.clone()),
                 _ => None,
@@ -363,6 +375,9 @@ impl SeloraApp {
                 let mut splash = Splash::new();
                 splash.set_reduce_motion(self.state.settings.ui.reduce_motion);
                 self.splash = SplashState::Showing(splash);
+            }
+            if update_checked {
+                self.update_check_in_flight = false;
             }
             // An F12 definition resolved (set by apply_lsp): jump — opening
             // the target file first when it is not loaded (the same
@@ -581,6 +596,7 @@ impl SeloraApp {
         self.state.palette.is_open()
             || self.state.fuzzy.is_open()
             || self.settings_dialog.is_some()
+            || self.about_dialog.is_some()
             || matches!(self.splash, SplashState::Showing(_))
             || ctx.text_edit_focused()
     }
@@ -1671,6 +1687,30 @@ impl SeloraApp {
         }
     }
 
+    /// The About dialog (Phase 6b, UI_SPEC.md §11). The update check rides
+    /// the effect channel; the reply toasts (newer tag + "download" link,
+    /// up-to-date, or the error's words) and re-arms the button.
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.about_dialog.as_mut() else {
+            return;
+        };
+        dialog.set_checking(self.update_check_in_flight);
+        let events = dialog.show(ctx);
+        let mut close = false;
+        for event in events {
+            match event {
+                AboutEvent::Close => close = true,
+                AboutEvent::CheckForUpdates => {
+                    self.update_check_in_flight = true;
+                    let _ = self.effect_tx.send(Effect::CheckForUpdates);
+                }
+            }
+        }
+        if close {
+            self.about_dialog = None;
+        }
+    }
+
     /// LSP overlays (Phase 3a): the hover tooltip and the completion popup,
     /// painted in a foreground layer anchored at the caret of the pane's
     /// editor that requested them.
@@ -1807,6 +1847,19 @@ impl SeloraApp {
                                             theme::font::FAMILY_SANS,
                                         )),
                                 );
+                                // The optional action link (Phase 6b:
+                                // "download" on the update-available toast).
+                                if let Some((label, url)) = &toast.link {
+                                    ui.hyperlink_to(
+                                        egui::RichText::new(label.as_str())
+                                            .color(theme::color::FG_MUTED)
+                                            .font(egui::FontId::new(
+                                                theme::type_scale::SM,
+                                                theme::font::FAMILY_SANS,
+                                            )),
+                                        url.as_str(),
+                                    );
+                                }
                                 if ui
                                     .button(egui::RichText::new("×").color(theme::color::FG_FAINT))
                                     .clicked()
@@ -1858,6 +1911,12 @@ impl SeloraApp {
             CommandId::ViewSplitEditor => self.state.split_editor(),
             CommandId::ViewCommandPalette => self.toggle_command_palette(),
             CommandId::SettingsOpen => self.open_settings(),
+            // Phase 6b: the About dialog (UI_SPEC.md §11).
+            CommandId::HelpAbout => {
+                if self.about_dialog.is_none() {
+                    self.about_dialog = Some(AboutDialog::new(env!("CARGO_PKG_VERSION")));
+                }
+            }
             // Phase 3: LSP, search, bottom panel.
             CommandId::ViewTogglePanel => self.toggle_bottom_panel(),
             CommandId::ViewGoToSymbol => {
@@ -2008,6 +2067,7 @@ impl SeloraApp {
         self.command_palette(ui.ctx(), workbench);
         self.lsp_popups(ui.ctx());
         self.settings_dialog(ui.ctx());
+        self.about_dialog(ui.ctx());
         // Phase 6a: the first-run splash covers everything below the title
         // strip; toasts still paint above it (a connect failure must be
         // visible).
@@ -3543,10 +3603,12 @@ mod tests {
         // The boot keyring read found a key and it validated: Pending
         // resolves to Dismissed without painting.
         app.msg_tx
-            .send(AppMessage::SeloraStatus(selora_ai::SeloraStatus::Connected {
-                model: None,
-                latency_ms: 40,
-            }))
+            .send(AppMessage::SeloraStatus(
+                selora_ai::SeloraStatus::Connected {
+                    model: None,
+                    latency_ms: 40,
+                },
+            ))
             .expect("send");
         agent_frame(&ctx, &mut app, raw_screen());
         assert!(matches!(app.splash, SplashState::Dismissed));
@@ -3607,9 +3669,7 @@ mod tests {
 
         // Connect: the status flips immediately (the splash disables its
         // button on it), the key goes to the runtime.
-        assert!(!app.route_splash_event(SplashEvent::Connect(
-            "sk-gw-rejected".to_owned()
-        )));
+        assert!(!app.route_splash_event(SplashEvent::Connect("sk-gw-rejected".to_owned())));
         assert!(matches!(
             app.state.selora_status,
             selora_ai::SeloraStatus::Connecting
@@ -3617,10 +3677,7 @@ mod tests {
 
         // The gateway's rejection lands: the splash stays up (no fade).
         pump_until(&ctx, &mut app, |app| {
-            matches!(
-                app.state.selora_status,
-                selora_ai::SeloraStatus::Error(_)
-            )
+            matches!(app.state.selora_status, selora_ai::SeloraStatus::Error(_))
         })
         .await;
         agent_frame(&ctx, &mut app, raw_screen());
@@ -3628,5 +3685,111 @@ mod tests {
             SplashState::Showing(splash) => assert!(!splash.is_fading()),
             _ => panic!("a rejected key keeps the splash up"),
         }
+    }
+
+    // --- About dialog + update check (Phase 6b) -------------------------------
+
+    #[tokio::test]
+    async fn help_about_opens_the_dialog_and_esc_closes_it() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.about_dialog.is_none());
+
+        app.run_command(CommandId::HelpAbout);
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.about_dialog.is_some());
+        assert!(app.overlay_open(&ctx));
+
+        // Esc closes (the dialog's own handling).
+        agent_frame(&ctx, &mut app, agent_key_event(egui::Key::Escape));
+        assert!(app.about_dialog.is_none());
+        assert!(!app.overlay_open(&ctx));
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_clicks_through_and_the_reply_rearms() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        // The releases endpoint is never really hit in tests: the About
+        // click only *sends the effect*; the reply below is synthetic.
+        let mut app = agent_app(&ctx);
+        app.run_command(CommandId::HelpAbout);
+
+        // Click "Check for updates" (the four-frame overlay click: two
+        // settle/hover frames, press, release). The dialog is centered on
+        // the 1280×800 screen.
+        let modal =
+            egui::Rect::from_center_size(egui::pos2(640.0, 400.0), egui::vec2(448.0, 328.0));
+        let check = egui::pos2(modal.center().x - 82.0, modal.bottom() - 44.0);
+        let move_frame = || {
+            let mut raw = raw_screen();
+            raw.events = vec![egui::Event::PointerMoved(check)];
+            raw
+        };
+        let button_frame = |pressed: bool| {
+            let mut raw = raw_screen();
+            raw.events = vec![egui::Event::PointerButton {
+                pos: check,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            }];
+            raw
+        };
+        agent_frame(&ctx, &mut app, move_frame());
+        agent_frame(&ctx, &mut app, move_frame());
+        agent_frame(&ctx, &mut app, button_frame(true));
+        agent_frame(&ctx, &mut app, button_frame(false));
+        assert!(
+            app.update_check_in_flight,
+            "the click sent the check (button disarmed)"
+        );
+
+        // A newer release toasts the tag with the download link.
+        app.msg_tx
+            .send(AppMessage::UpdateChecked(Ok(selora_ai::ReleaseInfo {
+                tag: "v9.9.9".to_owned(),
+                html_url: "https://github.com/ToxicAngelX/Selora-IDE/releases/tag/v9.9.9"
+                    .to_owned(),
+                newer: true,
+            })))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(!app.update_check_in_flight, "the reply rearmed the button");
+        let toast = app.state.toasts.last().expect("a toast landed");
+        assert!(toast.text.contains("v9.9.9"));
+        assert_eq!(
+            toast.link.as_ref().map(|(label, _)| label.as_str()),
+            Some("download")
+        );
+
+        // Up-to-date and failure forms.
+        app.msg_tx
+            .send(AppMessage::UpdateChecked(Ok(selora_ai::ReleaseInfo {
+                tag: "v0.1.0".to_owned(),
+                html_url: String::new(),
+                newer: false,
+            })))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app
+            .state
+            .toasts
+            .last()
+            .expect("toast")
+            .text
+            .contains("up to date"));
+        app.msg_tx
+            .send(AppMessage::UpdateChecked(Err("offline".to_owned())))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        let toast = app.state.toasts.last().expect("toast");
+        assert!(toast.text.contains("update check failed: offline"));
+        assert!(matches!(toast.severity, Severity::Error));
     }
 }
