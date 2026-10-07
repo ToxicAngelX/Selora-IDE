@@ -42,6 +42,7 @@ use selora_ui::palette::registry::CommandId;
 use selora_ui::panel::git::GitAction;
 use selora_ui::panel::search::SearchEvent;
 use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, ChatPanelEvent, TreeEvent};
+use selora_ui::splash::{Splash, SplashEvent};
 use selora_ui::{brand, theme};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -87,6 +88,17 @@ const GHOST_IDLE_SECS: f64 = 0.350;
 /// 240–600 resizable.
 const CHAT_MIN_WIDTH: f32 = 240.0;
 const CHAT_MAX_WIDTH: f32 = 600.0;
+
+/// The first-run splash's lifecycle (Phase 6a, UI_SPEC.md §7). `Pending`
+/// until the boot keyring read resolves ([`AppMessage::NoStoredKey`] shows
+/// it; a `Connected`/`Error` status — a key exists — dismisses it before it
+/// ever paints); `Dismissed` for the rest of the run after Skip or the
+/// post-Connect fade.
+enum SplashState {
+    Pending,
+    Showing(Splash),
+    Dismissed,
+}
 
 /// The Phase 2 shell. Owns the (main-thread-only) [`AppState`], the worker
 /// channels, and the transient view state that is not part of the document
@@ -163,6 +175,8 @@ pub struct SeloraApp {
     restore_in_flight: Option<PathBuf>,
     /// The file-tree panel width as of the previous frame (for persistence).
     last_tree_width: Option<f32>,
+    /// The first-run splash (Phase 6a).
+    splash: SplashState,
 }
 
 impl SeloraApp {
@@ -265,6 +279,7 @@ impl SeloraApp {
             last_selora_ping: None,
             ghost_last_request: None,
             show_chat: false,
+            splash: SplashState::Pending,
         }
     }
 
@@ -276,6 +291,9 @@ impl SeloraApp {
     fn drain_messages(&mut self) {
         while let Ok(message) = self.msg_rx.try_recv() {
             let is_settings = matches!(message, AppMessage::SettingsLoaded(_));
+            // Phase 6a: the boot keyring read resolved empty — the splash's
+            // cue to show (only ever sent by the SeloraAutoConnect worker).
+            let no_stored_key = matches!(message, AppMessage::NoStoredKey);
             let failed_path = match &message {
                 AppMessage::BufferLoadFailed { path, .. } => Some(path.clone()),
                 _ => None,
@@ -335,6 +353,16 @@ impl SeloraApp {
                     self.restore_in_flight = None;
                     self.restore_queue.retain(|queued| *queued != path);
                 }
+            }
+            if no_stored_key && matches!(self.splash, SplashState::Pending) {
+                // Phase 6a: launch with no key in the keyring → the splash
+                // (UI_SPEC.md §7). A keyring *error* never lands here —
+                // without a readable store the shell stays silent rather
+                // than badgering (the status bar's connect affordance
+                // remains).
+                let mut splash = Splash::new();
+                splash.set_reduce_motion(self.state.settings.ui.reduce_motion);
+                self.splash = SplashState::Showing(splash);
             }
             // An F12 definition resolved (set by apply_lsp): jump — opening
             // the target file first when it is not loaded (the same
@@ -553,6 +581,7 @@ impl SeloraApp {
         self.state.palette.is_open()
             || self.state.fuzzy.is_open()
             || self.settings_dialog.is_some()
+            || matches!(self.splash, SplashState::Showing(_))
             || ctx.text_edit_focused()
     }
 
@@ -1979,7 +2008,65 @@ impl SeloraApp {
         self.command_palette(ui.ctx(), workbench);
         self.lsp_popups(ui.ctx());
         self.settings_dialog(ui.ctx());
+        // Phase 6a: the first-run splash covers everything below the title
+        // strip; toasts still paint above it (a connect failure must be
+        // visible).
+        self.splash_cover(ui.ctx());
         self.toasts(ui.ctx());
+    }
+}
+
+impl SeloraApp {
+    /// One splash event's shell route (Phase 6a). `Connect` goes to the
+    /// runtime for validation + keyring storage (ARCHITECTURE.md §7.2) with
+    /// the status flipped to `Connecting` immediately (the splash paints
+    /// it); `Skip`/`Dismissed` close the splash for the run. Returns whether
+    /// the splash closed.
+    fn route_splash_event(&mut self, event: SplashEvent) -> bool {
+        match event {
+            SplashEvent::Connect(key) => {
+                self.state.selora_status = selora_ai::SeloraStatus::Connecting;
+                let _ = self.effect_tx.send(Effect::SeloraConnect(key));
+                false
+            }
+            SplashEvent::Skip | SplashEvent::Dismissed => true,
+        }
+    }
+
+    /// The first-run splash (Phase 6a, UI_SPEC.md §7): a full-window cover
+    /// over the workbench, below the title strip. Painted after every panel
+    /// so its opaque fill hides them.
+    fn splash_cover(&mut self, ctx: &egui::Context) {
+        // A connection status proving a key exists (valid or rejected)
+        // resolves the boot wait without ever painting the splash.
+        if matches!(self.splash, SplashState::Pending) {
+            match &self.state.selora_status {
+                selora_ai::SeloraStatus::Connected { .. } | selora_ai::SeloraStatus::Error(_) => {
+                    self.splash = SplashState::Dismissed;
+                }
+                _ => {}
+            }
+        }
+        let SplashState::Showing(splash) = &mut self.splash else {
+            return;
+        };
+        // The widget paints the live connection state (the Settings
+        // dialog's contract): Connecting disables, Connected starts the
+        // fade-out, Error prints the gateway's words.
+        splash.set_status(self.state.selora_status.clone());
+        let screen = ctx.content_rect();
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(screen.min.x, screen.min.y + TITLE_BAR_HEIGHT),
+            screen.max,
+        );
+        let events = splash.show(ctx, rect);
+        let mut dismiss = false;
+        for event in events {
+            dismiss |= self.route_splash_event(event);
+        }
+        if dismiss {
+            self.splash = SplashState::Dismissed;
+        }
     }
 }
 
@@ -3422,5 +3509,124 @@ mod tests {
         drop(guard2);
         drop(guard3);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- First-run splash (Phase 6a) ------------------------------------------
+
+    #[tokio::test]
+    async fn no_stored_key_shows_the_splash_and_owns_the_keyboard() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Pending));
+        assert!(!app.overlay_open(&ctx));
+
+        app.msg_tx.send(AppMessage::NoStoredKey).expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(
+            matches!(app.splash, SplashState::Showing(_)),
+            "the splash shows on the empty-keyring signal"
+        );
+        // While the splash covers the workbench the global keybinds stay
+        // quiet (the overlay gate).
+        assert!(app.overlay_open(&ctx));
+    }
+
+    #[tokio::test]
+    async fn a_validated_boot_key_never_shows_the_splash() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        // The boot keyring read found a key and it validated: Pending
+        // resolves to Dismissed without painting.
+        app.msg_tx
+            .send(AppMessage::SeloraStatus(selora_ai::SeloraStatus::Connected {
+                model: None,
+                latency_ms: 40,
+            }))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Dismissed));
+        // A late NoStoredKey (channel reordering) never reopens it.
+        app.msg_tx.send(AppMessage::NoStoredKey).expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Dismissed));
+        assert!(!app.overlay_open(&ctx));
+    }
+
+    #[tokio::test]
+    async fn splash_skip_dismisses_for_the_run() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        app.msg_tx.send(AppMessage::NoStoredKey).expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Showing(_)));
+
+        assert!(app.route_splash_event(SplashEvent::Skip));
+        app.splash = SplashState::Dismissed;
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(!app.overlay_open(&ctx));
+        // The splash never reappears after a skip (Pending-only rule).
+        app.msg_tx.send(AppMessage::NoStoredKey).expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Dismissed));
+    }
+
+    /// The Connect route, headless against the mock gateway: the status
+    /// flips to Connecting immediately; the gateway's rejection arrives as
+    /// `SeloraStatus::Error` and the splash stays up with the gateway's
+    /// words (never writes the keyring — the key failed validation).
+    #[tokio::test]
+    async fn splash_connect_validates_and_surfaces_rejection() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        let server = wiremock::MockServer::start().await;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("{\"error\":\"bad key\"}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut app = agent_app(&ctx);
+        let _ = app.effect_tx.send(Effect::SettingsSynced {
+            base_url: server.uri(),
+        });
+        app.msg_tx.send(AppMessage::NoStoredKey).expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(matches!(app.splash, SplashState::Showing(_)));
+
+        // Connect: the status flips immediately (the splash disables its
+        // button on it), the key goes to the runtime.
+        assert!(!app.route_splash_event(SplashEvent::Connect(
+            "sk-gw-rejected".to_owned()
+        )));
+        assert!(matches!(
+            app.state.selora_status,
+            selora_ai::SeloraStatus::Connecting
+        ));
+
+        // The gateway's rejection lands: the splash stays up (no fade).
+        pump_until(&ctx, &mut app, |app| {
+            matches!(
+                app.state.selora_status,
+                selora_ai::SeloraStatus::Error(_)
+            )
+        })
+        .await;
+        agent_frame(&ctx, &mut app, raw_screen());
+        match &app.splash {
+            SplashState::Showing(splash) => assert!(!splash.is_fading()),
+            _ => panic!("a rejected key keeps the splash up"),
+        }
     }
 }

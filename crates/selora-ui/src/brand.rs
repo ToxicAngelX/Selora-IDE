@@ -31,6 +31,14 @@ const RING_SEGMENTS: usize = 64;
 /// geometry multiplies by `rect.width() / 32`). The mark is centered in the
 /// rect, so callers can allocate a taller hit target without skewing the art.
 pub fn paint_mark(painter: &Painter, rect: Rect) {
+    paint_mark_orbiting(painter, rect, 0.0);
+}
+
+/// Paint the brand mark with the satellite at `theta` radians along its
+/// elliptical path (0 = the ring's far end, the static mark's pose). The
+/// splash's `orbit` animation (DESIGN_TOKENS.md §7.3, UI_SPEC.md §7) drives
+/// theta; every other surface keeps the static mark.
+pub fn paint_mark_orbiting(painter: &Painter, rect: Rect, theta: f32) {
     let scale = rect.width().max(rect.height()) / MARK_CANVAS;
     let center = rect.center();
 
@@ -52,7 +60,10 @@ pub fn paint_mark(painter: &Painter, rect: Rect) {
     // Core orb.
     painter.circle_filled(center, CORE_RADIUS * scale, Color32::WHITE);
 
-    // Satellite at the ring's far end (local point (a, 0) rotated by the tilt).
-    let satellite = Pos2::new(center.x + a * cos, center.y + a * sin);
+    // Satellite on the ring's path: the local point (a·cosθ, b·sinθ)
+    // rotated by the tilt.
+    let x = a * theta.cos();
+    let y = b * theta.sin();
+    let satellite = Pos2::new(center.x + x * cos - y * sin, center.y + x * sin + y * cos);
     painter.circle_filled(satellite, SATELLITE_RADIUS * scale, Color32::WHITE);
 }

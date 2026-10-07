@@ -275,6 +275,11 @@ pub enum AppMessage {
     /// Phase 4).
     #[allow(dead_code)]
     KeyringError(SeloraError),
+    /// The boot keyring read found no stored key (Phase 6a): the shell's
+    /// cue to show the first-run splash (UI_SPEC.md §7). Sent by the
+    /// `SeloraAutoConnect` worker — and only by it — so it is never
+    /// confused with the ping loop's keyless `Disconnected` replies.
+    NoStoredKey,
 
     // Git (Phase 3b)
     /// A fresh status snapshot (also sent after every stage/unstage/commit
@@ -686,6 +691,9 @@ impl AppState {
             AppMessage::KeyringError(error) => {
                 self.toast(format!("{error}"), Severity::Error);
             }
+            // Shell-only signal (Phase 6a first-run splash): no document
+            // state follows from it.
+            AppMessage::NoStoredKey => {}
 
             // -- Git (Phase 3b) -------------------------------------------------
             AppMessage::GitStatusChanged(status) => {

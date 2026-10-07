@@ -17,5 +17,6 @@ pub mod palette;
 pub mod panel;
 pub mod picker;
 pub mod sidebar;
+pub mod splash;
 pub mod status_bar;
 pub mod theme;

@@ -113,4 +113,29 @@ pub mod motion {
     pub const EASE_CALM: (f32, f32, f32, f32) = (0.4, 0.0, 0.2, 1.0);
     pub const EASE_ORBITAL: (f32, f32, f32, f32) = (0.65, 0.0, 0.35, 1.0);
     pub const EASE_FADE: (f32, f32, f32, f32) = (0.4, 0.0, 0.6, 1.0);
+
+    /// Evaluate a cubic-bezier easing curve (DESIGN_TOKENS.md §7.1 control
+    /// points; endpoints fixed at (0,0) and (1,1)) at linear progress `p`.
+    ///
+    /// Bisection on x(t): every token curve keeps its x control points in
+    /// [0,1], so x(t) is monotone and 24 halvings pin y far tighter than a
+    /// 1/255 alpha step needs.
+    pub fn ease_bezier(curve: (f32, f32, f32, f32), p: f32) -> f32 {
+        let (x1, y1, x2, y2) = curve;
+        let p = p.clamp(0.0, 1.0);
+        let coordinate = |t: f32, c1: f32, c2: f32| {
+            let u = 1.0 - t;
+            3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t
+        };
+        let (mut low, mut high) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = (low + high) / 2.0;
+            if coordinate(mid, x1, x2) < p {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        coordinate((low + high) / 2.0, y1, y2)
+    }
 }

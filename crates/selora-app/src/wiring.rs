@@ -908,7 +908,14 @@ pub fn spawn_dispatcher(
                                 false,
                             );
                         }
-                        Ok(None) => {}
+                        // No stored key is a fact the shell acts on (Phase
+                        // 6a: the first-run splash) — say so explicitly; a
+                        // silent arm is indistinguishable from "not yet
+                        // resolved".
+                        Ok(None) => {
+                            let _ = msg_tx.send(AppMessage::NoStoredKey);
+                            notify();
+                        }
                         Err(error) => {
                             let _ = msg_tx.send(AppMessage::KeyringError(error));
                             notify();
