@@ -181,25 +181,31 @@ impl SeloraApp {
 
         // Settings first (§8.1) — the tree panel waits on the width.
         let _ = app.effect_tx.send(Effect::SettingsLoad);
+        app.restore_session();
+        app
+    }
 
-        // Restore the last session (§8.2): a root that still exists reopens
-        // the workspace and requeues its files in tab order.
-        if let Some(dir) = app.workspace_dir.clone() {
+    /// Restore the last session (§8.2): a root that still exists reopens
+    /// the workspace and requeues its files in tab order. Split out of
+    /// `new` so the headless tests can drive it with a sandboxed
+    /// `workspace_dir`.
+    fn restore_session(&mut self) {
+        if let Some(dir) = self.workspace_dir.clone() {
             if let Some(saved) = persistence::load(&dir) {
                 let saved = persistence::restorable(&saved);
                 if let Some(root) = saved.root {
-                    app.state.workspace = Some(selora_core::Workspace::new(root.clone()));
-                    let _ = app.effect_tx.send(Effect::OpenFolder(root));
-                    app.restore_queue = saved.open_files.into();
+                    self.state.workspace = Some(selora_core::Workspace::new(root.clone()));
+                    let _ = self.effect_tx.send(Effect::OpenFolder(root));
+                    self.restore_queue = saved.open_files.into();
                 }
                 // Region ③ restores with the session (Phase 4c): the
-                // sidebar's visibility and the last 20 turns.
-                app.show_chat = saved.chat_open;
-                app.state.restore_chat(saved.chat_turns);
+                // sidebar's visibility, the agent pill (Phase 5d), and the
+                // last 20 turns.
+                self.show_chat = saved.chat_open;
+                self.state.chat_panel.set_agent_mode(saved.agent_mode);
+                self.state.restore_chat(saved.chat_turns);
             }
         }
-
-        app
     }
 
     /// The bare shell: dispatcher spawned, channels wired, nothing loaded,
@@ -297,6 +303,11 @@ impl SeloraApp {
             self.state.apply(message);
             if is_settings {
                 self.settings_loaded = true;
+                // DESIGN_TOKENS.md §7.4: the chat cards' pulse/spin follow
+                // `ui.reduce_motion`.
+                self.state
+                    .chat_panel
+                    .set_reduce_motion(self.state.settings.ui.reduce_motion);
                 // Phase 4a: restore the last session's connection — a key
                 // in the OS keyring is validated and becomes the session
                 // key (the base URL is the freshly loaded settings').
@@ -509,6 +520,29 @@ impl SeloraApp {
         }
     }
 
+    /// §17.7's LSP half: an agent buffer sync or undo can be a same-length
+    /// replacement the shape-compare in `paint_pane` cannot see — drain the
+    /// agent-touched paths and push a didChange for every didOpen'd one,
+    /// rebasing `lsp_shapes` so the next paint does not re-send.
+    fn drain_agent_touched(&mut self) {
+        for path in self.state.take_agent_touched() {
+            if !self.lsp_shapes.contains_key(&path) {
+                continue; // never didOpen'd — no server to tell
+            }
+            let Some(buffer) = self.state.buffers.get(&path).cloned() else {
+                continue;
+            };
+            let buffer = buffer.read().unwrap_or_else(|e| e.into_inner());
+            let text = buffer.text();
+            self.lsp_shapes
+                .insert(path.clone(), BufferShape::of(&buffer));
+            drop(buffer);
+            let _ = self
+                .effect_tx
+                .send(Effect::Lsp(selora_lsp::LspEffect::Change { path, text }));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Keybinds (UI_SPEC.md §15)
     // -----------------------------------------------------------------------
@@ -616,6 +650,14 @@ impl SeloraApp {
                 path: PathBuf::new(),
                 position: Default::default(),
             }),
+            KeyAction::UndoAgentEdit => {
+                // §17.7's Ctrl+Z: revert the newest agent edit on the
+                // active buffer (no-op when the buffer moved on or no
+                // agent edit touched it — never a clobber).
+                if let Some(path) = self.state.active_path() {
+                    self.state.undo_agent_edit(&path);
+                }
+            }
         }
     }
 
@@ -1201,6 +1243,65 @@ impl SeloraApp {
                 self.state.chat_ids.insert(chat_uuid, id);
                 let _ = self.effect_tx.send(Effect::SeloraChat(chat_uuid, request));
             }
+            ChatPanelEvent::AgentSend { id, .. } => {
+                // The agent twin of Send (§17.3): same sources, plus the
+                // resolved catalog model and the `agent.*` settings — the
+                // dispatcher builds the loop from exactly this payload.
+                let Some(model_id) = self.state.chat_panel.model().cloned() else {
+                    self.state
+                        .toast("pick a model first — the header's picker", Severity::Info);
+                    return;
+                };
+                let model = self
+                    .state
+                    .models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .cloned()
+                    .unwrap_or_else(|| selora_ai::Model {
+                        // Not in the catalog (a stale settings id): no
+                        // context window → no context cap, never a false
+                        // abort (turn.rs's context_budget_tokens).
+                        id: model_id.clone(),
+                        display_name: model_id,
+                        context_window: 0,
+                        price_per_1k_input: 0.0,
+                        price_per_1k_output: 0.0,
+                        supports_streaming: true,
+                        supports_tools: true,
+                        family: String::new(),
+                    });
+                let conversation = self.state.chat_panel.conversation();
+                let request = crate::app_state::AgentTurnRequest {
+                    model,
+                    conversation,
+                    agent: self.state.settings.agent.clone(),
+                };
+                let chat_uuid = uuid::Uuid::new_v4();
+                self.state.chat_ids.insert(chat_uuid, id);
+                let _ = self.effect_tx.send(Effect::AgentSend(chat_uuid, request));
+            }
+            ChatPanelEvent::AgentDecision {
+                id,
+                approval_id,
+                decision,
+            } => {
+                // Reverse-map the panel's ChatId to the turn's request uuid
+                // (one in-flight turn at a time — unambiguous). The panel's
+                // Clear-during-a-turn Stop flows through this same arm; the
+                // dispatcher drops unknown/ended turns silently.
+                let uuid = self
+                    .state
+                    .chat_ids
+                    .iter()
+                    .find(|(_, chat_id)| **chat_id == id)
+                    .map(|(uuid, _)| *uuid);
+                if let Some(uuid) = uuid {
+                    let _ = self
+                        .effect_tx
+                        .send(Effect::AgentDecision(uuid, approval_id, decision));
+                }
+            }
             // The panel emptied the transcript itself; an in-flight stream
             // (if any) lands into a stale id and is dropped.
             ChatPanelEvent::Clear => {}
@@ -1531,6 +1632,9 @@ impl SeloraApp {
             let _ = self.effect_tx.send(Effect::SettingsSynced {
                 base_url: settings.selora.base_url.clone(),
             });
+            self.state
+                .chat_panel
+                .set_reduce_motion(settings.ui.reduce_motion);
             self.state.settings = settings;
         }
         if close {
@@ -1857,6 +1961,7 @@ impl SeloraApp {
         // painted editor, the LSP manager's lazy start).
         self.pump_restore();
         self.maybe_start_lsp();
+        self.drain_agent_touched();
 
         // Keybinds run only when no overlay owns the keyboard.
         self.handle_keybinds(ui.ctx());
@@ -1984,6 +2089,10 @@ enum KeyAction {
     Completions,
     /// `Ctrl+K Ctrl+I` — hover (a two-stroke chord; Phase 3a).
     Hover,
+    /// `Ctrl+Z` — revert the newest agent edit on the active buffer
+    /// (Phase 5d, §17.7: agent-edit-scoped undo; the buffer has no
+    /// general undo log yet — human typing is unaffected).
+    UndoAgentEdit,
 }
 
 /// The fixed Phase 2 bindings (parsed once). The rebindable four live in
@@ -2034,6 +2143,7 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
             ctrl_shift(egui::Key::F, KeyAction::SearchInFiles),
             bare(egui::Key::F12, KeyAction::GoToDefinition),
             ctrl(egui::Key::Space, KeyAction::Completions),
+            ctrl(egui::Key::Z, KeyAction::UndoAgentEdit),
         ]
     })
 }
@@ -2456,6 +2566,8 @@ mod tests {
             (KeyAction::OpenFile, true, false, false, egui::Key::O),
             (KeyAction::TogglePanel, true, false, false, egui::Key::J),
             (KeyAction::SearchInFiles, true, true, false, egui::Key::F),
+            // Phase 5d: agent-edit undo (§17.7).
+            (KeyAction::UndoAgentEdit, true, false, false, egui::Key::Z),
         ];
         for (expected, ctrl, shift, alt, key) in cases {
             let got = key_action(&keybinds, &shortcut(ctrl, shift, alt, key));
@@ -2558,5 +2670,757 @@ mod tests {
         assert_eq!(language_name(None), "Plain Text");
         assert_eq!(language_name(Some(Language::Rust)), "Rust");
         assert_eq!(language_name(Some(Language::Markdown)), "Markdown");
+    }
+
+    // --- Agent Mode (Phase 5d) ------------------------------------------------
+
+    use std::time::Duration;
+
+    fn agent_key_event(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn raw_screen() -> egui::RawInput {
+        egui::RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn agent_frame(ctx: &egui::Context, app: &mut SeloraApp, raw: egui::RawInput) {
+        ctx.run_ui(raw, |ui| app.ui_body(ui))
+            .drop_without_applying_deltas();
+    }
+
+    /// Pump real frames (the message drain lives in ui_body) until
+    /// `until` holds, with a deadline so a broken turn fails instead of
+    /// hanging.
+    async fn pump_until(
+        ctx: &egui::Context,
+        app: &mut SeloraApp,
+        until: impl Fn(&SeloraApp) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            agent_frame(ctx, app, raw_screen());
+            if until(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "pump timed out");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn agent_test_model() -> selora_ai::Model {
+        selora_ai::Model {
+            id: "test-model".into(),
+            display_name: "Test Model".into(),
+            context_window: 128_000,
+            price_per_1k_input: 0.0,
+            price_per_1k_output: 0.0,
+            supports_streaming: true,
+            supports_tools: true,
+            family: "test".into(),
+        }
+    }
+
+    /// One streamed tool call (the wiring tests' shape).
+    fn agent_tool_call_sse(call_id: &str, name: &str, arguments: &str) -> String {
+        let escaped = arguments
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{call_id}\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"\"}}}}]}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{escaped}\"}}}}]}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        )
+    }
+
+    fn agent_answer_sse(text: &str, cost_usd: f64) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost_usd\":{cost_usd}}}}}\n\n\
+             data: [DONE]\n\n"
+        )
+    }
+
+    fn agent_app(ctx: &egui::Context) -> SeloraApp {
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        let mut app = SeloraApp::shell(
+            ctx.clone(),
+            Handle::current(),
+            msg_tx,
+            msg_rx,
+            effect_tx,
+            effect_rx,
+        );
+        // Isolated from the real %APPDATA%; settings never arrive, so the
+        // ping loop and the LSP manager stay off.
+        app.workspace_dir = None;
+        app
+    }
+
+    /// The whole path, headless (the brief's acceptance): composer Enter
+    /// with the pill on → Effect::AgentSend → the real loop against the
+    /// mock gateway → the diff card parks → the panel-event Approve route
+    /// → the router writes the real file → the open buffer syncs CLEAN →
+    /// the meter steps → the summary footer lands. Then Ctrl+Z's seam:
+    /// undo reverts the buffer (dirty), disk keeps the approved text.
+    #[tokio::test]
+    async fn agent_mode_end_to_end_approve_syncs_disk_buffer_and_meter() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        // A real workspace with a real file.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("selora-app-shell-agent-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let main_rs = root.join("main.rs");
+        std::fs::write(&main_rs, "fn main() {}\n").expect("write");
+
+        // The mock gateway: round 1 asks for the edit, round 2 answers.
+        let server = wiremock::MockServer::start().await;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("add a comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(agent_tool_call_sse(
+                "call_edit_1",
+                "edit_file",
+                r#"{"path":"main.rs","old_str":"fn main() {}","new_str":"// entry point\nfn main() {}"}"#,
+            )))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("tool_call_id"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(agent_answer_sse("Done.", 0.0021)),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let mut app = agent_app(&ctx);
+        app.state.models = vec![agent_test_model()];
+        app.state.chat_panel.set_model("test-model");
+        let _ = app
+            .effect_tx
+            .send(Effect::SeloraKeyringSet("sk-test".into()));
+        let _ = app.effect_tx.send(Effect::SettingsSynced {
+            base_url: server.uri(),
+        });
+        let _ = app.effect_tx.send(Effect::OpenFolder(root.clone()));
+        let _ = app.effect_tx.send(Effect::OpenFile(main_rs.clone()));
+
+        // Pump until the buffer is open (the real OpenFile worker ran).
+        pump_until(&ctx, &mut app, |app| {
+            app.state.buffers.contains_key(&main_rs)
+        })
+        .await;
+        assert!(!app.state.is_dirty(&main_rs));
+
+        // Agent mode on; submit through the composer (focus frame, then
+        // Enter — the mod.rs pattern).
+        app.show_chat = true;
+        app.state.chat_panel.set_agent_mode(true);
+        app.state.chat_panel.set_composer_text("add a comment");
+        app.state.chat_panel.focus_composer();
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, agent_key_event(egui::Key::Enter));
+        assert!(app.state.chat_panel.is_streaming(), "the turn started");
+        assert_eq!(app.state.chat_ids.len(), 1);
+
+        // Pump until the diff card parks.
+        pump_until(&ctx, &mut app, |app| {
+            app.state.chat_panel.pending_approval_id().is_some()
+        })
+        .await;
+        let approval_id = app
+            .state
+            .chat_panel
+            .pending_approval_id()
+            .expect("the diff card parked");
+        assert!(
+            std::fs::read_to_string(&main_rs).expect("read") == "fn main() {}\n",
+            "nothing writes before the decision"
+        );
+
+        // The panel-event route (the reverse ChatId→Uuid map): Approve.
+        let chat_id = app.state.chat_panel.in_flight().expect("in flight");
+        app.route_chat_event(ChatPanelEvent::AgentDecision {
+            id: chat_id,
+            approval_id,
+            decision: selora_ai::AgentDecision::Approve,
+        });
+
+        // Pump until the turn ends.
+        pump_until(&ctx, &mut app, |app| !app.state.chat_panel.is_streaming()).await;
+
+        // Disk + buffer + meter + footer, in one run.
+        let approved = "// entry point\nfn main() {}\n";
+        assert_eq!(
+            std::fs::read_to_string(&main_rs).expect("read"),
+            approved,
+            "the approved write is on disk"
+        );
+        assert_eq!(
+            app.state
+                .buffers
+                .get(&main_rs)
+                .expect("buffer")
+                .read()
+                .expect("lock")
+                .text(),
+            approved,
+            "the open buffer synced (§17.7)"
+        );
+        assert!(
+            !app.state.is_dirty(&main_rs),
+            "a synced buffer ends clean (the card was the save)"
+        );
+        assert!(
+            (app.state.cost_meter.total_usd() - 0.0021).abs() < 1e-12,
+            "the meter stepped by the scripted usage: {}",
+            app.state.cost_meter.total_usd()
+        );
+        // user bubble + the card + the answer bubble + the summary footer.
+        assert_eq!(app.state.chat_panel.turn_count(), 4);
+
+        // Ctrl+Z's seam: the buffer reverts (dirty); disk keeps the
+        // approved text.
+        assert!(app.state.undo_agent_edit(&main_rs));
+        assert_eq!(
+            app.state
+                .buffers
+                .get(&main_rs)
+                .expect("buffer")
+                .read()
+                .expect("lock")
+                .text(),
+            "fn main() {}\n"
+        );
+        assert!(app.state.is_dirty(&main_rs), "undo ends dirty against disk");
+        assert_eq!(
+            std::fs::read_to_string(&main_rs).expect("read"),
+            approved,
+            "undo never touches disk"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The visible-failure path end-to-end: AgentSend with no key routes
+    /// to the dispatcher, which answers with a synthetic Failed turn end —
+    /// the panel unblocks and the toast carries the reason.
+    #[tokio::test]
+    async fn agent_send_without_a_key_fails_visibly_through_the_shell() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        app.state.models = vec![agent_test_model()];
+        app.state.chat_panel.set_model("test-model");
+
+        app.show_chat = true;
+        app.state.chat_panel.set_agent_mode(true);
+        app.state.chat_panel.set_composer_text("do things");
+        app.state.chat_panel.focus_composer();
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, agent_key_event(egui::Key::Enter));
+        assert!(app.state.chat_panel.is_streaming());
+        assert_eq!(app.state.chat_ids.len(), 1, "the request mapped");
+
+        // No key anywhere: the dispatcher's synthetic AgentTurnDone lands.
+        pump_until(&ctx, &mut app, |app| !app.state.chat_panel.is_streaming()).await;
+        assert!(app.state.chat_ids.is_empty());
+        assert!(
+            app.state
+                .toasts
+                .iter()
+                .any(|toast| toast.text.contains("no API key")),
+            "toasts: {:?}",
+            app.state.toasts
+        );
+        // The summary footer still landed (a failed turn ends the timeline).
+        assert_eq!(app.state.chat_panel.turn_count(), 2); // user bubble + summary
+    }
+
+    /// §17.7's LSP half: a same-length agent edit is invisible to the
+    /// shape compare — the agent-touched drain still sends didChange for
+    /// the didOpen'd path.
+    #[tokio::test]
+    async fn agent_edit_sends_lsp_change_even_when_same_length() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+
+        let main_rs =
+            std::env::temp_dir().join(format!("selora-app-shell-agent-lsp-{}", std::process::id()));
+        std::fs::write(&main_rs, "aaa\n").expect("write");
+
+        // Open the file; the first paint sends didOpen.
+        app.state
+            .apply(AppMessage::FolderOpened(std::env::temp_dir()));
+        app.state.apply(AppMessage::BufferLoaded {
+            path: main_rs.clone(),
+            text: "aaa\n".to_owned(),
+        });
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.lsp_shapes.contains_key(&main_rs), "didOpen tracked");
+
+        // A same-length agent edit through the message arms.
+        let uuid = uuid::Uuid::new_v4();
+        let chat_id = selora_ui::sidebar::ChatId::next();
+        app.state.chat_panel.begin_stream(chat_id);
+        app.state.chat_ids.insert(uuid, chat_id);
+        app.state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            selora_ai::ToolCall {
+                id: "call_1".into(),
+                name: "edit_file".into(),
+                arguments: format!(
+                    "{{\"path\":\"{}\",\"old_str\":\"aaa\",\"new_str\":\"bbb\"}}",
+                    main_rs.file_name().expect("name").to_string_lossy()
+                ),
+            },
+        ));
+        app.state.apply(AppMessage::ToolResult(
+            uuid,
+            selora_ai::ToolResult {
+                id: "call_1".into(),
+                ok: true,
+                content: "edited".into(),
+            },
+        ));
+        assert_eq!(
+            app.state
+                .buffers
+                .get(&main_rs)
+                .expect("buffer")
+                .read()
+                .expect("lock")
+                .text(),
+            "bbb\n"
+        );
+
+        // Drain the LSP effects the frame sent (Open first, then the
+        // agent-touched Change — the shape alone saw nothing).
+        agent_frame(&ctx, &mut app, raw_screen());
+        let mut effects = Vec::new();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if let Some(receiver) = app.lsp_effect_rx.as_mut() {
+                while let Ok(effect) = receiver.try_recv() {
+                    effects.push(effect);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&main_rs);
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                selora_lsp::LspEffect::Change { path, text }
+                    if path == &main_rs && text == "bbb\n"
+            )),
+            "the agent-touched didChange reached the manager: {effects:?}"
+        );
+    }
+
+    /// Boot restore (§8.2): the agent pill follows the persisted session.
+    #[tokio::test]
+    async fn boot_restore_carries_agent_mode_from_workspace_state() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("selora-app-boot-root-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let dir =
+            std::env::temp_dir().join(format!("selora-app-boot-cfg-{}-{n}", std::process::id()));
+        persistence::save(
+            &dir,
+            &WorkspaceState {
+                root: Some(root.clone()),
+                open_files: Vec::new(),
+                active_path: None,
+                chat_open: true,
+                chat_turns: Vec::new(),
+                agent_mode: true,
+            },
+        )
+        .expect("save workspace.json");
+
+        let mut app = agent_app(&ctx);
+        app.workspace_dir = Some(dir.clone());
+        app.restore_session();
+        assert!(app.state.chat_panel.is_agent_mode());
+        assert!(app.show_chat);
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `ui.reduce_motion` threads into the chat panel when settings land
+    /// (the SettingsLoaded adoption site).
+    #[tokio::test]
+    async fn settings_loaded_threads_reduce_motion_into_the_panel() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        assert!(!app.state.chat_panel.is_reduce_motion());
+
+        let mut settings = Settings::default();
+        settings.ui.reduce_motion = true;
+        app.msg_tx
+            .send(AppMessage::SettingsLoaded(settings))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.state.chat_panel.is_reduce_motion());
+    }
+
+    /// The final Phase-5 test (the brief's acceptance): ONE scripted turn
+    /// through the whole path — AgentSend → the cards land in the panel →
+    /// a Deny continues the loop with the denied tool result (the wire
+    /// proves it) → an Approve writes the file AND syncs the open buffer →
+    /// a Stop ends the turn → the meter sees the turn's receipt →
+    /// stale/late ids drop without a panic. The mock mounts carry
+    /// `.expect(1)`: each scripted round must be hit exactly once.
+    #[tokio::test]
+    async fn agent_turn_deny_approve_stop_end_to_end() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        // A real workspace with the file the agent edits.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("selora-app-shell-deny-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let main_rs = root.join("main.rs");
+        std::fs::write(&main_rs, "fn main() {}\n").expect("write");
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        // Round 1: a write the user will Deny. (Every round's body still
+        // carries the first user message — priorities make the grown
+        // conversations win; wiremock tries lower numbers first.)
+        let guard1 = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "deny then approve",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(agent_tool_call_sse(
+                    "call_write_denied",
+                    "write_file",
+                    r#"{"path":"denied.rs","content":"nope\n"}"#,
+                )),
+            )
+            .with_priority(3)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        // Round 2 (its body carries the denied tool result): the edit the
+        // user will Approve. The usage rides this round's finish chunk.
+        let guard2 = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "user denied this action",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{}{}{}",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_edit_1\",\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"arguments\":\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"main.rs\\\",\\\"old_str\\\":\\\"fn main() {}\\\",\\\"new_str\\\":\\\"// entry point\\\\nfn main() {}\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost_usd\":0.0021}}\n\ndata: [DONE]\n\n",
+            )))
+            .with_priority(2)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        // Round 3 (its body carries the edit's tool result): a slow bash
+        // the user Approves and then Stops mid-run.
+        let guard3 = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("edited"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(agent_tool_call_sse(
+                    "call_bash_1",
+                    "bash",
+                    r#"{"command":"Start-Sleep -Seconds 30"}"#,
+                )),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut app = agent_app(&ctx);
+        app.state.models = vec![agent_test_model()];
+        app.state.chat_panel.set_model("test-model");
+        let _ = app
+            .effect_tx
+            .send(Effect::SeloraKeyringSet("sk-test".into()));
+        let _ = app.effect_tx.send(Effect::SettingsSynced {
+            base_url: server.uri(),
+        });
+        let _ = app.effect_tx.send(Effect::OpenFolder(root.clone()));
+        let _ = app.effect_tx.send(Effect::OpenFile(main_rs.clone()));
+        pump_until(&ctx, &mut app, |app| {
+            app.state.buffers.contains_key(&main_rs)
+        })
+        .await;
+
+        // Agent mode on; submit through the composer.
+        app.show_chat = true;
+        app.state.chat_panel.set_agent_mode(true);
+        app.state
+            .chat_panel
+            .set_composer_text("deny then approve then stop");
+        app.state.chat_panel.focus_composer();
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, agent_key_event(egui::Key::Enter));
+        assert!(app.state.chat_panel.is_streaming());
+
+        // -- Round 1 parks on the write card (user bubble + card). --------
+        pump_until(&ctx, &mut app, |app| {
+            app.state.chat_panel.pending_approval_id().is_some()
+                && app.state.chat_panel.turn_count() == 2
+        })
+        .await;
+        let chat_id = app.state.chat_panel.in_flight().expect("in flight");
+        let approval_id = app
+            .state
+            .chat_panel
+            .pending_approval_id()
+            .expect("the write card parked");
+
+        // -- Deny: the loop continues; the denied result rides round 2's
+        //    request (guard2's matcher + expect(1) prove the wire). -------
+        app.route_chat_event(ChatPanelEvent::AgentDecision {
+            id: chat_id,
+            approval_id,
+            decision: selora_ai::AgentDecision::Deny,
+        });
+        pump_until(&ctx, &mut app, |app| {
+            app.state.chat_panel.turn_count() == 3
+                && app.state.chat_panel.pending_approval_id().is_some()
+        })
+        .await;
+        assert!(
+            !root.join("denied.rs").exists(),
+            "a denied write never lands"
+        );
+
+        // -- Approve the edit: disk writes, the open buffer syncs clean.
+        //    The meter has NOT stepped yet — the receipt lands at TurnDone.
+        let approval_id = app
+            .state
+            .chat_panel
+            .pending_approval_id()
+            .expect("the edit card parked");
+        app.route_chat_event(ChatPanelEvent::AgentDecision {
+            id: chat_id,
+            approval_id,
+            decision: selora_ai::AgentDecision::Approve,
+        });
+        let approved = "// entry point\nfn main() {}\n";
+        pump_until(&ctx, &mut app, |app| {
+            // Round 3 parks on the command card — the edit's ToolResult
+            // (and its §17.7 sync) precede it.
+            app.state.chat_panel.turn_count() == 4
+                && app.state.chat_panel.pending_approval_id().is_some()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&main_rs).expect("read"),
+            approved,
+            "the approved edit is on disk"
+        );
+        assert_eq!(
+            app.state
+                .buffers
+                .get(&main_rs)
+                .expect("buffer")
+                .read()
+                .expect("lock")
+                .text(),
+            approved,
+            "the open buffer synced"
+        );
+        assert!(!app.state.is_dirty(&main_rs), "the card was the save");
+        assert_eq!(
+            app.state.cost_meter.total_usd(),
+            0.0,
+            "the receipt lands at TurnDone, not per round"
+        );
+
+        // -- Approve the bash, then Stop mid-run (the status-line Stop's
+        //    nil id, through the panel-event route). ---------------------
+        let approval_id = app
+            .state
+            .chat_panel
+            .pending_approval_id()
+            .expect("the command card parked");
+        app.route_chat_event(ChatPanelEvent::AgentDecision {
+            id: chat_id,
+            approval_id,
+            decision: selora_ai::AgentDecision::Approve,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await; // let the child spawn
+        app.route_chat_event(ChatPanelEvent::AgentDecision {
+            id: chat_id,
+            approval_id: selora_ai::ApprovalId::nil(),
+            decision: selora_ai::AgentDecision::Stop,
+        });
+        pump_until(&ctx, &mut app, |app| !app.state.chat_panel.is_streaming()).await;
+
+        // The turn ended StoppedByUser: summary footer, toast, meter.
+        assert_eq!(
+            app.state.chat_panel.turn_count(),
+            5,
+            "user bubble + 3 cards + summary footer"
+        );
+        assert!(
+            app.state
+                .toasts
+                .iter()
+                .any(|toast| toast.text.contains("stopped by user")),
+            "toasts: {:?}",
+            app.state.toasts
+        );
+        assert!(
+            (app.state.cost_meter.total_usd() - 0.0021).abs() < 1e-12,
+            "the meter saw the turn's receipt: {}",
+            app.state.cost_meter.total_usd()
+        );
+
+        // Ctrl+Z's seam: the buffer reverts (dirty); disk keeps the
+        // approved text.
+        app.run_key_action(KeyAction::UndoAgentEdit);
+        assert_eq!(
+            app.state
+                .buffers
+                .get(&main_rs)
+                .expect("buffer")
+                .read()
+                .expect("lock")
+                .text(),
+            "fn main() {}\n"
+        );
+        assert!(app.state.is_dirty(&main_rs));
+        assert_eq!(std::fs::read_to_string(&main_rs).expect("read"), approved);
+
+        // Stale/late ids drop without a panic: messages for a random uuid
+        // and decisions for the ended turn's.
+        let stale = uuid::Uuid::new_v4();
+        app.msg_tx
+            .send(AppMessage::ToolCallStarted(
+                stale,
+                selora_ai::ToolCall {
+                    id: "call_late".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            ))
+            .expect("send");
+        app.msg_tx
+            .send(AppMessage::ToolResult(
+                stale,
+                selora_ai::ToolResult {
+                    id: "call_late".into(),
+                    ok: true,
+                    content: "late".into(),
+                },
+            ))
+            .expect("send");
+        app.msg_tx
+            .send(AppMessage::ChatDelta(stale, "late".into()))
+            .expect("send");
+        // A stale turn end carrying a cost and a Failed end drops WHOLE:
+        // no panel entry, no meter movement, no toast.
+        let toasts_before = app.state.toasts.len();
+        app.msg_tx
+            .send(AppMessage::AgentTurnDone(
+                stale,
+                selora_ai::ChatReceipt {
+                    request_id: stale,
+                    model: "test-model".into(),
+                    prompt_tokens: 0,
+                    completion_tokens: 999,
+                    cost_usd: 9.99,
+                    duration_ms: 1,
+                    estimated: true,
+                },
+                selora_ai::AgentSummary {
+                    iterations: 9,
+                    tools_used: 9,
+                    approved: 9,
+                    denied: 0,
+                    tokens: 999,
+                    cost_usd: 9.99,
+                    completed: false,
+                },
+                selora_ai::TurnEnd::Failed("stale turn".into()),
+            ))
+            .expect("send");
+        let _ = app.effect_tx.send(Effect::AgentDecision(
+            stale,
+            selora_ai::ApprovalId::nil(),
+            selora_ai::AgentDecision::Approve,
+        ));
+        agent_frame(&ctx, &mut app, raw_screen());
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert_eq!(app.state.chat_panel.turn_count(), 5, "nothing appended");
+        assert!(
+            (app.state.cost_meter.total_usd() - 0.0021).abs() < 1e-12,
+            "the meter did not move"
+        );
+        assert_eq!(
+            app.state.toasts.len(),
+            toasts_before,
+            "a stale turn end never toasts: {:?}",
+            app.state.toasts
+        );
+
+        // The scoped mounts verify their expect(1) here.
+        drop(guard1);
+        drop(guard2);
+        drop(guard3);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

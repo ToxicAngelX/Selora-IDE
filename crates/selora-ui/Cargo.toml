@@ -17,3 +17,4 @@ selora-settings.workspace = true
 selora-git.workspace = true
 selora-lsp.workspace = true
 nucleo-matcher = "0.3.1"
+serde_json.workspace = true

@@ -27,7 +27,7 @@
 //! of a bare `FileTreeView` — owning the view twice would fork expanded/
 //! selection state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -49,6 +49,29 @@ use selora_ui::status_bar::cost_meter::CostMeterState;
 use uuid::Uuid;
 
 use crate::persistence::WorkspaceState;
+
+/// Everything the dispatcher needs to start one agent turn (§17.3):
+/// the resolved model, the panel's conversation, and the `agent.*`
+/// settings slice (boxed — the large-variant clippy reason documented at
+/// `AgentSettings`'s `Settings` field). The shell builds it exactly like
+/// the plain-chat `ChatRequest` (the payload travels with the effect —
+/// the `SeloraChat` precedent; the panel stays the conversation's single
+/// source of truth).
+///
+/// Adjustment note: the Phase-5 skeleton declared `AgentSend(Uuid,
+/// String)`; carrying the full request mirrors `Effect::SeloraChat` and
+/// keeps the dispatcher from duplicating panel state.
+#[derive(Debug, Clone)]
+pub struct AgentTurnRequest {
+    /// The resolved catalog model (an unknown id carries
+    /// `context_window: 0` — no context cap, never a false abort).
+    pub model: Model,
+    /// The panel's stable conversation (cards and the in-flight bubble
+    /// excluded by `ChatPanel::conversation`).
+    pub conversation: Vec<selora_ai::ChatMessage>,
+    /// The `agent.*` settings slice (caps, shell, allowlist, Brave key).
+    pub agent: Box<selora_settings::AgentSettings>,
+}
 
 /// Effects the main thread sends to the tokio runtime (ARCHITECTURE.md §2.2).
 ///
@@ -124,12 +147,11 @@ pub enum Effect {
     // Agent Mode (ARCHITECTURE.md §17.6 — additive; 5b/5c/5d consume,
     // the orchestrator owns this shared file). The request `Uuid` keys
     // the reply messages, the same `chat_ids` pattern as `SeloraChat`.
-    /// Start an agent turn: the user's message with the tool manifest
-    /// armed (the dispatcher builds the ChatRequest; the loop is 5c's).
-    #[allow(dead_code)] // skeleton — sent when the 5d agent toggle lands
-    AgentSend(Uuid, String),
+    /// Start an agent turn (§17.3): the loop streams the conversation
+    /// with the fixed tool manifest armed, executing tools through the
+    /// router rooted at the workspace.
+    AgentSend(Uuid, AgentTurnRequest),
     /// The user's answer to an approval card (§17.4).
-    #[allow(dead_code)] // skeleton — sent when the 5d cards land
     AgentDecision(Uuid, selora_ai::ApprovalId, selora_ai::AgentDecision),
 
     // Git (Phase 3b)
@@ -187,22 +209,29 @@ pub enum AppMessage {
     // `ToolResult` carries its own `tool_call_id`, so the variant does
     // not repeat it).
     /// The loop started executing one tool call (a read-type card opens
-    /// immediately; 5d renders the collapsed card).
-    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
+    /// immediately; the collapsed card paints).
     ToolCallStarted(Uuid, selora_ai::ToolCall),
     /// One tool call finished (approved-and-executed, auto-run, or
     /// denied → `ok: false`).
-    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
     ToolResult(Uuid, selora_ai::ToolResult),
     /// The loop parked on an approval card (§17.4): the UI renders the
     /// diff/command/delete card; the user's answer returns as
     /// [`Effect::AgentDecision`].
-    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
     ApprovalNeeded(Uuid, selora_ai::ApprovalId, selora_ai::ApprovalCard),
-    /// The turn ended: the final receipt feeds the cost meter; the
-    /// summary paints the footer (UI_SPEC.md §4.2).
-    #[allow(dead_code)] // skeleton — sent when the 5c loop lands
-    AgentTurnDone(Uuid, ChatReceipt, selora_ai::AgentSummary),
+    /// The turn ended: the receipt feeds the cost meter (§17.3), the
+    /// summary paints the footer (UI_SPEC.md §4.2), and a non-`Completed`
+    /// end toasts its reason (`TurnEnd::toast`).
+    ///
+    /// Adjustment note: the Phase-5 skeleton carried three fields; the
+    /// [`selora_ai::TurnEnd`] is additive-in-spirit — §17.3 requires the
+    /// abort reason in a toast and neither the receipt nor the summary
+    /// carries it.
+    AgentTurnDone(
+        Uuid,
+        ChatReceipt,
+        selora_ai::AgentSummary,
+        selora_ai::TurnEnd,
+    ),
 
     // File system
     FolderOpened(PathBuf),
@@ -361,6 +390,25 @@ pub struct AppState {
     /// Entries leave at the stream's terminal message; unknown ids are
     /// stale replies and dropped.
     pub chat_ids: BTreeMap<Uuid, ChatId>,
+    /// The in-flight agent turn's `write_file`/`edit_file` calls, stashed
+    /// at [`AppMessage::ToolCallStarted`] as `tool_call_id → (name,
+    /// arguments)` so the [`AppMessage::ToolResult`] arm can sync the open
+    /// buffer (§17.7 — the card is the save moment). One turn at a time;
+    /// cleared at turn end and on folder switch.
+    agent_write_calls: BTreeMap<String, (String, String)>,
+    /// §17.7 + the 5d brief's deliverable 13: per-path `(pre, post)`
+    /// snapshot stacks backing `Ctrl+Z` for agent edits. Agent-edit-scoped
+    /// undo, NOT a general undo (the buffer has no undo log yet — human
+    /// typing stays non-undoable; when §3.4's UndoLog lands this migrates
+    /// into it). A restore applies ONLY while the buffer still equals the
+    /// snapshot's post-edit text — a human edit since invalidates the
+    /// stack, never a clobber.
+    agent_edits: BTreeMap<PathBuf, Vec<(String, String)>>,
+    /// Paths whose buffer text changed outside the editor's own input
+    /// (an agent sync or undo): the shell drains this each frame and
+    /// sends `LspEffect::Change` for didOpen'd paths — the shape-compare
+    /// at the dirty/LSP seam cannot see same-length replacements.
+    agent_touched: BTreeSet<PathBuf>,
     /// Gateway connection state for the status-bar right zone (Phase 4f):
     /// driven by [`AppMessage::SeloraStatus`] from the 30s ping loop;
     /// `Connected` implies a key is present and the gateway answered.
@@ -423,6 +471,9 @@ impl Default for AppState {
             models: Vec::new(),
             chat_panel: ChatPanel::new(),
             chat_ids: BTreeMap::new(),
+            agent_write_calls: BTreeMap::new(),
+            agent_edits: BTreeMap::new(),
+            agent_touched: BTreeSet::new(),
             selora_status: SeloraStatus::Disconnected,
             cost_meter: CostMeterState::new(),
             git_status: None,
@@ -497,15 +548,76 @@ impl AppState {
             }
 
             // -- Agent Mode (Phase 5) -------------------------------------------
-            // Skeleton arms (the prep commit): the real reductions land
-            // with 5c (loop) and 5d (cards) — these only keep the enum
-            // exhaustive so the tree stays green while the five
-            // subagents build. Unreachable until the shell sends
-            // `Effect::AgentSend`.
-            AppMessage::ToolCallStarted(_, _) => {}
-            AppMessage::ToolResult(_, _) => {}
-            AppMessage::ApprovalNeeded(_, _, _) => {}
-            AppMessage::AgentTurnDone(_, _, _) => {}
+            // All four arms gate on `chat_ids`: a message for an unknown or
+            // ended turn is stale and dropped, never a panic (the
+            // `ChatDelta` precedent above).
+            AppMessage::ToolCallStarted(uuid, call) => {
+                if let Some(chat_id) = self.chat_ids.get(&uuid) {
+                    let chat_id = *chat_id;
+                    // Stash write/edit arguments for the §17.7 buffer sync
+                    // when the (approved) result lands.
+                    if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                        self.agent_write_calls
+                            .insert(call.id.clone(), (call.name.clone(), call.arguments.clone()));
+                    }
+                    self.chat_panel.tool_call_started(chat_id, call);
+                }
+            }
+            AppMessage::ToolResult(uuid, result) => {
+                if let Some(chat_id) = self.chat_ids.get(&uuid) {
+                    let chat_id = *chat_id;
+                    // §17.7: an approved write/edit to an OPEN buffer also
+                    // updates the in-memory text (clean buffers only —
+                    // never a clobber; see sync_agent_write). A denied or
+                    // failed call (`ok: false`) never touches buffers.
+                    if let Some((name, arguments)) = self.agent_write_calls.remove(&result.id) {
+                        if result.ok {
+                            self.sync_agent_write(&name, &arguments);
+                        }
+                    }
+                    self.chat_panel.tool_result(chat_id, result);
+                }
+            }
+            AppMessage::ApprovalNeeded(uuid, approval_id, card) => {
+                if let Some(chat_id) = self.chat_ids.get(&uuid) {
+                    let chat_id = *chat_id;
+                    self.chat_panel.approval_needed(chat_id, approval_id, card);
+                }
+            }
+            AppMessage::AgentTurnDone(uuid, receipt, summary, end) => {
+                // A stale/late/duplicate turn end drops WHOLE: no panel
+                // reduction, no meter movement, no toast (the arm-block
+                // contract above; the brief's "late/stale request ids are
+                // dropped"). The relay emits at most one TurnDone per turn
+                // keyed by a live chat_ids entry, so a miss means the turn
+                // is not ours to account.
+                let Some(chat_id) = self.chat_ids.remove(&uuid) else {
+                    return;
+                };
+                self.chat_panel.agent_turn_done(chat_id, summary);
+                // The turn's receipt feeds the cost meter exactly like
+                // ChatDone (the relay synthesized it from the loop's own
+                // totals; `estimated` — an aggregate, not a
+                // gateway-verbatim receipt).
+                let model = self.models.iter().find(|model| model.id == receipt.model);
+                self.cost_meter.add_receipt(
+                    &receipt,
+                    model,
+                    selora_ui::status_bar::cost_meter::day_number(SystemTime::now()),
+                );
+                // §17.3: an abnormal end toasts the reason (caps, Stop,
+                // failure).
+                if !end.is_completed() {
+                    let severity = match &end {
+                        selora_ai::TurnEnd::Failed(_) => Severity::Error,
+                        _ => Severity::Info,
+                    };
+                    self.toast(end.toast(), severity);
+                }
+                // The turn's write-call stash dies with it (one in-flight
+                // turn at a time).
+                self.agent_write_calls.clear();
+            }
 
             // -- File system ---------------------------------------------------
             AppMessage::FolderOpened(root) => {
@@ -808,6 +920,10 @@ impl AppState {
         // The conversation belongs to the old workspace (Phase 4c).
         self.chat_panel.clear();
         self.chat_ids.clear();
+        // …and so do the agent turn's stashes (Phase 5d).
+        self.agent_write_calls.clear();
+        self.agent_edits.clear();
+        self.agent_touched.clear();
     }
 
     /// Dirty derivation, one frame per painted editor (see the module docs).
@@ -824,10 +940,9 @@ impl AppState {
         }
     }
 
-    /// Whether the tab for `path` is dirty. Inspection helper for the
-    /// close-prompt / git-gutter features of later phases; the shell's
-    /// dirty *derivation* is [`Self::note_editor_frame`].
-    #[allow(dead_code)]
+    /// Whether the tab for `path` is dirty. The §17.7 sync guards on
+    /// this (a dirty buffer is never touched by an agent write) — and the
+    /// shell's dirty *derivation* is [`Self::note_editor_frame`].
     pub fn is_dirty(&self, path: &Path) -> bool {
         self.editor_area.pane_ids().iter().any(|pane| {
             self.editor_area
@@ -920,6 +1035,9 @@ impl AppState {
                     content: turn.content,
                 })
                 .collect(),
+            // The header's Agent Mode pill (Phase 5d) persists like
+            // chat_open.
+            agent_mode: self.chat_panel.is_agent_mode(),
         }
     }
 
@@ -936,6 +1054,202 @@ impl AppState {
             .collect();
         self.chat_panel.restore_turns(restored);
     }
+
+    // -- §17.7: agent writes meet open buffers --------------------------------
+
+    /// An approved `write_file`/`edit_file` to a file that is OPEN in a
+    /// buffer also updates the in-memory text (the diff card was the disk
+    /// write; a synced buffer ends matching disk — clean). A DIRTY buffer
+    /// (unsaved user edits) is never touched: the disk write already
+    /// happened, so the honest outcome is a toast, never a clobber.
+    fn sync_agent_write(&mut self, name: &str, arguments: &str) {
+        // The router already validated these arguments; a parse failure
+        // here is defensive-only (never a panic).
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) else {
+            return;
+        };
+        let Some(rel) = args.get("path").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(path) = self.resolve_open_buffer(rel) else {
+            return; // not open — the disk write stands alone
+        };
+        if self.is_dirty(&path) {
+            self.toast(
+                format!(
+                    "agent wrote {rel} to disk; the open buffer has unsaved changes — reload to see it"
+                ),
+                Severity::Info,
+            );
+            return;
+        }
+        let Some(buffer) = self.buffers.get(&path).cloned() else {
+            return;
+        };
+        let pre = buffer.read().unwrap_or_else(|e| e.into_inner()).text();
+        // The buffer is clean, so it equals the disk text the router
+        // computed its diff against — the transform is exact.
+        let post = match name {
+            "write_file" => args
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            "edit_file" => {
+                let old_str = args.get("old_str").and_then(serde_json::Value::as_str);
+                let new_str = args.get("new_str").and_then(serde_json::Value::as_str);
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                match (old_str, new_str) {
+                    (Some(old_str), Some(new_str)) => {
+                        if pre.contains(old_str) {
+                            Some(if replace_all {
+                                pre.replace(old_str, new_str)
+                            } else {
+                                pre.replacen(old_str, new_str, 1)
+                            })
+                        } else {
+                            // Belt-and-braces: a clean buffer should hold
+                            // old_str verbatim. Toast rather than guess.
+                            self.toast(
+                                format!(
+                                    "agent edit to {rel} did not apply to the open buffer — reload to see it"
+                                ),
+                                Severity::Info,
+                            );
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        let Some(post) = post else { return };
+        if post == pre {
+            return; // a no-op write: nothing to sync, nothing to undo
+        }
+
+        // Mutate the shared buffer in place (the Arc stays; every pane's
+        // editor keeps its clamped cursor), then resync highlighting.
+        replace_buffer_text(&buffer, &post);
+        for ((_pane, tab_path), editor) in self.editors.iter_mut() {
+            if tab_path == &path {
+                editor.resync_syntax();
+            }
+        }
+        // The undo snapshot (Ctrl+Z restores `pre` while the buffer still
+        // equals `post`).
+        self.agent_edits
+            .entry(path.clone())
+            .or_default()
+            .push((pre, post));
+        // The buffer now matches disk exactly: rebase the dirty baselines
+        // so the tab ends CLEAN (approving the card was the save).
+        let shape = BufferShape::of(&buffer.read().unwrap_or_else(|e| e.into_inner()));
+        self.saved_shapes.insert(path.clone(), shape);
+        self.last_shapes.insert(path.clone(), shape);
+        self.editor_area.set_dirty(&path, false);
+        self.mark_agent_touched(&path);
+    }
+
+    /// The open buffer for a workspace-relative tool path: the root join
+    /// first, then a normalized `strip_prefix` scan over the open buffers
+    /// (buffer keys come from the shell's open paths; the router resolves
+    /// against the canonical root — the two can differ by prefix
+    /// normalization on Windows).
+    fn resolve_open_buffer(&self, rel: &str) -> Option<PathBuf> {
+        let workspace = self.workspace.as_ref()?;
+        let joined = workspace.root.join(rel);
+        if self.buffers.contains_key(&joined) {
+            return Some(joined);
+        }
+        let rel = rel.replace('\\', "/");
+        let root = normalize_path(&workspace.root);
+        self.buffers
+            .keys()
+            .find(|path| {
+                normalize_path(path)
+                    .strip_prefix(&root)
+                    .map(str::to_owned)
+                    .is_some_and(|rest| rest.trim_start_matches('/') == rel)
+            })
+            .cloned()
+    }
+
+    /// `Ctrl+Z` on an agent-edited buffer (the 5d brief's deliverable 13):
+    /// restore the pre-edit text of the newest snapshot whose post-edit
+    /// text is still on screen — a human edit since invalidates the path's
+    /// stack (a no-op, never a clobber). Disk is never touched (the card
+    /// was the write); the buffer ends dirty against disk. Returns whether
+    /// a snapshot applied.
+    pub fn undo_agent_edit(&mut self, path: &Path) -> bool {
+        let Some(buffer) = self.buffers.get(path).cloned() else {
+            return false;
+        };
+        let current = buffer.read().unwrap_or_else(|e| e.into_inner()).text();
+        let Some(stack) = self.agent_edits.get_mut(path) else {
+            return false;
+        };
+        let Some(index) = stack.iter().rposition(|(_, post)| *post == current) else {
+            // The buffer moved on: the whole stack is invalidated.
+            stack.clear();
+            return false;
+        };
+        let (pre, _) = stack.remove(index);
+        // Entries above the matched one referred to texts that no longer
+        // exist — they die with it.
+        stack.truncate(index);
+        if stack.is_empty() {
+            self.agent_edits.remove(path);
+        }
+        replace_buffer_text(&buffer, &pre);
+        for ((_pane, tab_path), editor) in self.editors.iter_mut() {
+            if tab_path == path {
+                editor.resync_syntax();
+            }
+        }
+        // A same-length undo is shape-invisible — mark dirty explicitly
+        // (the shape-compare caveat in the module docs).
+        self.editor_area.set_dirty(path, true);
+        self.mark_agent_touched(path);
+        true
+    }
+
+    /// Mark a buffer as changed by an agent sync/undo (the shape-compare
+    /// at the dirty/LSP seam cannot see same-length replacements).
+    fn mark_agent_touched(&mut self, path: &Path) {
+        self.agent_touched.insert(path.to_path_buf());
+    }
+
+    /// Drain the agent-touched paths (the shell sends `LspEffect::Change`
+    /// for each didOpen'd one, each frame after the message drain).
+    pub fn take_agent_touched(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.agent_touched)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Replace a shared buffer's whole text in place (§17.7): the Arc stays,
+/// so every pane's editor keeps its (clamped) cursor.
+fn replace_buffer_text(buffer: &Arc<RwLock<Buffer>>, text: &str) {
+    let mut buffer = buffer.write().unwrap_or_else(|e| e.into_inner());
+    // `remove` clamps both ends (buffer.rs:147-155): `usize::MAX` resolves
+    // to the buffer's end — including a trailing newline's final position.
+    buffer.remove(Position::new(0, 0), Position::new(usize::MAX, usize::MAX));
+    buffer.insert(Position::new(0, 0), text);
+}
+
+/// A path with Windows separators and the `\\?\` verbatim prefix
+/// normalized away (the resolve fallback's comparison form).
+fn normalize_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized
+        .strip_prefix("//?/")
+        .map(str::to_owned)
+        .unwrap_or(normalized)
 }
 
 /// Walk a tree, collecting every file as `(path, parent-dir-name)`.
@@ -1649,5 +1963,448 @@ mod tests {
         assert_eq!(snapshot.active_path, Some(b));
         assert!(snapshot.chat_open);
         assert!(snapshot.chat_turns.is_empty());
+        assert!(!snapshot.agent_mode, "the pill defaults off (Phase 5d)");
+
+        state.chat_panel.set_agent_mode(true);
+        assert!(state.workspace_snapshot(true).agent_mode);
+    }
+
+    // --- Agent Mode (Phase 5d, ARCHITECTURE.md §17.6/§17.7) -------------------
+
+    /// Open an agent turn: the panel in flight + the uuid→ChatId mapping,
+    /// exactly what the shell's AgentSend route does.
+    fn agent_turn_open(state: &mut AppState) -> (Uuid, selora_ui::sidebar::ChatId) {
+        let uuid = Uuid::new_v4();
+        let chat_id = selora_ui::sidebar::ChatId::next();
+        state.chat_panel.begin_stream(chat_id);
+        state.chat_ids.insert(uuid, chat_id);
+        (uuid, chat_id)
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: &str) -> selora_ai::ToolCall {
+        selora_ai::ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    fn tool_result(id: &str, ok: bool, content: &str) -> selora_ai::ToolResult {
+        selora_ai::ToolResult {
+            id: id.to_owned(),
+            ok,
+            content: content.to_owned(),
+        }
+    }
+
+    fn agent_receipt(cost: f64) -> ChatReceipt {
+        ChatReceipt {
+            request_id: Uuid::new_v4(),
+            model: "test-model".into(),
+            prompt_tokens: 0,
+            completion_tokens: 100,
+            cost_usd: cost,
+            duration_ms: 5,
+            estimated: true,
+        }
+    }
+
+    fn agent_summary() -> selora_ai::AgentSummary {
+        selora_ai::AgentSummary {
+            iterations: 2,
+            tools_used: 1,
+            approved: 1,
+            denied: 0,
+            tokens: 100,
+            cost_usd: 0.25,
+            completed: true,
+        }
+    }
+
+    fn buffer_text(state: &AppState, p: &Path) -> String {
+        state
+            .buffers
+            .get(p)
+            .expect("buffer")
+            .read()
+            .expect("lock")
+            .text()
+    }
+
+    #[test]
+    fn agent_messages_reduce_into_the_panel_and_drop_stale_ids() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::FolderOpened(path("/repo")));
+        let (uuid, _chat_id) = agent_turn_open(&mut state);
+
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call("call_1", "read_file", r#"{"path":"a.rs"}"#),
+        ));
+        state.apply(AppMessage::ApprovalNeeded(
+            uuid,
+            selora_ai::ApprovalId::from_u128(1),
+            selora_ai::ApprovalCard::Diff {
+                path: "a.rs".into(),
+                diff: "diff".into(),
+            },
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "contents"),
+        ));
+
+        // Unknown uuids are stale: dropped, never a panic.
+        let stale = Uuid::new_v4();
+        state.apply(AppMessage::ToolCallStarted(
+            stale,
+            tool_call("call_9", "read_file", "{}"),
+        ));
+        state.apply(AppMessage::ToolResult(
+            stale,
+            tool_result("call_9", true, "x"),
+        ));
+        state.apply(AppMessage::ApprovalNeeded(
+            stale,
+            selora_ai::ApprovalId::nil(),
+            selora_ai::ApprovalCard::Delete { path: "x".into() },
+        ));
+        // A stale turn end drops WHOLE: no panel reduction, no meter
+        // movement, no toast — even carrying a cost and a Failed end.
+        state.apply(AppMessage::AgentTurnDone(
+            stale,
+            agent_receipt(9.99),
+            agent_summary(),
+            selora_ai::TurnEnd::Failed("stale turn".into()),
+        ));
+        // The stale AgentTurnDone did not end the live turn.
+        assert!(state.chat_panel.is_streaming());
+        // user-free timeline: one card so far.
+        assert_eq!(state.chat_panel.turn_count(), 1);
+        assert_eq!(
+            state.cost_meter.total_usd(),
+            0.0,
+            "a stale turn end never moves the meter"
+        );
+        assert!(
+            state.toasts.is_empty(),
+            "a stale turn end never toasts: {:?}",
+            state.toasts
+        );
+
+        state.apply(AppMessage::AgentTurnDone(
+            uuid,
+            agent_receipt(0.25),
+            agent_summary(),
+            selora_ai::TurnEnd::Completed,
+        ));
+        assert!(!state.chat_panel.is_streaming());
+        assert!(state.chat_ids.is_empty());
+        // The receipt fed the cost meter exactly like ChatDone.
+        assert!((state.cost_meter.total_usd() - 0.25).abs() < f64::EPSILON);
+        // The summary footer landed.
+        assert_eq!(state.chat_panel.turn_count(), 2);
+        // A Completed end toasts nothing.
+        assert!(state.toasts.is_empty());
+    }
+
+    #[test]
+    fn agent_turn_done_toasts_abnormal_ends() {
+        let mut state = AppState::default();
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::AgentTurnDone(
+            uuid,
+            agent_receipt(0.25),
+            agent_summary(),
+            selora_ai::TurnEnd::IterationCap { limit: 25 },
+        ));
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].severity, Severity::Info);
+        assert!(state.toasts[0].text.contains("iteration cap (25)"));
+
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::AgentTurnDone(
+            uuid,
+            agent_receipt(0.0),
+            agent_summary(),
+            selora_ai::TurnEnd::Failed("gateway unreachable".into()),
+        ));
+        assert_eq!(state.toasts.len(), 2);
+        assert_eq!(state.toasts[1].severity, Severity::Error);
+        assert!(state.toasts[1].text.contains("gateway unreachable"));
+
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::AgentTurnDone(
+            uuid,
+            agent_receipt(0.0),
+            agent_summary(),
+            selora_ai::TurnEnd::StoppedByUser,
+        ));
+        assert_eq!(state.toasts.len(), 3);
+        assert_eq!(state.toasts[2].severity, Severity::Info);
+    }
+
+    #[test]
+    fn an_approved_write_to_a_clean_open_buffer_syncs_it_and_ends_clean() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "fn main() {}\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "write_file",
+                r#"{"path":"a.rs","content":"fn main() { /* hi */ }\n"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "wrote"),
+        ));
+
+        // The buffer shows the approved text and ends CLEAN (the card was
+        // the save); the baselines rebase.
+        assert_eq!(buffer_text(&state, &p), "fn main() { /* hi */ }\n");
+        assert!(!state.is_dirty(&p));
+        assert_eq!(
+            state.saved_shape(&p),
+            Some(BufferShape::of(&Buffer::from_text(
+                "fn main() { /* hi */ }\n"
+            )))
+        );
+        assert!(state.toasts.is_empty());
+        // The LSP drain saw the path, once.
+        assert_eq!(state.take_agent_touched(), vec![p.clone()]);
+        assert!(state.take_agent_touched().is_empty());
+
+        // Ctrl+Z: the buffer reverts to the pre-edit text, dirty against
+        // disk (undo never touches disk).
+        assert!(state.undo_agent_edit(&p));
+        assert_eq!(buffer_text(&state, &p), "fn main() {}\n");
+        assert!(state.is_dirty(&p));
+        // The stack is drained: a second undo is a no-op.
+        assert!(!state.undo_agent_edit(&p));
+    }
+
+    #[test]
+    fn an_approved_edit_applies_the_exact_transform() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "one\ntwo\none\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+
+        // replacen(old, new, 1): the first occurrence only.
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"one","new_str":"1"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "edited"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "1\ntwo\none\n");
+
+        // replace_all: every remaining occurrence.
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_2",
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"one","new_str":"ONE","replace_all":true}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_2", true, "edited"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "1\ntwo\nONE\n");
+
+        // Two snapshots: undo pops the newest first.
+        assert!(state.undo_agent_edit(&p));
+        assert_eq!(buffer_text(&state, &p), "1\ntwo\none\n");
+        assert!(state.undo_agent_edit(&p));
+        assert_eq!(buffer_text(&state, &p), "one\ntwo\none\n");
+    }
+
+    #[test]
+    fn a_dirty_buffer_is_never_touched_by_an_agent_write() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "fn main() {}\n");
+        // The user edits: dirty.
+        {
+            let buffer = state.buffers.get(&p).cloned().expect("buffer");
+            buffer
+                .write()
+                .expect("lock")
+                .insert(Position::new(1, 0), "// mine\n");
+        }
+        let dirty_shape = BufferShape::of(&Buffer::from_text("fn main() {}\n// mine\n"));
+        state.note_editor_frame(&p, dirty_shape, true);
+        assert!(state.is_dirty(&p));
+
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "write_file",
+                r#"{"path":"a.rs","content":"fn main() { /* agent */ }\n"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "wrote"),
+        ));
+
+        // The buffer keeps the user's text; the toast names the rel path.
+        assert_eq!(buffer_text(&state, &p), "fn main() {}\n// mine\n");
+        assert!(state.is_dirty(&p));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(
+            state.toasts[0].text.contains("a.rs"),
+            "{:?}",
+            state.toasts[0]
+        );
+        assert!(state.toasts[0].text.contains("unsaved changes"));
+        // Nothing synced: no undo snapshot, no LSP touch.
+        assert!(!state.undo_agent_edit(&p));
+        assert!(state.take_agent_touched().is_empty());
+
+        // edit_file is equally guarded.
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_2",
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"fn","new_str":"fn!"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_2", true, "edited"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "fn main() {}\n// mine\n");
+        assert_eq!(state.toasts.len(), 2);
+    }
+
+    #[test]
+    fn unmatched_or_failed_results_never_touch_buffers() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "fn main() {}\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+
+        // An ok result for an unstashed tool_call_id (a read): nothing.
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_404", true, "x"),
+        ));
+        // A denied write (ok: false): nothing.
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "write_file",
+                r#"{"path":"a.rs","content":"clobber\n"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", false, "user denied this action"),
+        ));
+
+        assert_eq!(buffer_text(&state, &p), "fn main() {}\n");
+        assert!(!state.is_dirty(&p));
+        assert!(state.toasts.is_empty());
+        assert!(state.take_agent_touched().is_empty());
+    }
+
+    #[test]
+    fn undo_of_a_same_length_agent_edit_marks_dirty_explicitly() {
+        let mut state = AppState::default();
+        // A same-length agent edit pair: shape(post) == shape(pre) — the
+        // case the module docs warn the shape-compare cannot see.
+        let p = loaded(&mut state, "/repo/a.rs", "aaa\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"aaa","new_str":"bbb"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "edited"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "bbb\n");
+        assert!(!state.is_dirty(&p));
+
+        // Undo of the same-length edit marks dirty EXPLICITLY (shape is
+        // blind to it) and re-touches the LSP path.
+        let _ = state.take_agent_touched();
+        assert!(state.undo_agent_edit(&p));
+        assert_eq!(buffer_text(&state, &p), "aaa\n");
+        assert!(state.is_dirty(&p));
+        assert_eq!(state.take_agent_touched(), vec![p.clone()]);
+    }
+
+    #[test]
+    fn undo_agent_edit_invalidates_after_a_human_edit_and_never_clobbers() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "aaa\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call(
+                "call_1",
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"aaa","new_str":"ccc"}"#,
+            ),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "edited"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "ccc\n");
+
+        // A HUMAN edit on top: the snapshot's post no longer matches —
+        // the stack invalidates, never clobbers.
+        {
+            let buffer = state.buffers.get(&p).cloned().expect("buffer");
+            buffer
+                .write()
+                .expect("lock")
+                .insert(Position::new(0, 3), "!");
+        }
+        assert!(!state.undo_agent_edit(&p), "the buffer moved on");
+        assert_eq!(buffer_text(&state, &p), "ccc!\n", "never a clobber");
+        assert!(!state.undo_agent_edit(&p), "the stack is drained");
+    }
+
+    #[test]
+    fn switch_folder_clears_the_agent_stashes() {
+        let mut state = AppState::default();
+        let p = loaded(&mut state, "/repo/a.rs", "x\n");
+        let (uuid, _) = agent_turn_open(&mut state);
+        state.apply(AppMessage::ToolCallStarted(
+            uuid,
+            tool_call("call_1", "write_file", r#"{"path":"a.rs","content":"y\n"}"#),
+        ));
+        state.apply(AppMessage::ToolResult(
+            uuid,
+            tool_result("call_1", true, "wrote"),
+        ));
+        assert_eq!(buffer_text(&state, &p), "y\n");
+        assert!(!state.agent_edits.is_empty());
+
+        state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
+        assert!(state.agent_edits.is_empty());
+        assert!(state.agent_write_calls.is_empty());
+        assert!(state.agent_touched.is_empty());
     }
 }

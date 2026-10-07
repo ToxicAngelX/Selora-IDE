@@ -42,6 +42,10 @@ pub struct WorkspaceState {
     /// panel's `snapshot_turns`, not here).
     #[serde(default)]
     pub chat_turns: Vec<ChatTurnState>,
+    /// Whether the chat header's Agent Mode pill was on (Phase 5d); older
+    /// files default to off.
+    #[serde(default)]
+    pub agent_mode: bool,
 }
 
 /// `workspace.json`'s path inside the settings directory `dir`.
@@ -116,6 +120,7 @@ pub fn restorable(state: &WorkspaceState) -> WorkspaceState {
         // Chat state is not path-dependent — it restores verbatim.
         chat_open: state.chat_open,
         chat_turns: state.chat_turns.clone(),
+        agent_mode: state.agent_mode,
     }
 }
 
@@ -147,6 +152,7 @@ mod tests {
             active_path: Some(root.join("src").join("main.rs")),
             chat_open: false,
             chat_turns: Vec::new(),
+            agent_mode: false,
         };
         (root, state)
     }
@@ -198,6 +204,25 @@ mod tests {
         let loaded = load(&dir).expect("legacy load");
         assert!(!loaded.chat_open);
         assert!(loaded.chat_turns.is_empty());
+        assert!(!loaded.agent_mode, "pre-5d files default the pill to off");
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Phase 5d: the agent-mode pill round-trips like `chat_open`.
+    #[test]
+    fn agent_mode_round_trips() {
+        let (root, state) = fixture_session();
+        let state = WorkspaceState {
+            agent_mode: true,
+            ..state
+        };
+        let dir = temp_dir();
+        save(&dir, &state).expect("save");
+        assert_eq!(load(&dir).as_ref(), Some(&state));
+        // The restore filter carries it verbatim (not path-dependent).
+        assert!(restorable(&state).agent_mode);
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(root);

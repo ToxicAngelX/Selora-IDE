@@ -3481,6 +3481,7 @@ dependencies = [
  "selora-lsp",
  "selora-settings",
  "selora-tokens",
+ "serde_json",
 ]
 
 [[package]]

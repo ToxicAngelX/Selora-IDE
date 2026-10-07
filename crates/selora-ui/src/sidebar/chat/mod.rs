@@ -39,6 +39,19 @@
 //! Every color, font, and spacing value comes from [`crate::theme`] (the
 //! typed DESIGN_TOKENS.md contract); nothing is hardcoded here
 //! (DESIGN_TOKENS.md §12). No color outside `--ok` / `--err` semantics.
+//!
+//! Agent Mode (Phase 5d; UI_SPEC.md §4.2, ARCHITECTURE.md §17): the
+//! header's `agent` pill switches the composer submit from
+//! [`ChatPanelEvent::Send`] to [`ChatPanelEvent::AgentSend`]; the
+//! timeline then interleaves [`agent_cards`] tool cards and the turn
+//! summary between the bubbles in arrival order, paints the 24px status
+//! line under the last entry while the turn runs, and emits
+//! [`ChatPanelEvent::AgentDecision`] for the card buttons and the Stop
+//! affordances. Agent state arrives through the stale-gated inbound
+//! methods ([`ChatPanel::tool_call_started`] and friends); cards and
+//! summaries never enter [`ChatPanel::conversation`],
+//! [`ChatPanel::snapshot_turns`], or [`ChatPanel::transcript`] (agent
+//! transcripts are not persisted — the brief's DO-NOT).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,7 +59,10 @@ use std::time::{Duration, Instant};
 
 use egui::{pos2, vec2, Align2, Key, Rect, Sense, Ui, Vec2};
 
-use selora_ai::{ChatMessage, Model, ModelId, Role};
+use selora_ai::{
+    AgentDecision, AgentSummary, ApprovalCard, ApprovalId, ChatMessage, Model, ModelId, Role,
+    ToolCall, ToolResult,
+};
 
 use crate::sidebar::icons;
 use crate::theme::{color, font, radius, space, type_scale};
@@ -165,6 +181,23 @@ pub enum ChatPanelEvent {
     /// `Effect::SeloraChat(uuid, req)` while remembering its
     /// `ChatId -> uuid` mapping.
     Send { id: ChatId, text: String },
+    /// The user submitted composer text with Agent Mode on (UI_SPEC.md
+    /// §4.2): the shell builds the turn request (conversation + model +
+    /// agent settings) and dispatches `Effect::AgentSend`
+    /// (ARCHITECTURE.md §17.3/§17.6). Same id/stream discipline as
+    /// [`Send`](Self::Send).
+    AgentSend { id: ChatId, text: String },
+    /// The user's answer to an approval card, or a Stop from the status
+    /// line / a running bash card / Clear-during-an-agent-turn (§17.4).
+    /// The shell reverse-maps `id` to the turn's `Uuid` and dispatches
+    /// `Effect::AgentDecision`. `approval_id` is the pending card's id,
+    /// or `Uuid::nil()` for a Stop that names no card (the loop honors
+    /// Stop regardless).
+    AgentDecision {
+        id: ChatId,
+        approval_id: ApprovalId,
+        decision: AgentDecision,
+    },
     /// The conversation was cleared (overflow menu); the shell should
     /// cancel any in-flight stream (`Effect::SeloraCancelChat`) and
     /// persist the now-empty transcript.
@@ -211,6 +244,18 @@ pub struct ChatPanelOutcome {
     /// `(item label, row rect)` for the overflow menu's items, when the
     /// menu is open.
     pub menu_item_rects: Vec<(&'static str, Rect)>,
+    /// Tool cards painted this frame (Phase 5d).
+    pub cards_painted: usize,
+    /// `(label, rect)` for the card decision buttons painted this frame.
+    pub decision_button_rects: Vec<(&'static str, Rect)>,
+    /// The agent status line's rect, while a turn runs.
+    pub status_line_rect: Option<Rect>,
+    /// The status line's Stop button rect, while a turn runs.
+    pub stop_button_rect: Option<Rect>,
+    /// The header's agent-mode pill rect.
+    pub agent_pill_rect: Rect,
+    /// The turn summary footer's rect, when one painted this frame.
+    pub summary_footer_rect: Option<Rect>,
 }
 
 impl Default for ChatPanelOutcome {
@@ -224,6 +269,12 @@ impl Default for ChatPanelOutcome {
             send_button_rect: Rect::ZERO,
             model_row_rects: Vec::new(),
             menu_item_rects: Vec::new(),
+            cards_painted: 0,
+            decision_button_rects: Vec::new(),
+            status_line_rect: None,
+            stop_button_rect: None,
+            agent_pill_rect: Rect::ZERO,
+            summary_footer_rect: None,
         }
     }
 }
@@ -240,6 +291,12 @@ struct FrameArtifacts {
     send_button_rect: Rect,
     model_row_rects: Vec<(ModelId, Rect)>,
     menu_item_rects: Vec<(&'static str, Rect)>,
+    cards_painted: usize,
+    decision_button_rects: Vec<(&'static str, Rect)>,
+    status_line_rect: Option<Rect>,
+    stop_button_rect: Option<Rect>,
+    agent_pill_rect: Rect,
+    summary_footer_rect: Option<Rect>,
     /// Code copied this frame (applied by `show`: clipboard + event).
     copies: Vec<String>,
 }
@@ -255,6 +312,12 @@ impl Default for FrameArtifacts {
             send_button_rect: Rect::ZERO,
             model_row_rects: Vec::new(),
             menu_item_rects: Vec::new(),
+            cards_painted: 0,
+            decision_button_rects: Vec::new(),
+            status_line_rect: None,
+            stop_button_rect: None,
+            agent_pill_rect: Rect::ZERO,
+            summary_footer_rect: None,
             copies: Vec::new(),
         }
     }
@@ -299,6 +362,17 @@ impl Message {
             content: self.content.clone(),
         }
     }
+}
+
+/// One timeline row (Phase 5d): a chat bubble, an agent tool card, or a
+/// turn summary footer. Cards and summaries interleave between bubbles in
+/// arrival order (UI_SPEC.md §4.2); only bubbles are conversation context
+/// and persistence.
+#[derive(Clone, Debug)]
+enum TimelineEntry {
+    Bubble(Message),
+    Card(agent_cards::ToolCard),
+    Summary(AgentSummary),
 }
 
 /// One rendered piece of an assistant message: prose between fences, or
@@ -423,8 +497,9 @@ enum Part {
 /// The chat sidebar content. Create one per app and call [`show`] every
 /// frame from the shell's right `SidePanel`.
 pub struct ChatPanel {
-    /// The transcript (user, assistant, and the streaming bubble).
-    messages: Vec<Message>,
+    /// The timeline (user/assistant bubbles interleaved with agent tool
+    /// cards and turn summaries, in arrival order — Phase 5d).
+    entries: Vec<TimelineEntry>,
     /// The composer's buffer (single-line edit; Shift+Enter appends).
     composer: String,
     /// Focus the composer on the next frame (panel-open wiring).
@@ -441,6 +516,24 @@ pub struct ChatPanel {
     picker_open: bool,
     /// Whether the `⋯` overflow menu is open.
     menu_open: bool,
+    /// Agent Mode (the header pill, UI_SPEC.md §4.2): submits start agent
+    /// turns instead of plain chats. Persisted in workspace.json by the
+    /// shell (the `chat_open` precedent).
+    agent_mode: bool,
+    /// `ui.reduce_motion` (DESIGN_TOKENS.md §7.4), threaded by the shell:
+    /// the cards' pulse/spin become static dots.
+    reduce_motion: bool,
+    /// An agent turn is in flight (set by an agent-mode submit; cleared
+    /// by [`agent_turn_done`](Self::agent_turn_done) /
+    /// [`clear`](Self::clear)).
+    agent_in_flight: bool,
+    /// The in-flight turn's approval counter (drives "Approve all"
+    /// appearing from the second pending card, §4.2).
+    turn_approvals: u32,
+    /// The entries index where the in-flight turn's cards begin — the
+    /// status line and its Stop consider only this turn's cards (a
+    /// previous turn's latched card must never leak into the phase).
+    turn_cards_start: usize,
 }
 
 impl Default for ChatPanel {
@@ -453,7 +546,7 @@ impl ChatPanel {
     /// An empty panel with no transcript and no model.
     pub fn new() -> Self {
         Self {
-            messages: Vec::new(),
+            entries: Vec::new(),
             composer: String::new(),
             want_focus: false,
             in_flight: None,
@@ -461,6 +554,11 @@ impl ChatPanel {
             models: Vec::new(),
             picker_open: false,
             menu_open: false,
+            agent_mode: false,
+            reduce_motion: false,
+            agent_in_flight: false,
+            turn_approvals: 0,
+            turn_cards_start: 0,
         }
     }
 
@@ -488,6 +586,38 @@ impl ChatPanel {
     /// Install the model catalog.
     pub fn set_models(&mut self, models: Vec<Model>) {
         self.models = models;
+    }
+
+    /// Whether Agent Mode is on (the header pill; UI_SPEC.md §4.2). The
+    /// shell reads this for the workspace.json snapshot.
+    pub fn is_agent_mode(&self) -> bool {
+        self.agent_mode
+    }
+
+    /// Set Agent Mode (the shell's boot restore; the pill toggles it
+    /// in-place). Takes effect on the next submit — a running turn is
+    /// untouched.
+    pub fn set_agent_mode(&mut self, on: bool) {
+        self.agent_mode = on;
+    }
+
+    /// Thread `ui.reduce_motion` (DESIGN_TOKENS.md §7.4) into the cards:
+    /// pulse/spin become static dots. Called by the shell on settings
+    /// load and on dialog adopt.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.reduce_motion = on;
+    }
+
+    /// Whether reduced motion is on (the shell's threading assertions).
+    pub fn is_reduce_motion(&self) -> bool {
+        self.reduce_motion
+    }
+
+    /// The in-flight turn's pending approval id, when a card is parked
+    /// (the status-line Stop names it; the shell's tests drive
+    /// `Effect::AgentDecision` for the parked card through it).
+    pub fn pending_approval_id(&self) -> Option<ApprovalId> {
+        self.current_pending_approval()
     }
 
     /// Open the model picker dropdown (the command palette's
@@ -535,18 +665,25 @@ impl ChatPanel {
         self.composer = text.to_owned();
     }
 
-    /// Number of transcript entries (including the streaming bubble).
+    /// Number of timeline entries (bubbles, cards, summaries; including
+    /// the streaming bubble).
     pub fn turn_count(&self) -> usize {
-        self.messages.len()
+        self.entries.len()
     }
 
     /// The full transcript as wire-ready [`ChatMessage`]s for the next
     /// `ChatRequest`. The in-progress streaming bubble (if any) is
     /// excluded — it cannot be part of its own request — and so are
     /// failed turns (the shell surfaces those as toasts, not context).
+    /// Cards and summaries are never context (§17.6: the loop tracks its
+    /// own tool-call messages).
     pub fn conversation(&self) -> Vec<ChatMessage> {
-        self.messages
+        self.entries
             .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Bubble(message) => Some(message),
+                _ => None,
+            })
             .filter(|message| !message.streaming && message.error.is_none())
             .map(|message| ChatMessage {
                 role: message.role,
@@ -563,12 +700,17 @@ impl ChatPanel {
     /// The last [`MAX_PERSISTED_TURNS`] turns for `workspace.json`
     /// (conversations persist as the last 20 turns; Phase 4 brief,
     /// item 7). Mid-stream (failed or still-streaming) bubbles are not
-    /// stable state and are skipped. The shell serializes whatever this
+    /// stable state and are skipped — as are cards and summaries (agent
+    /// transcripts are not persisted). The shell serializes whatever this
     /// returns.
     pub fn snapshot_turns(&self) -> Vec<ChatTurn> {
         let stable: Vec<&Message> = self
-            .messages
+            .entries
             .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Bubble(message) => Some(message),
+                _ => None,
+            })
             .filter(|message| !message.streaming && message.error.is_none())
             .collect();
         let start = stable.len().saturating_sub(MAX_PERSISTED_TURNS);
@@ -579,18 +721,29 @@ impl ChatPanel {
     }
 
     /// Replace the transcript from persisted turns (app boot, before the
-    /// first frame). Restored turns are all complete; nothing streams.
+    /// first frame). Restored turns are all complete bubbles; nothing
+    /// streams, no turn is in flight.
     pub fn restore_turns(&mut self, turns: Vec<ChatTurn>) {
-        self.messages = turns.into_iter().map(turn_into_message).collect();
+        self.entries = turns
+            .into_iter()
+            .map(|turn| TimelineEntry::Bubble(turn_into_message(turn)))
+            .collect();
         self.in_flight = None;
+        self.agent_in_flight = false;
+        self.turn_approvals = 0;
+        self.turn_cards_start = 0;
     }
 
     /// The transcript as a plain-text transcript ("You: …" /
     /// "Selora: …" blocks) — the overflow menu's "Copy transcript"
-    /// payload.
+    /// payload. Bubbles only: the cards' detail is the loop's business.
     pub fn transcript(&self) -> String {
-        self.messages
+        self.entries
             .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Bubble(message) => Some(message),
+                _ => None,
+            })
             .map(|message| format!("{}: {}", role_label(message.role), message.content.trim()))
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -601,36 +754,43 @@ impl ChatPanel {
     /// Append a user bubble (programmatic injection — the Enter path
     /// already echoes its own; do not call both for one message).
     pub fn push_user(&mut self, text: &str) {
-        self.messages.push(Message::user(text));
+        self.entries
+            .push(TimelineEntry::Bubble(Message::user(text)));
     }
 
     /// Feed one streamed delta into the assistant bubble (from
     /// `AppMessage::ChatDelta`). Stale ids — anything but the in-flight
     /// request — are dropped. The first delta opens the bubble and
-    /// starts its fade-in.
+    /// starts its fade-in. When the last entry isn't a streaming
+    /// assistant bubble (e.g. a tool card just interrupted), a fresh
+    /// bubble opens — agent rounds separate for free.
     pub fn push_assistant_delta(&mut self, id: ChatId, delta: &str) {
         if self.in_flight != Some(id) {
             return;
         }
         let now = Instant::now();
-        let opens_bubble = !self
-            .messages
-            .last()
-            .is_some_and(|message| message.streaming && message.role == Role::Assistant);
+        let opens_bubble = !matches!(
+            self.entries.last(),
+            Some(TimelineEntry::Bubble(message)) if message.streaming && message.role == Role::Assistant
+        );
         if opens_bubble {
-            self.messages.push(Message {
+            self.entries.push(TimelineEntry::Bubble(Message {
                 role: Role::Assistant,
                 content: delta.to_owned(),
                 streaming: true,
                 stream_started: Some(now),
                 last_delta: Some(now),
                 error: None,
-            });
+            }));
             return;
         }
-        let message = self.messages.last_mut().expect("checked above");
-        message.content.push_str(delta);
-        message.last_delta = Some(now);
+        match self.entries.last_mut() {
+            Some(TimelineEntry::Bubble(message)) => {
+                message.content.push_str(delta);
+                message.last_delta = Some(now);
+            }
+            _ => unreachable!("checked above"),
+        }
     }
 
     /// End the stream (from `AppMessage::ChatDone`): the bubble stops
@@ -640,15 +800,15 @@ impl ChatPanel {
             return;
         }
         self.in_flight = None;
-        if let Some(message) = self.messages.last_mut() {
+        if let Some(TimelineEntry::Bubble(message)) = self.entries.last_mut() {
             message.streaming = false;
         }
-        let is_empty_assistant = self
-            .messages
-            .last()
-            .is_some_and(|message| message.role == Role::Assistant && message.content.is_empty());
+        let is_empty_assistant = matches!(
+            self.entries.last(),
+            Some(TimelineEntry::Bubble(message)) if message.role == Role::Assistant && message.content.is_empty()
+        );
         if is_empty_assistant {
-            self.messages.pop();
+            self.entries.pop();
         }
     }
 
@@ -659,28 +819,139 @@ impl ChatPanel {
             return;
         }
         self.in_flight = None;
-        match self.messages.last_mut() {
-            Some(message) if message.role == Role::Assistant => {
+        match self.entries.last_mut() {
+            Some(TimelineEntry::Bubble(message)) if message.role == Role::Assistant => {
                 message.streaming = false;
                 message.error = Some(error.to_owned());
             }
-            _ => self.messages.push(Message {
+            _ => self.entries.push(TimelineEntry::Bubble(Message {
                 role: Role::Assistant,
                 content: String::new(),
                 streaming: false,
                 stream_started: None,
                 last_delta: None,
                 error: Some(error.to_owned()),
-            }),
+            })),
         }
+    }
+
+    // -- agent turn lifecycle (Phase 5d; the shell reduces the §17.6
+    //    AppMessages into these, keyed by the same in-flight ChatId) ----
+
+    /// `AppMessage::ToolCallStarted`: open the tool's card. Stale ids
+    /// (anything but the in-flight request) are dropped, like deltas.
+    pub fn tool_call_started(&mut self, id: ChatId, call: ToolCall) {
+        if self.in_flight != Some(id) {
+            return;
+        }
+        // A card interrupts the streaming bubble above it: finalize the
+        // bubble so the wave stops and the round's text re-enters the
+        // next request's context.
+        self.finalize_last_streaming_bubble();
+        self.entries
+            .push(TimelineEntry::Card(agent_cards::ToolCard::new(call)));
+    }
+
+    /// `AppMessage::ApprovalNeeded`: attach the parked approval to the
+    /// card the loop just started (the loop emits ApprovalNeeded right
+    /// after its ToolCallStarted) and count the turn's approval ordinal
+    /// ("Approve all" appears from the second pending card, §4.2).
+    pub fn approval_needed(&mut self, id: ChatId, approval_id: ApprovalId, card: ApprovalCard) {
+        if self.in_flight != Some(id) {
+            return;
+        }
+        self.turn_approvals += 1;
+        let ordinal = self.turn_approvals;
+        for entry in self.entries.iter_mut().rev() {
+            if let TimelineEntry::Card(tool_card) = entry {
+                if tool_card.result.is_none() && tool_card.approval.is_none() {
+                    tool_card.approval = Some((approval_id, card, ordinal));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `AppMessage::ToolResult`: land the result on its card (matched by
+    /// the tool-call id the result carries).
+    pub fn tool_result(&mut self, id: ChatId, result: ToolResult) {
+        if self.in_flight != Some(id) {
+            return;
+        }
+        for entry in self.entries.iter_mut().rev() {
+            if let TimelineEntry::Card(card) = entry {
+                if card.call.id == result.id {
+                    card.result = Some(result);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `AppMessage::AgentTurnDone`: the turn ends; the summary footer
+    /// lands under the final bubble (§4.2). EVERY streaming assistant
+    /// bubble of the turn finalizes (complete_stream only clears the
+    /// last one — earlier rounds' text would otherwise never re-enter
+    /// the next request's context and their wave would animate forever),
+    /// and cards still parked at the end (a Stop or cap while parked
+    /// emits no ToolResult — the loop breaks out) latch so their buttons
+    /// die with the turn.
+    pub fn agent_turn_done(&mut self, id: ChatId, summary: AgentSummary) {
+        if self.in_flight != Some(id) {
+            return;
+        }
+        self.in_flight = None;
+        self.agent_in_flight = false;
+        for entry in &mut self.entries {
+            match entry {
+                TimelineEntry::Bubble(message) => {
+                    if message.streaming && message.role == Role::Assistant {
+                        message.streaming = false;
+                    }
+                }
+                TimelineEntry::Card(card) => {
+                    if card.approval.is_some() && card.decided.is_none() && card.result.is_none() {
+                        card.decided = Some(AgentDecision::Stop);
+                    }
+                }
+                TimelineEntry::Summary(_) => {}
+            }
+        }
+        self.entries.push(TimelineEntry::Summary(summary));
+    }
+
+    /// A Card or Summary entry interrupts the streaming bubble above it:
+    /// finalize the bubble so the wave stops mid-turn.
+    fn finalize_last_streaming_bubble(&mut self) {
+        if let Some(TimelineEntry::Bubble(message)) = self.entries.last_mut() {
+            if message.streaming {
+                message.streaming = false;
+            }
+        }
+    }
+
+    /// The in-flight turn's pending approval id (the status-line Stop
+    /// names it when a card is parked).
+    fn current_pending_approval(&self) -> Option<ApprovalId> {
+        self.entries[self.turn_cards_start.min(self.entries.len())..]
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Card(card) => Some(card),
+                _ => None,
+            })
+            .find(|card| card.is_pending())
+            .and_then(|card| card.approval_id())
     }
 
     /// Empty the transcript (the overflow menu's "Clear conversation").
     /// The shell still gets the [`ChatPanelEvent::Clear`] event and is
     /// responsible for cancelling any in-flight stream.
     pub fn clear(&mut self) {
-        self.messages.clear();
+        self.entries.clear();
         self.in_flight = None;
+        self.agent_in_flight = false;
+        self.turn_approvals = 0;
+        self.turn_cards_start = 0;
     }
 
     // -- painting ---------------------------------------------------------------
@@ -717,6 +988,12 @@ impl ChatPanel {
             send_button_rect: frame.send_button_rect,
             model_row_rects: frame.model_row_rects,
             menu_item_rects: frame.menu_item_rects,
+            cards_painted: frame.cards_painted,
+            decision_button_rects: frame.decision_button_rects,
+            status_line_rect: frame.status_line_rect,
+            stop_button_rect: frame.stop_button_rect,
+            agent_pill_rect: frame.agent_pill_rect,
+            summary_footer_rect: frame.summary_footer_rect,
         }
     }
 
@@ -808,6 +1085,65 @@ impl ChatPanel {
             self.menu_open = !self.menu_open;
             self.picker_open = false;
         }
+
+        // -- agent-mode pill (UI_SPEC.md §4.2:241), left of the overflow --
+        // A 24px chip: `--type-xs --fg-muted`, `--radius-pill`, 1px
+        // `--ink-hi` border; on = an `--ok` dot left of the label.
+        let pill_label = "agent";
+        let pill_galley = painter.layout_no_wrap(
+            pill_label.to_owned(),
+            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+            color::FG_MUTED,
+        );
+        let dot_slot = if self.agent_mode {
+            6.0 + space::S1
+        } else {
+            0.0
+        };
+        let pill_width = dot_slot + pill_galley.size().x + 2.0 * space::S2;
+        let pill_rect = Rect::from_min_size(
+            pos2(
+                overflow_rect.left() - space::S1 - pill_width,
+                rect.top() + 8.0,
+            ),
+            vec2(pill_width, 24.0),
+        );
+        let pill_response = ui.interact(
+            pill_rect,
+            egui::Id::new("selora_chat_agent_pill"),
+            Sense::click(),
+        );
+        if pill_response.hovered() {
+            painter.rect_filled(pill_rect, radius::PILL, color::INK_FAINT);
+        }
+        painter.rect(
+            pill_rect,
+            radius::PILL,
+            egui::Color32::TRANSPARENT,
+            egui::Stroke::new(1.0, color::INK_HI),
+            egui::StrokeKind::Inside,
+        );
+        let mut pill_text_x = pill_rect.left() + space::S2;
+        if self.agent_mode {
+            painter.circle_filled(
+                pos2(pill_text_x + 3.0, pill_rect.center().y),
+                3.0,
+                color::OK,
+            );
+            pill_text_x += dot_slot;
+        }
+        painter.galley(
+            pos2(
+                pill_text_x,
+                pill_rect.center().y - pill_galley.size().y / 2.0,
+            ),
+            pill_galley,
+            color::FG_MUTED,
+        );
+        if pill_response.clicked() {
+            self.agent_mode = !self.agent_mode;
+        }
+        frame.agent_pill_rect = pill_rect;
 
         self.paint_model_picker(&model_response, frame);
         self.paint_overflow_menu(ui, &overflow_response, frame);
@@ -990,6 +1326,18 @@ impl ChatPanel {
 
         match action {
             Some(OverflowAction::Clear) => {
+                // Clear's contract: the shell cancels in-flight work. For
+                // an agent turn that cancel IS the Stop decision — else
+                // the loop would keep burning tokens invisibly (§17.4).
+                if self.agent_in_flight {
+                    if let Some(id) = self.in_flight {
+                        frame.events.push(ChatPanelEvent::AgentDecision {
+                            id,
+                            approval_id: ApprovalId::nil(),
+                            decision: AgentDecision::Stop,
+                        });
+                    }
+                }
                 self.clear();
                 frame.events.push(ChatPanelEvent::Clear);
                 open = false;
@@ -1011,9 +1359,12 @@ impl ChatPanel {
         self.menu_open = open;
     }
 
-    /// The conversation scroll: bubbles, code blocks, streaming visuals.
+    /// The conversation scroll: bubbles, tool cards, the summary footer,
+    /// and the agent status line while a turn runs (§4.2).
     fn paint_conversation(&mut self, ui: &mut Ui, frame: &mut FrameArtifacts) {
-        let messages = &self.messages;
+        let reduce_motion = self.reduce_motion;
+        let in_flight = self.in_flight;
+        let agent_in_flight = self.agent_in_flight;
         egui::ScrollArea::vertical()
             .id_salt("selora_chat_transcript")
             .auto_shrink([false, false])
@@ -1021,9 +1372,69 @@ impl ChatPanel {
             .show(ui, |scroll| {
                 scroll.add_space(AREA_PADDING);
                 let content_width = scroll.available_width();
-                for (index, message) in messages.iter().enumerate() {
-                    paint_message(scroll, message, index, content_width, frame);
+                for index in 0..self.entries.len() {
+                    match &mut self.entries[index] {
+                        TimelineEntry::Bubble(message) => {
+                            paint_message(scroll, message, index, content_width, frame);
+                        }
+                        TimelineEntry::Card(card) => {
+                            // A card is live only if its OWN turn is: the
+                            // in-flight turn's cards (index ≥ the turn's
+                            // start) while it runs. A dead turn's
+                            // resultless card freezes (no spin, no Stop).
+                            let turn_live = agent_in_flight && index >= self.turn_cards_start;
+                            let outcome =
+                                agent_cards::tool_card(scroll, card, reduce_motion, turn_live);
+                            if let (Some(decision), Some(id)) = (outcome.decision, in_flight) {
+                                let approval_id =
+                                    card.approval_id().unwrap_or_else(ApprovalId::nil);
+                                frame.events.push(ChatPanelEvent::AgentDecision {
+                                    id,
+                                    approval_id,
+                                    decision,
+                                });
+                            }
+                            if let Some(url) = outcome.copy {
+                                // The copy+toast seam: the shell toasts
+                                // CopyCode; the clipboard is set by show().
+                                frame.copies.push(url);
+                            }
+                            frame.cards_painted += 1;
+                            frame.decision_button_rects.extend(outcome.button_rects);
+                        }
+                        TimelineEntry::Summary(summary) => {
+                            let rect = agent_cards::summary_footer(scroll, summary);
+                            frame.summary_footer_rect = Some(rect);
+                        }
+                    }
                     scroll.add_space(BUBBLE_GAP);
+                }
+                if agent_in_flight {
+                    // The 24px status line under the last entry (§4.2):
+                    // the phase derives from this turn's card states.
+                    let phase = agent_cards::status_phase_for(
+                        self.entries[self.turn_cards_start.min(self.entries.len())..]
+                            .iter()
+                            .filter_map(|entry| match entry {
+                                TimelineEntry::Card(card) => Some(card),
+                                _ => None,
+                            }),
+                    );
+                    let status = agent_cards::status_line(scroll, &phase, reduce_motion);
+                    frame.status_line_rect = Some(status.rect);
+                    frame.stop_button_rect = Some(status.stop_rect);
+                    if status.stop_clicked {
+                        if let Some(id) = in_flight {
+                            let approval_id = self
+                                .current_pending_approval()
+                                .unwrap_or_else(ApprovalId::nil);
+                            frame.events.push(ChatPanelEvent::AgentDecision {
+                                id,
+                                approval_id,
+                                decision: AgentDecision::Stop,
+                            });
+                        }
+                    }
                 }
                 scroll.add_space(AREA_PADDING);
             });
@@ -1144,8 +1555,9 @@ impl ChatPanel {
     }
 
     /// Submit the composer: assign the id, echo the user bubble, clear
-    /// the input, emit [`ChatPanelEvent::Send`]. A no-op while empty or
-    /// mid-stream.
+    /// the input, emit [`ChatPanelEvent::Send`] — or, with Agent Mode on,
+    /// [`ChatPanelEvent::AgentSend`] (ARCHITECTURE.md §17.3). A no-op
+    /// while empty or mid-stream.
     fn submit(&mut self, events: &mut Vec<ChatPanelEvent>) {
         if self.in_flight.is_some() {
             return;
@@ -1158,7 +1570,14 @@ impl ChatPanel {
         self.in_flight = Some(id);
         self.push_user(&text);
         self.composer.clear();
-        events.push(ChatPanelEvent::Send { id, text });
+        if self.agent_mode {
+            self.agent_in_flight = true;
+            self.turn_approvals = 0;
+            self.turn_cards_start = self.entries.len();
+            events.push(ChatPanelEvent::AgentSend { id, text });
+        } else {
+            events.push(ChatPanelEvent::Send { id, text });
+        }
     }
 }
 
@@ -1834,7 +2253,10 @@ mod tests {
         // The partial reply stays; the error rides on the bubble.
         assert_eq!(panel.turn_count(), 2);
         assert_eq!(
-            panel.messages.last().and_then(|m| m.error.as_deref()),
+            panel.entries.last().and_then(|entry| match entry {
+                TimelineEntry::Bubble(message) => message.error.as_deref(),
+                _ => None,
+            }),
             Some("gateway unreachable")
         );
         // The failed turn is excluded from request context.
@@ -1852,10 +2274,8 @@ mod tests {
         let id = send(&mut panel).expect("send");
         panel.fail_stream(id, "key invalid");
         assert_eq!(panel.turn_count(), 2);
-        assert!(panel
-            .messages
-            .last()
-            .is_some_and(|m| m.error.as_deref() == Some("key invalid")));
+        assert!(panel.entries.last().is_some_and(|entry| matches!(entry,
+            TimelineEntry::Bubble(message) if message.error.as_deref() == Some("key invalid"))));
     }
 
     // -- rendering ---------------------------------------------------------------
@@ -1924,8 +2344,8 @@ mod tests {
     fn code_block_copy_puts_the_code_on_the_clipboard() {
         let mut panel = ChatPanel::new();
         panel.push_user("show me code");
-        panel.messages.push(turn_into_message(ChatTurn::assistant(
-            "here:\n\n```rust\nfn main() {}\n```\n",
+        panel.entries.push(TimelineEntry::Bubble(turn_into_message(
+            ChatTurn::assistant("here:\n\n```rust\nfn main() {}\n```\n"),
         )));
 
         // Frame 1: paint, then hover the code block — the Copy button
@@ -1960,9 +2380,9 @@ mod tests {
         let mut panel = ChatPanel::new();
         panel.push_user("show me code");
         // An open fence (mid-stream): no closing fence, no Copy button.
-        panel
-            .messages
-            .push(turn_into_message(ChatTurn::assistant("```\nfn partial(\n")));
+        panel.entries.push(TimelineEntry::Bubble(turn_into_message(
+            ChatTurn::assistant("```\nfn partial(\n"),
+        )));
 
         let ctx = egui::Context::default();
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
@@ -2325,5 +2745,522 @@ mod tests {
             assert!((-3.0..=0.0).contains(&dy));
             assert!((0.5..=1.0).contains(&opacity));
         }
+    }
+
+    // -- Agent Mode (Phase 5d) ------------------------------------------------
+
+    /// Submit with agent mode on (mirrors the Enter path's agent branch).
+    fn send_agent(panel: &mut ChatPanel) -> Option<ChatId> {
+        let mut events = Vec::new();
+        panel.submit(&mut events);
+        match events.pop() {
+            Some(ChatPanelEvent::AgentSend { id, .. }) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn tool_call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call_{name}"),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    fn tool_result(call: &ToolCall, ok: bool, content: &str) -> ToolResult {
+        ToolResult {
+            id: call.id.clone(),
+            ok,
+            content: content.to_owned(),
+        }
+    }
+
+    fn diff_approval() -> ApprovalCard {
+        ApprovalCard::Diff {
+            path: "src/main.rs".to_owned(),
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_owned(),
+        }
+    }
+
+    fn summary() -> AgentSummary {
+        AgentSummary {
+            iterations: 2,
+            tools_used: 1,
+            approved: 1,
+            denied: 0,
+            tokens: 1240,
+            cost_usd: 0.004,
+            completed: true,
+        }
+    }
+
+    /// The timeline row kinds, in order (the interleave assertion).
+    fn entry_kinds(panel: &ChatPanel) -> Vec<&'static str> {
+        panel
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                TimelineEntry::Bubble(_) => "bubble",
+                TimelineEntry::Card(_) => "card",
+                TimelineEntry::Summary(_) => "summary",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_pill_toggles_agent_mode() {
+        let mut panel = ChatPanel::new();
+        assert!(!panel.is_agent_mode());
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let pill = outcome.agent_pill_rect;
+        assert!(pill.width() > 0.0, "the pill paints in the header");
+        frame(&ctx, raw_input_with(click_at(pill.center())), &mut panel);
+        assert!(panel.is_agent_mode(), "the pill click toggles on");
+        frame(&ctx, raw_input_with(click_at(pill.center())), &mut panel);
+        assert!(!panel.is_agent_mode(), "and back off");
+    }
+
+    #[test]
+    fn agent_submit_emits_agent_send_and_paints_the_status_line() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("read src/main.rs");
+
+        let mut events = Vec::new();
+        panel.submit(&mut events);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        match &events[0] {
+            ChatPanelEvent::AgentSend { id, text } => {
+                assert_eq!(text, "read src/main.rs");
+                assert_eq!(panel.in_flight(), Some(*id));
+            }
+            other => panic!("expected AgentSend, got {other:?}"),
+        }
+        assert!(panel.is_streaming());
+
+        // While the turn runs the status line + Stop paint under the
+        // last entry (no cards yet: the `thinking` phase).
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(outcome.status_line_rect.is_some());
+        assert!(outcome.stop_button_rect.is_some());
+        assert_eq!(outcome.cards_painted, 0);
+    }
+
+    #[test]
+    fn plain_submit_still_emits_send_with_agent_mode_off() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("hi");
+        let mut events = Vec::new();
+        panel.submit(&mut events);
+        assert!(matches!(events[0], ChatPanelEvent::Send { .. }));
+        // No status line for a plain chat.
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(outcome.status_line_rect.is_none());
+    }
+
+    #[test]
+    fn stale_agent_events_are_dropped() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("hi");
+        let id = send_agent(&mut panel).expect("agent send");
+
+        let stale = ChatId::next();
+        panel.tool_call_started(stale, tool_call("read_file", r#"{"path":"a.rs"}"#));
+        panel.approval_needed(stale, ApprovalId::from_u128(1), diff_approval());
+        panel.tool_result(stale, tool_result(&tool_call("read_file", ""), true, "x"));
+        panel.agent_turn_done(stale, summary());
+        assert!(
+            panel.is_streaming(),
+            "a stale turn-done must not end the turn"
+        );
+        assert_eq!(panel.turn_count(), 1, "only the user bubble");
+
+        // The real turn's events land.
+        let call = tool_call("read_file", r#"{"path":"a.rs"}"#);
+        panel.tool_call_started(id, call.clone());
+        assert_eq!(panel.turn_count(), 2);
+        panel.tool_result(id, tool_result(&call, true, "x"));
+        panel.agent_turn_done(id, summary());
+        assert!(!panel.is_streaming());
+        assert_eq!(panel.turn_count(), 3, "user bubble + card + summary");
+    }
+
+    #[test]
+    fn cards_interleave_in_arrival_order_and_finalize_streaming_bubbles() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("fix it");
+        let id = send_agent(&mut panel).expect("agent send");
+
+        panel.push_assistant_delta(id, "reading the file first.");
+        let call = tool_call("read_file", r#"{"path":"src/main.rs"}"#);
+        panel.tool_call_started(id, call.clone());
+
+        // The card interrupted the streaming bubble: it finalized, so its
+        // text is context for the next request already (the round-1
+        // context-loss fix).
+        assert!(panel
+            .conversation()
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.content == "reading the file first."));
+
+        panel.tool_result(id, tool_result(&call, true, "contents"));
+        panel.push_assistant_delta(id, "now the answer.");
+        assert_eq!(
+            entry_kinds(&panel),
+            ["bubble", "bubble", "card", "bubble"],
+            "arrival order interleaves cards between bubbles"
+        );
+
+        panel.agent_turn_done(id, summary());
+        assert_eq!(
+            entry_kinds(&panel),
+            ["bubble", "bubble", "card", "bubble", "summary"]
+        );
+        // No bubble is left streaming; BOTH rounds' texts are context.
+        assert!(panel
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry, TimelineEntry::Bubble(m) if m.streaming)));
+        let texts: Vec<String> = panel
+            .conversation()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(texts.iter().any(|t| t == "reading the file first."));
+        assert!(texts.iter().any(|t| t == "now the answer."));
+        assert!(!panel.is_streaming());
+    }
+
+    #[test]
+    fn cards_and_summaries_never_enter_context_snapshots_or_transcripts() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("fix it");
+        let id = send_agent(&mut panel).expect("agent send");
+        panel.push_assistant_delta(id, "the answer.");
+        let call = tool_call("read_file", r#"{"path":"src/main.rs"}"#);
+        panel.tool_call_started(id, call.clone());
+        panel.tool_result(id, tool_result(&call, true, "contents"));
+        panel.agent_turn_done(id, summary());
+
+        // Bubbles only: user + assistant; the card and the summary are
+        // neither context, nor persisted, nor transcript text.
+        assert_eq!(
+            panel.conversation(),
+            vec![
+                ChatMessage::user("fix it"),
+                ChatMessage::assistant("the answer."),
+            ]
+        );
+        assert_eq!(panel.snapshot_turns().len(), 2);
+        let transcript = panel.transcript();
+        assert!(transcript.contains("You: fix it"));
+        assert!(transcript.contains("Selora: the answer."));
+        assert!(
+            !transcript.contains("call_read_file"),
+            "cards never enter the transcript: {transcript}"
+        );
+    }
+
+    #[test]
+    fn a_deny_click_on_the_diff_card_emits_the_agent_decision() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("edit it");
+        let id = send_agent(&mut panel).expect("agent send");
+        panel.tool_call_started(
+            id,
+            tool_call(
+                "edit_file",
+                r#"{"path":"src/main.rs","old_str":"a","new_str":"b"}"#,
+            ),
+        );
+        let approval_id = ApprovalId::from_u128(42);
+        panel.approval_needed(id, approval_id, diff_approval());
+
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert_eq!(outcome.cards_painted, 1);
+        let deny_rect = outcome
+            .decision_button_rects
+            .iter()
+            .find(|(label, _)| *label == "Deny")
+            .map(|(_, rect)| *rect)
+            .expect("Deny button paints");
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(deny_rect.center())),
+            &mut panel,
+        );
+        assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
+        match &outcome.events[0] {
+            ChatPanelEvent::AgentDecision {
+                id: event_id,
+                approval_id: event_approval,
+                decision,
+            } => {
+                assert_eq!(*event_id, id);
+                assert_eq!(*event_approval, approval_id);
+                assert_eq!(*decision, AgentDecision::Deny);
+            }
+            other => panic!("expected AgentDecision, got {other:?}"),
+        }
+
+        // The latch: no buttons next frame, no double-fire.
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(deny_rect.center())),
+            &mut panel,
+        );
+        assert!(outcome.decision_button_rects.is_empty());
+        assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
+    }
+
+    #[test]
+    fn the_status_line_stop_names_the_pending_card_or_nil() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("run it");
+        let id = send_agent(&mut panel).expect("agent send");
+
+        let ctx = egui::Context::default();
+        // No card parked yet: Stop names Uuid::nil().
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let stop = outcome.stop_button_rect.expect("Stop paints").center();
+        let outcome = frame(&ctx, raw_input_with(click_at(stop)), &mut panel);
+        match &outcome.events[0] {
+            ChatPanelEvent::AgentDecision {
+                approval_id,
+                decision,
+                ..
+            } => {
+                assert_eq!(*approval_id, ApprovalId::nil());
+                assert_eq!(*decision, AgentDecision::Stop);
+            }
+            other => panic!("expected AgentDecision, got {other:?}"),
+        }
+
+        // With a card parked, Stop names its approval id.
+        panel.tool_call_started(id, tool_call("bash", r#"{"command":"cargo test"}"#));
+        let approval_id = ApprovalId::from_u128(7);
+        panel.approval_needed(
+            id,
+            approval_id,
+            ApprovalCard::Command {
+                command: "cargo test".to_owned(),
+            },
+        );
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let stop = outcome.stop_button_rect.expect("Stop paints").center();
+        let outcome = frame(&ctx, raw_input_with(click_at(stop)), &mut panel);
+        match &outcome.events[0] {
+            ChatPanelEvent::AgentDecision {
+                approval_id: got,
+                decision,
+                ..
+            } => {
+                assert_eq!(*got, approval_id);
+                assert_eq!(*decision, AgentDecision::Stop);
+            }
+            other => panic!("expected AgentDecision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_during_an_agent_turn_emits_stop_before_clear() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("work");
+        send_agent(&mut panel).expect("agent send");
+        panel.menu_open = true;
+
+        let ctx = egui::Context::default();
+        frame(&ctx, egui::RawInput::default(), &mut panel);
+        // Second warm-up frame: the popup sizes on its first open frame.
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let clear_rect = outcome
+            .menu_item_rects
+            .iter()
+            .find(|(label, _)| *label == "Clear conversation")
+            .map(|(_, rect)| *rect)
+            .expect("clear menu item");
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(clear_rect.center())),
+            &mut panel,
+        );
+
+        assert_eq!(outcome.events.len(), 2, "events: {:?}", outcome.events);
+        assert!(
+            matches!(
+                &outcome.events[0],
+                ChatPanelEvent::AgentDecision {
+                    decision: AgentDecision::Stop,
+                    approval_id,
+                    ..
+                } if approval_id.is_nil()
+            ),
+            "Stop (nil id) lands BEFORE Clear: {:?}",
+            outcome.events
+        );
+        assert!(matches!(outcome.events[1], ChatPanelEvent::Clear));
+        assert_eq!(panel.turn_count(), 0);
+        assert!(!panel.is_streaming());
+    }
+
+    #[test]
+    fn approve_all_appears_from_the_turns_second_pending_card() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("edits");
+        let id = send_agent(&mut panel).expect("agent send");
+
+        // First pending card: no "Approve all".
+        let call1 = tool_call(
+            "edit_file",
+            r#"{"path":"a.rs","old_str":"a","new_str":"b"}"#,
+        );
+        panel.tool_call_started(id, call1.clone());
+        panel.approval_needed(id, ApprovalId::from_u128(1), diff_approval());
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(!outcome
+            .decision_button_rects
+            .iter()
+            .any(|(label, _)| *label == "Approve all"));
+
+        // It resolves (denied → result), then the turn's second pending
+        // card shows "Approve all" (§4.2:268).
+        panel.tool_result(id, tool_result(&call1, false, "user denied this action"));
+        let call2 = tool_call(
+            "edit_file",
+            r#"{"path":"b.rs","old_str":"c","new_str":"d"}"#,
+        );
+        panel.tool_call_started(id, call2);
+        panel.approval_needed(id, ApprovalId::from_u128(2), diff_approval());
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert_eq!(
+            outcome
+                .decision_button_rects
+                .iter()
+                .filter(|(label, _)| *label == "Approve all")
+                .count(),
+            1,
+            "exactly one Approve all: {:?}",
+            outcome.decision_button_rects
+        );
+    }
+
+    #[test]
+    fn the_summary_footer_paints_and_the_status_line_dies_with_the_turn() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("fix it");
+        let id = send_agent(&mut panel).expect("agent send");
+        let call = tool_call("read_file", r#"{"path":"src/main.rs"}"#);
+        panel.tool_call_started(id, call.clone());
+        panel.tool_result(id, tool_result(&call, true, "contents"));
+
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert_eq!(outcome.cards_painted, 1);
+        assert!(outcome.status_line_rect.is_some(), "mid-turn status line");
+        assert!(outcome.summary_footer_rect.is_none());
+
+        panel.agent_turn_done(id, summary());
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(outcome.summary_footer_rect.is_some());
+        assert!(
+            outcome.status_line_rect.is_none(),
+            "the status line is gone once the turn ends"
+        );
+    }
+
+    #[test]
+    fn a_card_parked_at_turn_end_latches_its_buttons_off() {
+        // Stop while parked: the loop breaks without a ToolResult for
+        // the parked card — its buttons must die with the turn.
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("edit it");
+        let id = send_agent(&mut panel).expect("agent send");
+        panel.tool_call_started(
+            id,
+            tool_call(
+                "edit_file",
+                r#"{"path":"a.rs","old_str":"a","new_str":"b"}"#,
+            ),
+        );
+        panel.approval_needed(id, ApprovalId::from_u128(9), diff_approval());
+        panel.agent_turn_done(id, summary());
+
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(
+            outcome.decision_button_rects.is_empty(),
+            "a dead turn's card offers no buttons"
+        );
+        // And a click where Approve was is a no-op (no in-flight id).
+        assert!(outcome.events.is_empty());
+    }
+
+    #[test]
+    fn a_running_bash_card_freezes_when_its_turn_ends() {
+        // Approved and mid-run when the turn ends (Stop/cap): the loop
+        // breaks without a ToolResult for the killed command — the card's
+        // Stop must die with the turn, not spin forever.
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("run it");
+        let id = send_agent(&mut panel).expect("agent send");
+        panel.tool_call_started(id, tool_call("bash", r#"{"command":"cargo test"}"#));
+        panel.approval_needed(
+            id,
+            ApprovalId::from_u128(7),
+            ApprovalCard::Command {
+                command: "cargo test".to_owned(),
+            },
+        );
+
+        // Approve via the card's button.
+        let ctx = egui::Context::default();
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        let approve = outcome
+            .decision_button_rects
+            .iter()
+            .find(|(label, _)| *label == "Approve")
+            .map(|(_, rect)| *rect)
+            .expect("Approve paints");
+        let outcome = frame(&ctx, raw_input_with(click_at(approve.center())), &mut panel);
+        assert!(matches!(
+            outcome.events[0],
+            ChatPanelEvent::AgentDecision {
+                decision: AgentDecision::Approve,
+                ..
+            }
+        ));
+
+        // Running: the card's Stop replaces Approve.
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(
+            outcome
+                .decision_button_rects
+                .iter()
+                .any(|(label, _)| *label == "Stop"),
+            "running: Stop paints"
+        );
+
+        // The turn ends mid-run: the card freezes — no Stop, no buttons.
+        panel.agent_turn_done(id, summary());
+        let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
+        assert!(
+            outcome.decision_button_rects.is_empty(),
+            "a dead turn's running card offers no buttons"
+        );
     }
 }

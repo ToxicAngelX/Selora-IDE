@@ -157,6 +157,11 @@ pub struct UiSettings {
 
     #[serde(default = "default_chat_sidebar_width")]
     pub chat_sidebar_width: u32,
+
+    /// DESIGN_TOKENS.md §7.4: `orbit`/`pulse`/`wave`/`spin`/`comet` become
+    /// static under reduced motion (`fade`/`bloom` stay). Default off.
+    #[serde(default)]
+    pub reduce_motion: bool,
 }
 
 /// `lsp.*` (ARCHITECTURE.md §8.1) — `None` means "resolve from PATH".
@@ -223,6 +228,28 @@ pub struct AgentSettings {
     /// prefix match, user-editable).
     #[serde(default = "default_agent_auto_approve_commands")]
     pub auto_approve_commands: Vec<String>,
+
+    /// §17.1 `web_search`: the optional Brave Search API key (DuckDuckGo
+    /// Lite is the no-key default).
+    ///
+    /// Posture (owner-signed-off, Phase 5): this is plaintext at rest in
+    /// settings.json — the user's chosen configuration file (the VS Code
+    /// extension-key posture). A `skip_serializing` field would be
+    /// silently deleted by the next unrelated `SettingsSave` (the shell's
+    /// SelectModel route clones and saves the whole `Settings`), and
+    /// keyring-only storage would make the feature unconfigurable today
+    /// (no settings-dialog field exists for it). The no-echo half of
+    /// §17.2 is the invariant to protect: the key must never land in
+    /// workspace.json, logs, tool results, or the bash environment, and
+    /// the router-side copy (`AgentToolSettings::brave_api_key`) stays
+    /// `skip_serializing` (router.rs, frozen) — its only sink is the
+    /// `X-Subscription-Token` header.
+    ///
+    /// Follow-up (post-Phase-5, owner decision): OS keyring storage like
+    /// the Selora key, plus a settings-dialog field so it stays
+    /// configurable.
+    #[serde(default)]
+    pub brave_search_api_key: Option<String>,
 }
 
 fn default_agent_max_iterations() -> u32 {
@@ -300,6 +327,7 @@ impl Default for UiSettings {
             theme: default_theme(),
             sidebar_width: default_sidebar_width(),
             chat_sidebar_width: default_chat_sidebar_width(),
+            reduce_motion: false,
         }
     }
 }
@@ -332,6 +360,7 @@ impl Default for AgentSettings {
             max_cost_usd: default_agent_max_cost_usd(),
             shell: default_agent_shell(),
             auto_approve_commands: default_agent_auto_approve_commands(),
+            brave_search_api_key: None,
         }
     }
 }
@@ -522,6 +551,8 @@ pub(crate) mod tests {
         assert_eq!(s.keybinds.fuzzy_find, "Ctrl+P");
         assert_eq!(s.keybinds.toggle_chat, "Ctrl+L");
         assert_eq!(s.keybinds.save, "Ctrl+S");
+        assert!(!s.ui.reduce_motion);
+        assert_eq!(s.agent.brave_search_api_key, None);
     }
 
     #[test]
@@ -532,6 +563,9 @@ pub(crate) mod tests {
         settings.editor.font_size = 18;
         settings.lsp.rust_analyzer_path = Some("C:/tools/rust-analyzer.exe".into());
         settings.selora.active_model = Some("glm-5.3".into());
+        // Phase 5d: the agent Brave key and the reduced-motion flag.
+        settings.agent.brave_search_api_key = Some("brave-test-key".into());
+        settings.ui.reduce_motion = true;
 
         settings.save_to(&path).expect("save");
         assert!(path.is_file(), "settings file must exist after save");
@@ -604,6 +638,27 @@ pub(crate) mod tests {
         assert_eq!(s.ui.sidebar_width, 240);
         assert_eq!(s.selora.base_url, "https://api.selora.lol");
         assert_eq!(s.keybinds.save, "Ctrl+S");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Phase 5d: a pre-5d settings.json (no `agent.brave_search_api_key`,
+    /// no `ui.reduce_motion`) deserializes with `None` / `false`.
+    #[test]
+    fn pre_5d_file_loads_with_agent_and_motion_defaults() {
+        let dir = temp_settings_dir("pre-5d");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            &path,
+            br#"{"_v":1,"agent":{"max_iterations":3},"ui":{"theme":"selora-dark"}}"#,
+        )
+        .expect("write pre-5d file");
+
+        let s = Settings::load_from(&path).expect("pre-5d file must load");
+        assert_eq!(s.agent.max_iterations, 3, "the present field survives");
+        assert_eq!(s.agent.brave_search_api_key, None);
+        assert!(!s.ui.reduce_motion);
 
         let _ = std::fs::remove_dir_all(dir);
     }

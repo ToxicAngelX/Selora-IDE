@@ -28,8 +28,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use selora_ai::{ChatEvent, SeloraClient};
+use selora_ai::{ChatEvent, ChatReceipt, SeloraClient};
 use selora_core::{Buffer, SeloraError};
 use selora_fs::tree::build_tree;
 use selora_git::{open_repo, GitError};
@@ -38,7 +39,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use crate::app_state::{AppMessage, Effect};
+use crate::app_state::{AgentTurnRequest, AppMessage, Effect};
 
 /// Default gateway base URL (ARCHITECTURE.md §6.1). Overridable in settings;
 /// tests point it at a wiremock server.
@@ -625,6 +626,184 @@ pub fn spawn_chat(
 }
 
 // ---------------------------------------------------------------------------
+// Agent Mode (ARCHITECTURE.md §17 — Phase 5d's wiring half)
+// ---------------------------------------------------------------------------
+
+/// The receipt an agent turn reports at `TurnDone` (the brief's seam
+/// decision — `AgentTurnReport` carries no receipt): the loop's own token
+/// and cost totals (it already applied its per-round `compute_cost_usd`
+/// fallback, so `cost_usd` is the honest total), the relay's wall clock,
+/// `estimated: true` (an aggregate, not a gateway-verbatim receipt). The
+/// prompt/completion split is unrecoverable from the loop's summed
+/// `tokens` (selora-ai is frozen) and cosmetic for the meter, which sums
+/// cost, not tokens — `completion_tokens` carries the clamped total.
+fn synthesize_receipt(
+    turn_id: Uuid,
+    model: &str,
+    summary: &selora_ai::AgentSummary,
+    elapsed: std::time::Duration,
+) -> ChatReceipt {
+    ChatReceipt {
+        request_id: turn_id,
+        model: model.to_owned(),
+        prompt_tokens: 0,
+        completion_tokens: summary.tokens.min(u64::from(u32::MAX)) as u32,
+        cost_usd: summary.cost_usd,
+        duration_ms: elapsed.as_millis().min(u128::from(u32::MAX)) as u32,
+        estimated: true,
+    }
+}
+
+/// The Brave key mapping (§17.1): an empty/whitespace setting is no key
+/// (DuckDuckGo Lite); a real key maps into the router's
+/// `skip_serializing` field and is never logged (§17.2).
+fn map_brave_key(key: Option<&str>) -> Option<String> {
+    key.map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// A zeroed turn summary (the visible-failure path before a turn exists).
+fn zeroed_summary() -> selora_ai::AgentSummary {
+    selora_ai::AgentSummary {
+        iterations: 0,
+        tools_used: 0,
+        approved: 0,
+        denied: 0,
+        tokens: 0,
+        cost_usd: 0.0,
+        completed: false,
+    }
+}
+
+/// Effect (§17.6): run one agent turn — 5c's loop over 5a's gateway
+/// stream and 5b's router rooted at the workspace — relaying its events
+/// as the four agent [`AppMessage`]s, and return the turn's decision
+/// channel for the dispatcher to key by request id.
+///
+/// The relay mirrors [`spawn_chat`]: every event maps to one message with
+/// `notify()` after each send; `AgentEvent::Delta` reuses
+/// `AppMessage::ChatDelta` (the `chat_ids` map keys both); `State` is not
+/// forwarded (the panel derives its status line from the card states —
+/// `Thinking` is in-flight-with-no-running-card, when the bubble's wave
+/// already shows). `TurnDone` synthesizes the receipt (see
+/// [`synthesize_receipt`]). A send failure means the window is gone: stop
+/// relaying, then still join the loop task so a panicked turn becomes one
+/// synthetic `Failed` end when `TurnDone` never arrived (the
+/// worker-died pattern, `spawn_chat`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent(
+    handle: &Handle,
+    notify: &Notify,
+    tx: UnboundedSender<AppMessage>,
+    base_url: String,
+    api_key: String,
+    workspace_root: PathBuf,
+    turn_id: Uuid,
+    request: AgentTurnRequest,
+) -> UnboundedSender<selora_ai::TurnDecision> {
+    let notify = notify.clone();
+
+    // Build the turn: the client behind 5c's ChatStream adapter; the
+    // router behind 5b's ToolRunner, rooted at the workspace (§17.2).
+    let client = SeloraClient::new(&base_url, &api_key);
+    let chat = selora_ai::ClientChatStream::new(client);
+    let tool_settings = selora_ai::AgentToolSettings {
+        shell: request.agent.shell.clone(),
+        auto_approve_commands: request.agent.auto_approve_commands.clone(),
+        // The Brave key maps into the router's `skip_serializing` field —
+        // it is never persisted back out and never logged (§17.2).
+        brave_api_key: map_brave_key(request.agent.brave_search_api_key.as_deref()),
+    };
+    let tools = selora_ai::RouterToolRunner::new(selora_ai::ToolContext::new(
+        workspace_root,
+        tool_settings,
+    ));
+    // §17.3 caps from settings.agent; the context window + the 0.20
+    // reserve come from the model via spec_defaults (turn.rs:78-96).
+    let caps = selora_ai::TurnCaps {
+        max_tool_iterations: request.agent.max_iterations,
+        max_turn_secs: request.agent.max_turn_secs,
+        max_cost_usd: request.agent.max_cost_usd,
+        ..selora_ai::TurnCaps::spec_defaults(request.model.context_window)
+    };
+    let input =
+        selora_ai::TurnInput::new(request.model.clone(), request.conversation).with_caps(caps);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<selora_ai::AgentEvent>();
+    let (decision_tx, join) = selora_ai::spawn_agent_turn(handle, input, chat, tools, events_tx);
+
+    let model_id = request.model.id.clone();
+    let started = Instant::now();
+    handle.spawn(async move {
+        let mut done_seen = false;
+        while let Some(event) = events_rx.recv().await {
+            let message = match event {
+                selora_ai::AgentEvent::Delta(text) => AppMessage::ChatDelta(turn_id, text),
+                selora_ai::AgentEvent::ToolCallStarted(call) => {
+                    AppMessage::ToolCallStarted(turn_id, call)
+                }
+                selora_ai::AgentEvent::ToolResult(result) => {
+                    AppMessage::ToolResult(turn_id, result)
+                }
+                selora_ai::AgentEvent::ApprovalNeeded { approval_id, card } => {
+                    AppMessage::ApprovalNeeded(turn_id, approval_id, card)
+                }
+                selora_ai::AgentEvent::State(_) => continue,
+                selora_ai::AgentEvent::TurnDone(report) => {
+                    done_seen = true;
+                    AppMessage::AgentTurnDone(
+                        turn_id,
+                        synthesize_receipt(turn_id, &model_id, &report.summary, started.elapsed()),
+                        report.summary,
+                        report.end,
+                    )
+                }
+            };
+            if tx.send(message).is_err() {
+                break; // window closed — stop relaying, still join below
+            }
+            notify();
+            if done_seen {
+                break;
+            }
+        }
+        // Always join the loop task: a panicked turn without a TurnDone
+        // becomes one synthetic Failed end (never a hang, PLAN.md §8).
+        if let Err(join_error) = join.await {
+            if !done_seen {
+                let _ = tx.send(AppMessage::AgentTurnDone(
+                    turn_id,
+                    synthesize_receipt(turn_id, &model_id, &zeroed_summary(), started.elapsed()),
+                    zeroed_summary(),
+                    selora_ai::TurnEnd::Failed(format!("agent worker died: {join_error}")),
+                ));
+                notify();
+            }
+        }
+    });
+    decision_tx
+}
+
+/// A turn that can never start (no API key / no workspace root) still
+/// gets its terminal message — the panel is waiting on this uuid and a
+/// hang is never acceptable (PLAN.md §8).
+pub fn send_agent_turn_failed(
+    tx: &UnboundedSender<AppMessage>,
+    notify: &Notify,
+    turn_id: Uuid,
+    model: &str,
+    reason: &str,
+) {
+    let _ = tx.send(AppMessage::AgentTurnDone(
+        turn_id,
+        synthesize_receipt(turn_id, model, &zeroed_summary(), std::time::Duration::ZERO),
+        zeroed_summary(),
+        selora_ai::TurnEnd::Failed(reason.to_owned()),
+    ));
+    notify();
+}
+
+// ---------------------------------------------------------------------------
 // The effect dispatcher (ARCHITECTURE.md §2.2: one consumer task)
 // ---------------------------------------------------------------------------
 
@@ -632,6 +811,12 @@ pub fn spawn_chat(
 /// worker, tracks the in-memory Selora key, and follows the gateway base URL
 /// from settings as they load/save. The task ends when the UI drops the
 /// effect sender (window closed).
+///
+/// Agent Mode (§17.6): the dispatcher also tracks the workspace root (the
+/// router's `ToolContext` needs it — `Effect::OpenFolder` is the only
+/// re-root effect) and the live turns' decision channels, keyed by request
+/// id (`agent_turns`; an ended turn's closed channel is pruned on the next
+/// `AgentSend`, bounding the map).
 pub fn spawn_dispatcher(
     handle: &Handle,
     notify: Notify,
@@ -645,12 +830,18 @@ pub fn spawn_dispatcher(
         let mut effect_rx = effect_rx;
         let mut api_key: Option<String> = None;
         let mut base_url = base_url;
+        let mut workspace_root: Option<PathBuf> = None;
+        let mut agent_turns: std::collections::HashMap<
+            Uuid,
+            UnboundedSender<selora_ai::TurnDecision>,
+        > = std::collections::HashMap::new();
         while let Some(effect) = effect_rx.recv().await {
             match effect {
                 Effect::OpenFile(path) => {
                     spawn_open_file(&dispatch_handle, &notify, &msg_tx, path);
                 }
                 Effect::OpenFolder(root) => {
+                    workspace_root = Some(root.clone());
                     spawn_open_folder(&dispatch_handle, &notify, &msg_tx, root);
                 }
                 Effect::RefreshFileTree(root) => {
@@ -825,11 +1016,58 @@ pub fn spawn_dispatcher(
                     // the key lives only in this dispatcher's memory.
                     api_key = Some(key);
                 }
-                // Agent Mode (Phase 5): skeleton arms — the loop task and
-                // router land with 5b/5c. Unreachable until the chat
-                // sidebar's agent toggle sends them.
-                Effect::AgentSend(_, _) => {}
-                Effect::AgentDecision(_, _, _) => {}
+                // Agent Mode (Phase 5, ARCHITECTURE.md §17.6): the turn
+                // runs on the runtime; the relay reduces its events to the
+                // four agent AppMessages; the decision channel keys by
+                // request id.
+                Effect::AgentSend(turn_id, request) => {
+                    match (api_key.clone(), workspace_root.clone()) {
+                        (Some(key), Some(root)) => {
+                            // Prune ended turns' closed channels (the loop
+                            // drops its receiver at turn end).
+                            agent_turns.retain(|_, decisions| !decisions.is_closed());
+                            let decisions = spawn_agent(
+                                &dispatch_handle,
+                                &notify,
+                                msg_tx.clone(),
+                                base_url.clone(),
+                                key,
+                                root,
+                                turn_id,
+                                request,
+                            );
+                            agent_turns.insert(turn_id, decisions);
+                        }
+                        (key, root) => {
+                            // A visible failure, never a hang (PLAN.md §8):
+                            // the panel is parked on this uuid's stream.
+                            let reason = match (&key, &root) {
+                                (None, _) => "no API key connected — connect a Selora key first",
+                                (Some(_), None) => {
+                                    "no workspace folder open — agent tools need a root"
+                                }
+                                (Some(_), Some(_)) => unreachable!("the Ok arm matched above"),
+                            };
+                            send_agent_turn_failed(
+                                &msg_tx,
+                                &notify,
+                                turn_id,
+                                &request.model.id,
+                                reason,
+                            );
+                        }
+                    }
+                }
+                Effect::AgentDecision(turn_id, approval_id, decision) => {
+                    // An ended turn's channel is closed (the loop drops its
+                    // receiver); an unknown uuid is stale. Both are silent
+                    // no-ops, never a panic.
+                    if let Some(decisions) = agent_turns.get(&turn_id) {
+                        if decisions.send((approval_id, decision)).is_err() {
+                            agent_turns.remove(&turn_id);
+                        }
+                    }
+                }
                 Effect::GitStatus(root) => {
                     spawn_git_status(&dispatch_handle, &notify, &msg_tx, root);
                 }
@@ -1457,5 +1695,512 @@ mod tests {
                 other => panic!("expected ChatDelta/ChatError, got {other:?}"),
             }
         }
+    }
+
+    // --- Agent Mode (Phase 5d, ARCHITECTURE.md §17.6) -------------------------
+
+    /// A catalog-shaped model for the turn requests.
+    fn agent_model() -> selora_ai::Model {
+        selora_ai::Model {
+            id: "test-model".into(),
+            display_name: "Test Model".into(),
+            context_window: 128_000,
+            price_per_1k_input: 0.0,
+            price_per_1k_output: 0.0,
+            supports_streaming: true,
+            supports_tools: true,
+            family: "test".into(),
+        }
+    }
+
+    fn agent_request(agent: selora_settings::AgentSettings) -> AgentTurnRequest {
+        AgentTurnRequest {
+            model: agent_model(),
+            conversation: vec![selora_ai::ChatMessage::user("edit it")],
+            agent: Box::new(agent),
+        }
+    }
+
+    /// One streamed tool call: id+name on the first chunk, the arguments
+    /// in one fragment, then `finish_reason: tool_calls` (the
+    /// fragment-split shapes are selora-ai's own tests' business).
+    fn tool_call_sse(call_id: &str, name: &str, arguments: &str) -> String {
+        let escaped = arguments
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{call_id}\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"\"}}}}]}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{escaped}\"}}}}]}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        )
+    }
+
+    /// A plain answer with a usage-bearing final chunk.
+    fn answer_sse(text: &str, cost_usd: f64) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost_usd\":{cost_usd}}}}}\n\n\
+             data: [DONE]\n\n"
+        )
+    }
+
+    /// The dispatcher against a mock gateway, with a key and a workspace
+    /// root installed.
+    async fn agent_dispatcher(
+        server: &MockServer,
+        root: &Path,
+    ) -> (UnboundedSender<Effect>, UnboundedReceiver<AppMessage>) {
+        let handle = Handle::current();
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+        spawn_dispatcher(
+            &handle,
+            noop_notify(),
+            effect_rx,
+            msg_tx,
+            server.uri(),
+            lsp_effect_tx(),
+        );
+        let _ = effect_tx.send(Effect::SeloraKeyringSet(TEST_KEY.into()));
+        let _ = effect_tx.send(Effect::OpenFolder(root.to_path_buf()));
+        (effect_tx, msg_rx)
+    }
+
+    /// The full scripted turn (the brief's acceptance): read (auto-runs on
+    /// the real temp fs) → write (parked) → Approve → the router writes
+    /// the real file → the final answer's receipt lands with the loop's
+    /// cost and `TurnEnd::Completed`, and the grown conversation went back
+    /// out on the wire (the round-3 mount's body matcher).
+    #[tokio::test]
+    async fn agent_turn_runs_read_write_approve_and_writes_the_real_file() {
+        let root = unique_temp_path("agent-happy");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("write main.rs");
+
+        let server = MockServer::start().await;
+        // Every round's body still carries the first user message, so a
+        // plain mount order would let round 1 shadow the rest (wiremock
+        // tries same-priority mocks in insertion order). Priorities make
+        // the grown-conversation rounds win their own requests: lower
+        // number = tried first.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("edit it"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_read_1",
+                "read_file",
+                r#"{"path":"main.rs"}"#,
+            )))
+            .with_priority(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("tool_call_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_write_1",
+                "write_file",
+                r#"{"path":"new.rs","content":"// from the agent\n"}"#,
+            )))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            // Round 3's body carries the write's tool result — the grown
+            // conversation is on the wire.
+            .and(wiremock::matchers::body_string_contains("wrote"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(answer_sse("Done.", 0.0021)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (effect_tx, mut msg_rx) = agent_dispatcher(&server, &root).await;
+        let turn_id = Uuid::new_v4();
+        let _ = effect_tx.send(Effect::AgentSend(
+            turn_id,
+            agent_request(selora_settings::AgentSettings::default()),
+        ));
+
+        // Round 1: the read card opens and completes without approval.
+        recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ToolCallStarted(id, _) if *id == turn_id),
+        )
+        .await;
+        recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ToolResult(id, r) if *id == turn_id && r.ok),
+        )
+        .await;
+
+        // Round 2: the write parks on the diff card.
+        let approval = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ApprovalNeeded(id, _, _) if *id == turn_id),
+        )
+        .await;
+        let approval_id = match approval {
+            AppMessage::ApprovalNeeded(_, approval_id, selora_ai::ApprovalCard::Diff { .. }) => {
+                approval_id
+            }
+            other => panic!("expected ApprovalNeeded(Diff), got {other:?}"),
+        };
+        assert!(
+            !root.join("new.rs").exists(),
+            "nothing writes before Approve"
+        );
+
+        let _ = effect_tx.send(Effect::AgentDecision(
+            turn_id,
+            approval_id,
+            selora_ai::AgentDecision::Approve,
+        ));
+
+        // Round 3: the answer and the synthesized receipt.
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        match done {
+            AppMessage::AgentTurnDone(id, receipt, summary, end) => {
+                assert_eq!(id, turn_id);
+                assert_eq!(end, selora_ai::TurnEnd::Completed);
+                assert!(summary.completed);
+                assert_eq!(summary.approved, 1);
+                // The receipt carries the loop's own totals (round 1 was
+                // usage-free → the price fallback; round 2 scripted 0.0021).
+                assert!(
+                    (receipt.cost_usd - 0.0021).abs() < 1e-12,
+                    "receipt: {receipt:?}"
+                );
+                assert!(receipt.estimated);
+                assert_eq!(receipt.model, "test-model");
+            }
+            other => panic!("expected AgentTurnDone, got {other:?}"),
+        }
+
+        // The approved write went to disk through the real router.
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.rs")).expect("new.rs written"),
+            "// from the agent\n"
+        );
+
+        // A decision for the ended turn is a silent no-op (never a panic).
+        let _ = effect_tx.send(Effect::AgentDecision(
+            turn_id,
+            approval_id,
+            selora_ai::AgentDecision::Deny,
+        ));
+        let _ = effect_tx.send(Effect::AgentDecision(
+            Uuid::new_v4(),
+            selora_ai::ApprovalId::nil(),
+            selora_ai::AgentDecision::Stop,
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// §17.4: Deny continues the loop with the denied tool result — the
+    /// next request's body carries it; nothing reaches disk.
+    #[tokio::test]
+    async fn agent_turn_deny_continues_the_loop_and_writes_nothing() {
+        let root = unique_temp_path("agent-deny");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("edit it"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_write_1",
+                "write_file",
+                r#"{"path":"new.rs","content":"nope\n"}"#,
+            )))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            // The denied tool result is in the next request's body.
+            .and(wiremock::matchers::body_string_contains(
+                "user denied this action",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(answer_sse("Understood.", 0.0)),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (effect_tx, mut msg_rx) = agent_dispatcher(&server, &root).await;
+        let turn_id = Uuid::new_v4();
+        let _ = effect_tx.send(Effect::AgentSend(
+            turn_id,
+            agent_request(selora_settings::AgentSettings::default()),
+        ));
+
+        let approval = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ApprovalNeeded(id, _, _) if *id == turn_id),
+        )
+        .await;
+        let approval_id = match approval {
+            AppMessage::ApprovalNeeded(_, approval_id, _) => approval_id,
+            other => panic!("{other:?}"),
+        };
+        let _ = effect_tx.send(Effect::AgentDecision(
+            turn_id,
+            approval_id,
+            selora_ai::AgentDecision::Deny,
+        ));
+
+        // The denied call's ToolResult is ok:false…
+        recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ToolResult(id, r) if *id == turn_id && !r.ok),
+        )
+        .await;
+        // …and the turn ends Completed after the model's adaptation.
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        match done {
+            AppMessage::AgentTurnDone(_, _, summary, end) => {
+                assert_eq!(end, selora_ai::TurnEnd::Completed);
+                assert_eq!(summary.denied, 1);
+                assert_eq!(summary.approved, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!root.join("new.rs").exists(), "a denied write never lands");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// §17.3: Stop kills a running bash child; the turn ends
+    /// `StoppedByUser` promptly. (A real powershell child — the router's
+    /// own tests do the same.)
+    #[tokio::test]
+    async fn agent_turn_stop_mid_bash_ends_the_turn() {
+        let root = unique_temp_path("agent-stop");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_bash_1",
+                "bash",
+                r#"{"command":"Start-Sleep -Seconds 30"}"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let (effect_tx, mut msg_rx) = agent_dispatcher(&server, &root).await;
+        let turn_id = Uuid::new_v4();
+        let _ = effect_tx.send(Effect::AgentSend(
+            turn_id,
+            agent_request(selora_settings::AgentSettings::default()),
+        ));
+
+        // The command card parks (Start-Sleep is not allowlisted).
+        let approval = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::ApprovalNeeded(id, _, _) if *id == turn_id),
+        )
+        .await;
+        let approval_id = match approval {
+            AppMessage::ApprovalNeeded(_, approval_id, selora_ai::ApprovalCard::Command { .. }) => {
+                approval_id
+            }
+            other => panic!("expected ApprovalNeeded(Command), got {other:?}"),
+        };
+        let _ = effect_tx.send(Effect::AgentDecision(
+            turn_id,
+            approval_id,
+            selora_ai::AgentDecision::Approve,
+        ));
+
+        // The command is running; Stop (naming no card, the status-line
+        // button's nil id) aborts it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stop_started = std::time::Instant::now();
+        let _ = effect_tx.send(Effect::AgentDecision(
+            turn_id,
+            selora_ai::ApprovalId::nil(),
+            selora_ai::AgentDecision::Stop,
+        ));
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(10),
+            "Stop must end the turn promptly"
+        );
+        match done {
+            AppMessage::AgentTurnDone(_, _, _, end) => {
+                assert_eq!(end, selora_ai::TurnEnd::StoppedByUser);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// No key / no workspace root: the turn never starts but its terminal
+    /// message still arrives (the panel never hangs, PLAN.md §8).
+    #[tokio::test]
+    async fn agent_send_without_key_or_root_fails_visibly() {
+        let server = MockServer::start().await;
+        let root = unique_temp_path("agent-no-root");
+
+        // Case 1: a key but no OpenFolder ever arrived (no root).
+        let (effect_tx, mut msg_rx) = {
+            let handle = Handle::current();
+            let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+            let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+            spawn_dispatcher(
+                &handle,
+                noop_notify(),
+                effect_rx,
+                msg_tx,
+                server.uri(),
+                lsp_effect_tx(),
+            );
+            let _ = effect_tx.send(Effect::SeloraKeyringSet(TEST_KEY.into()));
+            (effect_tx, msg_rx)
+        };
+        let turn_id = Uuid::new_v4();
+        let _ = effect_tx.send(Effect::AgentSend(
+            turn_id,
+            agent_request(selora_settings::AgentSettings::default()),
+        ));
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        match done {
+            AppMessage::AgentTurnDone(_, _, summary, selora_ai::TurnEnd::Failed(reason)) => {
+                assert!(reason.contains("no workspace folder"), "got: {reason}");
+                assert!(!summary.completed);
+                assert_eq!(summary.tools_used, 0);
+            }
+            other => panic!("expected a Failed AgentTurnDone, got {other:?}"),
+        }
+
+        // Case 2: a root but no key.
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let (effect_tx, mut msg_rx) = {
+            let handle = Handle::current();
+            let (msg_tx, msg_rx) = mpsc::unbounded_channel::<AppMessage>();
+            let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
+            spawn_dispatcher(
+                &handle,
+                noop_notify(),
+                effect_rx,
+                msg_tx,
+                server.uri(),
+                lsp_effect_tx(),
+            );
+            let _ = effect_tx.send(Effect::OpenFolder(root.clone()));
+            (effect_tx, msg_rx)
+        };
+        let turn_id = Uuid::new_v4();
+        let _ = effect_tx.send(Effect::AgentSend(
+            turn_id,
+            agent_request(selora_settings::AgentSettings::default()),
+        ));
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        match done {
+            AppMessage::AgentTurnDone(_, _, _, selora_ai::TurnEnd::Failed(reason)) => {
+                assert!(reason.contains("no API key"), "got: {reason}");
+            }
+            other => panic!("expected a Failed AgentTurnDone, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The caps mapping, proven end-to-end: `agent.max_iterations = 1`
+    /// aborts the turn at the second tool call with `IterationCap { 1 }`.
+    #[tokio::test]
+    async fn agent_turn_maps_settings_caps_into_the_loop() {
+        let root = unique_temp_path("agent-caps");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").expect("write");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("edit it"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_read_1",
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+            )))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("tool_call_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                "call_read_2",
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+            )))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (effect_tx, mut msg_rx) = agent_dispatcher(&server, &root).await;
+        let turn_id = Uuid::new_v4();
+        let settings = selora_settings::AgentSettings {
+            max_iterations: 1,
+            max_turn_secs: 12,
+            max_cost_usd: 0.25,
+            ..Default::default()
+        };
+        let _ = effect_tx.send(Effect::AgentSend(turn_id, agent_request(settings)));
+
+        let done = recv_until(
+            &mut msg_rx,
+            |m| matches!(m, AppMessage::AgentTurnDone(id, ..) if *id == turn_id),
+        )
+        .await;
+        match done {
+            AppMessage::AgentTurnDone(_, _, _, end) => {
+                assert_eq!(end, selora_ai::TurnEnd::IterationCap { limit: 1 });
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The Brave key mapping (§17.1/§17.2): empty/whitespace is no key; a
+    /// real key passes through trimmed.
+    #[test]
+    fn brave_key_mapping_trims_and_drops_empty() {
+        assert_eq!(map_brave_key(None), None);
+        assert_eq!(map_brave_key(Some("")), None);
+        assert_eq!(map_brave_key(Some("   ")), None);
+        assert_eq!(
+            map_brave_key(Some("  brave-key  ")).as_deref(),
+            Some("brave-key")
+        );
     }
 }

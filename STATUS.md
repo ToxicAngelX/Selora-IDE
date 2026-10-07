@@ -3,6 +3,48 @@
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
 
+## 2026-10-07 — Phase 5d landed in the working tree (uncommitted; review then merge)
+
+Phase 5d (Agent Mode cards UI) + the final Phase 5 wiring are implemented in the
+working tree — **not yet committed**. Full gate green on top: `cargo build
+--workspace`, `cargo test --workspace` (637 passed / 0 failed, up from the 554
+baseline), `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --
+-D warnings`. Independent five-axis review ran; all findings closed (see the
+run's "Phase 5d completion report" artifact for the long form).
+
+- Cards: `agent_cards.rs` (stub → full) — collapsed read card, diff approval
+  card, bash card, web cards, status line, turn summary footer, + delete card;
+  headless paint tests for all. `chat/mod.rs` — `TimelineEntry` (Bubble | Card |
+  Summary), the `agent` header pill (persisted in workspace.json), additive
+  `ChatPanelEvent::AgentSend/AgentDecision`, stale-id-gated inbound reductions.
+- Wiring: `Effect::AgentSend(Uuid, AgentTurnRequest)` (skeleton payload became a
+  struct — documented adjustment on a dead variant), dispatcher tracks the
+  workspace root, TurnCaps via `TurnCaps::spec_defaults(model.context_window)`
+  (the 0.20 reserve; CONTEXT_RESERVE is not exported from selora-ai),
+  `synthesize_receipt` at TurnDone (the ChatReceipt seam: summary tokens/cost +
+  wall-clock, `estimated: true`), decision channel keyed by request id,
+  `AgentTurnDone` gained a `TurnEnd` payload (additive; abnormal ends toast).
+- §17.7: approved write/edit to an open buffer syncs it through the buffer's own
+  edit API (undoable); dirty buffers are never touched (toast instead);
+  `agent_touched` set drains into `LspEffect::Change` so didOpen'd servers never
+  hold stale text.
+- Pre-flight fixes (tree was red on this machine, unrelated to 5d): rg
+  `--no-require-git` engine-parity fix (selora-fs), rust-analyzer test hardened
+  to poll through indexing/-32801 (selora-lsp; machine needed the
+  `rust-analyzer`+`rust-src` components), one clippy precedence parens fix
+  (selora-editor).
+- Open items: (1) the ROADMAP Phase 5 acceptance list (11 steps, real key +
+  real workspace) is the owner's post-merge gate — NOT run; (2) agent
+  transcripts are not persisted across sessions (chat_turns keeps plain turns);
+  (3) `agent.brave_search_api_key` is plaintext-at-rest in settings.json by
+  owner-plan design — OS keyring + a settings-dialog field is the named
+  follow-up (owner decision at the smoke-test gate); (4) bash card output
+  renders when the ToolResult lands — live streaming output would need a
+  selora-ai AgentEvent variant (frozen in 5c), documented deviation; (5)
+  ENV_ALLOWLIST additions (CARGO_HOME, proxies) if the real-key run hits them.
+- **Phase 6h (KIMI_UI_PROMPT.md) can start** once 5d is merged and the owner's
+  real-key smoke test passes.
+
 ## Owner decisions (2026-10-06)
 
 - **Phase 4 smoke test deferred** by owner decision: Phase 5 spawn prep
