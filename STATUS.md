@@ -14,7 +14,7 @@ strictly inside the ink design language — §12 still rules):
 | R1 the composer | **merged** (see below) |
 | R2 transcript rendering | **merged** (see below) |
 | R3 multi-session + restore | **merged** (see below) |
-| R4 cards & diffs | planned (shared DiffView, syntax + word-level diff emphasis, open-at-line, bash ANSI, orb reserved arms in the status bar) |
+| R4 cards & diffs | **merged** (see below) |
 | R5 settings completion | planned (Agent section, keyring Brave key, real General) |
 | R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
 | R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
@@ -141,7 +141,45 @@ trace back to these two.
 - Tests: +4 panel (stash/titles, switch restores a parked diff card,
   busy refusal, snapshot/restore round trip), +1 persistence
   (serde round trip incl. a card; garbage/schema refuse), +1 shell
-  (boot restore)., `cargo clippy
+  (boot restore — re-added after a heredoc truncation ate the first copy).
+
+**R4 details** (cards & diffs — the approval moment, premium):
+
+- `crates/selora-ui/src/diff_view.rs` (new): `DiffLine`,
+  `parse_unified_diff`, and the row renderer moved out of
+  `agent_cards` (Phase R6's git tabs reuse it). Upgrades:
+  **tree-sitter highlighting** of the new side (context + added lines
+  reassembled, parsed once, spans mapped back to per-row char columns;
+  a global 32-entry content-hash cache keeps steady frames parse-free),
+  and **word-level emphasis** — paired removed/added runs (common
+  prefix/suffix trim, backed to word edges) paint the changed span with
+  a 12% alpha tint of `--err`/`--ok`. §12 bend logged below.
+- `language_for_diff` reads the `+++ b/path` header; `first_changed_line`
+  feeds the open target.
+- Card affordances: `CardOutcome.open_at` — the "open path · line N"
+  link rides the top of every expanded file-touching body (diff cards,
+  read/write/edit results); the panel routes
+  `ChatPanelEvent::OpenFileAt`, the shell resolves the workspace-
+  relative path through the existing open-and-jump queue.
+- Bash output strips ANSI (CSI/OSC/two-letter; the ✓/✕ header glyph
+  already carries the semantics — no SGR mapping, per §12). web_search
+  rows open the browser on click; a hover `copy` glyph keeps the
+  clipboard path.
+- The orb's reserved arms in the status bar: `Shaping` (tree rebuild —
+  set on RefreshFileTree/OpenFolder, cleared on FileTreeUpdated),
+  `Composing` (search — RunSearch → SearchResults), `Weaving` (ghost —
+  request → GhostTextReady). `selora_status::show` takes the activity +
+  reduce-motion; the cost meter clears the orb's zone; 20ms repaints
+  while an orb animates.
+- Tests: +6 (strip_ansi, diff-card open link, web rows open the url,
+  first_changed_line, changed-span pairing, activity orb paint) +1
+  shell (reserved-arm flag lifecycle). selora-ui 321, selora-app 84.
+
+**§12 bend for owner sign-off (R4)**: the diff emphasis paints a 12%
+alpha tint of the existing `--err`/`--ok` behind changed words (DESIGN
+TOKENS has no token for it; it is alpha-of-semantic-color applied at
+paint time, the `with_alpha` pattern — refuse by deleting the tint in
+`diff_view.rs`, one `EMPHASIS_ALPHA` const)., `cargo clippy
   --all-targets` clean, `cargo fmt` applied.
 
 ## 2026-10-07 — Phase 6 (Polish & Ship): 6a–6g merged on main; 6h in flight

@@ -62,6 +62,23 @@ All notable changes to Selora IDE are documented here. The format follows
   only when the content or the panel width changes — a settled message
   costs no per-frame re-layout.
 
+- The shared DiffView widget (Phase R4): the diff renderer extracted from
+  the chat's approval cards into `diff_view` (Phase R6's git tabs reuse it),
+  now with tree-sitter highlighting of the new-side text (§1.5 palette, the
+  parse cached by content hash so steady frames cost nothing) and word-level
+  intra-line emphasis — a paired removed/added run's changed words carry a
+  12% alpha tint of the same `--err`/`--ok` (a §12 bend: alpha of existing
+  semantic colors, no new values — flagged for sign-off).
+- Card affordances (Phase R4): every file-touching card body (diff, read,
+  write/edit results) carries an "open path · line N" link — one click
+  opens the buffer at the diff's first changed line; bash output strips
+  ANSI escape sequences; web_search rows open in the browser on click (the
+  hover `copy` glyph keeps the clipboard path).
+- The status bar's Selora zone gains the ThinkingOrb's reserved arms
+  (Phase R4): `Shaping` while the file tree rebuilds, `Composing` while a
+  workspace search runs, `Weaving` while a ghost completion is in flight —
+  the Phase 6h states' documented surfaces, wired.
+
 ### Changed
 
 - Architecture seams ahead of the UI revamp (Phase R0): the title strip, the

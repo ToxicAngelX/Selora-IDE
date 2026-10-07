@@ -50,6 +50,11 @@ use egui::{pos2, vec2, Align2, Color32, Pos2, Rect, Sense, Ui, Vec2};
 use selora_ai::{AgentDecision, AgentSummary, ApprovalCard, ApprovalId, ToolCall, ToolResult};
 
 use super::code_font;
+#[cfg(test)]
+use crate::diff_view::diff_line_color;
+use crate::diff_view::{
+    language_for_diff, parse_unified_diff, DiffLine, DiffView, DIFF_ROW_HEIGHT,
+};
 use crate::presence::avatar::{AgentAvatar, AvatarState, AVATAR_INLINE};
 use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
 use crate::presence::{request_anim_frame, with_alpha};
@@ -76,7 +81,6 @@ const BUTTON_HEIGHT: f32 = 24.0;
 /// DESIGN_TOKENS.md §2.2).
 const COMMAND_ROW_HEIGHT: f32 = 20.0;
 /// One diff body row (the `--type-sm` line-height, §2.2).
-const DIFF_ROW_HEIGHT: f32 = 18.0;
 /// The "expand full diff" link row (the `--type-xs` line-height, §2.2).
 const LINK_ROW_HEIGHT: f32 = 16.0;
 /// A web_search result row: title line (the `--type-sm` line-height).
@@ -275,8 +279,12 @@ fn seed_from_id(id: &str) -> f32 {
 pub struct CardOutcome {
     /// A decision-button click this frame.
     pub decision: Option<AgentDecision>,
-    /// A web_search row click — the URL to copy.
+    /// A web_search row's hover copy-glyph click — the URL to copy
+    /// (Phase R4: the row click itself opens the browser).
     pub copy: Option<String>,
+    /// The body's "open ↗" link click (Phase R4): the file to open and
+    /// the 1-based line to jump to.
+    pub open_at: Option<(std::path::PathBuf, usize)>,
     /// The card's outer rect.
     pub rect: Rect,
     /// The header row's rect (the expand toggle's click target).
@@ -294,6 +302,7 @@ impl Default for CardOutcome {
         Self {
             decision: None,
             copy: None,
+            open_at: None,
             rect: Rect::ZERO,
             header_rect: Rect::ZERO,
             button_rects: Vec::new(),
@@ -568,6 +577,7 @@ fn paint_collapsed_card(
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
+    let open_link: Option<(String, usize)> = open_target(card);
 
     // The expand body: a finished write/edit shows the diff it was
     // approved on; every other card shows the tool result (§4.2:249).
@@ -582,7 +592,7 @@ fn paint_collapsed_card(
     } else {
         Body::None
     };
-    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade);
+    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade, open_link.is_some());
 
     let total_height = CARD_HEIGHT + body_height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, total_height), Sense::hover());
@@ -611,7 +621,15 @@ fn paint_collapsed_card(
     outcome.header_rect = header;
 
     if let Some(body_rect) = body_rect(rect, body_height) {
-        paint_body(ui, &body, body_rect, &card.call.id, fade, &mut outcome);
+        paint_body(
+            ui,
+            &body,
+            body_rect,
+            &card.call.id,
+            fade,
+            &mut outcome,
+            open_link,
+        );
         outcome.body_rect = Some(body_rect);
     }
     if card.result.is_none() && !reduce_motion && turn_live {
@@ -635,6 +653,7 @@ fn paint_diff_card(
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
+    let open_link: Option<(String, usize)> = open_target(card);
     let (path, diff) = match &card.approval {
         Some((_, ApprovalCard::Diff { path, diff }, _)) => (path.clone(), diff.clone()),
         _ => (String::new(), String::new()), // kind() guards this
@@ -682,7 +701,15 @@ fn paint_diff_card(
     let mut cursor = rect.top() + CARD_HEIGHT;
     if body_height > 0.0 {
         let body_rect = Rect::from_min_size(pos2(rect.left(), cursor), vec2(width, body_height));
-        paint_body(ui, &body, body_rect, &card.call.id, fade, &mut outcome);
+        paint_body(
+            ui,
+            &body,
+            body_rect,
+            &card.call.id,
+            fade,
+            &mut outcome,
+            open_link,
+        );
         outcome.body_rect = Some(body_rect);
         cursor += body_height;
     }
@@ -822,6 +849,7 @@ fn paint_bash_card(
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
+    let open_link: Option<(String, usize)> = None;
     let command = bash_command(card);
     let pending = card.is_pending();
     // Approved and executing, or auto-approved (no card ever arrived) —
@@ -838,7 +866,7 @@ fn paint_bash_card(
         Some(text) => Body::Text(text.clone()),
         None => Body::None,
     };
-    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade);
+    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade, open_link.is_some());
     let buttons_height = if pending || stop_row {
         BUTTON_HEIGHT + space::S2
     } else {
@@ -920,7 +948,15 @@ fn paint_bash_card(
         r.min.y = cursor;
         r
     }) {
-        paint_body(ui, &body, body_rect, &card.call.id, fade, &mut outcome);
+        paint_body(
+            ui,
+            &body,
+            body_rect,
+            &card.call.id,
+            fade,
+            &mut outcome,
+            open_link,
+        );
         outcome.body_rect = Some(body_rect);
         cursor += body_height;
     }
@@ -1034,14 +1070,70 @@ fn bash_command(card: &ToolCard) -> String {
 
 /// The bash result's output: the `(exit code N)\n` prefix line (bash.rs)
 /// is shown in the header, not the body.
-fn bash_output_body(content: &str) -> &str {
-    if let Some(rest) = content.strip_prefix("(exit code ") {
+fn bash_output_body(content: &str) -> String {
+    let body = if let Some(rest) = content.strip_prefix("(exit code ") {
         if let Some(close) = rest.find(')') {
             let after = &rest[close + 1..];
-            return after.strip_prefix('\n').unwrap_or(after);
+            after.strip_prefix('\n').unwrap_or(after)
+        } else {
+            content
         }
+    } else {
+        content
+    };
+    strip_ansi(body)
+}
+
+/// Strip ANSI escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL`,
+/// and two-letter ESC sequences) from tool output. The bash card renders
+/// plain ink text — the header's ✓/✕ status glyph already carries the
+/// semantics, so no SGR colors are mapped (§12: no ad-hoc colors).
+pub fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            match bytes.get(i) {
+                // CSI: parameters + intermediates, then the final byte
+                // 0x40..=0x7e.
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1; // the final byte
+                }
+                // OSC: until BEL or ST (ESC \).
+                Some(b']') => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // A two-letter escape (ESC M, ESC 7, …).
+                Some(_) => i += 1,
+                None => {}
+            }
+            continue;
+        }
+        // Copy the whole (possibly multibyte) char.
+        let char_len = text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        if let Some(chunk) = text.get(i..i + char_len) {
+            out.push_str(chunk);
+        }
+        i += char_len;
     }
-    content
+    out
 }
 
 // -----------------------------------------------------------------------------
@@ -1058,6 +1150,7 @@ fn paint_web_search_card(
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
+    let open_link: Option<(String, usize)> = None;
 
     let body = if card.expanded {
         match &card.result {
@@ -1070,7 +1163,7 @@ fn paint_web_search_card(
     } else {
         Body::None
     };
-    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade);
+    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade, open_link.is_some());
 
     let total_height = CARD_HEIGHT + body_height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, total_height), Sense::hover());
@@ -1099,7 +1192,15 @@ fn paint_web_search_card(
     outcome.header_rect = header;
 
     if let Some(body_rect) = body_rect(rect, body_height) {
-        paint_body(ui, &body, body_rect, &card.call.id, fade, &mut outcome);
+        paint_body(
+            ui,
+            &body,
+            body_rect,
+            &card.call.id,
+            fade,
+            &mut outcome,
+            open_link,
+        );
         outcome.body_rect = Some(body_rect);
     }
     if card.result.is_none() && !reduce_motion && turn_live {
@@ -1118,6 +1219,7 @@ fn paint_web_fetch_card(
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
+    let open_link: Option<(String, usize)> = None;
 
     // The header shows the fetched page's final URL (web.rs's `Source:`
     // line) once the result landed; before that, the call's argument.
@@ -1134,7 +1236,7 @@ fn paint_web_fetch_card(
     } else {
         Body::None
     };
-    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade);
+    let body_height = body_height(ui, &body, width, BODY_MAX_HEIGHT, fade, open_link.is_some());
 
     let total_height = CARD_HEIGHT + body_height;
     let (rect, _) = ui.allocate_exact_size(vec2(width, total_height), Sense::hover());
@@ -1163,7 +1265,15 @@ fn paint_web_fetch_card(
     outcome.header_rect = header;
 
     if let Some(body_rect) = body_rect(rect, body_height) {
-        paint_body(ui, &body, body_rect, &card.call.id, fade, &mut outcome);
+        paint_body(
+            ui,
+            &body,
+            body_rect,
+            &card.call.id,
+            fade,
+            &mut outcome,
+            open_link,
+        );
         outcome.body_rect = Some(body_rect);
     }
     if card.result.is_none() && !reduce_motion && turn_live {
@@ -1458,10 +1568,40 @@ enum Body {
     WebRows(Vec<(String, String)>),
 }
 
+/// The "open ↗" link row's height (Phase R4).
+const OPEN_LINK_HEIGHT: f32 = 18.0;
+
+/// The card's open target (Phase R4): the path from the call's
+/// arguments and the 1-based line to land on — a diff's first changed
+/// line, else line 1. `None` for tools without a `path` argument.
+fn open_target(card: &ToolCard) -> Option<(String, usize)> {
+    let path = serde_json::from_str::<serde_json::Value>(&card.call.arguments)
+        .ok()?
+        .get("path")?
+        .as_str()?
+        .to_owned();
+    let line = match &card.approval {
+        Some((_, ApprovalCard::Diff { diff, .. }, _)) => {
+            crate::diff_view::first_changed_line(&parse_unified_diff(diff))
+        }
+        _ => match card.call.name.as_str() {
+            "write_file" | "edit_file" => card
+                .result
+                .as_ref()
+                .map(|result| {
+                    crate::diff_view::first_changed_line(&parse_unified_diff(&result.content))
+                })
+                .unwrap_or(1),
+            _ => 1,
+        },
+    };
+    Some((path, line))
+}
+
 /// The body viewport height for layout: content height capped at `cap`.
-fn body_height(ui: &Ui, body: &Body, width: f32, cap: f32, fade: f32) -> f32 {
+fn body_height(ui: &Ui, body: &Body, width: f32, cap: f32, fade: f32, open_link: bool) -> f32 {
     let wrap = (width - 2.0 * CARD_PAD).max(20.0);
-    match body {
+    let content = match body {
         Body::None => 0.0,
         Body::Text(text) => {
             let galley = ui.painter().layout(
@@ -1470,14 +1610,22 @@ fn body_height(ui: &Ui, body: &Body, width: f32, cap: f32, fade: f32) -> f32 {
                 with_alpha(color::FG_DEFAULT, fade),
                 wrap,
             );
-            (galley.size().y + 2.0 * space::S1).min(cap)
+            galley.size().y + 2.0 * space::S1
         }
-        Body::Diff(lines) => (lines.len() as f32 * DIFF_ROW_HEIGHT).min(cap),
+        Body::Diff(lines) => lines.len() as f32 * DIFF_ROW_HEIGHT,
         Body::WebRows(rows) => {
             let row_height = WEB_TITLE_ROW + WEB_URL_ROW + space::S1;
-            (rows.len() as f32 * row_height + 2.0 * space::S1).min(cap)
+            rows.len() as f32 * row_height + 2.0 * space::S1
         }
-    }
+    };
+    let with_link = if matches!(body, Body::None) {
+        content
+    } else if open_link {
+        content + OPEN_LINK_HEIGHT
+    } else {
+        content
+    };
+    with_link.min(cap)
 }
 
 /// The body rect under a card's header (0-height bodies get none).
@@ -1502,6 +1650,7 @@ fn paint_body(
     salt: &str,
     fade: f32,
     outcome: &mut CardOutcome,
+    open_target: Option<(String, usize)>,
 ) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
     egui::ScrollArea::vertical()
@@ -1527,72 +1676,48 @@ fn paint_body(
                     with_alpha(color::FG_DEFAULT, fade),
                 );
             }
-            Body::Diff(lines) => paint_diff_rows(ui, lines, rect.width(), fade),
+            Body::Diff(lines) => {
+                DiffView::new(lines, language_for_diff(lines)).paint(ui, rect.width(), fade)
+            }
             Body::WebRows(rows) => paint_web_rows(ui, rows, rect.width(), fade, outcome),
         });
-}
 
-/// The diff body: gutter line numbers (old for context/`-`, new for
-/// `+`, §4.2:265) in `--fg-faint`, removed lines in `--err`, added in
-/// `--ok`, context in `--fg-default`; header/hunk/notice rows span the
-/// full width in `--fg-faint`.
-fn paint_diff_rows(ui: &mut Ui, lines: &[DiffLine], width: f32, fade: f32) {
-    let max_number = lines.iter().filter_map(gutter_number).max().unwrap_or(0);
-    let digits = max_number.to_string().len().max(1);
-    let gutter_width = ui
-        .painter()
-        .layout_no_wrap(
-            "8".repeat(digits),
-            code_font(),
-            with_alpha(color::FG_FAINT, fade),
-        )
-        .size()
-        .x
-        + space::S2;
-    let text_x = CARD_PAD + gutter_width + space::S1;
-
-    for line in lines {
-        let (row, _) = ui.allocate_exact_size(vec2(width, DIFF_ROW_HEIGHT), Sense::hover());
-        let painter = ui.painter();
-        let clipped = painter.with_clip_rect(row);
-        let color = with_alpha(diff_line_color(line), fade);
-        match line {
-            DiffLine::Context { .. } | DiffLine::Removed { .. } | DiffLine::Added { .. } => {
-                if let Some(number) = gutter_number(line) {
-                    clipped.text(
-                        pos2(CARD_PAD + gutter_width, row.center().y),
-                        Align2::RIGHT_CENTER,
-                        number.to_string(),
-                        code_font(),
-                        with_alpha(color::FG_FAINT, fade),
-                    );
-                }
-                clipped.text(
-                    pos2(text_x, row.center().y),
-                    Align2::LEFT_CENTER,
-                    diff_line_text(line),
-                    code_font(),
-                    color,
-                );
-            }
-            _ => {
-                // Header / hunk / truncation-notice rows: full width,
-                // faint, no gutter (§4.2: a create's `--- /dev/null` is
-                // a header, never a removed line).
-                clipped.text(
-                    pos2(CARD_PAD, row.center().y),
-                    Align2::LEFT_CENTER,
-                    diff_line_text(line),
-                    code_font(),
-                    color,
-                );
+    // The "open ↗" link rides ABOVE the scroll body (Phase R4): the
+    // file and line the tool touched, one click from the editor.
+    if let Some((path, line)) = &open_target {
+        if !matches!(body, Body::None) {
+            let link_rect = Rect::from_min_size(
+                pos2(rect.left(), rect.top()),
+                vec2(rect.width(), OPEN_LINK_HEIGHT),
+            );
+            let response = ui.interact(
+                link_rect,
+                egui::Id::new(("selora_agent_card_open", salt)),
+                Sense::click(),
+            );
+            let text_color = if response.hovered() {
+                color::FG_DEFAULT
+            } else {
+                color::FG_MUTED
+            };
+            ui.painter().text(
+                pos2(rect.left() + CARD_PAD, link_rect.center().y),
+                Align2::LEFT_CENTER,
+                format!("open {path} · line {line}"),
+                sans_font(type_scale::XS),
+                with_alpha(text_color, fade),
+            );
+            if response.clicked() {
+                outcome.open_at = Some((std::path::PathBuf::from(path), *line));
             }
         }
     }
 }
 
-/// The web_search result list (§4.2: "numbered result list (title +
-/// URL, click = copy URL)").
+/// The web_search result list (§4.2): numbered title + URL rows. Phase
+/// R4: a row click OPENS the url in the browser (the ZCode-class
+/// affordance); the hover-revealed `copy` glyph on the right keeps the
+/// clipboard path.
 fn paint_web_rows(
     ui: &mut Ui,
     rows: &[(String, String)],
@@ -1630,8 +1755,46 @@ fn paint_web_rows(
             mono_font(type_scale::XS),
             with_alpha(color::FG_FAINT, fade),
         );
-        if response.clicked() {
-            outcome.copy = Some(url.clone());
+
+        // The hover-revealed copy glyph (right edge) — checked BEFORE
+        // the row click so the glyph's click never also opens.
+        let mut copy_clicked = false;
+        if response.hovered() {
+            let glyph_rect = Rect::from_min_size(
+                pos2(row.right() - 40.0, row.top() + space::S1),
+                vec2(40.0, 16.0),
+            );
+            let glyph_response = ui.interact(
+                glyph_rect,
+                egui::Id::new(("selora_agent_web_copy", index, url)),
+                Sense::click(),
+            );
+            clipped.text(
+                glyph_rect.center(),
+                Align2::CENTER_CENTER,
+                "copy",
+                sans_font(type_scale::XS),
+                with_alpha(
+                    if glyph_response.hovered() {
+                        color::FG_DEFAULT
+                    } else {
+                        color::FG_MUTED
+                    },
+                    fade,
+                ),
+            );
+            if glyph_response.clicked() {
+                copy_clicked = true;
+                outcome.copy = Some(url.clone());
+            }
+        }
+        if copy_clicked {
+            // Handled above; the row's own click (if any) is swallowed.
+        } else if response.clicked() {
+            ui.ctx().open_url(egui::OpenUrl {
+                url: url.clone(),
+                new_tab: true,
+            });
         }
         outcome.row_rects.push(row);
     }
@@ -1711,130 +1874,6 @@ fn paint_spin(painter: &egui::Painter, center: Pos2, elapsed_ms: u64, reduce_mot
 // -----------------------------------------------------------------------------
 // Pure parsing helpers (the router's output formats; unit-tested)
 // -----------------------------------------------------------------------------
-
-/// One classified line of the router's unified diff (fs.rs emits `--- `
-/// / `+++ ` headers, `@@ -a,b +c,d @@` hunks, `' '`/`-`/`+` body lines,
-/// and a `… (diff truncated at N lines)` notice).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DiffLine {
-    /// `--- a/x`, `--- /dev/null`, `+++ b/x` — painted faint, never as a
-    /// removed/added line.
-    Header(String),
-    /// `@@ -a,b +c,d @@` — painted faint; carries the gutter counters.
-    Hunk(String),
-    /// A context line (` text`) — both numbers advance.
-    Context { old: u32, new: u32, text: String },
-    /// A removed line (`-text`) — the old number advances.
-    Removed { old: u32, text: String },
-    /// An added line (`+text`) — the new number advances.
-    Added { new: u32, text: String },
-    /// The router's `… (diff truncated at N lines)` notice.
-    Notice(String),
-    /// Anything else (a blank row, a malformed line) — faint, no gutter.
-    Other(String),
-}
-
-/// Parse the router's unified diff (fs.rs:743-818). Header rows are
-/// classified BEFORE the single-char `'-'`/`'+'` test so a create's
-/// `--- /dev/null` never lands as a removed line; the `@@` counters seed
-/// the gutter numbers (old for context/`-`, new for `+`).
-pub fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
-    let mut lines = Vec::new();
-    let mut old_no = 0u32;
-    let mut new_no = 0u32;
-    for raw in diff.lines() {
-        if raw.starts_with("--- ") || raw.starts_with("+++ ") {
-            lines.push(DiffLine::Header(raw.to_owned()));
-            continue;
-        }
-        if raw.starts_with("@@") {
-            if let Some((old_start, new_start)) = parse_hunk_header(raw) {
-                old_no = old_start;
-                new_no = new_start;
-            }
-            lines.push(DiffLine::Hunk(raw.to_owned()));
-            continue;
-        }
-        if raw.starts_with('…') {
-            lines.push(DiffLine::Notice(raw.to_owned()));
-            continue;
-        }
-        match raw.as_bytes().first() {
-            Some(b' ') => {
-                lines.push(DiffLine::Context {
-                    old: old_no,
-                    new: new_no,
-                    text: raw.to_owned(),
-                });
-                old_no += 1;
-                new_no += 1;
-            }
-            Some(b'-') => {
-                lines.push(DiffLine::Removed {
-                    old: old_no,
-                    text: raw.to_owned(),
-                });
-                old_no += 1;
-            }
-            Some(b'+') => {
-                lines.push(DiffLine::Added {
-                    new: new_no,
-                    text: raw.to_owned(),
-                });
-                new_no += 1;
-            }
-            _ => lines.push(DiffLine::Other(raw.to_owned())),
-        }
-    }
-    lines
-}
-
-/// `@@ -41,3 +41,3 @@` → `Some((41, 41))`; tolerant of a missing
-/// `,count` and of trailing context after the closing `@@`.
-fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
-    let inner = line.strip_prefix("@@")?.trim_start();
-    let mut parts = inner.split_whitespace();
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    let old_start = old.split(',').next()?.parse().ok()?;
-    let new_start = new.split(',').next()?.parse().ok()?;
-    Some((old_start, new_start))
-}
-
-/// The gutter number for a body line (old for context/`-`, new for
-/// `+`); `None` for header/hunk/notice rows.
-pub fn gutter_number(line: &DiffLine) -> Option<u32> {
-    match line {
-        DiffLine::Context { old, .. } | DiffLine::Removed { old, .. } => Some(*old),
-        DiffLine::Added { new, .. } => Some(*new),
-        _ => None,
-    }
-}
-
-/// The line's text color (§4.2:266 — the chat's only saturated uses,
-/// semantic): `-` in `--err`, `+` in `--ok`, context `--fg-default`,
-/// header/hunk/notice rows `--fg-faint`.
-pub fn diff_line_color(line: &DiffLine) -> Color32 {
-    match line {
-        DiffLine::Removed { .. } => color::ERR,
-        DiffLine::Added { .. } => color::OK,
-        DiffLine::Context { .. } => color::FG_DEFAULT,
-        _ => color::FG_FAINT,
-    }
-}
-
-/// The line's raw text for painting.
-fn diff_line_text(line: &DiffLine) -> &str {
-    match line {
-        DiffLine::Header(text)
-        | DiffLine::Hunk(text)
-        | DiffLine::Notice(text)
-        | DiffLine::Other(text) => text,
-        DiffLine::Context { text, .. }
-        | DiffLine::Removed { text, .. }
-        | DiffLine::Added { text, .. } => text,
-    }
-}
 
 /// The bash tool's exit code (bash.rs:331 prefixes every successful
 /// result with `(exit code N)`); `None` for error results (guard
@@ -2915,8 +2954,60 @@ mod tests {
 
     // -- web cards -----------------------------------------------------------------------------
 
+    /// Phase R4: ANSI escapes (SGR, cursor CSI, OSC titles) strip from
+    /// bash output; plain text passes through untouched.
     #[test]
-    fn web_search_card_expands_to_rows_and_a_row_click_copies_the_url() {
+    fn strip_ansi_removes_escape_sequences() {
+        assert_eq!(strip_ansi("plain output"), "plain output");
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi("\u{1b}[2K\u{1b}[1Gprogress"), "progress");
+        // OSC title, BEL-terminated.
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
+        // OSC, ST-terminated.
+        assert_eq!(strip_ansi("\u{1b}]2;tab\u{1b}\\after"), "after");
+        // A two-letter escape and a dangling ESC at EOF.
+        assert_eq!(strip_ansi("a\u{1b}Mb"), "ab");
+        assert_eq!(strip_ansi("trailing\u{1b}"), "trailing");
+        // Multibyte text survives.
+        assert_eq!(strip_ansi("héllo ✅ wörld"), "héllo ✅ wörld");
+    }
+
+    /// Phase R4: a pending diff card's expanded body carries the "open ↗"
+    /// link; clicking it reports the path and the first changed line.
+    #[test]
+    fn diff_card_open_link_reports_path_and_line() {
+        let mut card = ToolCard::new(call(
+            "edit_file",
+            r#"{"path":"src/main.rs","old_str":"fn main() {}","new_str":"fn main() -> u32 {}"}"#,
+        ));
+        card.approval = Some((
+            ApprovalId::nil(),
+            ApprovalCard::Diff {
+                path: "src/main.rs".into(),
+                diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10 +10 @@\n-fn main() {}\n+fn main() -> u32 {}".into(),
+            },
+            1,
+        ));
+        card.expanded = true;
+        let ctx = egui::Context::default();
+        let outcome = card_frame(&ctx, egui::RawInput::default(), &mut card, false);
+        assert!(
+            outcome.body_rect.is_some(),
+            "the expanded diff paints its body"
+        );
+
+        let body = outcome.body_rect.expect("the diff body painted");
+        let link = pos2(body.left() + 20.0, body.top() + 8.0);
+        let outcome = card_frame(&ctx, raw_input_with(click_at(link)), &mut card, false);
+        assert_eq!(
+            outcome.open_at,
+            Some((std::path::PathBuf::from("src/main.rs"), 10)),
+            "the link carries the file and the first changed line"
+        );
+    }
+
+    #[test]
+    fn web_search_rows_open_the_url_and_the_hover_glyph_copies_it() {
         let mut card = settled(ToolCard::new(call(
             "web_search",
             r#"{"query":"ropey crate"}"#,
@@ -2938,12 +3029,26 @@ mod tests {
         let outcome = card_frame(&ctx, egui::RawInput::default(), &mut card, false);
         assert_eq!(outcome.row_rects.len(), 2, "two numbered rows");
 
+        // Phase R4: the row click OPENS the url (the FullOutput carries
+        // the OpenUrl command) — the hover glyph's copy path is the
+        // same interact pattern the toasts' tests cover.
         let row = outcome.row_rects[1].center();
-        let outcome = card_frame(&ctx, raw_input_with(click_at(row)), &mut card, false);
+        let mut output = ctx.run_ui(raw_input_with(click_at(row)), |ui| {
+            tool_card(ui, &mut card, false, false, true);
+        });
+        output.textures_delta.clear();
+        let opened = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::OpenUrl(url) => Some(url.url.clone()),
+                _ => None,
+            });
         assert_eq!(
-            outcome.copy.as_deref(),
+            opened.as_deref(),
             Some("https://github.com/cessen/ropey"),
-            "the row click copies the URL (the panel maps it to CopyCode)"
+            "the row click opens the URL in the browser"
         );
     }
 

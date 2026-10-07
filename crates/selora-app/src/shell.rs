@@ -42,6 +42,7 @@ use selora_ui::editor::split::{self, PaneView};
 use selora_ui::palette::registry::CommandId;
 use selora_ui::panel::git::GitAction;
 use selora_ui::panel::search::SearchEvent;
+use selora_ui::presence::orb::OrbState;
 use selora_ui::sidebar::{activity_bar, Activity, ActivityBar, ChatPanelEvent, TreeEvent};
 use selora_ui::splash::{Splash, SplashEvent};
 use selora_ui::status_bar::{self, workbench_zone};
@@ -175,6 +176,11 @@ pub struct SeloraApp {
     last_tree_width: Option<f32>,
     /// The first-run splash (Phase 6a).
     splash: SplashState,
+    /// Phase R4: the status-bar orb's reserved-arm signals — set when the
+    /// effect leaves, cleared when the reply lands.
+    ghost_in_flight: bool,
+    search_in_flight: bool,
+    tree_in_flight: bool,
 }
 
 impl SeloraApp {
@@ -285,6 +291,9 @@ impl SeloraApp {
             last_workspace_save: Instant::now(),
             last_workspace_snapshot: None,
             last_sessions_snapshot: None,
+            ghost_in_flight: false,
+            search_in_flight: false,
+            tree_in_flight: false,
             restore_queue: VecDeque::new(),
             restore_in_flight: None,
             last_tree_width: None,
@@ -303,6 +312,11 @@ impl SeloraApp {
     fn drain_messages(&mut self) {
         while let Ok(message) = self.msg_rx.try_recv() {
             let is_settings = matches!(message, AppMessage::SettingsLoaded(_));
+            // Phase R4: the reserved-arm signals clear when their replies
+            // land (the observation lives here, ahead of `apply`).
+            let ghost_ready = matches!(message, AppMessage::GhostTextReady { .. });
+            let search_ready = matches!(message, AppMessage::SearchResults { .. });
+            let tree_ready = matches!(message, AppMessage::FileTreeUpdated { .. });
             // Phase 6a: the boot keyring read resolved empty — the splash's
             // cue to show (only ever sent by the SeloraAutoConnect worker).
             let no_stored_key = matches!(message, AppMessage::NoStoredKey);
@@ -334,6 +348,15 @@ impl SeloraApp {
                 _ => None,
             };
             self.state.apply(message);
+            if ghost_ready {
+                self.ghost_in_flight = false;
+            }
+            if search_ready {
+                self.search_in_flight = false;
+            }
+            if tree_ready {
+                self.tree_in_flight = false;
+            }
             if is_settings {
                 self.settings_loaded = true;
                 // DESIGN_TOKENS.md §7.4: the chat cards' pulse/spin follow
@@ -361,6 +384,7 @@ impl SeloraApp {
                 for path in self.state.buffers.keys().cloned().collect::<Vec<_>>() {
                     self.close_lsp_doc(&path);
                 }
+                self.tree_in_flight = true;
                 let _ = self.effect_tx.send(Effect::OpenFolder(root));
             }
             if let Some(root) = tree_or_save {
@@ -566,6 +590,7 @@ impl SeloraApp {
             return; // this exact request is already in flight / answered
         }
         self.ghost_last_request = Some(key);
+        self.ghost_in_flight = true;
         let _ = self.effect_tx.send(Effect::SeloraGhostText {
             path,
             prefix,
@@ -928,6 +953,7 @@ impl SeloraApp {
             TreeEvent::OpenFile(path) => self.open_path(path),
             TreeEvent::TreeChanged => {
                 if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+                    self.tree_in_flight = true;
                     let _ = self.effect_tx.send(Effect::RefreshFileTree(root));
                 }
             }
@@ -1001,6 +1027,7 @@ impl SeloraApp {
             SearchEvent::RunSearch { id, query } => {
                 match self.state.workspace.as_ref().map(|w| w.root.clone()) {
                     Some(root) => {
+                        self.search_in_flight = true;
                         let _ = self.effect_tx.send(Effect::Search { id, root, query });
                     }
                     None => {
@@ -1119,14 +1146,37 @@ impl SeloraApp {
                 // edge, the `Σ today` cost meter (Phase 4e) left of it.
                 // The active model from settings wins over the ping's own
                 // (the ping cannot see the picker's choice).
+                //
+                // Phase R4: the reserved-arm orb left of the run —
+                // `Shaping` while the tree rebuilds, `Composing` while a
+                // search runs, `Weaving` while a ghost completion is in
+                // flight (the Phase 6h states' surfaces, wired).
                 let rect = ui.max_rect();
                 let painter = ui.painter_at(rect);
                 let active_model = self.state.settings.selora.active_model.clone();
+                let activity = if self.tree_in_flight {
+                    Some(OrbState::Shaping)
+                } else if self.search_in_flight {
+                    Some(OrbState::Composing)
+                } else if self.ghost_in_flight {
+                    Some(OrbState::Weaving)
+                } else {
+                    None
+                };
                 let status_events = selora_ui::status_bar::selora_status::show(
                     ui,
                     &self.state.selora_status,
                     active_model.as_deref(),
+                    activity,
+                    self.state.settings.ui.reduce_motion,
                 );
+                // The activity orb animates: keep frames coming while
+                // one is live (the presence widgets' discipline — an
+                // idle orb breathes at 20ms repaints, bounded).
+                if activity.is_some() && !self.state.settings.ui.reduce_motion {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(20));
+                }
                 // Measure the connection run to anchor the meter left of
                 // it without overlap (same font the widget paints with).
                 let connection_run = selora_ui::status_bar::selora_status::label(
@@ -1141,10 +1191,19 @@ impl SeloraApp {
                     )
                     .size()
                     .x;
+                let activity_zone = if activity.is_some() {
+                    selora_ui::status_bar::selora_status::ACTIVITY_ZONE
+                } else {
+                    0.0
+                };
                 let meter_zone = egui::Rect::from_min_max(
                     egui::pos2(rect.left(), rect.top()),
                     egui::pos2(
-                        rect.right() - theme::space::S3 - run_width - theme::space::S4,
+                        rect.right()
+                            - theme::space::S3
+                            - run_width
+                            - activity_zone
+                            - theme::space::S4,
                         rect.bottom(),
                     ),
                 );
@@ -1278,6 +1337,22 @@ impl SeloraApp {
                     self.state.chat_ids.remove(&uuid);
                     let _ = self.effect_tx.send(Effect::SeloraChatAbort(uuid));
                 }
+            }
+            // A card body's "open ↗" link (Phase R4): the path is
+            // workspace-relative — resolve it against the root, then the
+            // shared open-and-jump (opening the buffer first when it is
+            // not loaded).
+            ChatPanelEvent::OpenFileAt { path, line } => {
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    self.state
+                        .workspace
+                        .as_ref()
+                        .map(|workspace| workspace.root.join(&path))
+                        .unwrap_or(path)
+                };
+                self.open_at_line(resolved, line);
             }
             // A session switch/new was refused while a turn runs
             // (Phase R3).
@@ -2975,6 +3050,133 @@ mod tests {
             )),
             "the agent-touched didChange reached the manager: {effects:?}"
         );
+    }
+
+    /// Phase R4: the status-bar orb's reserved-arm signals — an effect
+    /// leaving sets the flag, the reply landing clears it.
+    #[tokio::test]
+    async fn reserved_arm_flags_follow_the_effects() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        assert!(!app.search_in_flight);
+        // The search route needs a workspace root to build the effect.
+        app.state
+            .apply(AppMessage::FolderOpened(PathBuf::from("/repo")));
+
+        // A workspace search leaves → Composing; the reply clears it.
+        let search_id = selora_fs::search::SearchId::next();
+        app.state.search.set_root(PathBuf::from("/repo"));
+        let query = selora_fs::search::SearchQuery::new("main");
+        app.route_search_event(SearchEvent::RunSearch {
+            id: search_id,
+            query,
+        });
+        assert!(app.search_in_flight, "the search set its flag");
+        app.msg_tx
+            .send(AppMessage::SearchResults {
+                id: selora_fs::search::SearchId::next(),
+                results: Ok(Vec::new()),
+            })
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(!app.search_in_flight, "the reply cleared it");
+
+        // A tree refresh leaves → Shaping; FileTreeUpdated clears it.
+        app.route_tree_event(TreeEvent::TreeChanged);
+        assert!(app.tree_in_flight);
+        app.msg_tx
+            .send(AppMessage::FileTreeUpdated {
+                root: PathBuf::from("/repo"),
+                tree: selora_fs::tree::FileTreeNode {
+                    name: "repo".into(),
+                    path: PathBuf::from("/repo"),
+                    is_dir: true,
+                    children: Vec::new(),
+                    truncated: false,
+                },
+            })
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(!app.tree_in_flight);
+    }
+
+    /// Phase R3: boot restore loads `sessions.json` — the full timeline
+    /// (bubbles + agent cards) becomes the live session.
+    #[tokio::test]
+    async fn boot_restore_loads_the_full_session_history() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+
+        use selora_ai::{AgentSummary, ApprovalCard, ToolResult};
+        use selora_ui::sidebar::chat::{ChatSession, SessionCard, SessionEntry};
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("selora-app-boot-sess-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sessions = vec![ChatSession {
+            id: uuid::Uuid::new_v4(),
+            title: "fix the build".into(),
+            created_at: 1_700_000_000,
+            entries: vec![
+                SessionEntry::Bubble {
+                    role: selora_ai::Role::User,
+                    content: "fix the build".into(),
+                    error: None,
+                },
+                SessionEntry::Card(SessionCard {
+                    id: "call_1".into(),
+                    name: "edit_file".into(),
+                    arguments: r#"{"path":"main.rs"}"#.into(),
+                    approval: Some((
+                        selora_ai::ApprovalId::nil(),
+                        ApprovalCard::Diff {
+                            path: "main.rs".into(),
+                            diff: "@@ -1 +1 @@".into(),
+                        },
+                        1,
+                    )),
+                    result: Some(ToolResult {
+                        id: "call_1".into(),
+                        ok: true,
+                        content: "edited".into(),
+                    }),
+                    decided: None,
+                    expanded: false,
+                }),
+                SessionEntry::Summary(AgentSummary {
+                    iterations: 1,
+                    tools_used: 1,
+                    approved: 1,
+                    denied: 0,
+                    tokens: 500,
+                    cost_usd: 0.01,
+                    completed: true,
+                }),
+            ],
+        }];
+        persistence::save_sessions(&dir, &sessions).expect("save sessions");
+
+        let mut app = agent_app(&ctx);
+        app.workspace_dir = Some(dir.clone());
+        app.restore_session();
+        assert_eq!(app.state.chat_panel.session_title(), "fix the build");
+        assert_eq!(app.state.chat_panel.turn_count(), 3);
+        assert!(
+            !app.state.chat_panel.is_streaming(),
+            "a restored session never streams"
+        );
+        assert_eq!(
+            app.state.chat_panel.sessions().len(),
+            0,
+            "the last session went live"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Boot restore (§8.2): the agent pill follows the persisted session.

@@ -12,6 +12,7 @@
 
 pub mod brand;
 pub mod dialogs;
+pub mod diff_view;
 pub mod editor;
 pub mod empty_state;
 pub mod palette;

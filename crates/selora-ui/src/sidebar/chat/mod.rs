@@ -52,6 +52,7 @@
 //! [`ChatPanel::snapshot_turns`], or [`ChatPanel::transcript`] (agent
 //! transcripts are not persisted — the brief's DO-NOT).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -380,6 +381,10 @@ pub enum ChatPanelEvent {
     /// A session action (switch / new) was refused while a turn runs
     /// (Phase R3) — the shell toasts the reason.
     SessionBlocked,
+    /// A card body's "open ↗" link was clicked (Phase R4): open the file
+    /// at the 1-based line. The path is workspace-relative; the shell
+    /// resolves it against the root.
+    OpenFileAt { path: PathBuf, line: usize },
     /// A model was selected in the header's model picker. The panel has
     /// already switched its own header label; the shell persists the
     /// active model (next chat uses it).
@@ -1869,6 +1874,9 @@ impl ChatPanel {
                                 // The copy+toast seam: the shell toasts
                                 // CopyCode; the clipboard is set by show().
                                 frame.copies.push(url);
+                            }
+                            if let Some((path, line)) = outcome.open_at {
+                                frame.events.push(ChatPanelEvent::OpenFileAt { path, line });
                             }
                             frame.cards_painted += 1;
                             frame.decision_button_rects.extend(outcome.button_rects);

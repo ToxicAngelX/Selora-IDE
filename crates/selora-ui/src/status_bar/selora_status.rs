@@ -29,6 +29,7 @@
 use egui::{Id, Sense, Ui};
 use selora_ai::SeloraStatus;
 
+use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
 use crate::theme::{color, font, space, type_scale};
 
 /// The run's id — one interactive element per frame, so a plain constant
@@ -45,6 +46,11 @@ const DOT_CONNECTING: &str = "…";
 /// The longest gateway error words painted before eliding — the status bar
 /// is one 24px line, not an error surface (toasts carry the full text).
 const ERROR_MAX_CHARS: usize = 64;
+
+/// The width the activity orb zone takes (the orb + its gap) — the
+/// shell clears this much more room for the cost meter when an activity
+/// is live (Phase R4).
+pub const ACTIVITY_ZONE: f32 = ORB_INLINE + space::S2;
 
 /// What the shell must do in response to a click on the status run.
 ///
@@ -89,6 +95,14 @@ pub fn label(status: &SeloraStatus, active_model: Option<&str>) -> String {
     }
 }
 
+/// The run's measured width (the orb's anchor).
+fn galley_zone(painter: &egui::Painter, text: &str, font: &egui::FontId) -> f32 {
+    painter
+        .layout_no_wrap(text.to_owned(), font.clone(), color::FG_MUTED)
+        .size()
+        .x
+}
+
 /// Elide `text` to at most `max` characters (on a char boundary), ending
 /// in `…` when something was cut.
 fn elide(text: &str, max: usize) -> String {
@@ -114,12 +128,37 @@ fn elide(text: &str, max: usize) -> String {
 /// error run's prefix is `--err` and the gateway's words stay
 /// `--fg-muted`. Typography: `--type-xs` sans, the status bar's right-zone
 /// run.
-pub fn show(ui: &mut Ui, status: &SeloraStatus, active_model: Option<&str>) -> Vec<StatusEvent> {
+/// `activity` (Phase R4) paints the ThinkingOrb's reserved arms left of
+/// the connection run: `Weaving` while a ghost-text completion is in
+/// flight, `Composing` while a workspace search runs, `Shaping` while
+/// the file tree rebuilds — the Phase 6h states' documented surfaces,
+/// wired at last.
+pub fn show(
+    ui: &mut Ui,
+    status: &SeloraStatus,
+    active_model: Option<&str>,
+    activity: Option<OrbState>,
+    reduce_motion: bool,
+) -> Vec<StatusEvent> {
     let rect = ui.max_rect();
     let painter = ui.painter_at(rect);
     let run_font = egui::FontId::new(type_scale::XS, font::FAMILY_SANS);
     let right = (rect.right() - space::S3, rect.center().y);
     let text = label(status, active_model);
+
+    // The reserved arms' orb, left of the run.
+    if let Some(orb_state) = activity {
+        let orb_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                right.0 - galley_zone(&painter, &text, &run_font) - ACTIVITY_ZONE,
+                rect.center().y - ORB_INLINE / 2.0,
+            ),
+            egui::vec2(ORB_INLINE, ORB_INLINE),
+        );
+        ThinkingOrb::new(orb_state, ORB_INLINE)
+            .reduce_motion(reduce_motion)
+            .paint(ui, orb_rect);
+    }
 
     // The full run in its base color, laid out once — the overlays below
     // reuse offsets measured with the same font, the same technique as
@@ -274,7 +313,7 @@ mod tests {
         for status in states {
             egui::__run_test_ui(|ui| {
                 ui.set_min_size(vec2(400.0, 24.0));
-                let events = show(ui, &status, Some("glm-5.3"));
+                let events = show(ui, &status, Some("glm-5.3"), None, false);
                 assert!(
                     events.is_empty(),
                     "{status:?} paints without side effects, got {events:?}"
@@ -306,7 +345,7 @@ mod tests {
                 // The run hugs the right edge minus --space-3; aim a bit
                 // further in to land inside the text itself.
                 spot = Pos2::new(screen.right() - space::S3 - 40.0, screen.center().y);
-                let _ = show(ui, status, None);
+                let _ = show(ui, status, None, Some(OrbState::Weaving), false);
             },
         )
         .drop_without_applying_deltas();
@@ -329,7 +368,7 @@ mod tests {
             },
             |ui| {
                 ui.set_min_size(screen.size());
-                let _ = show(ui, status, None);
+                let _ = show(ui, status, None, Some(OrbState::Weaving), false);
             },
         )
         .drop_without_applying_deltas();
@@ -350,7 +389,7 @@ mod tests {
             },
             |ui| {
                 ui.set_min_size(screen.size());
-                events = show(ui, status, None);
+                events = show(ui, status, None, None, false);
             },
         )
         .drop_without_applying_deltas();
@@ -363,6 +402,28 @@ mod tests {
             click_run(&SeloraStatus::Disconnected),
             vec![StatusEvent::OpenConnect]
         );
+    }
+
+    /// Phase R4: an activity paints the reserved-arm orb left of the run
+    /// without touching the click behavior.
+    #[test]
+    fn an_activity_paints_the_orb_and_stays_silent() {
+        for activity in [OrbState::Weaving, OrbState::Composing, OrbState::Shaping] {
+            egui::__run_test_ui(|ui| {
+                ui.set_min_size(vec2(400.0, 24.0));
+                let events = show(
+                    ui,
+                    &SeloraStatus::Connected {
+                        model: None,
+                        latency_ms: 5,
+                    },
+                    None,
+                    Some(activity),
+                    false,
+                );
+                assert!(events.is_empty(), "{activity:?} painted silently");
+            });
+        }
     }
 
     #[test]
