@@ -15,7 +15,7 @@ strictly inside the ink design language — §12 still rules):
 | R2 transcript rendering | **merged** (see below) |
 | R3 multi-session + restore | **merged** (see below) |
 | R4 cards & diffs | **merged** (see below) |
-| R5 settings completion | planned (Agent section, keyring Brave key, real General) |
+| R5 settings completion | **merged** (see below) |
 | R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
 | R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
 
@@ -174,6 +174,24 @@ trace back to these two.
 - Tests: +6 (strip_ansi, diff-card open link, web rows open the url,
   first_changed_line, changed-span pairing, activity orb paint) +1
   shell (reserved-arm flag lifecycle). selora-ui 321, selora-app 84.
+
+**R5 details** (settings completion):
+
+- The Agent section: max_iterations (1–100), max_turn_secs (10–3600),
+  max_cost_usd (0.01–50) as DragValues; the shell; the auto-approve
+  allowlist editor (editable rows with remove `×`, an add field,
+  deduped); the Brave key — masked input, committed on blur to the new
+  `keyring::brave_key_{get,set,delete}` (service `selora-ide`, entry
+  `brave-key`), scrubbing any legacy plaintext field with the save.
+- The shell's AgentSend seam injects the keyring key when the settings
+  field is empty (legacy plaintext wins only if the keyring is empty —
+  nothing breaks, nothing new lands in files).
+- General: the reduce-motion toggle (the SettingsSaved adoption already
+  threads it into the panel). The Git placeholder section and the
+  no-op Minimap checkbox are gone (schema fields stay).
+- Tests: keyring brave round-trip (throwaway service), the Agent
+  section's allowlist paint; the every-section loop covers the new
+  list. selora-ui 320, selora-settings 29.
 
 **§12 bend for owner sign-off (R4)**: the diff emphasis paints a 12%
 alpha tint of the existing `--err`/`--ok` behind changed words (DESIGN

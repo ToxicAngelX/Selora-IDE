@@ -1291,10 +1291,23 @@ impl SeloraApp {
                         family: String::new(),
                     });
                 let conversation = self.state.chat_panel.conversation();
+                // Phase R5: the Brave key's home is the OS keyring; the
+                // settings field stays empty (legacy files may carry a
+                // plaintext one — it wins only if the keyring is empty).
+                let mut agent = self.state.settings.agent.clone();
+                if agent
+                    .brave_search_api_key
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                {
+                    if let Ok(Some(key)) = selora_settings::keyring::brave_key_get() {
+                        agent.brave_search_api_key = Some(key);
+                    }
+                }
                 let request = crate::app_state::AgentTurnRequest {
                     model,
                     conversation,
-                    agent: self.state.settings.agent.clone(),
+                    agent,
                 };
                 let chat_uuid = uuid::Uuid::new_v4();
                 self.state.chat_ids.insert(chat_uuid, id);

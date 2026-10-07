@@ -75,15 +75,17 @@ fn field_gap(ui: &mut egui::Ui) {
     ui.add_space(space::S4);
 }
 
-/// One section in the left column. General and Git are Phase 3 placeholders.
+/// One section in the left column. The Git placeholder went in Phase R5
+/// (nothing to configure — git2 reads the repository's own config); the
+/// Agent section arrived with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     General,
     Editor,
     Ui,
     Selora,
+    Agent,
     Lsp,
-    Git,
     Keybinds,
 }
 
@@ -93,8 +95,8 @@ impl Section {
         (Section::Editor, "Editor"),
         (Section::Ui, "UI"),
         (Section::Selora, "Selora"),
+        (Section::Agent, "Agent"),
         (Section::Lsp, "LSP"),
-        (Section::Git, "Git"),
         (Section::Keybinds, "Keybinds"),
     ];
 }
@@ -210,6 +212,13 @@ pub struct SettingsDialog {
     rust_detect_note: String,
     /// Inline result note for the typescript "Auto-detect" button.
     ts_detect_note: String,
+    /// The masked Brave Search key buffer (Phase R5). On commit it goes
+    /// to the OS keyring and is cleared — settings.json never sees it.
+    brave_key: String,
+    /// Inline note for the Brave key row.
+    brave_note: String,
+    /// The allowlist editor's add field (Phase R5).
+    allowlist_add: String,
     /// Whether one of the panes' text fields held keyboard focus this
     /// frame (re-set by every field as it paints). Read by `show`'s Esc
     /// handler — egui surrenders focus on Esc before `show` can see it.
@@ -238,6 +247,9 @@ impl SettingsDialog {
             keybind_capture: None,
             rust_detect_note: String::new(),
             ts_detect_note: String::new(),
+            brave_key: String::new(),
+            brave_note: String::new(),
+            allowlist_add: String::new(),
             field_focused: false,
         }
     }
@@ -416,20 +428,151 @@ impl SettingsDialog {
     fn pane(&mut self, ui: &mut egui::Ui) {
         ui.add_space(space::S1);
         match self.section {
-            Section::General => {
-                self.pane_placeholder(ui, "General settings are coming in Phase 3.")
-            }
+            Section::General => self.pane_general(ui),
             Section::Editor => self.pane_editor(ui),
             Section::Ui => self.pane_ui(ui),
             Section::Selora => selora_section::pane_selora(self, ui),
+            Section::Agent => self.pane_agent(ui),
             Section::Lsp => self.pane_lsp(ui),
-            Section::Git => self.pane_placeholder(ui, "Git settings are coming in Phase 3."),
             Section::Keybinds => self.pane_keybinds(ui),
         }
     }
 
-    fn pane_placeholder(&mut self, ui: &mut egui::Ui, text: &str) {
-        note_style(ui, text);
+    /// General (Phase R5, real at last): the motion discipline. The
+    /// theme stays in UI (only selora-dark exists).
+    fn pane_general(&mut self, ui: &mut egui::Ui) {
+        let resp = ui.checkbox(
+            &mut self.settings.ui.reduce_motion,
+            "Reduce motion (static dots instead of loops)",
+        );
+        self.commit_if_changed(&resp);
+        note_style(
+            ui,
+            "Freezes the loops (pulse/spin/orbit); essential fades stay.",
+        );
+    }
+
+    /// The Agent section (Phase R5): the turn caps, the shell, the
+    /// auto-approve allowlist, and the Brave key (OS keyring — never in
+    /// settings.json).
+    fn pane_agent(&mut self, ui: &mut egui::Ui) {
+        label_style(ui, "Max Iterations");
+        let resp =
+            ui.add(egui::DragValue::new(&mut self.settings.agent.max_iterations).range(1..=100));
+        self.commit_drag(&resp);
+
+        field_gap(ui);
+        label_style(ui, "Max Turn Seconds");
+        let resp =
+            ui.add(egui::DragValue::new(&mut self.settings.agent.max_turn_secs).range(10..=3600));
+        self.commit_drag(&resp);
+
+        field_gap(ui);
+        label_style(ui, "Max Cost (USD)");
+        let resp = ui.add(
+            egui::DragValue::new(&mut self.settings.agent.max_cost_usd)
+                .range(0.01..=50.0)
+                .speed(0.01),
+        );
+        self.commit_drag(&resp);
+
+        field_gap(ui);
+        label_style(ui, "Shell");
+        let resp = ui.text_edit_singleline(&mut self.settings.agent.shell);
+        self.commit_text_on_blur(&resp);
+
+        field_gap(ui);
+        label_style(ui, "Auto-approve Commands");
+        note_style(ui, "Read-only prefixes that run without an approval card.");
+        self.pane_allowlist(ui);
+
+        field_gap(ui);
+        label_style(ui, "Brave Search API Key");
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.brave_key)
+                    .hint_text("stored in the OS keyring")
+                    .password(true)
+                    .desired_width(240.0),
+            );
+            if resp.lost_focus() && !self.brave_key.trim().is_empty() {
+                match selora_settings::keyring::brave_key_set(self.brave_key.trim()) {
+                    Ok(()) => {
+                        self.brave_note =
+                            "stored in the OS keyring — never written to settings.json".into();
+                        // The plaintext field (legacy pre-R5 files) is
+                        // scrubbed with the save.
+                        self.settings.agent.brave_search_api_key = None;
+                        self.brave_key.clear();
+                        self.save_now();
+                    }
+                    Err(error) => self.brave_note = format!("{error}"),
+                }
+            }
+            if ui.button("Remove").clicked() {
+                match selora_settings::keyring::brave_key_delete() {
+                    Ok(()) => {
+                        self.brave_note = "removed from the keyring".into();
+                        self.settings.agent.brave_search_api_key = None;
+                        self.save_now();
+                    }
+                    Err(error) => self.brave_note = format!("{error}"),
+                }
+            }
+        });
+        if !self.brave_note.is_empty() {
+            note_style(ui, &self.brave_note.clone());
+        }
+    }
+
+    /// The auto-approve allowlist editor: one row per command prefix with
+    /// a remove `×`, plus an add field.
+    fn pane_allowlist(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("agent_allowlist")
+            .max_height(96.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let mut remove: Option<usize> = None;
+                let count = self.settings.agent.auto_approve_commands.len();
+                for index in 0..count {
+                    ui.horizontal(|ui| {
+                        let mut text = self.settings.agent.auto_approve_commands[index].clone();
+                        let resp =
+                            ui.add(egui::TextEdit::singleline(&mut text).desired_width(220.0));
+                        if resp.changed() {
+                            self.settings.agent.auto_approve_commands[index] = text;
+                            self.save_now();
+                        }
+                        if ui
+                            .button(egui::RichText::new("×").color(color::FG_FAINT))
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    self.settings.agent.auto_approve_commands.remove(index);
+                    self.save_now();
+                }
+            });
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.allowlist_add)
+                    .hint_text("add a command prefix")
+                    .desired_width(220.0),
+            );
+            if ui.button("Add").clicked() && !self.allowlist_add.trim().is_empty() {
+                let command = self.allowlist_add.trim().to_owned();
+                if !self.settings.agent.auto_approve_commands.contains(&command) {
+                    self.settings.agent.auto_approve_commands.push(command);
+                    self.save_now();
+                }
+                self.allowlist_add.clear();
+            }
+            let _ = resp;
+        });
     }
 
     // -- sections ---------------------------------------------------------
@@ -457,8 +600,9 @@ impl SettingsDialog {
         let resp = ui.checkbox(&mut self.settings.editor.line_numbers, "Show line numbers");
         self.commit_if_changed(&resp);
 
-        let resp = ui.checkbox(&mut self.settings.editor.minimap, "Minimap");
-        self.commit_if_changed(&resp);
+        // The Minimap checkbox went in Phase R5 — no minimap exists, and
+        // a no-op control is a lie (the settings field stays for the
+        // future feature).
 
         let resp = ui.checkbox(&mut self.settings.editor.word_wrap, "Word wrap");
         self.commit_if_changed(&resp);
@@ -719,6 +863,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Phase R5: the Agent section paints its allowlist rows (and the
+    /// caps/shell/Brave fields) without side effects; the General
+    /// section paints the motion toggle.
+    #[test]
+    fn agent_section_paints_the_allowlist_rows() {
+        let dir = temp_dir();
+        let mut dialog = SettingsDialog::with_save_dir(Settings::default(), Some(dir.clone()));
+        dialog.settings.agent.auto_approve_commands =
+            vec!["ls".into(), "cargo check".into(), "dir".into()];
+        dialog.section = Section::Agent;
+        for _ in 0..2 {
+            let mut events = Vec::new();
+            egui::__run_test_ui(|ui| {
+                let ctx = ui.ctx().clone();
+                events = dialog.show(&ctx);
+            });
+            assert!(events.is_empty(), "events: {events:?}");
+        }
+        assert_eq!(
+            dialog.settings.agent.auto_approve_commands.len(),
+            3,
+            "painting alone never edits the list"
+        );
+        assert!(!dir.join(SETTINGS_FILE_NAME).exists(), "no implicit save");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn dialog_paints_every_section_without_events() {
         let dir = temp_dir();
@@ -731,8 +902,8 @@ mod tests {
             Section::Editor,
             Section::Ui,
             Section::Selora,
+            Section::Agent,
             Section::Lsp,
-            Section::Git,
             Section::Keybinds,
         ] {
             dialog.section = section;

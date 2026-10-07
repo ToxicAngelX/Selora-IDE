@@ -79,6 +79,17 @@ All notable changes to Selora IDE are documented here. The format follows
   workspace search runs, `Weaving` while a ghost completion is in flight —
   the Phase 6h states' documented surfaces, wired.
 
+- The Settings dialog's Agent section (Phase R5): the turn caps (max
+  iterations / seconds / USD), the bash shell, the auto-approve allowlist
+  (editable rows + add field), and the Brave Search API key — which now
+  lives in the OS keyring (`brave-key` entry), never in settings.json; the
+  agent turn injects it from the keyring at send time (a legacy plaintext
+  field still wins if the keyring is empty, so nothing breaks).
+- General is a real section (Phase R5): the reduce-motion toggle
+  (live-wired through the existing settings adoption). The Git placeholder
+  section and the no-op Minimap checkbox were removed — a control that
+  does nothing is a lie (the schema fields stay for the future features).
+
 ### Changed
 
 - Architecture seams ahead of the UI revamp (Phase R0): the title strip, the

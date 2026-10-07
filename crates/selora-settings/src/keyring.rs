@@ -16,11 +16,19 @@ use selora_core::SeloraError;
 pub const SERVICE: &str = "selora-ide";
 /// The keyring entry (the `user` field) holding the API key.
 pub const ENTRY: &str = "api-key";
+/// The entry holding the Brave Search API key (Phase R5: the agent
+/// section's field stores it here — never in settings.json).
+pub const BRAVE_ENTRY: &str = "brave-key";
 
 /// The entry for `service` (tests use throwaway service names so the
 /// round-trips never touch the real key).
 fn entry(service: &str) -> Result<keyring::Entry, SeloraError> {
-    keyring::Entry::new(service, ENTRY)
+    entry_for(service, ENTRY)
+}
+
+/// The entry for `service` and `user`.
+fn entry_for(service: &str, user: &str) -> Result<keyring::Entry, SeloraError> {
+    keyring::Entry::new(service, user)
         .map_err(|err| SeloraError::Config(format!("keyring unavailable: {err}")))
 }
 
@@ -40,6 +48,33 @@ pub fn api_key_set(key: &str) -> Result<(), SeloraError> {
     entry(SERVICE)?
         .set_password(key)
         .map_err(|err| SeloraError::Config(format!("keyring write failed: {err}")))
+}
+
+/// Read the stored Brave Search API key. `Ok(None)` = nothing stored.
+/// Phase R5: the agent's web_search tool reads it through the shell's
+/// turn-request seam; settings.json never carries it.
+pub fn brave_key_get() -> Result<Option<String>, SeloraError> {
+    match entry_for(SERVICE, BRAVE_ENTRY)?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(SeloraError::Config(format!("keyring read failed: {err}"))),
+    }
+}
+
+/// Store (overwrite) the Brave Search API key — the Agent section's
+/// field, on commit.
+pub fn brave_key_set(key: &str) -> Result<(), SeloraError> {
+    entry_for(SERVICE, BRAVE_ENTRY)?
+        .set_password(key)
+        .map_err(|err| SeloraError::Config(format!("keyring write failed: {err}")))
+}
+
+/// Remove the stored Brave Search API key. A missing entry is a no-op.
+pub fn brave_key_delete() -> Result<(), SeloraError> {
+    match entry_for(SERVICE, BRAVE_ENTRY)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(SeloraError::Config(format!("keyring delete failed: {err}"))),
+    }
 }
 
 /// Remove the stored API key (Disconnect). A missing entry is a no-op.
@@ -80,6 +115,22 @@ mod tests {
             Err(keyring::Error::NoEntry) => {}
             other => panic!("expected NoEntry on second delete, got {other:?}"),
         }
+        match entry.get_password() {
+            Err(keyring::Error::NoEntry) => {}
+            other => panic!("expected NoEntry after delete, got {other:?}"),
+        }
+    }
+
+    /// Phase R5: the Brave entry round-trips under the same throwaway
+    /// service discipline (the real service's entry is never touched).
+    #[test]
+    fn brave_entry_round_trip() {
+        let service = test_service();
+        let entry = entry_for(&service, BRAVE_ENTRY).expect("brave entry");
+
+        entry.set_password("BSA-key").expect("set");
+        assert_eq!(entry.get_password().expect("get"), "BSA-key");
+        entry.delete_credential().expect("delete");
         match entry.get_password() {
             Err(keyring::Error::NoEntry) => {}
             other => panic!("expected NoEntry after delete, got {other:?}"),
