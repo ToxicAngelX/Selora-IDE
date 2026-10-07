@@ -102,6 +102,11 @@ All notable changes to Selora IDE are documented here. The format follows
   header, the working-tree-vs-index unified diff through the shared
   DiffView (syntax highlighted), Esc/× to close. `FileDiff::to_unified` is
   new in selora-git.
+- Find/replace in the editor (Phase R6c): Ctrl+F opens the find bar over
+  the active pane (query, match count, `Aa` case toggle, ↑/↓, ×); Ctrl+H
+  adds the replace row (Replace / Replace All). Every match gets a hairline
+  box, the active one an ink-mid fill; Enter/Shift+Enter step, Esc closes.
+  The palette's Find/Replace commands and the Edit menu route to it.
 
 ### Changed
 

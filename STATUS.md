@@ -16,7 +16,7 @@ strictly inside the ink design language — §12 still rules):
 | R3 multi-session + restore | **merged** (see below) |
 | R4 cards & diffs | **merged** (see below) |
 | R5 settings completion | **merged** (see below) |
-| R6 IDE gaps | planned (find/replace, problems panel, git diff tabs, title-bar menus) |
+| R6 IDE gaps | **merged** (see below) |
 | R7 final polish + docs | planned (MetalMark **enabled** per owner, scrim applied, cheat sheet, screenshots) |
 
 **Standing references (owner directive, 2026-10-07):** ZCode
@@ -192,6 +192,29 @@ trace back to these two.
 - Tests: keyring brave round-trip (throwaway service), the Agent
   section's allowlist paint; the every-section loop covers the new
   list. selora-ui 320, selora-settings 29.
+
+**R6 details** (the workbench — the last "real IDE" gaps):
+
+- 6a: the §1.1 title-bar menus (File/Edit/View/Help → palette commands +
+  Exit) — the strip's `show` returns a `TitleBarOutcome` (event + the
+  menu rects test seam); popups paint one frame late (the test's settle
+  frame). Plus the problems panel: `LspViewState.diagnostics` (the mapped
+  squiggle shape, per-path), `panel/problems.rs` (grouped rows, severity
+  glyphs, open-at-line), the Problems activity with the warning glyph +
+  count badge.
+- 6b: the git read-only diff view — `FileDiff::to_unified` in selora-git,
+  `Effect::GitDiff` + `GitDiffReady`, the editor-area overlay (header +
+  close, Esc), the DiffView (highlighted). The git panel's OpenDiff
+  stopped opening the raw file.
+- 6c: find/replace — `selora-ui/src/editor/find_bar.rs` (query, count,
+  `Aa` case toggle, prev/next, ×; replace row under Ctrl+H; Esc closes
+  regardless of focus — egui clears focus on Escape globally). The
+  editor's `FindState`: matches computed per query edit, the active one
+  follows the cursor via `find_next/prev` (wrapping), `replace_current`/
+  `replace_all` (reverse-order edits so positions hold). Match paint:
+  hairline boxes + the active ink-mid fill (the paint loop's x_offsets).
+  Ctrl+F/Ctrl+H + the palette commands route here (the "lands in
+  Phase 3" toasts are gone).
 
 **§12 bend for owner sign-off (R4)**: the diff emphasis paints a 12%
 alpha tint of the existing `--err`/`--ok` behind changed words (DESIGN

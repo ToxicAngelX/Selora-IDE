@@ -47,6 +47,54 @@ use crate::syntax::{Language, LineSection, Span, SyntaxKind, SyntaxLayer};
 use crate::{layout, motion, theme};
 
 /// An editor pane: gutter + text canvas for one shared [`Buffer`].
+/// Compute every match of `query` in the buffer: (start Position, char
+/// length), document order. Case-insensitive folds both sides to
+/// lowercase (Unicode-correct; a non-ASCII fold that changes byte length
+/// may misalign a column — an accepted Lite trade).
+fn find_matches(buffer: &Buffer, query: &str, case_sensitive: bool) -> Vec<(Position, usize)> {
+    let mut matches = Vec::new();
+    if query.is_empty() {
+        return matches;
+    }
+    for line_index in 0..buffer.line_count() {
+        let line = buffer.line(line_index).unwrap_or_default();
+        let (haystack, needle) = if case_sensitive {
+            (line.clone(), query.to_owned())
+        } else {
+            (line.to_lowercase(), query.to_lowercase())
+        };
+        let mut start = 0usize;
+        while let Some(found) = haystack[start..].find(&needle) {
+            let byte_col = start + found;
+            // Char column: count the chars before the byte offset.
+            let char_col = line[..byte_col.min(line.len())].chars().count();
+            matches.push((
+                Position::new(line_index, char_col),
+                query.chars().count(),
+            ));
+            start = byte_col + needle.len().max(1);
+        }
+    }
+    matches
+}
+
+/// The find state (Phase R6c): the query, the matches, and the active
+/// one (the cursor follows it). The find bar in `selora-ui` drives these
+/// methods; painting happens in the editor's paint loop.
+#[derive(Clone, Debug, Default)]
+pub struct FindState {
+    /// The query text ("" never matches).
+    pub query: String,
+    /// Case-sensitivity (the default is off).
+    pub case_sensitive: bool,
+    /// (start, length in chars) per match, document order.
+    matches: Vec<(Position, usize)>,
+    /// The active match index.
+    active: usize,
+}
+
+/// One editor pane. Every field is per-pane view state (two panes over
+/// the same buffer scroll independently).
 pub struct Editor {
     buffer: Arc<RwLock<Buffer>>,
     cursor: Position,
@@ -76,6 +124,8 @@ pub struct Editor {
     /// §2 stage 2) compares this against the current frame time — see
     /// [`Editor::last_edit_time`].
     last_edit: Option<f64>,
+    /// The find state (Phase R6c): `None` while the bar is closed.
+    find: Option<FindState>,
 }
 
 impl Editor {
@@ -92,6 +142,7 @@ impl Editor {
             lsp: OverlayState::default(),
             ghost: None,
             last_edit: None,
+            find: None,
         }
     }
 
@@ -383,6 +434,135 @@ impl Editor {
             .min(line_count.saturating_sub(1));
         self.move_cursor(Position::new(line, 0), false);
         self.pending_reveal = Some(line);
+    }
+
+    // ------------------------------------------------------------------
+    // Find (Phase R6c) — the bar in `selora-ui` drives these
+    // ------------------------------------------------------------------
+
+    /// Set the find query and recompute the matches ("" clears the state).
+    /// The active match is clamped to the new list.
+    pub fn set_find(&mut self, query: &str, case_sensitive: bool) {
+        if query.is_empty() {
+            self.find = None;
+            return;
+        }
+        let matches = find_matches(&self.read_buffer(), query, case_sensitive);
+        let state = self.find.get_or_insert_with(FindState::default);
+        state.query = query.to_owned();
+        state.case_sensitive = case_sensitive;
+        state.matches = matches;
+        if state.active >= state.matches.len() {
+            state.active = state.matches.len().saturating_sub(1);
+        }
+    }
+
+    /// Clear the find state (the bar closed).
+    pub fn clear_find(&mut self) {
+        self.find = None;
+    }
+
+    /// The match count (0 while the bar is closed).
+    pub fn find_matches(&self) -> usize {
+        self.find.as_ref().map_or(0, |state| state.matches.len())
+    }
+
+    /// The active match as a 1-based display index (0 while closed).
+    pub fn find_active(&self) -> usize {
+        self.find
+            .as_ref()
+            .filter(|state| !state.matches.is_empty())
+            .map_or(0, |state| state.active + 1)
+    }
+
+    /// The find state, for the paint loop (and the tests).
+    pub fn find(&self) -> Option<&FindState> {
+        self.find.as_ref()
+    }
+
+    /// Step to the next/previous match (wrapping); the cursor moves to
+    /// it and the buffer reveals the line (the goto_line reveal).
+    pub fn find_next(&mut self) {
+        self.find_step(1);
+    }
+
+    /// Step to the previous match (wrapping).
+    pub fn find_prev(&mut self) {
+        self.find_step(-1);
+    }
+
+    /// Step the active match by `direction` (+1 / -1), wrapping.
+    fn find_step(&mut self, direction: i64) {
+        let count = self.find_matches();
+        if count == 0 {
+            return;
+        }
+        let state = self.find.as_mut().expect("checked");
+        let current = state.active as i64;
+        state.active = (current + direction).rem_euclid(count as i64) as usize;
+        let (position, _) = state.matches[state.active];
+        self.cursor = position;
+        self.anchor = None;
+        self.pending_reveal = Some(position.line);
+    }
+
+    /// Replace the active match with `replacement` (Phase R6c): removes
+    /// the matched range and inserts the text. Returns whether it
+    /// replaced (false with no active match).
+    pub fn find_replace_current(&mut self, replacement: &str) -> bool {
+        let (position, len) = {
+            let Some(state) = &self.find else {
+                return false;
+            };
+            if state.matches.is_empty() {
+                return false;
+            }
+            state.matches[state.active]
+        };
+        {
+            let mut buffer = self.write_buffer();
+            let end = Position::new(position.line, position.col + len);
+            buffer.remove(position, end);
+            buffer.insert(position, replacement);
+        }
+        // Recompute against the edited buffer; the cursor sits at the
+        // replacement.
+        let query = self.find.as_ref().map(|state| state.query.clone());
+        let case = self
+            .find
+            .as_ref()
+            .map(|state| state.case_sensitive)
+            .unwrap_or(false);
+        if let Some(query) = query {
+            self.set_find(&query, case);
+        }
+        self.last_edit = Some(self.frame_time);
+        true
+    }
+
+    /// Replace every match with `replacement` (Phase R6c). Iterates in
+    /// reverse document order so earlier replacements never shift the
+    /// later positions. Returns the count.
+    pub fn find_replace_all(&mut self, replacement: &str) -> usize {
+        let Some(state) = &self.find else {
+            return 0;
+        };
+        if state.matches.is_empty() {
+            return 0;
+        }
+        let matches: Vec<(Position, usize)> = state.matches.clone();
+        let count = matches.len();
+        {
+            let mut buffer = self.write_buffer();
+            for (position, len) in matches.into_iter().rev() {
+                let end = Position::new(position.line, position.col + len);
+                buffer.remove(position, end);
+                buffer.insert(position, replacement);
+            }
+        }
+        self.last_edit = Some(self.frame_time);
+        self.find = None; // the query no longer matches by construction
+        count
     }
 
     // ------------------------------------------------------------------
@@ -771,6 +951,43 @@ impl Editor {
             }
         }
 
+        // Find highlights (Phase R6c): every match a hairline box, the
+        // active one on an ink-step fill — the faded emphasis of the
+        // find flow (functional, not decorative, §12-clean).
+        if let Some(find) = &self.find {
+            for (index, (position, len)) in find.matches.iter().enumerate() {
+                let row = position.line.wrapping_sub(self.scroll);
+                if row >= rows {
+                    continue;
+                }
+                let visuals = &visuals[row];
+                let x_start = visuals
+                    .x_offsets
+                    .get(position.col)
+                    .copied()
+                    .unwrap_or(visuals.width);
+                let x_end = visuals
+                    .x_offsets
+                    .get(position.col + *len)
+                    .copied()
+                    .unwrap_or(visuals.width.max(char_width));
+                let rect = Rect::from_min_size(
+                    pos2(text_x + x_start, row_y(row)),
+                    vec2(x_end - x_start, layout::LINE_HEIGHT),
+                );
+                if index == find.active {
+                    painter.rect_filled(rect, theme::radius::R0, theme::color::INK_MID);
+                } else {
+                    painter.rect_stroke(
+                        rect,
+                        theme::radius::R0,
+                        egui::Stroke::new(1.0, theme::color::FG_FAINT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+        }
+
         // Text + gutter.
         let number_font = FontId::new(theme::type_scale::SM, theme::font::FAMILY_MONO);
         for (row, line_visual) in visuals.iter().enumerate() {
@@ -1122,6 +1339,66 @@ fn line_visuals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- find (Phase R6c) ------------------------------------------------------
+
+    #[test]
+    fn find_matches_count_navigate_and_highlight_state() {
+        let mut editor = editor("one banana two
+banana split
+no fruit here");
+        assert_eq!(editor.find_matches(), 0, "nothing while the bar is closed");
+
+        editor.set_find("banana", false);
+        assert_eq!(editor.find_matches(), 2);
+        assert_eq!(editor.find_active(), 1, "the first match is active");
+
+        editor.find_next();
+        assert_eq!(editor.cursor(), Position::new(1, 0), "the cursor moved to match 2");
+        editor.find_next(); // wraps
+        assert_eq!(editor.cursor(), Position::new(0, 4));
+        editor.find_prev();
+        assert_eq!(editor.cursor(), Position::new(1, 0));
+
+        // An empty query clears.
+        editor.set_find("", false);
+        assert_eq!(editor.find_matches(), 0);
+        assert!(editor.find().is_none());
+    }
+
+    #[test]
+    fn find_case_sensitivity() {
+        let mut editor = editor("Banana BANANA banana");
+        editor.set_find("banana", false);
+        assert_eq!(editor.find_matches(), 3, "case-insensitive");
+        editor.set_find("banana", true);
+        assert_eq!(editor.find_matches(), 1, "case-sensitive");
+    }
+
+    #[test]
+    fn find_replace_current_and_all() {
+        let mut editor = editor("the quick brown fox
+the lazy dog
+the end");
+        // Case-sensitive: the capital-THE stay-out keeps the math honest.
+        editor.set_find("the", true);
+        assert_eq!(editor.find_matches(), 3);
+
+        // Replace current (match 1 = the first "the").
+        assert!(editor.find_replace_current("THE"));
+        assert!(editor.text().starts_with("THE quick"));
+        assert_eq!(editor.find_matches(), 2, "the recomputed matches");
+
+        // Replace all remaining ("the" twice left).
+        assert_eq!(editor.find_replace_all("those"), 2);
+        assert_eq!(
+            editor.text(),
+            "THE quick brown fox
+those lazy dog
+those end"
+        );
+        assert_eq!(editor.find_matches(), 0, "cleared after replace-all");
+    }
 
     fn editor(text: &str) -> Editor {
         Editor::new(Arc::new(RwLock::new(Buffer::from_text(text))))

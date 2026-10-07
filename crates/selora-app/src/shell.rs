@@ -179,6 +179,11 @@ pub struct SeloraApp {
     /// Phase R6b: the open read-only git diff (the path + unified text);
     /// the workbench overlay over the editor area.
     git_diff: Option<(std::path::PathBuf, String)>,
+    /// Phase R6c: the find bar over the active pane.
+    find_bar: selora_ui::editor::find_bar::FindBar,
+    /// The (query, path) last applied to the active editor — re-applied
+    /// when either moves.
+    find_applied: Option<(String, PathBuf)>,
     /// Phase R4: the status-bar orb's reserved-arm signals — set when the
     /// effect leaves, cleared when the reply lands.
     ghost_in_flight: bool,
@@ -295,6 +300,8 @@ impl SeloraApp {
             last_workspace_snapshot: None,
             last_sessions_snapshot: None,
             git_diff: None,
+            find_bar: selora_ui::editor::find_bar::FindBar::default(),
+            find_applied: None,
             ghost_in_flight: false,
             search_in_flight: false,
             tree_in_flight: false,
@@ -756,6 +763,8 @@ impl SeloraApp {
                 path: PathBuf::new(),
                 position: Default::default(),
             }),
+            KeyAction::FindInFile => self.find_bar.open_for_find(),
+            KeyAction::ReplaceInFile => self.find_bar.open_for_replace(),
             KeyAction::UndoAgentEdit => {
                 // §17.7's Ctrl+Z: revert the newest agent edit on the
                 // active buffer (no-op when the buffer moved on or no
@@ -1657,6 +1666,67 @@ impl SeloraApp {
                     position,
                 }));
         }
+
+        // The find bar (Phase R6c): over the ACTIVE pane's top-right. The
+        // query re-applies when it (or the pane's file) moved.
+        if self.find_bar.open && view.pane == self.state.editor_area.active_pane_id() {
+            let applied = (self.find_bar.query.clone(), path.clone());
+            if self.find_applied.as_ref() != Some(&applied) {
+                if let Some(editor) = self.state.editors.get_mut(&(view.pane, path.clone())) {
+                    editor.set_find(&self.find_bar.query.clone(), self.find_bar.case_sensitive);
+                }
+                self.find_applied = Some(applied);
+            }
+            let (matches, active) = self
+                .state
+                .editors
+                .get(&(view.pane, path.clone()))
+                .map(|editor| (editor.find_matches(), editor.find_active()))
+                .unwrap_or((0, 0));
+            let bar = &mut self.find_bar;
+            let events = bar.show(ui, view.content, matches, active);
+            for event in events {
+                let editor = self
+                    .state
+                    .editors
+                    .get_mut(&(view.pane, path.clone()));
+                use selora_ui::editor::find_bar::FindBarEvent;
+                match event {
+                    FindBarEvent::Query(text) => {
+                        if let Some(editor) = editor {
+                            editor.set_find(&text, self.find_bar.case_sensitive);
+                        }
+                    }
+                    FindBarEvent::Next => {
+                        if let Some(editor) = editor {
+                            editor.find_next();
+                        }
+                    }
+                    FindBarEvent::Prev => {
+                        if let Some(editor) = editor {
+                            editor.find_prev();
+                        }
+                    }
+                    FindBarEvent::Replace(replacement) => {
+                        if let Some(editor) = editor {
+                            editor.find_replace_current(&replacement);
+                        }
+                    }
+                    FindBarEvent::ReplaceAll(replacement) => {
+                        if let Some(editor) = editor {
+                            editor.find_replace_all(&replacement);
+                        }
+                    }
+                    FindBarEvent::Close => {
+                        if let Some(editor) = editor {
+                            editor.clear_find();
+                        }
+                        self.find_bar.close();
+                        self.find_applied = None;
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1935,14 +2005,8 @@ impl SeloraApp {
                 self.state
                     .toast("toggle comment lands in Phase 3", Severity::Info);
             }
-            CommandId::EditFindInFile => {
-                self.state
-                    .toast("find in file lands in Phase 3", Severity::Info);
-            }
-            CommandId::EditReplaceInFile => {
-                self.state
-                    .toast("replace in file lands in Phase 3", Severity::Info);
-            }
+            CommandId::EditFindInFile => self.find_bar.open_for_find(),
+            CommandId::EditReplaceInFile => self.find_bar.open_for_replace(),
             CommandId::EditGoToDefinition => {
                 self.state
                     .toast("go to definition lands in Phase 3", Severity::Info);
@@ -2195,6 +2259,10 @@ enum KeyAction {
     /// (Phase 5d, §17.7: agent-edit-scoped undo; the buffer has no
     /// general undo log yet — human typing is unaffected).
     UndoAgentEdit,
+    /// `Ctrl+F` — the find bar (Phase R6c).
+    FindInFile,
+    /// `Ctrl+H` — the find bar with the replace row (Phase R6c).
+    ReplaceInFile,
 }
 
 /// The fixed Phase 2 bindings (parsed once). The rebindable four live in
@@ -2246,6 +2314,8 @@ fn fixed_keybinds() -> &'static [(Keybind, KeyAction)] {
             bare(egui::Key::F12, KeyAction::GoToDefinition),
             ctrl(egui::Key::Space, KeyAction::Completions),
             ctrl(egui::Key::Z, KeyAction::UndoAgentEdit),
+            ctrl(egui::Key::F, KeyAction::FindInFile),
+            ctrl(egui::Key::H, KeyAction::ReplaceInFile),
         ]
     })
 }
