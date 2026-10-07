@@ -322,15 +322,17 @@ impl SettingsDialog {
         let modal = egui::Modal::new(egui::Id::new("selora-settings-dialog"))
             .frame(frame)
             .show(ctx, |ui| {
-                // Pin both ends: the modal sizes to content, and the body
-                // was built for a fixed 720×520 pane (its ScrollArea and
-                // text edits size to `available_*`). With only a min, the
-                // available-size feedback loop makes the layout drift
-                // frame to frame; min == max makes it deterministic —
-                // the exact geometry the old fixed-size Window gave.
-                ui.set_min_size(egui::vec2(WIDTH, HEIGHT));
-                ui.set_max_size(egui::vec2(WIDTH, HEIGHT));
-                self.body(ui);
+                // Pin the geometry with an exact allocation: the Modal
+                // sizes to its content, and neither a placer pin
+                // (set_min_size == set_max_size) nor a size-based
+                // allocate_ui bound the horizontal body's children — the
+                // ScrollArea's greedy width (`auto_shrink(false)`) grew the
+                // modal toward the full screen. Allocating the exact rect
+                // tells the modal the content's size (centering works) and
+                // the body paints into explicit child rects.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(WIDTH, HEIGHT), egui::Sense::hover());
+                self.body(ui, rect);
             });
         // A backdrop click dismisses — Esc's mouse twin.
         if modal.backdrop_response.clicked() {
@@ -342,26 +344,38 @@ impl SettingsDialog {
 
     // -- layout -----------------------------------------------------------
 
-    fn body(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // Left column: the 200px section list.
-            ui.allocate_ui(egui::vec2(SIDEBAR_WIDTH, ui.available_height()), |ui| {
-                self.sidebar(ui);
-            });
-
-            // 1px hairline divider between the columns (DESIGN_TOKENS.md §5).
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(1.0, ui.available_height()), egui::Sense::hover());
-            ui.painter().rect_filled(rect, radius::R0, color::INK_HI);
-
-            // Right pane: the fields, scrollable.
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    self.pane(ui);
-                });
+    /// The two panes, positioned explicitly: a `horizontal` layout in a
+    /// modal sized to content mis-measures (the ScrollArea's greedy width
+    /// escapes placer pins, and `available_height` inside a fresh
+    /// horizontal strip reads the strip's 18px row height, collapsing the
+    /// sidebar). Explicit child rects are deterministic.
+    fn body(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        // Left column: the 200px section list.
+        let sidebar_rect =
+            egui::Rect::from_min_size(rect.min, egui::vec2(SIDEBAR_WIDTH, rect.height()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_rect), |ui| {
+            self.sidebar(ui)
         });
+
+        // 1px hairline divider between the columns (DESIGN_TOKENS.md §5).
+        let divider = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + SIDEBAR_WIDTH, rect.top()),
+            egui::vec2(1.0, rect.height()),
+        );
+        ui.painter().rect_filled(divider, radius::R0, color::INK_HI);
+
+        // Right pane: the fields, scrollable.
+        let pane_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + SIDEBAR_WIDTH + 1.0, rect.top()),
+            egui::vec2(rect.width() - SIDEBAR_WIDTH - 1.0, rect.height()),
+        );
+        let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane_rect));
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(&mut pane_ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.pane(ui);
+            });
     }
 
     /// The section list (UI_SPEC.md §6 wireframe: plain text labels, no
@@ -910,6 +924,48 @@ mod tests {
             "connected dialog keeps no key copy"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod geometry_probe2 {
+    use super::*;
+
+    /// TEMPORARY: the real body inside the bare scope (no Modal).
+    #[test]
+    fn scope_max_rect_probe() {
+        let dir = std::env::temp_dir().join(format!("selora-geom2-{}", std::process::id()));
+        let mut dialog = SettingsDialog::with_save_dir(Settings::default(), Some(dir.clone()));
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_min_size(egui::vec2(1280.0, 800.0));
+                let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(720.0, 520.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    eprintln!("scoped available: {:?}", ui.available_size());
+                    // Bisect: the pane alone, vertical, no scroll area.
+                    dialog.pane(ui);
+                    eprintln!("after pane, cursor y advance: {:?}", ui.cursor().min);
+                });
+            },
+        );
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Rect(r) = &clipped.shape {
+                if r.rect.width() > 600.0 {
+                    eprintln!("  wide rect {:?} fill={:?}", r.rect, r.fill);
+                }
+            }
+        }
+        output.drop_without_applying_deltas();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

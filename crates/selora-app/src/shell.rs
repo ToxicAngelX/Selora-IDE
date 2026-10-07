@@ -338,6 +338,14 @@ impl SeloraApp {
                 self.state
                     .chat_panel
                     .set_reduce_motion(self.state.settings.ui.reduce_motion);
+                // The panel adopts the persisted model at boot (the header
+                // and both send paths read the panel, not the settings);
+                // a picker choice already made is never clobbered.
+                if self.state.chat_panel.model().is_none() {
+                    if let Some(model) = self.state.settings.selora.active_model.clone() {
+                        self.state.chat_panel.set_model(model);
+                    }
+                }
                 // Phase 4a: restore the last session's connection — a key
                 // in the OS keyring is validated and becomes the session
                 // key (the base URL is the freshly loaded settings').
@@ -3256,6 +3264,42 @@ mod tests {
             .expect("send");
         agent_frame(&ctx, &mut app, raw_screen());
         assert!(app.state.chat_panel.is_reduce_motion());
+    }
+
+    /// Phase 6g fix: the chat panel adopts `settings.selora.active_model`
+    /// at boot — before this, the header read "no model" and sends were
+    /// blocked behind a picker round-trip even though a model was persisted.
+    #[tokio::test]
+    async fn settings_loaded_seeds_the_panels_model_once() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        assert!(app.state.chat_panel.model().is_none());
+
+        let mut settings = Settings::default();
+        settings.selora.active_model = Some("claude-opus-5-5".to_owned());
+        app.msg_tx
+            .send(AppMessage::SettingsLoaded(settings))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert_eq!(
+            app.state.chat_panel.model().map(|m| m.as_str()),
+            Some("claude-opus-5-5")
+        );
+
+        // A later settings reload never clobbers a picker choice.
+        app.state.chat_panel.set_model("kimi-k3");
+        let mut settings = Settings::default();
+        settings.selora.active_model = Some("claude-opus-5-5".to_owned());
+        app.msg_tx
+            .send(AppMessage::SettingsLoaded(settings))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert_eq!(
+            app.state.chat_panel.model().map(|m| m.as_str()),
+            Some("kimi-k3")
+        );
     }
 
     /// The final Phase-5 test (the brief's acceptance): ONE scripted turn

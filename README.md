@@ -17,6 +17,17 @@ of [egui](https://github.com/emilk/egui) — pure Rust, no webview.
 
 ![Selora IDE — main window](assets/screenshots/main-window.png)
 
+<details>
+<summary>More screenshots</summary>
+
+| | |
+|---|---|
+| ![First-run splash](assets/screenshots/first-run-splash.png) | ![Chat streaming](assets/screenshots/chat-streaming.png) |
+| ![LSP hover](assets/screenshots/lsp-hover.png) | ![Git panel](assets/screenshots/git-panel.png) |
+| ![Settings](assets/screenshots/settings-dialog.png) | |
+
+</details>
+
 ## Features
 
 - **Editor** — multi-tab, split panes, syntax highlighting (tree-sitter:

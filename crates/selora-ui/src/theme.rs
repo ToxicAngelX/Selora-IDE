@@ -36,6 +36,12 @@ const JETBRAINS_MONO_MEDIUM: &[u8] =
 /// named egui families — see [`font::family_sans_medium`] and friends —
 /// because egui resolves weight via family, not via a `FontId` weight field.
 pub fn set_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(build_fonts());
+}
+
+/// Build the font definitions (split from `set_fonts` so tests can inspect
+/// the fallback chains without a context).
+fn build_fonts() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     fn put(
@@ -93,7 +99,21 @@ pub fn set_fonts(ctx: &egui::Context) {
         false,
     );
 
-    ctx.set_fonts(fonts);
+    // Symbol coverage: Space Grotesk has no geometric shapes (●/○ — the
+    // status run's dots, UI_SPEC.md §1.2) and the egui built-ins below it in
+    // the chain cover ○ but not ● (a tofu box shipped once). JetBrains Mono
+    // has both; insert it as the sans fallback so symbols resolve in one
+    // face instead of split-rendering across families.
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if let Some(pos) = family
+            .iter()
+            .position(|name| name == "SpaceGrotesk-Regular")
+        {
+            family.insert(pos + 1, "JetBrainsMono-Regular".to_owned());
+        }
+    }
+
+    fonts
 }
 
 /// Apply the Selora dark visuals to the context. Called once on app boot.
@@ -172,4 +192,28 @@ fn text_styles() -> std::collections::BTreeMap<egui::TextStyle, egui::FontId> {
     ]
     .into_iter()
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The status run's dots (● U+25CF / ○ U+25CB, UI_SPEC.md §1.2) are not
+    /// in Space Grotesk; they resolve through the sans fallback chain. If
+    /// JetBrains Mono ever drops out of that chain, ● renders as tofu.
+    #[test]
+    fn sans_fallback_resolves_geometric_dots_in_jetbrains_mono() {
+        let fonts = super::build_fonts();
+        let sans = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("sans family");
+        let sg = sans
+            .iter()
+            .position(|n| n == "SpaceGrotesk-Regular")
+            .expect("Space Grotesk is the primary sans");
+        let jb = sans
+            .iter()
+            .position(|n| n == "JetBrainsMono-Regular")
+            .expect("JetBrains Mono is the sans symbol fallback");
+        assert!(sg < jb, "JetBrains Mono follows Space Grotesk");
+    }
 }
