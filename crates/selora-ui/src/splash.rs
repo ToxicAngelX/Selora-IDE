@@ -22,6 +22,7 @@ use selora_ai::SeloraStatus;
 use selora_tokens::{color, font, motion, radius, space, type_scale};
 
 use crate::brand;
+use crate::presence::metal;
 
 /// The mark at splash scale (UI_SPEC.md §7): 64px.
 const MARK_SIZE: f32 = 64.0;
@@ -199,6 +200,19 @@ impl Splash {
             egui::vec2(MARK_SIZE, MARK_SIZE),
         );
         brand::paint_mark_orbiting(ui.painter(), mark_rect, theta);
+        // Phase 6h (OWNER-DECISION): the MetalMark liquid-metal sheen —
+        // the app's single permitted specular highlight, monochrome white
+        // on ink, on the §7.3 comet vocabulary. Behind
+        // `metal::METAL_MARK_ENABLED`; the owner flips the flag. The
+        // splash's orbit repaint cadence drives it; reduce-motion freezes
+        // it (the comet family is §7.4-disabled).
+        if metal::METAL_MARK_ENABLED && !self.reduce_motion {
+            metal::paint_sheen(
+                ui.painter(),
+                mark_rect,
+                self.created.elapsed().as_secs_f32(),
+            );
+        }
         cursor += MARK_SIZE + space::S5;
 
         // Wordmark + tagline.

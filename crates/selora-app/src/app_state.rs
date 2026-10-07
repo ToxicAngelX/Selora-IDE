@@ -546,6 +546,13 @@ impl AppState {
                 self.toast(format!("chat: {error}"), Severity::Error);
             }
             AppMessage::SeloraStatus(status) => {
+                // Phase 6h: the presence avatars sleep while the gateway
+                // is unreachable (Connecting counts as reachable — a ping
+                // is in flight, not a failure).
+                self.chat_panel.set_gateway_connected(matches!(
+                    status,
+                    selora_ai::SeloraStatus::Connected { .. } | selora_ai::SeloraStatus::Connecting
+                ));
                 self.selora_status = status;
             }
             AppMessage::GhostTextReady {

@@ -3836,4 +3836,32 @@ mod tests {
         assert!(toast.text.contains("update check failed: offline"));
         assert!(matches!(toast.severity, Severity::Error));
     }
+
+    /// Phase 6h: the SeloraStatus reduction threads gateway reachability
+    /// into the chat panel's presence widgets (the avatars sleep while
+    /// disconnected; Connecting is not a failure).
+    #[tokio::test]
+    async fn gateway_status_drives_the_presence_avatars() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let mut app = agent_app(&ctx);
+        assert!(app.state.chat_panel.is_gateway_connected());
+
+        app.msg_tx
+            .send(AppMessage::SeloraStatus(
+                selora_ai::SeloraStatus::Disconnected,
+            ))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(!app.state.chat_panel.is_gateway_connected());
+
+        app.msg_tx
+            .send(AppMessage::SeloraStatus(
+                selora_ai::SeloraStatus::Connecting,
+            ))
+            .expect("send");
+        agent_frame(&ctx, &mut app, raw_screen());
+        assert!(app.state.chat_panel.is_gateway_connected());
+    }
 }

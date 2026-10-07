@@ -16,6 +16,7 @@ pub mod editor;
 pub mod palette;
 pub mod panel;
 pub mod picker;
+pub mod presence;
 pub mod sidebar;
 pub mod splash;
 pub mod status_bar;

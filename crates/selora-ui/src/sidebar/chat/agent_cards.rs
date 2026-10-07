@@ -50,6 +50,8 @@ use egui::{pos2, vec2, Align2, Color32, Pos2, Rect, Sense, Ui, Vec2};
 use selora_ai::{AgentDecision, AgentSummary, ApprovalCard, ApprovalId, ToolCall, ToolResult};
 
 use super::{code_font, with_alpha};
+use crate::presence::avatar::{AgentAvatar, AvatarState, AVATAR_INLINE};
+use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
 use crate::theme::{color, font, motion, radius, space, type_scale};
 
 // -----------------------------------------------------------------------------
@@ -87,8 +89,11 @@ const CARD_PAD: f32 = space::S2;
 const ANIM_FRAME_MS: u64 = motion::DUR_LOOP_MS as u64 / 60;
 /// The status glyph's reserved slot at the right edge of a card header.
 const GLYPH_SLOT: f32 = 16.0;
-/// The status-line glyph's distance from the text that follows it.
-const STATUS_GLYPH_GAP: f32 = space::S2 + 12.0;
+/// Phase 6h: the avatar's reserved slot at the LEFT edge of a card
+/// header (the glyph plus its gap to the tool name).
+const AVATAR_SLOT: f32 = AVATAR_INLINE + space::S1;
+/// The status-line avatar's left inset.
+const STATUS_AVATAR_INSET: f32 = space::S2;
 
 /// The result-status glyphs (§4.2: "✓ in `--ok`, ✕ in `--err`"; the
 /// `✕` precedent lives in the settings dialog's selora section).
@@ -152,11 +157,15 @@ pub struct ToolCard {
     pub expanded: bool,
     /// When the card appeared (the fade-in anchor).
     pub appeared: Instant,
+    /// Phase 6h: the header's agent identity glyph (its cross-fade clock
+    /// lives here; the pose is derived per frame from the card state).
+    pub avatar: AgentAvatar,
 }
 
 impl ToolCard {
     /// A fresh collapsed card for a just-started call.
     pub fn new(call: ToolCall) -> Self {
+        let avatar = AgentAvatar::new(seed_from_id(&call.id));
         Self {
             call,
             approval: None,
@@ -164,6 +173,7 @@ impl ToolCard {
             decided: None,
             expanded: false,
             appeared: Instant::now(),
+            avatar,
         }
     }
 
@@ -212,6 +222,46 @@ pub fn status_phase_for<'a>(cards: impl IntoIterator<Item = &'a ToolCard>) -> St
         Some(card) => StatusPhase::Running(status_verb(&card.call)),
         None => StatusPhase::Thinking,
     }
+}
+
+/// The running tool's name for the status line's orb (Phase 6h):
+/// `None` when [`status_phase_for`] would not say `Running` (a pending
+/// card parks the phase on AwaitingApproval; nothing running reads as
+/// Thinking). Read-type vs write/bash drives searching vs solving.
+pub fn status_running_tool<'a>(cards: impl IntoIterator<Item = &'a ToolCard>) -> Option<&'a str> {
+    let mut last_running: Option<&ToolCard> = None;
+    for card in cards {
+        if card.is_pending() {
+            return None; // the phase is AwaitingApproval, not Running
+        }
+        if card.result.is_none() {
+            last_running = Some(card);
+        }
+    }
+    last_running.map(|card| card.call.name.as_str())
+}
+
+/// The card header avatar's state (Phase 6h): sleeping while the gateway
+/// is disconnected, working while the tool executes on a live turn,
+/// default otherwise (a parked card waits patiently).
+fn card_avatar_state(card: &ToolCard, turn_live: bool, gateway_connected: bool) -> AvatarState {
+    if !gateway_connected {
+        AvatarState::Sleeping
+    } else if card.result.is_none() && !card.is_pending() && turn_live {
+        AvatarState::Working
+    } else {
+        AvatarState::Default
+    }
+}
+
+/// The avatar's roster seed from its card's call id (deterministic —
+/// a row of cards never blinks in unison).
+fn seed_from_id(id: &str) -> f32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in id.bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    (hash % 1000) as f32 / 1000.0
 }
 
 // -----------------------------------------------------------------------------
@@ -273,12 +323,14 @@ pub struct StatusLineOutcome {
 /// dots. `turn_live` is whether the card's own turn is still in flight —
 /// a turn that ended while a tool ran (Stop/cap: the loop breaks without
 /// a ToolResult for it) must freeze the card's spin and kill its Stop
-/// button, or the card would request repaints forever.
+/// button, or the card would request repaints forever. `gateway_connected`
+/// drives the header avatar's sleeping state (Phase 6h).
 pub fn tool_card(
     ui: &mut Ui,
     card: &mut ToolCard,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     // Every card fades in over --dur-quick (§4.2:302); fade is kept
     // under reduced motion (§7.4).
@@ -291,49 +343,90 @@ pub fn tool_card(
     }
 
     match card_kind(card) {
-        CardKind::Bash => paint_bash_card(ui, card, fade, reduce_motion, turn_live),
-        CardKind::DiffApproval => paint_diff_card(ui, card, fade, reduce_motion, turn_live),
-        CardKind::DeleteApproval => paint_delete_card(ui, card, fade, reduce_motion, turn_live),
-        CardKind::WebSearch => paint_web_search_card(ui, card, fade, reduce_motion, turn_live),
-        CardKind::WebFetch => paint_web_fetch_card(ui, card, fade, reduce_motion, turn_live),
-        CardKind::Collapsed => paint_collapsed_card(ui, card, fade, reduce_motion, turn_live),
+        CardKind::Bash => {
+            paint_bash_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
+        CardKind::DiffApproval => {
+            paint_diff_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
+        CardKind::DeleteApproval => {
+            paint_delete_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
+        CardKind::WebSearch => {
+            paint_web_search_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
+        CardKind::WebFetch => {
+            paint_web_fetch_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
+        CardKind::Collapsed => {
+            paint_collapsed_card(ui, card, fade, reduce_motion, turn_live, gateway_connected)
+        }
     }
 }
 
-/// The 24px agent status line (§4.2:300): phase text + glyph (pulse for
-/// `thinking` / `awaiting your approval`, spin for `running …`; static
-/// dots under reduced motion) with the Stop button on the right
-/// (`--type-xs --fg-muted`, hover `--err`).
-pub fn status_line(ui: &mut Ui, phase: &StatusPhase, reduce_motion: bool) -> StatusLineOutcome {
+/// The 24px agent status line (§4.2:300): the AgentAvatar, the
+/// ThinkingOrb at the loop-mapped state, the phase text, and the Stop
+/// button on the right (`--type-xs --fg-muted`, hover `--err`). Phase
+/// 6h: the avatar + orb replace 5d's pulse/spin dot. The avatar sleeps
+/// while the gateway is disconnected.
+pub fn status_line(
+    ui: &mut Ui,
+    phase: &StatusPhase,
+    orb: OrbState,
+    avatar: &mut AgentAvatar,
+    gateway_connected: bool,
+    reduce_motion: bool,
+) -> StatusLineOutcome {
     let (rect, _) = ui.allocate_exact_size(
         vec2(ui.available_width(), STATUS_LINE_HEIGHT),
         Sense::hover(),
     );
-    let elapsed_ms = (ui.ctx().input(|i| i.time) * 1000.0) as u64;
-    {
-        let painter = ui.painter();
-        let glyph_center = pos2(rect.left() + space::S2 + 4.0, rect.center().y);
-        match phase {
-            StatusPhase::Thinking | StatusPhase::AwaitingApproval => {
-                paint_pulse(painter, glyph_center, elapsed_ms, reduce_motion);
-            }
-            StatusPhase::Running(_) => {
-                paint_spin(painter, glyph_center, elapsed_ms, reduce_motion);
-            }
-        }
-        let text = match phase {
-            StatusPhase::Thinking => TEXT_THINKING,
-            StatusPhase::AwaitingApproval => TEXT_AWAITING,
-            StatusPhase::Running(verb) => verb.as_str(),
-        };
-        painter.text(
-            pos2(rect.left() + STATUS_GLYPH_GAP, rect.center().y),
-            Align2::LEFT_CENTER,
-            text,
-            sans_font(type_scale::SM),
-            color::FG_MUTED,
-        );
-    }
+    let now = crate::presence::clock_s(ui.ctx());
+
+    // The identity glyph (the status line only exists mid-turn: working,
+    // or sleeping while the gateway is down).
+    let avatar_rect = Rect::from_min_size(
+        pos2(
+            rect.left() + STATUS_AVATAR_INSET,
+            rect.center().y - AVATAR_INLINE / 2.0,
+        ),
+        vec2(AVATAR_INLINE, AVATAR_INLINE),
+    );
+    avatar.set_reduce_motion(reduce_motion);
+    avatar.set_state(
+        if gateway_connected {
+            AvatarState::Working
+        } else {
+            AvatarState::Sleeping
+        },
+        now,
+    );
+    avatar.paint(ui, avatar_rect, 1.0, true);
+
+    // The thought indicator.
+    let orb_rect = Rect::from_min_size(
+        pos2(
+            avatar_rect.right() + space::S1,
+            rect.center().y - ORB_INLINE / 2.0,
+        ),
+        vec2(ORB_INLINE, ORB_INLINE),
+    );
+    ThinkingOrb::new(orb, ORB_INLINE)
+        .reduce_motion(reduce_motion)
+        .paint(ui, orb_rect);
+
+    let text = match phase {
+        StatusPhase::Thinking => TEXT_THINKING,
+        StatusPhase::AwaitingApproval => TEXT_AWAITING,
+        StatusPhase::Running(verb) => verb.as_str(),
+    };
+    ui.painter().text(
+        pos2(orb_rect.right() + space::S2, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        sans_font(type_scale::SM),
+        color::FG_MUTED,
+    );
 
     // Stop (right): --type-xs --fg-muted, hover --err (§4.2:300 — the
     // spec's one saturated hover, semantic for a destructive action).
@@ -367,9 +460,8 @@ pub fn status_line(ui: &mut Ui, phase: &StatusPhase, reduce_motion: bool) -> Sta
         },
     );
 
-    if !reduce_motion {
-        request_animation_frame(ui.ctx());
-    }
+    // The avatar and the orb request their own animation frames (the
+    // presence widgets' discipline — nothing here repaints on its own).
     StatusLineOutcome {
         stop_clicked: stop_response.clicked(),
         rect,
@@ -472,6 +564,7 @@ fn paint_collapsed_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -505,7 +598,16 @@ fn paint_collapsed_card(
     if header_response.clicked() {
         card.expanded = !card.expanded;
     }
-    paint_card_header(ui, header, card, None, fade, reduce_motion, turn_live);
+    paint_card_header(
+        ui,
+        header,
+        card,
+        None,
+        fade,
+        reduce_motion,
+        turn_live,
+        gateway_connected,
+    );
     outcome.header_rect = header;
 
     if let Some(body_rect) = body_rect(rect, body_height) {
@@ -529,6 +631,7 @@ fn paint_diff_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -571,6 +674,7 @@ fn paint_diff_card(
         fade,
         reduce_motion,
         turn_live,
+        gateway_connected,
     );
     outcome.header_rect = header;
 
@@ -638,6 +742,7 @@ fn paint_delete_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -675,6 +780,7 @@ fn paint_delete_card(
         fade,
         reduce_motion,
         turn_live,
+        gateway_connected,
     );
     outcome.header_rect = header;
 
@@ -712,6 +818,7 @@ fn paint_bash_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -743,12 +850,28 @@ fn paint_bash_card(
     outcome.rect = rect;
     paint_chrome(ui, rect, fade);
 
-    // Header: `bash` left; right — spin while running, the exit status
-    // once finished (✓ exit 0 / ✕ exit N, §4.2).
+    // Header: the identity glyph, `bash` left; right — spin while
+    // running, the exit status once finished (✓ exit 0 / ✕ exit N, §4.2).
     let header = Rect::from_min_size(rect.min, vec2(width, CARD_HEIGHT));
     {
+        let now = crate::presence::clock_s(ui.ctx());
+        let avatar_rect = Rect::from_min_size(
+            pos2(
+                header.left() + CARD_PAD,
+                header.center().y - AVATAR_INLINE / 2.0,
+            ),
+            vec2(AVATAR_INLINE, AVATAR_INLINE),
+        );
+        card.avatar.set_reduce_motion(reduce_motion);
+        card.avatar
+            .set_state(card_avatar_state(card, turn_live, gateway_connected), now);
+        card.avatar.paint(ui, avatar_rect, fade, turn_live);
+
         let painter = ui.painter();
-        let clip = header.shrink2(vec2(CARD_PAD, 0.0));
+        let clip = Rect::from_min_max(
+            pos2(header.left() + CARD_PAD + AVATAR_SLOT, header.top()),
+            pos2(header.right() - CARD_PAD, header.bottom()),
+        );
         let p = painter.with_clip_rect(clip);
         p.text(
             pos2(clip.left(), header.center().y),
@@ -931,6 +1054,7 @@ fn paint_web_search_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -962,7 +1086,16 @@ fn paint_web_search_card(
     if header_response.clicked() {
         card.expanded = !card.expanded;
     }
-    paint_card_header(ui, header, card, None, fade, reduce_motion, turn_live);
+    paint_card_header(
+        ui,
+        header,
+        card,
+        None,
+        fade,
+        reduce_motion,
+        turn_live,
+        gateway_connected,
+    );
     outcome.header_rect = header;
 
     if let Some(body_rect) = body_rect(rect, body_height) {
@@ -981,6 +1114,7 @@ fn paint_web_fetch_card(
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) -> CardOutcome {
     let mut outcome = CardOutcome::default();
     let width = ui.available_width();
@@ -1024,6 +1158,7 @@ fn paint_web_fetch_card(
         fade,
         reduce_motion,
         turn_live,
+        gateway_connected,
     );
     outcome.header_rect = header;
 
@@ -1055,23 +1190,41 @@ fn paint_chrome(ui: &mut Ui, rect: Rect, fade: f32) {
     );
 }
 
-/// The card header: tool name (`--type-xs --fg-faint`), ` ─ ` separator,
-/// argument summary (`--type-sm --fg-muted`), and the status glyph on the
-/// right (✓ `--ok` / ✕ `--err`, or the spin while the tool runs).
+/// The card header: the agent identity glyph (Phase 6h), tool name
+/// (`--type-xs --fg-faint`), ` ─ ` separator, argument summary
+/// (`--type-sm --fg-muted`), and the status glyph on the right (✓
+/// `--ok` / ✕ `--err`, or the spin while the tool runs).
 /// `summary_override` replaces the argument summary (the diff/delete
 /// cards' path, the fetched page's final URL).
+#[allow(clippy::too_many_arguments)]
 fn paint_card_header(
     ui: &mut Ui,
     header: Rect,
-    card: &ToolCard,
+    card: &mut ToolCard,
     summary_override: Option<&str>,
     fade: f32,
     reduce_motion: bool,
     turn_live: bool,
+    gateway_connected: bool,
 ) {
+    // The identity glyph at the header's left edge (its pose derives
+    // from the card's state; a dead turn freezes it).
+    let now = crate::presence::clock_s(ui.ctx());
+    let avatar_rect = Rect::from_min_size(
+        pos2(
+            header.left() + CARD_PAD,
+            header.center().y - AVATAR_INLINE / 2.0,
+        ),
+        vec2(AVATAR_INLINE, AVATAR_INLINE),
+    );
+    card.avatar.set_reduce_motion(reduce_motion);
+    card.avatar
+        .set_state(card_avatar_state(card, turn_live, gateway_connected), now);
+    card.avatar.paint(ui, avatar_rect, fade, turn_live);
+
     let painter = ui.painter();
     let clip = Rect::from_min_max(
-        pos2(header.left() + CARD_PAD, header.top()),
+        pos2(header.left() + CARD_PAD + AVATAR_SLOT, header.top()),
         pos2(header.right() - CARD_PAD - GLYPH_SLOT, header.bottom()),
     );
     let p = painter.with_clip_rect(clip);
@@ -1549,13 +1702,6 @@ fn cubic_bezier_y(curve: (f32, f32, f32, f32), t: f32) -> f32 {
     3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t
 }
 
-/// The `pulse` dot (the status line's thinking/awaiting glyph).
-fn paint_pulse(painter: &egui::Painter, center: Pos2, elapsed_ms: u64, reduce_motion: bool) {
-    let alpha = pulse_alpha(elapsed_ms, reduce_motion);
-    let scale = pulse_scale(elapsed_ms, reduce_motion);
-    painter.circle_filled(center, 3.0 * scale, with_alpha(color::FG_MUTED, alpha));
-}
-
 /// The `spin` glyph: a 270° arc turning 360° per `--dur-loop`; under
 /// reduced motion, the §7.4 static dot.
 fn paint_spin(painter: &egui::Painter, center: Pos2, elapsed_ms: u64, reduce_motion: bool) {
@@ -2001,7 +2147,8 @@ mod tests {
     }
 
     /// The same, with the turn-liveness knob (a dead turn freezes its
-    /// resultless cards).
+    /// resultless cards). The gateway reads as connected (the sleeping
+    /// avatar's tests drive the flag directly).
     fn card_frame_live(
         ctx: &egui::Context,
         input: egui::RawInput,
@@ -2016,7 +2163,7 @@ mod tests {
         let mut outcome = CardOutcome::default();
         let mut output = ctx.run_ui(input, |ui| {
             ui.set_min_size(vec2(360.0, 600.0));
-            outcome = tool_card(ui, card, reduce_motion, turn_live);
+            outcome = tool_card(ui, card, reduce_motion, turn_live, true);
         });
         output.textures_delta.clear();
         outcome
@@ -2033,6 +2180,7 @@ mod tests {
         if input.screen_rect.is_none() {
             input.screen_rect = Some(test_screen());
         }
+        let mut avatar = AgentAvatar::new(0.0);
         let mut outcome = StatusLineOutcome {
             stop_clicked: false,
             rect: Rect::ZERO,
@@ -2040,7 +2188,14 @@ mod tests {
         };
         let mut output = ctx.run_ui(input, |ui| {
             ui.set_min_size(vec2(360.0, 600.0));
-            outcome = status_line(ui, phase, reduce_motion);
+            outcome = status_line(
+                ui,
+                phase,
+                OrbState::Working,
+                &mut avatar,
+                true,
+                reduce_motion,
+            );
         });
         output.textures_delta.clear();
         outcome
@@ -2704,7 +2859,7 @@ mod tests {
         turn_live: bool,
     ) -> Option<Duration> {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            tool_card(ui, card, false, turn_live);
+            tool_card(ui, card, false, turn_live, true);
         });
         let delay = output
             .viewport_output
@@ -2907,5 +3062,116 @@ mod tests {
         let fresh_outcome = card_frame(&ctx, egui::RawInput::default(), &mut fresh, false);
         let settled_outcome = card_frame(&ctx, egui::RawInput::default(), &mut settled_card, false);
         assert_eq!(fresh_outcome.rect, settled_outcome.rect);
+    }
+
+    // -- Phase 6h presence (avatar + orb) -------------------------------------
+
+    #[test]
+    fn status_running_tool_matches_the_phase_scan() {
+        let mut pending = ToolCard::new(call("edit_file", r#"{"path":"a.rs"}"#));
+        pending.approval = Some((
+            ApprovalId::from_u128(1),
+            ApprovalCard::Diff {
+                path: "a.rs".to_owned(),
+                diff: DIFF.to_owned(),
+            },
+            1,
+        ));
+        let running = ToolCard::new(call("bash", r#"{"command":"cargo test"}"#));
+        let mut done = ToolCard::new(call("read_file", r#"{"path":"b.rs"}"#));
+        done.result = Some(result(&done.call.id.clone(), true, "contents"));
+
+        // A pending card parks the phase on AwaitingApproval: no running tool.
+        assert_eq!(status_running_tool([&pending, &running, &done]), None);
+        // Otherwise the latest resultless card's name.
+        assert_eq!(status_running_tool([&running, &done]), Some("bash"));
+        assert_eq!(status_running_tool([&done]), None);
+    }
+
+    #[test]
+    fn the_card_header_paints_the_avatar_and_shifts_the_name_right() {
+        let mut card = settled(ToolCard::new(call("read_file", r#"{"path":"a.rs"}"#)));
+        card.result = Some(result(&card.call.id.clone(), true, "contents"));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            tool_card(ui, &mut card, false, true, true);
+        });
+        // The avatar's open eyes: two --fg-muted dots (alpha-255 fills are
+        // stored unpremultiplied).
+        let eye_dots = output
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Circle(c) if c.fill == color::FG_MUTED))
+            .count();
+        output.textures_delta.clear();
+        assert_eq!(eye_dots, 2, "the avatar's two eyes paint");
+    }
+
+    #[test]
+    fn a_disconnected_gateway_sleeps_the_card_avatar() {
+        let mut card = settled(ToolCard::new(call("read_file", r#"{"path":"a.rs"}"#)));
+        card.result = Some(result(&card.call.id.clone(), true, "contents"));
+        let ctx = egui::Context::default();
+        // Two frames: the first starts the Default → Sleeping cross-fade,
+        // the second (a second later) is past it.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            tool_card(ui, &mut card, false, false, false);
+        });
+        output.textures_delta.clear();
+        let input = egui::RawInput {
+            time: Some(1.0),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            tool_card(ui, &mut card, false, false, false);
+        });
+        // Sleeping: the eyes are hairlines, and there are no eye dots.
+        let eye_dots = output
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Circle(c) if c.fill == color::FG_MUTED))
+            .count();
+        output.textures_delta.clear();
+        assert_eq!(eye_dots, 0, "no open eyes while asleep");
+        assert_eq!(card.avatar.state(), AvatarState::Sleeping);
+    }
+
+    #[test]
+    fn the_status_line_paints_avatar_orb_text_and_stop() {
+        let ctx = egui::Context::default();
+        let outcome = status_frame(
+            &ctx,
+            egui::RawInput::default(),
+            &StatusPhase::Thinking,
+            false,
+        );
+        assert_eq!(outcome.rect.height(), STATUS_LINE_HEIGHT);
+        // The avatar left of the orb: the line's left edge hosts the
+        // avatar's body (a filled rect), then the orb's dots.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            let mut avatar = AgentAvatar::new(0.0);
+            status_line(
+                ui,
+                &StatusPhase::Thinking,
+                OrbState::Working,
+                &mut avatar,
+                true,
+                false,
+            );
+        });
+        let circles = output
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Circle(_)))
+            .count();
+        output.textures_delta.clear();
+        assert!(
+            circles >= 5,
+            "two avatar eyes + three orb dots at least: {circles}"
+        );
     }
 }

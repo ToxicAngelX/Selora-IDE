@@ -64,6 +64,10 @@ use selora_ai::{
     ToolCall, ToolResult,
 };
 
+use crate::presence::liquid::LiquidPill;
+use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
+use crate::presence::stream_glow::StreamGlow;
+use crate::presence::AgentAvatar;
 use crate::sidebar::icons;
 use crate::theme::{color, font, radius, space, type_scale};
 
@@ -105,15 +109,12 @@ const SEND_GLYPH: &str = "⏎";
 const SEND_BUTTON_SIZE: Vec2 = Vec2::new(28.0, 20.0);
 /// The overflow menu's glyph (UI_SPEC.md §4: "⋯ overflow menu").
 const OVERFLOW_GLYPH: &str = "⋯";
-/// The thinking wave indicator appears only after this long without a
+/// The thinking indicator appears only after this long without a
 /// delta (UI_SPEC.md §4: "longer than 800ms with no chunk").
 const THINKING_AFTER: Duration = Duration::from_millis(800);
 /// The streaming bubble's fade-in on the first delta (the `comet`
 /// glyph's fade half; DESIGN_TOKENS.md §7.2 `--dur-base`).
 const FADE_DURATION: Duration = Duration::from_millis(240);
-/// The `wave` indicator's loop length (DESIGN_TOKENS.md §7.2
-/// `--dur-loop`).
-const WAVE_LOOP_MS: u64 = 1200;
 /// The composer's stable widget id.
 const COMPOSER_ID: &str = "selora_chat_composer";
 
@@ -534,6 +535,18 @@ pub struct ChatPanel {
     /// status line and its Stop consider only this turn's cards (a
     /// previous turn's latched card must never leak into the phase).
     turn_cards_start: usize,
+    /// Phase 6h: the composer's streaming-activity glow (the voice-glow
+    /// port — deltas, not a microphone).
+    stream_glow: StreamGlow,
+    /// Phase 6h: the header pill's gooey melt (animation state only; the
+    /// source of truth stays `agent_mode`).
+    agent_pill: LiquidPill,
+    /// Phase 6h: the status line's agent identity glyph.
+    status_avatar: AgentAvatar,
+    /// Phase 6h: the gateway's reachability (the avatars sleep while
+    /// disconnected). Threaded by the shell's `AppMessage::SeloraStatus`
+    /// reduction.
+    gateway_connected: bool,
 }
 
 impl Default for ChatPanel {
@@ -559,6 +572,10 @@ impl ChatPanel {
             agent_in_flight: false,
             turn_approvals: 0,
             turn_cards_start: 0,
+            stream_glow: StreamGlow::new(),
+            agent_pill: LiquidPill::default(),
+            status_avatar: AgentAvatar::new(0.0),
+            gateway_connected: true,
         }
     }
 
@@ -601,16 +618,32 @@ impl ChatPanel {
         self.agent_mode = on;
     }
 
-    /// Thread `ui.reduce_motion` (DESIGN_TOKENS.md §7.4) into the cards:
-    /// pulse/spin become static dots. Called by the shell on settings
-    /// load and on dialog adopt.
+    /// Thread `ui.reduce_motion` (DESIGN_TOKENS.md §7.4) into the cards
+    /// and the presence widgets: pulse/spin/orbit become static dots.
+    /// Called by the shell on settings load and on dialog adopt.
     pub fn set_reduce_motion(&mut self, on: bool) {
         self.reduce_motion = on;
+        self.stream_glow.set_reduce_motion(on);
+        self.agent_pill.set_reduce_motion(on);
+        self.status_avatar.set_reduce_motion(on);
     }
 
     /// Whether reduced motion is on (the shell's threading assertions).
     pub fn is_reduce_motion(&self) -> bool {
         self.reduce_motion
+    }
+
+    /// Thread the gateway's reachability into the presence widgets
+    /// (Phase 6h): while disconnected, the status-line and card avatars
+    /// sleep. The shell's `AppMessage::SeloraStatus` reduction calls this.
+    pub fn set_gateway_connected(&mut self, connected: bool) {
+        self.gateway_connected = connected;
+    }
+
+    /// Whether the gateway is reachable (drives the avatars' sleeping
+    /// state; the shell's wiring assertions).
+    pub fn is_gateway_connected(&self) -> bool {
+        self.gateway_connected
     }
 
     /// The in-flight turn's pending approval id, when a card is parked
@@ -768,6 +801,8 @@ impl ChatPanel {
         if self.in_flight != Some(id) {
             return;
         }
+        // Phase 6h: the composer's glow rises with the delta rate.
+        self.stream_glow.note_delta();
         let now = Instant::now();
         let opens_bubble = !matches!(
             self.entries.last(),
@@ -799,6 +834,8 @@ impl ChatPanel {
         if self.in_flight != Some(id) {
             return;
         }
+        // Phase 6h: the composer's one-shot --ok spark (turn complete).
+        self.stream_glow.note_turn_done();
         self.in_flight = None;
         if let Some(TimelineEntry::Bubble(message)) = self.entries.last_mut() {
             message.streaming = false;
@@ -900,6 +937,8 @@ impl ChatPanel {
         if self.in_flight != Some(id) {
             return;
         }
+        // Phase 6h: the composer's one-shot --ok spark (turn complete).
+        self.stream_glow.note_turn_done();
         self.in_flight = None;
         self.agent_in_flight = false;
         for entry in &mut self.entries {
@@ -1086,64 +1125,22 @@ impl ChatPanel {
             self.picker_open = false;
         }
 
-        // -- agent-mode pill (UI_SPEC.md §4.2:241), left of the overflow --
-        // A 24px chip: `--type-xs --fg-muted`, `--radius-pill`, 1px
-        // `--ink-hi` border; on = an `--ok` dot left of the label.
-        let pill_label = "agent";
-        let pill_galley = painter.layout_no_wrap(
-            pill_label.to_owned(),
-            egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-            color::FG_MUTED,
+        // -- agent-mode pill (UI_SPEC.md §4.2), left of the overflow ------
+        // Phase 6h: the LiquidPill port — the `--ok` dot slides into its
+        // slot with a goo trail while the background melts between
+        // `--ink-low` and `--ink-mid`. The pill's width is constant (the
+        // dot slot is always reserved — the gooey track).
+        let now = ui.ctx().input(|i| i.time);
+        self.agent_pill.set_on(self.agent_mode, now);
+        let pill = self.agent_pill.show(
+            ui,
+            pos2(overflow_rect.left() - space::S1, rect.top() + 8.0),
+            "agent",
         );
-        let dot_slot = if self.agent_mode {
-            6.0 + space::S1
-        } else {
-            0.0
-        };
-        let pill_width = dot_slot + pill_galley.size().x + 2.0 * space::S2;
-        let pill_rect = Rect::from_min_size(
-            pos2(
-                overflow_rect.left() - space::S1 - pill_width,
-                rect.top() + 8.0,
-            ),
-            vec2(pill_width, 24.0),
-        );
-        let pill_response = ui.interact(
-            pill_rect,
-            egui::Id::new("selora_chat_agent_pill"),
-            Sense::click(),
-        );
-        if pill_response.hovered() {
-            painter.rect_filled(pill_rect, radius::PILL, color::INK_FAINT);
-        }
-        painter.rect(
-            pill_rect,
-            radius::PILL,
-            egui::Color32::TRANSPARENT,
-            egui::Stroke::new(1.0, color::INK_HI),
-            egui::StrokeKind::Inside,
-        );
-        let mut pill_text_x = pill_rect.left() + space::S2;
-        if self.agent_mode {
-            painter.circle_filled(
-                pos2(pill_text_x + 3.0, pill_rect.center().y),
-                3.0,
-                color::OK,
-            );
-            pill_text_x += dot_slot;
-        }
-        painter.galley(
-            pos2(
-                pill_text_x,
-                pill_rect.center().y - pill_galley.size().y / 2.0,
-            ),
-            pill_galley,
-            color::FG_MUTED,
-        );
-        if pill_response.clicked() {
+        if pill.clicked {
             self.agent_mode = !self.agent_mode;
         }
-        frame.agent_pill_rect = pill_rect;
+        frame.agent_pill_rect = pill.rect;
 
         self.paint_model_picker(&model_response, frame);
         self.paint_overflow_menu(ui, &overflow_response, frame);
@@ -1375,7 +1372,14 @@ impl ChatPanel {
                 for index in 0..self.entries.len() {
                     match &mut self.entries[index] {
                         TimelineEntry::Bubble(message) => {
-                            paint_message(scroll, message, index, content_width, frame);
+                            paint_message(
+                                scroll,
+                                message,
+                                index,
+                                content_width,
+                                frame,
+                                reduce_motion,
+                            );
                         }
                         TimelineEntry::Card(card) => {
                             // A card is live only if its OWN turn is: the
@@ -1383,8 +1387,13 @@ impl ChatPanel {
                             // start) while it runs. A dead turn's
                             // resultless card freezes (no spin, no Stop).
                             let turn_live = agent_in_flight && index >= self.turn_cards_start;
-                            let outcome =
-                                agent_cards::tool_card(scroll, card, reduce_motion, turn_live);
+                            let outcome = agent_cards::tool_card(
+                                scroll,
+                                card,
+                                reduce_motion,
+                                turn_live,
+                                self.gateway_connected,
+                            );
                             if let (Some(decision), Some(id)) = (outcome.decision, in_flight) {
                                 let approval_id =
                                     card.approval_id().unwrap_or_else(ApprovalId::nil);
@@ -1420,7 +1429,26 @@ impl ChatPanel {
                                 _ => None,
                             }),
                     );
-                    let status = agent_cards::status_line(scroll, &phase, reduce_motion);
+                    // Phase 6h: the status line's indicator is the
+                    // ThinkingOrb (the loop state mapped per the module
+                    // table) next to the AgentAvatar.
+                    let tool = agent_cards::status_running_tool(
+                        self.entries[self.turn_cards_start.min(self.entries.len())..]
+                            .iter()
+                            .filter_map(|entry| match entry {
+                                TimelineEntry::Card(card) => Some(card),
+                                _ => None,
+                            }),
+                    );
+                    let orb_state = orb_state_for(&phase, tool, self.streaming_active());
+                    let status = agent_cards::status_line(
+                        scroll,
+                        &phase,
+                        orb_state,
+                        &mut self.status_avatar,
+                        self.gateway_connected,
+                        reduce_motion,
+                    );
                     frame.status_line_rect = Some(status.rect);
                     frame.stop_button_rect = Some(status.stop_rect);
                     if status.stop_clicked {
@@ -1443,9 +1471,13 @@ impl ChatPanel {
     /// The 60px composer: single-line input + `⏎` send button, then the
     /// keyboard hint. Enter sends (the single-line edit surrenders focus
     /// on Enter; `lost_focus` + the key still down is the documented
-    /// submit signal); Shift+Enter appends a newline to the buffer.
+    /// submit signal); Shift+Enter appends a newline to the buffer. The
+    /// Phase 6h StreamGlow rides the bar's bottom edge.
     fn paint_composer(&mut self, ui: &mut Ui, frame: &mut FrameArtifacts) {
-        let composer_top = ui.max_rect().top();
+        // The bar's rect (captured before any allocation shrinks it) —
+        // the StreamGlow's edge.
+        let bar_rect = ui.max_rect();
+        let composer_top = bar_rect.top();
         ui.painter().hline(
             ui.max_rect().x_range(),
             composer_top,
@@ -1552,6 +1584,31 @@ impl ChatPanel {
             egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
             color::FG_FAINT,
         );
+
+        // Phase 6h: the StreamGlow along the bar's bottom edge — rises
+        // with the delta rate; a running tool gathers it into the beam.
+        let processing = self.agent_in_flight && self.turn_tool_running();
+        self.stream_glow.show(ui, bar_rect, processing);
+    }
+
+    /// Whether this turn has a tool executing right now (a resultless,
+    /// non-parked card since the turn's start) — the StreamGlow's
+    /// `processing`.
+    fn turn_tool_running(&self) -> bool {
+        self.entries[self.turn_cards_start.min(self.entries.len())..]
+            .iter()
+            .any(|entry| matches!(entry, TimelineEntry::Card(card) if card.result.is_none() && !card.is_pending()))
+    }
+
+    /// Whether a streaming bubble received a delta within the
+    /// no-delta window (the status line's orb shows `connecting` while
+    /// deltas stream, `working` while the model thinks between them).
+    fn streaming_active(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, TimelineEntry::Bubble(message)
+                if message.streaming
+                    && message.last_delta.is_some_and(|delta| delta.elapsed() < THINKING_AFTER))
+        })
     }
 
     /// Submit the composer: assign the id, echo the user bubble, clear
@@ -1613,6 +1670,33 @@ fn role_label(role: Role) -> &'static str {
     }
 }
 
+/// The status line's orb state for the loop phase (Phase 6h — the
+/// thinking-orbs port's mapping; ARCHITECTURE.md §17.3 states):
+/// `Thinking` → `working` (or `connecting` while deltas stream);
+/// read-type tools → `searching`; bash/write tools → `solving`;
+/// parked on an approval → `listening`.
+fn orb_state_for(
+    phase: &agent_cards::StatusPhase,
+    running_tool: Option<&str>,
+    streaming_active: bool,
+) -> OrbState {
+    use agent_cards::StatusPhase;
+    match phase {
+        StatusPhase::AwaitingApproval => OrbState::Listening,
+        StatusPhase::Thinking => {
+            if streaming_active {
+                OrbState::Connecting
+            } else {
+                OrbState::Working
+            }
+        }
+        StatusPhase::Running(_) => match running_tool {
+            Some("bash" | "write_file" | "edit_file" | "delete_file") => OrbState::Solving,
+            _ => OrbState::Searching,
+        },
+    }
+}
+
 /// `""` for 1, `"s"` otherwise.
 fn plural(count: usize) -> &'static str {
     if count == 1 {
@@ -1654,6 +1738,7 @@ fn paint_message(
     message_index: usize,
     content_width: f32,
     frame: &mut FrameArtifacts,
+    reduce_motion: bool,
 ) {
     let is_user = message.role == Role::User;
     let max_bubble_width = (content_width - 2.0 * BUBBLE_INSET).max(60.0);
@@ -1748,15 +1833,17 @@ fn paint_message(
         }
     }
 
-    // The wave indicator (three pulsing dots): after 800ms without a
-    // delta, or while waiting for the first one. An empty bubble
-    // reserves the wave's line so its height is stable as it streams.
+    // The thinking indicator: after 800ms without a delta, or while
+    // waiting for the first one (UI_SPEC.md §4's trigger). Phase 6h: the
+    // ThinkingOrb (20px, `working`) replaces the ⠿⠿⠿ wave. An empty
+    // bubble reserves the orb's band so its height is stable as it
+    // streams.
     let thinking = message
         .last_delta
         .is_some_and(|delta| delta.elapsed() > THINKING_AFTER);
-    let show_wave = message.streaming && (thinking || message.content.is_empty());
-    if show_wave {
-        content_height += 12.0;
+    let show_orb = message.streaming && (thinking || message.content.is_empty());
+    if show_orb {
+        content_height += ORB_INLINE;
     }
 
     let bubble_height = content_height + 2.0 * BUBBLE_PADDING;
@@ -1850,15 +1937,18 @@ fn paint_message(
         cursor += BUBBLE_GAP;
     }
 
-    if show_wave {
-        let anchor = message.last_delta.or(message.stream_started);
-        if let Some(anchor) = anchor {
-            paint_wave(
-                ui.painter(),
-                pos2(bubble_rect.left() + BUBBLE_PADDING, cursor),
-                anchor.elapsed().as_millis() as u64,
-            );
-        }
+    if show_orb {
+        // The orb drives its clock from the frame time and requests its
+        // own repaints while it animates (the ghost_text.rs pattern) —
+        // including through a quiet gap between deltas, which the wave
+        // never survived.
+        let orb_rect = Rect::from_min_size(
+            pos2(bubble_rect.left() + BUBBLE_PADDING, cursor),
+            vec2(ORB_INLINE, ORB_INLINE),
+        );
+        ThinkingOrb::new(OrbState::Working, ORB_INLINE)
+            .reduce_motion(reduce_motion)
+            .paint(ui, orb_rect);
     }
 
     // A failed stream renders its note under the bubble (the only red
@@ -1882,31 +1972,6 @@ fn paint_message(
     }
 
     frame.bubbles_painted += 1;
-}
-
-/// The three-dot `wave` indicator: each dot bobs on its own 200ms phase
-/// of the 1200ms `--dur-loop` (DESIGN_TOKENS.md §7.3).
-fn paint_wave(painter: &egui::Painter, origin: egui::Pos2, elapsed_ms: u64) {
-    for dot in 0..3u64 {
-        let phase = ((elapsed_ms + dot * 200) % WAVE_LOOP_MS) as f32 / WAVE_LOOP_MS as f32;
-        let (dy, opacity) = wave_keyframe(phase);
-        let center = pos2(origin.x + 3.0 + dot as f32 * 8.0, origin.y + 4.0 + dy);
-        painter.circle_filled(center, 1.75, with_alpha(color::FG_DEFAULT, opacity));
-    }
-}
-
-/// One dot's offset/opacity over the wave loop (rise 0–30%, fall
-/// 30–60%, rest 60–100%).
-fn wave_keyframe(phase: f32) -> (f32, f32) {
-    if phase < 0.3 {
-        let t = phase / 0.3;
-        (-3.0 * t, 0.5 + 0.5 * t)
-    } else if phase < 0.6 {
-        let t = (phase - 0.3) / 0.3;
-        (-3.0 * (1.0 - t), 1.0 - 0.5 * t)
-    } else {
-        (0.0, 0.5)
-    }
 }
 
 /// Prose font: `--type-md` in `--font-sans` (DESIGN_TOKENS.md §2).
@@ -2738,13 +2803,166 @@ mod tests {
         assert!(b.as_u64() > a.as_u64());
     }
 
+    // -- Phase 6h presence ------------------------------------------------------------
+
+    /// One panel frame with its `FullOutput` kept (the presence tests
+    /// inspect painted shapes; the shared `frame` helper drops them).
+    fn paint_panel(ctx: &egui::Context, panel: &mut ChatPanel) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw_input_with(vec![]), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            panel.show(ui);
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn circles(output: &egui::FullOutput) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter(|s| matches!(s.shape, egui::Shape::Circle(_)))
+            .count()
+    }
+
     #[test]
-    fn wave_keyframe_stays_in_bounds() {
-        for phase in [0.0, 0.15, 0.3, 0.45, 0.6, 0.9, 1.0] {
-            let (dy, opacity) = wave_keyframe(phase);
-            assert!((-3.0..=0.0).contains(&dy));
-            assert!((0.5..=1.0).contains(&opacity));
+    fn the_streaming_bubble_paints_the_thinking_orb() {
+        // The stream opened but no text landed yet: the ThinkingOrb
+        // (three `working` dots) stands where the ⠿⠿⠿ wave stood.
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("hi");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "");
+        let output = paint_panel(&egui::Context::default(), &mut panel);
+        assert!(
+            circles(&output) >= 3,
+            "the working orb's three dots: {}",
+            circles(&output)
+        );
+    }
+
+    #[test]
+    fn reduce_motion_freezes_the_streaming_orb_to_a_dot() {
+        let mut panel = ChatPanel::new();
+        panel.set_reduce_motion(true);
+        panel.set_composer_text("hi");
+        let id = send(&mut panel).expect("send");
+        panel.push_assistant_delta(id, "");
+        let output = paint_panel(&egui::Context::default(), &mut panel);
+        assert_eq!(circles(&output), 1, "the §7.4 static dot");
+    }
+
+    #[test]
+    fn the_status_line_paints_the_avatar_and_the_orb() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_composer_text("work");
+        send_agent(&mut panel).expect("agent send");
+        let output = paint_panel(&egui::Context::default(), &mut panel);
+        // The thinking orb (3 dots) plus the working avatar's two eyes.
+        assert!(
+            circles(&output) >= 5,
+            "orb dots + avatar eyes: {}",
+            circles(&output)
+        );
+    }
+
+    #[test]
+    fn a_disconnected_gateway_sleeps_the_status_line_avatar() {
+        let mut panel = ChatPanel::new();
+        panel.set_agent_mode(true);
+        panel.set_gateway_connected(false);
+        panel.set_composer_text("work");
+        send_agent(&mut panel).expect("agent send");
+
+        let ctx = egui::Context::default();
+        // Frame 1 starts the Default → Sleeping cross-fade; frame 2 (a
+        // second later) is past it.
+        let mut line_rect = Rect::ZERO;
+        let mut warm = ctx.run_ui(raw_input_with(vec![]), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            line_rect = panel.show(ui).status_line_rect.expect("status line");
+        });
+        warm.textures_delta.clear();
+        let mut input = raw_input_with(vec![]);
+        input.time = Some(1.0);
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            line_rect = panel.show(ui).status_line_rect.expect("status line");
+        });
+        // The sleeping avatar's closed eyes: two horizontal hairlines at
+        // the status line's center height, inside the line's left slot.
+        let lid_lines = output
+            .shapes
+            .iter()
+            .filter(|s| match &s.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    let [a, b] = points;
+                    (a.y - b.y).abs() < 0.01
+                        && (a.y - line_rect.center().y).abs() < 6.0
+                        && a.x >= line_rect.left()
+                        && b.x <= line_rect.left() + 40.0
+                }
+                _ => false,
+            })
+            .count();
+        output.textures_delta.clear();
+        assert_eq!(lid_lines, 2, "two closed-eye hairlines in the status line");
+    }
+
+    #[test]
+    fn the_orb_state_maps_the_loop_phase() {
+        use agent_cards::StatusPhase;
+        // Thinking without fresh deltas works; with them, connects.
+        assert_eq!(
+            orb_state_for(&StatusPhase::Thinking, None, false),
+            OrbState::Working
+        );
+        assert_eq!(
+            orb_state_for(&StatusPhase::Thinking, None, true),
+            OrbState::Connecting
+        );
+        // Read-type searches; bash/write solves; approvals listen.
+        let running = StatusPhase::Running("reading src/main.rs".to_owned());
+        assert_eq!(
+            orb_state_for(&running, Some("read_file"), false),
+            OrbState::Searching
+        );
+        assert_eq!(
+            orb_state_for(&running, Some("bash"), false),
+            OrbState::Solving
+        );
+        assert_eq!(
+            orb_state_for(&running, Some("write_file"), false),
+            OrbState::Solving
+        );
+        assert_eq!(
+            orb_state_for(&StatusPhase::AwaitingApproval, None, false),
+            OrbState::Listening
+        );
+    }
+
+    #[test]
+    fn the_composer_glow_rises_on_deltas_and_sparks_on_completion() {
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("hi");
+        let id = send(&mut panel).expect("send");
+        for _ in 0..8 {
+            panel.push_assistant_delta(id, "word ");
         }
+        // The attack lands at the next frame's tick (deltas carry no
+        // frame clock).
+        let output = paint_panel(&egui::Context::default(), &mut panel);
+        assert!(panel.stream_glow.level() > 0.0, "deltas raise the glow");
+        // The glow band paints along the composer's bottom edge.
+        let band = output.shapes.iter().any(|s| match &s.shape {
+            egui::Shape::Rect(r) => r.fill != egui::Color32::TRANSPARENT && r.rect.height() <= 6.0,
+            _ => false,
+        });
+        assert!(band, "the glow band paints");
+        panel.complete_stream(id);
+        // The spark plays on the next frame (and is spent within
+        // --dur-long — the widget's own tests cover the envelope).
+        assert!(panel.stream_glow.spark_pending());
     }
 
     // -- Agent Mode (Phase 5d) ------------------------------------------------
