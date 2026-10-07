@@ -446,6 +446,9 @@ pub struct LspViewState {
     pub hover: Option<(PathBuf, Vec<String>)>,
     /// The open completion popup, for the path it was requested on.
     pub completion: Option<(PathBuf, selora_editor::lsp_overlay::CompletionPopup)>,
+    /// The latest diagnostics per path (Phase R6's problems panel — the
+    /// same reduction the editors' squiggles come from).
+    pub diagnostics: BTreeMap<PathBuf, Vec<selora_editor::lsp_overlay::LspDiagnostic>>,
 }
 
 impl Default for AppState {
@@ -482,6 +485,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// The total diagnostics count (the activity bar's problems badge).
+    pub fn problems_count(&self) -> usize {
+        self.lsp.diagnostics.values().map(Vec::len).sum()
+    }
+
     /// Apply one worker message — the message-drain reduction (ARCHITECTURE
     /// §2 stage 1). Called at the top of every frame for every drained
     /// message, on the main thread.
@@ -797,6 +805,13 @@ impl AppState {
                     if tab_path == &path {
                         editor.set_diagnostics(mapped.clone());
                     }
+                }
+                // Phase R6: the problems panel's store (the same mapped
+                // shape the squiggles read).
+                if mapped.is_empty() {
+                    self.lsp.diagnostics.remove(&path);
+                } else {
+                    self.lsp.diagnostics.insert(path.clone(), mapped);
                 }
             }
             LspEvent::Hover {

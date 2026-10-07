@@ -852,7 +852,10 @@ impl SeloraApp {
     fn toggle_bottom_panel(&mut self) {
         self.show_bottom_panel = !self.show_bottom_panel;
         if self.show_bottom_panel
-            && !matches!(self.activity_bar.selected, Activity::Git | Activity::Search)
+            && !matches!(
+                self.activity_bar.selected,
+                Activity::Git | Activity::Search | Activity::Problems
+            )
         {
             self.activity_bar.selected = Activity::Search;
             if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
@@ -886,7 +889,8 @@ impl SeloraApp {
             .show_separator_line(true)
             .frame(egui::Frame::default().fill(theme::color::INK_CANVAS))
             .show(ui, |ui| {
-                if let Some(activity) = self.activity_bar.show(ui) {
+                let problems = self.state.problems_count();
+                if let Some(activity) = self.activity_bar.show_with_problems(ui, problems) {
                     self.route_activity(activity);
                 }
             });
@@ -925,6 +929,11 @@ impl SeloraApp {
                     self.state.search.set_root(root);
                 }
                 self.state.search.focus_query();
+            }
+            Activity::Problems => {
+                // The diagnostics are already in state — the panel just
+                // shows (Phase R6).
+                self.show_bottom_panel = true;
             }
             Activity::Git => {
                 // Selecting the git activity shows the panel (region ④) and
@@ -990,7 +999,12 @@ impl SeloraApp {
     /// 200px default, capped at half the workbench.
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
         let selected = self.activity_bar.selected;
-        if !self.show_bottom_panel || !matches!(selected, Activity::Git | Activity::Search) {
+        if !self.show_bottom_panel
+            || !matches!(
+                selected,
+                Activity::Git | Activity::Search | Activity::Problems
+            )
+        {
             return;
         }
         let max_height = ui.max_rect().height() * PANEL_MAX_HEIGHT_FRAC;
@@ -1015,6 +1029,17 @@ impl SeloraApp {
                     let outcome = self.state.search.show(ui);
                     for event in outcome.events {
                         self.route_search_event(event);
+                    }
+                }
+                Activity::Problems => {
+                    let diagnostics = self.state.lsp.diagnostics.clone();
+                    for event in selora_ui::panel::problems::show(ui, &diagnostics) {
+                        match event {
+                            selora_ui::panel::problems::ProblemsEvent::OpenAtLine {
+                                path,
+                                line,
+                            } => self.open_at_line(path, line),
+                        }
                     }
                 }
                 _ => {}
@@ -1944,8 +1969,16 @@ impl SeloraApp {
         self.handle_keybinds(ui.ctx());
 
         // Stages 4–6: layout, chrome, editor. The title strip is the
-        // `title_bar` widget (Phase R0).
-        title_bar::show(ui);
+        // `title_bar` widget (Phase R0); its menus (Phase R6) route to
+        // the palette commands.
+        for event in title_bar::show(ui).event.into_iter() {
+            match event {
+                title_bar::TitleBarEvent::Command(id) => self.run_command(id),
+                title_bar::TitleBarEvent::Exit => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
         self.status_bar(ui);
         self.bottom_panel(ui);
         self.left_region(ui);

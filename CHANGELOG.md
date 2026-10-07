@@ -90,6 +90,14 @@ All notable changes to Selora IDE are documented here. The format follows
   section and the no-op Minimap checkbox were removed — a control that
   does nothing is a lie (the schema fields stay for the future features).
 
+- Title-bar menus (Phase R6, UI_SPEC §1.1 wired at last): File / Edit /
+  View / Help dropdowns routing to the palette commands, plus File → Exit
+  (the viewport close; the graceful-close hook persists).
+- The problems panel (Phase R6): region ④'s third view — the latest LSP
+  diagnostics grouped by file with severity glyphs (`✕` err / `!` warn /
+  `i` info / `·` hint), a row click opening the buffer at the diagnostic's
+  line, and a problems count badge on the activity bar's warning icon.
+
 ### Changed
 
 - Architecture seams ahead of the UI revamp (Phase R0): the title strip, the

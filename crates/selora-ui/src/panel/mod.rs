@@ -6,4 +6,5 @@
 #![forbid(unsafe_code)]
 
 pub mod git;
+pub mod problems;
 pub mod search;

@@ -145,6 +145,20 @@ pub fn paint_git_branch(painter: &Painter, slot: Rect, color: Color32) {
     );
 }
 
+/// A warning triangle (the problems activity's glyph): an equilateral
+/// outline with a center dot — the 16×16 monochrome stroke discipline.
+pub fn paint_warning(painter: &Painter, slot: Rect, color: Color32) {
+    let r = square(slot);
+    let cx = r.center().x;
+    let top = Pos2::new(cx, r.top() + 2.0);
+    let bottom_left = Pos2::new(r.left() + 2.0, r.bottom() - 2.0);
+    let bottom_right = Pos2::new(r.right() - 2.0, r.bottom() - 2.0);
+    painter.line_segment([top, bottom_left], Stroke::new(1.5, color));
+    painter.line_segment([bottom_left, bottom_right], Stroke::new(1.5, color));
+    painter.line_segment([bottom_right, top], Stroke::new(1.5, color));
+    painter.circle_filled(Pos2::new(cx, r.bottom() - 6.0), 1.25, color);
+}
+
 /// `chat` — a speech bubble.
 pub fn paint_chat(painter: &Painter, slot: Rect, color: Color32) {
     let r = square(slot);

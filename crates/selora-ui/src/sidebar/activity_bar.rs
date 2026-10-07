@@ -9,7 +9,7 @@
 //! its content and reports activity switches. The icons are painted in
 //! code per DESIGN_TOKENS.md §8 (`crate::sidebar::icons`).
 
-use egui::{vec2, Align, Layout, Sense, Ui, Vec2};
+use egui::{vec2, Align, Layout, Pos2, Rect, Sense, Ui, Vec2};
 
 use crate::sidebar::icons;
 use crate::theme::{color, radius, space};
@@ -33,6 +33,8 @@ pub enum Activity {
     Files,
     /// Search in files.
     Search,
+    /// The problems panel (Phase R6) — LSP diagnostics.
+    Problems,
     /// Git panel.
     Git,
     /// Chat sidebar.
@@ -40,9 +42,10 @@ pub enum Activity {
 }
 
 impl Activity {
-    const ALL: [Activity; 4] = [
+    const ALL: [Activity; 5] = [
         Activity::Files,
         Activity::Search,
+        Activity::Problems,
         Activity::Git,
         Activity::Chat,
     ];
@@ -52,6 +55,7 @@ impl Activity {
         match self {
             Activity::Files => icons::paint_sheet(painter, slot, color),
             Activity::Search => icons::paint_search(painter, slot, color),
+            Activity::Problems => icons::paint_warning(painter, slot, color),
             Activity::Git => icons::paint_git_branch(painter, slot, color),
             Activity::Chat => icons::paint_chat(painter, slot, color),
         }
@@ -60,6 +64,9 @@ impl Activity {
 
 /// Stateful activity bar: remembers the selected activity.
 pub struct ActivityBar {
+    /// The problems count for the badge (Phase R6; set per frame by the
+    /// shell via `show_with_problems`).
+    problems_badge: usize,
     /// The currently-selected activity.
     pub selected: Activity,
 }
@@ -74,11 +81,22 @@ impl ActivityBar {
     /// A bar with `selected` active (the default is [`Activity::Files`],
     /// per UI_SPEC.md §2.1).
     pub fn new(selected: Activity) -> Self {
-        Self { selected }
+        Self {
+            selected,
+            problems_badge: 0,
+        }
     }
 
     /// Paint the strip into `ui` (the shell hands us a 48px-wide,
     /// full-height Ui). Returns `Some(activity)` on the frame the user
+    /// Paint the bar with a problems badge (Phase R6): the count rides
+    /// the problems icon's bottom-right (the `--info` tone, mono XS) —
+    /// VS Code's affordance, in ink. Switches selection like [`show`].
+    pub fn show_with_problems(&mut self, ui: &mut Ui, problems: usize) -> Option<Activity> {
+        self.problems_badge = problems;
+        self.show(ui)
+    }
+
     /// switches activity; `None` otherwise.
     pub fn show(&mut self, ui: &mut Ui) -> Option<Activity> {
         let strip_height = ui.available_height();
@@ -114,6 +132,33 @@ impl ActivityBar {
                 };
                 let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat(16.0));
                 activity.paint_icon(ui.painter(), icon, icon_color);
+
+                // The problems badge (Phase R6): the count on the icon's
+                // bottom-right corner.
+                if matches!(activity, Activity::Problems) && self.problems_badge > 0 {
+                    let badge_text = if self.problems_badge > 99 {
+                        "99+".to_owned()
+                    } else {
+                        self.problems_badge.to_string()
+                    };
+                    let badge_font = egui::FontId::new(9.0, crate::theme::font::FAMILY_MONO);
+                    let badge_galley = ui.painter().layout_no_wrap(
+                        badge_text,
+                        badge_font,
+                        crate::theme::color::FG_DEFAULT,
+                    );
+                    let badge_rect = Rect::from_min_max(
+                        Pos2::new(rect.right() - badge_galley.size().x, rect.bottom() - 11.0),
+                        Pos2::new(rect.right(), rect.bottom()),
+                    );
+                    ui.painter()
+                        .rect_filled(badge_rect, radius::R1, crate::theme::color::INK_MID);
+                    ui.painter().galley(
+                        Pos2::new(badge_rect.left(), badge_rect.center().y - 4.5),
+                        badge_galley,
+                        crate::theme::color::FG_DEFAULT,
+                    );
+                }
 
                 if response.clicked() && !is_selected {
                     self.selected = activity;
