@@ -24,7 +24,7 @@ of [egui](https://github.com/emilk/egui) — pure Rust, no webview.
 |---|---|
 | ![First-run splash](assets/screenshots/first-run-splash.png) | ![Chat streaming](assets/screenshots/chat-streaming.png) |
 | ![LSP hover](assets/screenshots/lsp-hover.png) | ![Git panel](assets/screenshots/git-panel.png) |
-| ![Settings](assets/screenshots/settings-dialog.png) | |
+| ![Settings](assets/screenshots/settings-dialog.png) | ![About](assets/screenshots/about-dialog.png) |
 
 </details>
 
