@@ -69,6 +69,13 @@ run's "Phase 5d completion report" artifact for the long form).
   rotating refresh tokens, revoke, /v1/usage). Client-side is wiremock-buildable
   anytime; real-account acceptance is gated on the gateway shipping those
   endpoints. Key-paste stays supported permanently.
+- **Phase 8 — Workflows (ZCode-style dynamic multi-agent orchestration) is
+  planned** (2026-10-07, owner request): ROADMAP.md Phase 8 (decision table —
+  boa JS sandbox over a fixed facade, subagents = §17 loop turns, journaled
+  resume, cost caps; 8a/8b/8c/8d subagent split) + ARCHITECTURE.md §18 (the
+  engine contract: the "no eval" exception narrowed structurally, the facade,
+  subagent/gate/journal semantics, process-model wiring). Largest phase since
+  5; 8a/8b are engine-side and wiremock-testable with no UI.
 
 ## Owner decisions (2026-10-06)
 

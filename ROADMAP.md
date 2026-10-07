@@ -571,6 +571,66 @@ ACCEPTANCE:
 
 ---
 
+## Phase 8 — Workflows (dynamic multi-agent orchestration)
+
+**Goal:** The ZCode-style dynamic workflow, inside Selora IDE: the chat agent (or the user, pasting one in) authors a small script that orchestrates *subagents* — parallel fan-outs, per-item pipelines, loops with round caps, deterministic command gates — and the IDE runs it with a live phase graph, journaled crash recovery, per-run cost accounting, and approval cards exactly like Agent Mode's.
+
+**Why its own phase:** it is the largest trust and complexity surface since Agent Mode — an embedded scripting engine (a controlled, deliberate exception to §17.2's "no eval" rule), a subagent scheduler over the Phase 5 loop, a run journal, and a new panel. It is also the feature that closes the biggest parity gap with ZCode/Cursor-class tools.
+
+**Reference implementation studied:** ZCode's dynamic-workflows (skill + facade + patterns catalogue). The anatomy that matters, mapped to Selora seams:
+
+| ZCode piece | Selora counterpart |
+|---|---|
+| TS script against a fixed facade (`agent`/`phase`/`world`/`files`/`git`/`report`/`artifact`) | JS script (see tradeoffs) against the same facade shape, §18 |
+| `agent(name, persona).ask<T>(instructions)` — one context per named agent, FIFO on shared agents | a conversation + a `spawn_agent_turn` per ask, §18.2 |
+| `world.run` gates — "model generates, code gates" | the §17.5 bash spawn (env-cleared, caps, timeouts) under a user-confirmed command set |
+| `files.*` / `git.*` journaled reads | read-only wrappers over `selora-fs` / `selora-git` with the same caps |
+| `phase()` markers → the user-facing run graph | journal entries → the Workflows panel's phase graph |
+| run journal → resume; name-keyed cache → amend | `.selora/workflow-runs/{run_id}/journal.jsonl` → resume (v1); amend/cache (v1.x) |
+| user confirms the script + command set before anything runs | a workflow confirmation card in the chat (a new §4.2 card type) |
+
+**Decisions and tradeoffs:**
+
+| Decision | Choice | Rejected alternative, and why |
+|---|---|---|
+| Script language | **JavaScript subset on an embedded engine, against a fixed facade** — types are declared as JSON-Schema-ish objects and validated at the `ask` boundary | Full TS + typechecker: needs a compiler service we don't ship; v2 can layer it. Declarative YAML: safe but loses loops/branching/composition — the entire point of *dynamic* workflows. |
+| Engine | **`boa` (pure Rust)** — scripts are orchestration glue; engine speed is irrelevant; no C toolchain surface, auditable under `cargo deny` | `rquickjs`/QuickJS (C): faster, but a native dep for zero real benefit here; the documented upgrade path if we ever host heavier script logic. |
+| The "no eval" invariant (§17.2) | **A controlled exception, narrowed to the bone:** the engine exposes *exactly* the §18 facade and no ambient APIs (no fs/net/process/math-random-time); the script text + its command set are user-confirmed before the run; subagent writes still card | Allowing the engine ambient IO: one script becomes arbitrary code execution. Banning scripts outright: the feature *is* scripted orchestration. |
+| Subagent approvals | Writes/bash inside a subagent **still park on approval cards** (the Workflows panel shows them; §17.4 semantics unchanged) | Script-level blanket pre-approval: one confirmed script would then cover every write N subagents ever propose — too broad a grant. |
+| Who authors scripts | The chat agent writes them (a `run_workflow` tool, manifest v2) and the user can paste one into the panel | User-only authorship: forfeits the "ask for a review workflow" experience that makes the feature sing. A Selora-side skills system (prompt-pattern library) is future work; v1 leans on the tool description + docs. |
+| Concurrency | Runtime-side scheduler, default 4 subagents in flight (setting `workflow.max_concurrency`) | Unbounded: gateway rate limits + cost spikes. Per-script control: the script asks, the runtime adapts. |
+| Run journal | Append-only JSONL **in the workspace** (`.selora/workflow-runs/`, gitignored) | AppData: hides the run from the project it belongs to; in-memory: an app crash kills a 40-step run. |
+| Cost/caps | Per-ask `TurnCaps` (already enforced by the loop) + a **workflow-level budget** (`workflow.max_cost_usd`, default $5) checked between steps | Per-ask only: a 50-subagent fan-out of cheap turns still lands a bill. |
+
+**Tasks (four subagents; 8a+8b are engine-side and wiremock-testable with no UI):**
+
+- **8a — Engine core:** `crates/selora-workflow` — the boa sandbox with the §18 facade, no ambient globals, script-size and step-count caps, JSON-schema validation of `ask` results (fail the run with the offending field, never silently coerce), the confirmation payload builder (script text + extracted `world.run` command set).
+- **8b — Orchestration semantics:** named-agent contexts (per-agent conversation + FIFO), fan-out/joins, phase tracking, `world.run` over the §17.5 spawn, `files`/`git` read wrappers, the journal + resume (replay world reads; re-dispatch unfinished steps), the workflow-level budget. Tests: fan-out ordering, round caps, gate branches on exit codes, crash-resume equivalence, budget abort.
+- **8c — The `run_workflow` tool + wiring:** manifest v2 (the §17.1 "versioned with the app" clause exercised for the first time — ten tools + `run_workflow`); the confirmation card in the chat (new §4.2 card type: script body, command set, cost cap; Approve starts the run); additive `Effect::Workflow*` / `AppMessage::Workflow*` arms in the shell; receipts from every ask feed the cost meter.
+- **8d — Workflows panel (region ④ activity):** run list, the phase graph (one node per phase, live step status), the run log, artifacts (markdown + files), inline approval cards, Stop (kills the run + in-flight bash children). Headless paint tests; every color/duration from theme.rs.
+
+**v1.x (named, not v1):** dashboards (charts/tables/boards fed by tagged reports), amend/cache (name-keyed replay of unchanged asks), free-text escalation questions, a skills library for script authoring.
+
+**Acceptance tests (owner, real key + a real workspace):**
+```bash
+# 1. Chat: "review every Rust file in src/ for unwrap() calls; report the worst five"
+#    → the agent proposes a run_workflow script; the confirmation card shows it + its commands
+# 2. Approve → the Workflows panel shows the phase graph; subagents fan out; cards appear
+# 3. A subagent proposes an edit → an approval card parks the run; Deny → the run continues
+# 4. Kill the app mid-run → relaunch → the run offers Resume and finishes correctly
+# 5. A gate (`world.run cargo test`) fails → the script's fix loop round is visible in the panel
+# 6. Stop mid-run → run ends within seconds; in-flight bash children are dead
+# 7. The cost meter reflects every ask; the run summary shows tokens + USD per phase
+# 8. The journal lands under .selora/workflow-runs/ (never in git; .gitignore updated)
+# 9. A script that tries `fetch`/`fs`/`process` fails at the facade — structurally absent
+```
+
+**Estimated complexity:** Large — the biggest phase since 5. ~3-4 sessions: 8a/8b parallel, 8c after both, 8d parallel with 8c.
+
+**DONE means:** Ask the chat "review my changed files, confirm each finding, and only report what survives" — the agent writes the workflow, you approve the script once, N subagents fan out with real tool calls and approval gates, the panel shows the story live, the app can crash and resume it, and the bill is capped and visible.
+
+---
+
 ## Total effort framing
 
 - **Phase 0:** ~1 session (4-6 hours of agent time).
@@ -581,6 +641,7 @@ ACCEPTANCE:
 - **Phase 5:** ~2-3 sessions. Agent Mode. Five parallel subagents, then merge.
 - **Phase 6:** ~1-2 sessions. Mostly sequential.
 - **Phase 7:** ~1-2 client sessions (three subagents), gated on the gateway's account endpoints for acceptance only — the code is wiremock-buildable anytime.
+- **Phase 8:** ~3-4 sessions. Workflows — the largest phase since 5; 8a/8b engine-side and UI-free.
 
 **Total: ~10-16 overnight sessions for one owner + one orchestrating agent running subagents.** Realistic for a single motivated owner who runs the orchestrator each evening.
 

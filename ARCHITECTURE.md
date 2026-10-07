@@ -861,3 +861,91 @@ AgentTurnDone(ChatId, ChatReceipt, AgentSummary),  // iterations, tools used, co
 - No sandboxing (approval gates are the trust boundary; container isolation is v1.x).
 - No agent-initiated git operations beyond read-only git commands through `bash` (no agent commit/push).
 - No MCP/external tool servers — the manifest is fixed, defined by us, versioned with the app.
+
+---
+
+## 18. Workflows (Phase 8) — dynamic multi-agent orchestration
+
+A workflow is a small script, authored by the chat agent (via the `run_workflow`
+tool, manifest v2) or pasted by the user, that orchestrates **subagents** —
+independent agent conversations driven through the §17 loop — plus deterministic
+command gates and journaled world reads. The plan (decisions, tradeoffs, task
+split) is ROADMAP.md Phase 8; this section is the engine contract. The design
+is studied from ZCode's dynamic-workflows: the facade below mirrors its shape
+deliberately, so the orchestration patterns (fan-out per item, loops with round
+caps, "model generates, code gates") transfer as muscle memory.
+
+### 18.1 The sandbox — the controlled exception to "no eval"
+
+§17.2 bans model-executed code; a workflow script *is* code. The exception is
+narrow and structural:
+
+- The engine (boa, pure Rust — no ambient standard library beyond the language
+  core) exposes **exactly the §18.2 facade** as globals. There is no `fetch`,
+  no `fs`, no `process`, no timers: those identifiers do not exist in the
+  realm, so a script cannot reach them — the facade *is* the attack surface.
+- **The user confirms the script before anything runs**: a confirmation card
+  in the chat shows the full script text and the extracted `world.run` command
+  set. Approving it starts the run; nothing before that.
+- Script size ≤ 64 KB, ≤ 256 steps, and a workflow-level cost cap
+  (`workflow.max_cost_usd`, default $5) checked between every step.
+- Subagent tool calls keep §17.4 semantics unchanged: a subagent's writes/bash
+  still park on approval cards. Confirming a script never pre-approves a write.
+
+### 18.2 The facade (the whole API a script sees)
+
+```
+agent(name?, persona?) → { ask(type?, instructions) → Promise<result> }
+phase(name)                      // marker; the panel's graph is built from these
+world.run(cmd, args, {timeoutMs?}) → Promise<{exitCode, stdout, stderr}>  // §17.5 spawn
+files.glob(pattern) / files.grep(pattern, glob?) / files.read(path)
+git.changedFiles(base?) / git.diff(base?, path?) / git.status() / git.log(count?)
+report(item, artifactId?)        // progressive results, ≤256 items, ≤32 KB each
+artifact.markdown(id, content, opts) / artifact.file(id, path, opts)
+log(message)
+```
+
+Names in `agent()` are identities: unique within a run, and the key resume
+matches steps by. `ask` carries a type as a JSON-schema-ish object declared in
+the script; results are validated against it at the boundary — a mismatch
+fails the run naming the field, never a silent coercion. `world.run`'s command
+must be from the confirmed command set (a literal in the script; the set is
+extracted at confirmation time — a command assembled at runtime fails loudly
+rather than silently widening the grant). `files`/`git` are read-only and
+cap-reject rather than truncate, mirroring the reference semantics.
+
+### 18.3 Subagents, gates, and the journal
+
+**A subagent is a conversation, not a process.** Each named `agent()` owns a
+`Vec<ChatMessage>`; each `ask` is one `spawn_agent_turn` with the fixed
+manifest and per-ask `TurnCaps` — so every §17.3 cap, the §17.4 approval park,
+and receipt-based cost accounting apply per ask, unchanged. Concurrent asks on
+one agent queue FIFO; separate agents run concurrently up to
+`workflow.max_concurrency` (default 4). Each ask's receipt feeds the cost
+meter like any chat turn.
+
+**Gates are the bash spawn.** `world.run` executes through the same §17.5 path
+a tool call uses (env-cleared, output-capped, `start_kill` on timeout), with
+the exit code as a normal value the script branches on.
+
+**The journal is the run's memory.** Every step, `ask` result, `world.run`
+outcome, and world read appends to
+`.selora/workflow-runs/{run_id}/journal.jsonl` (gitignored) before the run
+proceeds. A relaunch offers Resume: world reads replay from the journal
+byte-identically, finished asks are not re-paid, unfinished steps re-dispatch.
+Amend/cache (re-running a revised script while importing unchanged named
+asks) is v1.x. On crash-or-Stop the journal is still on disk — the run is
+inspectable and resumable, which is the whole point.
+
+### 18.4 Process model and wiring
+
+The engine lives in `crates/selora-workflow` (depends on `selora-ai`'s public
+agent API, `selora-fs`, `selora-git`; no new dependency on `selora-ui`). It
+runs on the tokio runtime, never the UI thread: the shell talks to it through
+additive `Effect::Workflow*` variants (run/resume/stop/decision), the engine
+reduces progress onto additive `AppMessage::Workflow*` variants (phase/step/
+approval/report/done) with `notify()` per send — the §2 pattern verbatim. The
+Workflows panel (region ④ activity) renders the phase graph, live steps, the
+run log, artifacts, and the same approval cards as the chat. `run_workflow`
+joins the tool manifest as v2 — the first exercise of §17.1's "versioned with
+the app" clause.
