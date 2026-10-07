@@ -69,6 +69,14 @@ const ENV_ALLOWLIST: &[&str] = &[
     "PROCESSOR_ARCHITECTURE",
     "LANG",
     "TERM",
+    // Toolchain locations (paths, not secrets): rustup/cargo proxies resolve
+    // the toolchain through these on machines with nonstandard homes (the
+    // Phase 5d real-key smoke hit this). CARGO_TARGET_DIR lets a cargo child
+    // share the machine's build cache instead of recompiling per workspace.
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_TARGET_DIR",
 ];
 
 // -----------------------------------------------------------------------------
