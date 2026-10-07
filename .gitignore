@@ -7,3 +7,8 @@
 
 # Installer output
 installer/output/
+
+# Agent tooling (local session state — never published)
+.claude/
+.zcode/
+graphify-out/
