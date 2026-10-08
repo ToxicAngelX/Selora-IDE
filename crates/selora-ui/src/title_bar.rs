@@ -8,11 +8,18 @@
 //! added the menus. Menu clicks come back to the shell as
 //! [`TitleBarEvent`]s — command-palette ids where a command exists, plus
 //! the app-level actions that do not (Exit).
+//!
+//! The menus ride egui's `menu_button` (its popup anchoring, mutual
+//! exclusion, and hover-follows stay egui's). Their states come from the
+//! DESIGN_TOKENS.md §10 matrix — hover `--ink-faint`, pressed/open
+//! `--ink-low`, no borders (§5.2), text `--fg-default` in every state
+//! (app chrome, like the wordmark) — via the scoped widget-visuals
+//! override in [`menu_button_matrix`].
 
 use egui::Ui;
 
 use crate::palette::registry::CommandId;
-use crate::theme::{color, font, type_scale};
+use crate::theme::{color, font, radius, type_scale};
 use crate::{brand, theme};
 
 /// Title bar height (UI_SPEC.md §1.1).
@@ -69,9 +76,15 @@ pub fn show(ui: &mut Ui) -> TitleBarOutcome {
 
                 // The menu bar (§1.1). egui's `menu_button` owns the
                 // popup; an item's click lands in `outcome.event` and
-                // closes the menu.
+                // closes the menu. The buttons take the §10 matrix from
+                // the widget visuals (no RichText tint — an explicit text
+                // color would pin all four states to one color); the
+                // scoped override below is what lands the theme on egui's
+                // Button paint path.
+                menu_button_matrix(ui);
                 let mut event: Option<TitleBarEvent> = None;
                 let file_menu = ui.menu_button("File", |ui| {
+                    menu_button_matrix(ui);
                     menu_item(ui, "Open File…", &mut event, CommandId::FileOpenFile);
                     menu_item(ui, "Open Folder…", &mut event, CommandId::FileOpenFolder);
                     menu_item(ui, "Save", &mut event, CommandId::FileSave);
@@ -91,6 +104,7 @@ pub fn show(ui: &mut Ui) -> TitleBarOutcome {
                     }
                 });
                 let edit_menu = ui.menu_button("Edit", |ui| {
+                    menu_button_matrix(ui);
                     menu_item(ui, "Find in File…", &mut event, CommandId::EditFindInFile);
                     menu_item(
                         ui,
@@ -112,6 +126,7 @@ pub fn show(ui: &mut Ui) -> TitleBarOutcome {
                     );
                 });
                 let view_menu = ui.menu_button("View", |ui| {
+                    menu_button_matrix(ui);
                     menu_item(
                         ui,
                         "Toggle File Tree",
@@ -135,6 +150,7 @@ pub fn show(ui: &mut Ui) -> TitleBarOutcome {
                     );
                 });
                 let help_menu = ui.menu_button("Help", |ui| {
+                    menu_button_matrix(ui);
                     menu_item(ui, "Settings…", &mut event, CommandId::SettingsOpen);
                     menu_item(ui, "About Selora IDE", &mut event, CommandId::HelpAbout);
                 });
@@ -163,6 +179,31 @@ fn menu_item(ui: &mut Ui, label: &str, event: &mut Option<TitleBarEvent>, comman
     }
 }
 
+/// Land the §10 state matrix on egui's `Button` paint path, scoped to the
+/// calling `Ui` (the menu row, or one popup). egui's button frame fill is
+/// `weak_bg_fill` — not the `bg_fill` the global theme sets
+/// (`theme::set_visuals`) — and its hover/press strokes are egui's dark
+/// defaults, so without this the menus paint off-token grays. After the
+/// override: hover `--ink-faint`, pressed/open `--ink-low`, no border
+/// (DESIGN_TOKENS.md §5.2: menu bar items carry none), corners `--radius-1`
+/// (§4: the button radius). Menu *text* is untouched: it rides the
+/// widget-state `fg_stroke` the theme already sets (`--fg-default` in every
+/// interactive state — app chrome, like the wordmark).
+fn menu_button_matrix(ui: &mut Ui) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.hovered.weak_bg_fill = color::INK_FAINT;
+    widgets.active.weak_bg_fill = color::INK_LOW;
+    widgets.open.weak_bg_fill = color::INK_LOW;
+    widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    widgets.active.bg_stroke = egui::Stroke::NONE;
+    widgets.open.bg_stroke = egui::Stroke::NONE;
+    let button_radius = egui::CornerRadius::same(radius::R1 as u8);
+    widgets.inactive.corner_radius = button_radius;
+    widgets.hovered.corner_radius = button_radius;
+    widgets.active.corner_radius = button_radius;
+    widgets.open.corner_radius = button_radius;
+}
+
 /// The gutter between the wordmark and the menus.
 fn space_gutter() -> f32 {
     crate::theme::space::S4
@@ -184,12 +225,18 @@ mod tests {
 
     /// One headless frame with its texture deltas handled.
     fn run(ctx: &egui::Context, input: egui::RawInput) -> TitleBarOutcome {
+        run_full(ctx, input).1
+    }
+
+    /// One headless frame, keeping the `FullOutput` for shape assertions
+    /// (the §9 paint tests inspect `shapes`).
+    fn run_full(ctx: &egui::Context, input: egui::RawInput) -> (egui::FullOutput, TitleBarOutcome) {
         let mut outcome = TitleBarOutcome::default();
         let mut output = ctx.run_ui(input, |ui| {
             outcome = show(ui);
         });
         output.textures_delta.clear();
-        outcome
+        (output, outcome)
     }
 
     /// The strip paints headlessly with the bundled fonts.
@@ -201,6 +248,50 @@ mod tests {
         let outcome = run(&ctx, screen());
         assert!(outcome.event.is_none());
         assert_eq!(outcome.menu_rects.len(), 4, "four menu buttons");
+    }
+
+    /// Whether an `--ink-faint` filled rect covers `pos`.
+    fn paints_ink_faint_at(output: &egui::FullOutput, pos: egui::Pos2) -> bool {
+        output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Rect(shape)
+                    if shape.fill == color::INK_FAINT && shape.rect.contains(pos)
+            )
+        })
+    }
+
+    /// REVAMP_SPEC.md §7/§10: the menu buttons take the DESIGN_TOKENS.md
+    /// §10 matrix — the
+    /// conformance proof is the hover *background* (`--ink-faint`), not a
+    /// text-color flip (the menu text is `--fg-default` in every state).
+    #[test]
+    fn menu_button_hover_paints_ink_faint_background() {
+        let ctx = egui::Context::default();
+        theme::set_fonts(&ctx);
+        theme::set_visuals(&ctx);
+        let (output, outcome) = run_full(&ctx, screen());
+        let file_rect = outcome
+            .menu_rects
+            .iter()
+            .find(|(label, _)| *label == "File")
+            .map(|(_, rect)| *rect)
+            .expect("the File button");
+        assert!(
+            !paints_ink_faint_at(&output, file_rect.center()),
+            "idle: no hover surface under the File button"
+        );
+
+        // The pointer parked over the button: the same frame paints the
+        // hovered widget visuals.
+        let mut raw = screen();
+        raw.focused = true;
+        raw.events = vec![egui::Event::PointerMoved(file_rect.center())];
+        let (output, _) = run_full(&ctx, raw);
+        assert!(
+            paints_ink_faint_at(&output, file_rect.center()),
+            "hover: the File button paints its --ink-faint background"
+        );
     }
 
     /// Phase R6: opening the File menu and clicking an item emits its

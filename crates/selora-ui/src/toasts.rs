@@ -117,10 +117,34 @@ pub fn show(ctx: &Context, toasts: &mut Vec<Toast>) {
                                     url.as_str(),
                                 );
                             }
-                            if ui
-                                .button(egui::RichText::new("×").color(color::FG_FAINT))
-                                .clicked()
-                            {
+                            // The dismiss ×: a glyph-level affordance (the
+                            // editor tab's × pattern) — idle `--fg-faint`,
+                            // hover `--fg-default`, no button box
+                            // (DESIGN_TOKENS.md §5.2's borderless chrome;
+                            // an egui `Button` would paint its off-token
+                            // default hover fill here).
+                            let close_font = egui::FontId::new(type_scale::MD, font::FAMILY_SANS);
+                            let galley = ui.painter().layout_no_wrap(
+                                "×".to_owned(),
+                                close_font.clone(),
+                                color::FG_FAINT,
+                            );
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(galley.size().x + 2.0 * space::S1, galley.size().y),
+                                egui::Sense::click(),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "×",
+                                close_font,
+                                if response.hovered() {
+                                    color::FG_DEFAULT
+                                } else {
+                                    color::FG_FAINT
+                                },
+                            );
+                            if response.clicked() {
                                 dismissed = Some(index);
                             }
                         });

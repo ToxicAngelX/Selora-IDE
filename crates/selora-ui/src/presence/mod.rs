@@ -1,11 +1,12 @@
 //! AI presence & motion effects (Phase 6h) — native egui ports.
 //!
-//! The five reference web libraries (thinking-orbs, bot-avatars,
-//! voice-glow, liquid-gooey, metal-fx) are JavaScript; Selora IDE is pure
-//! egui (PLAN.md §2 non-goals — no webview, no React, no JS). These modules
-//! port the libraries' *behavior* — their state sets, reaction curves, and
-//! motion semantics — as painted widgets in the Selora monochrome design
-//! language. No package is installed; the libraries were reference material.
+//! The six reference web libraries (thinking-orbs, bot-avatars,
+//! voice-glow, liquid-gooey, metal-fx, border-beam) are JavaScript;
+//! Selora IDE is pure egui (PLAN.md §2 non-goals — no webview, no React,
+//! no JS). These modules port the libraries' *behavior* — their state
+//! sets, reaction curves, and motion semantics — as painted widgets in
+//! the Selora monochrome design language. No package is installed; the
+//! libraries were reference material.
 //!
 //! Every widget here is paint-only (ARCHITECTURE.md §1: no threads, no
 //! channels), driven by the egui frame clock (`Context::input(|i| i.time)`)
@@ -26,18 +27,22 @@
 //!   agent-mode pill.
 //! - [`metal`] — `MetalMark`: the liquid-metal sheen on the splash brand
 //!   mark, behind `metal::METAL_MARK_ENABLED` (owner-decision item).
+//! - [`beam`] — `BorderBeam`: the in-flight beam riding the composer
+//!   card's perimeter (REVAMP_SPEC §8; the border-beam port).
 
 use std::time::Duration;
 
 use crate::theme::motion;
 
 pub mod avatar;
+pub mod beam;
 pub mod liquid;
 pub mod metal;
 pub mod orb;
 pub mod stream_glow;
 
 pub use avatar::{AgentAvatar, AvatarState};
+pub use beam::BorderBeam;
 pub use liquid::{LiquidPill, PillTransition};
 pub use orb::{OrbState, ThinkingOrb};
 pub use stream_glow::StreamGlow;
@@ -49,6 +54,10 @@ pub(crate) const ANIM_FRAME: Duration = Duration::from_millis(motion::DUR_LOOP_M
 
 /// The one animation loop period in seconds (`--dur-loop`, §7.2).
 pub(crate) const LOOP_S: f32 = motion::DUR_LOOP_MS as f32 / 1000.0;
+
+/// The border beam's perimeter lap in seconds (`--dur-lap`, REVAMP_SPEC
+/// §8.3 — exactly 2 × `--dur-loop`, the §11 bend-6a token).
+pub(crate) const LAP_S: f32 = motion::DUR_LAP_MS as f32 / 1000.0;
 
 /// The egui frame clock in seconds (the `agent_cards.rs` status-line
 /// pattern; `RawInput.time` drives it headlessly).
@@ -93,6 +102,21 @@ pub(crate) fn ping_pong(phase: f32) -> f32 {
     }
 }
 
+/// The welcome chips' stagger step (REVAMP_SPEC §1/§4: `--dur-instant`).
+pub(crate) const STAGGER_S: f32 = motion::DUR_INSTANT_MS as f32 / 1000.0;
+/// The welcome chips' per-chip bloom run (REVAMP_SPEC §4: `--dur-base`).
+pub(crate) const BLOOM_S: f32 = motion::DUR_BASE_MS as f32 / 1000.0;
+
+/// One welcome chip's §7.3 `bloom` progress (eased, 0..1) at frame-clock
+/// `now`: chip `step` starts `step` × `--dur-instant` after `anchor` and
+/// blooms over `--dur-base` on `--ease-precise` (alpha 0→1, scale
+/// 0.96→1.0 are the caller's lerp of this value). A one-shot, so §7.4
+/// keeps it under reduce-motion.
+pub(crate) fn bloom_progress(now: f64, anchor: f64, step: usize) -> f32 {
+    let t = ((now - anchor) as f32 - step as f32 * STAGGER_S) / BLOOM_S;
+    motion::ease_bezier(motion::EASE_PRECISE, t.clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +149,32 @@ mod tests {
         assert_eq!(c.a(), 128);
         assert_eq!(with_alpha(crate::theme::color::FG_MUTED, 2.0).a(), 255);
         assert_eq!(with_alpha(crate::theme::color::FG_MUTED, -1.0).a(), 0);
+    }
+
+    #[test]
+    fn the_welcome_bloom_staggers_each_chip_by_dur_instant() {
+        let anchor = 10.0;
+        // 40ms in: chip 0 mid-bloom, chip 2 has not started (the §9
+        // welcome_chips_bloom_in_three_staggered_steps contract).
+        let mid = bloom_progress(anchor + 0.04, anchor, 0);
+        assert!(mid > 0.0 && mid < 1.0, "chip 0 mid-bloom: {mid}");
+        assert!(
+            bloom_progress(anchor + 0.04, anchor, 2) < 1e-6,
+            "chip 2 still dark"
+        );
+        // Each chip starts one --dur-instant after the previous.
+        assert!(bloom_progress(anchor + STAGGER_S as f64 - 0.01, anchor, 1) < 1e-6);
+        assert!(bloom_progress(anchor + STAGGER_S as f64 + 0.01, anchor, 1) > 0.0);
+        // Every bloom completes --dur-base after its own start.
+        for step in 0..3 {
+            let done = anchor + (step as f32 * STAGGER_S + BLOOM_S) as f64 + 0.01;
+            assert!(
+                bloom_progress(done, anchor, step) > 1.0 - 1e-4,
+                "chip {step} bloomed"
+            );
+        }
+        // Before the anchor: nothing.
+        assert!(bloom_progress(anchor - 0.5, anchor, 0) < 1e-6);
     }
 
     /// The 60fps budget: 100 live presence widgets (orbs across all nine

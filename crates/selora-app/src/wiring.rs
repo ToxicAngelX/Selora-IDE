@@ -1786,8 +1786,22 @@ mod tests {
             cancel_rx,
         );
 
-        // The request is in flight (the mock's delay holds it).
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Synchronize with the server instead of assuming the nested stream
+        // task was scheduled within a fixed sleep under parallel test load.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .is_some_and(|requests| !requests.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request reaches the delayed mock before cancellation");
         assert!(
             rx.try_recv().is_err(),
             "nothing arrived while the response stalls"

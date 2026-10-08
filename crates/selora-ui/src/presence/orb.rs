@@ -52,7 +52,9 @@ const MAX_DOTS: usize = 4;
 pub enum OrbState {
     /// Idle / finished: the §7.3 `pulse` — one dot breathing
     /// (scale 1.0↔1.08, alpha 1.0↔0.7). At [`ORB_AVATAR`] a small `--ok`
-    /// satellite marks liveness (§1.3).
+    /// satellite marks liveness (§1.3) — painted only while
+    /// [`ThinkingOrb::liveness`] holds and never under reduce-motion
+    /// (REVAMP_SPEC §4).
     Breathing,
     /// `Thinking` with no recent delta: the §7.3 `wave` — three dots
     /// bobbing on a 200ms stagger (the `⠿⠿⠿` successor).
@@ -148,6 +150,10 @@ pub struct ThinkingOrb {
     speed: f32,
     /// The web library's `paused` prop: freeze the clock at phase 0.
     paused: bool,
+    /// The 64px breathing hero's `--ok` satellite switch (REVAMP_SPEC §4):
+    /// `false` when the gateway is disconnected — the hero still breathes
+    /// but claims no liveness. Default `true`.
+    liveness: bool,
     reduce_motion: bool,
 }
 
@@ -158,6 +164,7 @@ impl ThinkingOrb {
             size,
             speed: 1.0,
             paused: false,
+            liveness: true,
             reduce_motion: false,
         }
     }
@@ -172,6 +179,14 @@ impl ThinkingOrb {
     /// Freeze the animation at phase 0 (the web library's `paused`).
     pub fn paused(mut self, paused: bool) -> Self {
         self.paused = paused;
+        self
+    }
+
+    /// The `--ok` satellite's liveness switch (REVAMP_SPEC §4, builder
+    /// style like [`speed`](Self::speed); default `true`). The satellite
+    /// paints iff `size >= ORB_AVATAR && liveness && !reduce_motion`.
+    pub fn liveness(mut self, on: bool) -> Self {
+        self.liveness = on;
         self
     }
 
@@ -216,11 +231,20 @@ impl ThinkingOrb {
     /// Paint for an explicit clock value (tests; the streaming bubble's
     /// anchor-relative clock).
     pub fn paint_with(&self, painter: &Painter, rect: Rect, time_s: f64) {
-        let geometry = if self.reduce_motion {
+        let mut geometry = if self.reduce_motion {
             static_geometry(rect)
         } else {
             geometry(self.state, self.phase(time_s), rect)
         };
+        if !self.liveness {
+            // §4: the --ok satellite claims liveness — strip it when the
+            // gateway is disconnected.
+            for dot in &mut geometry.dots {
+                if matches!(dot, Some(d) if d.tone == Tone::Ok) {
+                    *dot = None;
+                }
+            }
+        }
         paint_geometry(painter, &geometry);
     }
 }
@@ -631,6 +655,35 @@ mod tests {
             Some(std::time::Duration::MAX),
             "reduce-motion requests no animation frames"
         );
+    }
+
+    #[test]
+    fn liveness_off_suppresses_the_ok_satellite_at_avatar_scale() {
+        let ctx = egui::Context::default();
+        // Circles in --ok's hue (premultiply-invariant — the liquid.rs
+        // ok_circles pattern).
+        let has_ok_circle = |out: &egui::FullOutput| {
+            out.shapes.iter().any(|s| {
+                matches!(&s.shape, egui::Shape::Circle(c)
+                    if c.fill.a() > 0 && c.fill.g() > c.fill.r() && c.fill.g() > c.fill.b())
+            })
+        };
+        // Connected: the 64px breathing hero carries its --ok satellite.
+        let live = ThinkingOrb::new(OrbState::Breathing, ORB_AVATAR);
+        let out = paint_frame(&ctx, 0.42, &live);
+        assert!(has_ok_circle(&out), "liveness: the satellite paints");
+        // Disconnected: no --ok, but the hero still breathes.
+        let dark = ThinkingOrb::new(OrbState::Breathing, ORB_AVATAR).liveness(false);
+        let out = paint_frame(&ctx, 0.42, &dark);
+        assert!(!has_ok_circle(&out), "liveness off: no --ok satellite");
+        assert!(
+            circle_count(&out) >= 1,
+            "the breathing dot itself still paints"
+        );
+        // Inline orbs never carried the satellite — unaffected either way.
+        let inline = ThinkingOrb::new(OrbState::Breathing, ORB_INLINE).liveness(false);
+        let out = paint_frame(&ctx, 0.42, &inline);
+        assert_eq!(circle_count(&out), 1);
     }
 
     #[test]

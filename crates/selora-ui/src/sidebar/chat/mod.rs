@@ -5,17 +5,22 @@
 //! per UI_SPEC.md §2 and §15 — persisted in workspace state by the
 //! shell); this widget paints the panel's content:
 //!
-//! - the 40px header: "CHAT" label, the model picker trigger
-//!   (`claude-opus-5-5 ▾`) with its dropdown, and the `⋯` overflow menu
-//!   (clear conversation, copy transcript, switch model),
+//! - the 40px header: the 20px presence orb (the status line's mapping,
+//!   so the two never disagree), the session switcher, and the `⋯`
+//!   overflow menu (clear conversation, copy transcript, switch model),
 //! - the conversation scroll: user bubbles (`--ink-mid`, right-aligned),
 //!   assistant bubbles (`--ink-low`, left-aligned) with fenced code
 //!   blocks (`--ink-canvas` + 1px `--ink-hi` border, JetBrains Mono, a
 //!   hover "Copy" button top-right), and the streaming bubble with a
 //!   comet fade-in on the first delta and the `wave` thinking indicator,
-//! - the 60px composer: a single-line input ("Ask anything…"), Enter to
-//!   send, Shift+Enter for a newline, and the `⏎` send button (disabled
-//!   when the input is empty).
+//! - the hero composer (REVAMP_SPEC §2): the `--ink-low` prompt card
+//!   (the frameless multiline input — "Ask anything…", Enter to send,
+//!   Shift+Enter for a newline — and the `⏎` send / `■` stop button)
+//!   with the five focus glow rings, the border beam riding the card's
+//!   perimeter while a request is in flight (§8), the streaming glow +
+//!   ready shimmer on its bottom edge, and a footer row carrying the
+//!   model chip, the `agent` pill, and the key hint when it fits whole
+//!   (§2.1).
 //!
 //! The panel owns only *view* state (transcript, composer buffer,
 //! in-flight id, picker open flags); the data flow is the effect/message
@@ -67,12 +72,13 @@ use selora_ai::{
 };
 
 use crate::picker::model_picker::{self, ModelPicker, ModelPickerEvent};
+use crate::presence::beam::BorderBeam;
 use crate::presence::liquid::LiquidPill;
-use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
+use crate::presence::orb::{OrbState, ThinkingOrb, ORB_AVATAR, ORB_INLINE};
 use crate::presence::stream_glow::StreamGlow;
-use crate::presence::{with_alpha, AgentAvatar};
+use crate::presence::{bloom_progress, clock_s, request_anim_frame, with_alpha, AgentAvatar};
 use crate::sidebar::icons;
-use crate::theme::{color, font, radius, space, type_scale};
+use crate::theme::{color, font, motion, radius, space, type_scale};
 
 /// Agent Mode cards (UI_SPEC.md §4.2) — Phase 5d's file.
 pub mod agent_cards;
@@ -81,8 +87,6 @@ pub mod markdown;
 
 /// Header bar height (UI_SPEC.md §4: "Header bar (40px tall)").
 pub const HEADER_HEIGHT: f32 = 40.0;
-/// Composer height (UI_SPEC.md §4: "Composer (60px tall)").
-pub const COMPOSER_HEIGHT: f32 = 60.0;
 /// Conversation-area padding (UI_SPEC.md §4: "12px padding").
 pub const AREA_PADDING: f32 = space::S3;
 /// Bubble inset from the conversation-area edge on each side (UI_SPEC
@@ -100,9 +104,6 @@ const COMPOSER_HINT: &str = "Ask anything…";
 const COMPOSER_KEY_HINT: &str = "Enter to send, Shift+Enter for newline";
 /// The send button's glyph (UI_SPEC.md §4: "⏎ glyph").
 const SEND_GLYPH: &str = "⏎";
-/// One composer text row's pitch — the `--type-md` line height in the
-/// multiline edit (Phase R1's auto-grow).
-const COMPOSER_LINE_HEIGHT: f32 = 18.0;
 /// The composer's row cap (Phase R1): the bar grows to this many rows,
 /// then the edit scrolls internally.
 const COMPOSER_MAX_ROWS: usize = 6;
@@ -135,6 +136,26 @@ const THINKING_AFTER: Duration = Duration::from_millis(800);
 const FADE_DURATION: Duration = Duration::from_millis(240);
 /// The composer's stable widget id.
 const COMPOSER_ID: &str = "selora_chat_composer";
+/// The focus glow rings' stepped alphas (REVAMP_SPEC §2.2 — painted
+/// alpha on `--fg-faint`, the `LiquidPill` layered-alpha precedent: no
+/// blur, no new hue; §11 bend #1).
+const GLOW_RING_ALPHAS: [f32; 5] = [0.18, 0.12, 0.08, 0.05, 0.03];
+/// Ring i's outset from the card edge: `GLOW_RING_STEP · (i+1)` (§2.2).
+/// A centered 1px stroke reaches outset + 0.5 = 10.5px at most — inside
+/// the 12px card margins, so the rings never meet the panel's clip.
+const GLOW_RING_STEP: f32 = 2.0;
+/// The rings' entrance/exit fade, seconds (`--dur-quick`, §2.2's `fade`
+/// glyph — snapped under reduce-motion per §11 bend #5).
+const RING_FADE_S: f32 = motion::DUR_QUICK_MS as f32 / 1000.0;
+/// The welcome chips' stagger step and per-chip bloom live in
+/// `presence::bloom_progress` (`--dur-instant` / `--dur-base`, §1/§4).
+/// The chips' bloom start scale (§4: 0.96 → 1.0 on `--ease-precise`).
+const CHIP_BLOOM_FROM: f32 = 0.96;
+/// The agent pill's dot diameter — mirrors `liquid.rs`'s file-private
+/// `DOT`, so the footer's fit-or-hide math (§2.1) knows the pill's
+/// constant width before it paints. `footer_layout_and_hint_fit_or_hide`
+/// pins the two formulas together.
+const AGENT_PILL_DOT: f32 = 6.0;
 
 // -----------------------------------------------------------------------------
 // Ids and data types
@@ -412,8 +433,11 @@ pub struct ChatPanelOutcome {
     /// Rects of the Copy buttons actually shown this frame (code blocks
     /// under the pointer).
     pub copy_button_rects: Vec<Rect>,
-    /// Rect of the composer's send button.
+    /// Rect of the composer's send button (inside the card, §2.1).
     pub send_button_rect: Rect,
+    /// The composer card's rect (REVAMP_SPEC §2 — the glow rings expand
+    /// from it, the footer lives inside it).
+    pub composer_card_rect: Rect,
     /// `(model id, row rect)` for the model picker's rows, when the
     /// dropdown is open.
     pub model_row_rects: Vec<(ModelId, Rect)>,
@@ -428,7 +452,8 @@ pub struct ChatPanelOutcome {
     pub status_line_rect: Option<Rect>,
     /// The status line's Stop button rect, while a turn runs.
     pub stop_button_rect: Option<Rect>,
-    /// The header's agent-mode pill rect.
+    /// The agent-mode pill's rect (the composer footer's left cluster,
+    /// REVAMP_SPEC §2.1).
     pub agent_pill_rect: Rect,
     /// The turn summary footer's rect, when one painted this frame.
     pub summary_footer_rect: Option<Rect>,
@@ -443,6 +468,7 @@ impl Default for ChatPanelOutcome {
             code_block_rects: Vec::new(),
             copy_button_rects: Vec::new(),
             send_button_rect: Rect::ZERO,
+            composer_card_rect: Rect::ZERO,
             model_row_rects: Vec::new(),
             menu_item_rects: Vec::new(),
             cards_painted: 0,
@@ -465,6 +491,7 @@ struct FrameArtifacts {
     code_block_rects: Vec<Rect>,
     copy_button_rects: Vec<Rect>,
     send_button_rect: Rect,
+    composer_card_rect: Rect,
     model_row_rects: Vec<(ModelId, Rect)>,
     menu_item_rects: Vec<(&'static str, Rect)>,
     cards_painted: usize,
@@ -489,6 +516,7 @@ impl Default for FrameArtifacts {
             code_block_rects: Vec::new(),
             copy_button_rects: Vec::new(),
             send_button_rect: Rect::ZERO,
+            composer_card_rect: Rect::ZERO,
             model_row_rects: Vec::new(),
             menu_item_rects: Vec::new(),
             cards_painted: 0,
@@ -692,6 +720,21 @@ pub struct ChatPanel {
     live_created: u64,
     /// Whether the sessions dropdown is open.
     sessions_open: bool,
+    /// The welcome entrance's frame-clock anchor (REVAMP_SPEC §4): armed
+    /// while the transcript is empty, cleared the moment it isn't — a
+    /// Clear / new_session / restored empty session re-runs the bloom.
+    welcome_anchor: Option<f64>,
+    /// Whether the composer's focus glow rings are on (§2.2);
+    /// `ring_anim` carries the entrance/exit clock.
+    rings_on: bool,
+    /// The rings' fade clock: (frame-clock start, appearing) — the
+    /// `LiquidPill::anim` pattern. `None` once settled, and always under
+    /// reduce-motion (the rings snap, §11 bend #5).
+    ring_anim: Option<(f64, bool)>,
+    /// The border beam (REVAMP_SPEC §8): rides the composer card's
+    /// perimeter while a request is in flight, painted only then
+    /// (§8.6) — inactive it freezes at its held phase, unseen.
+    beam: BorderBeam,
 }
 
 impl Default for ChatPanel {
@@ -703,20 +746,27 @@ impl Default for ChatPanel {
 impl ChatPanel {
     /// An empty panel with no transcript and no model.
     pub fn new() -> Self {
+        // REVAMP_SPEC §2.1: the picker's closed trigger lives on the
+        // composer card — its header tuning would invert there.
+        let mut picker = ModelPicker::new(None);
+        picker.set_on_card(true);
+        // §2.2: the glow band's end caps match the card's `--radius-2`.
+        let mut stream_glow = StreamGlow::new();
+        stream_glow.set_cap_radius(radius::R2);
         Self {
             entries: Vec::new(),
             composer: String::new(),
             want_focus: false,
             in_flight: None,
             model: None,
-            picker: ModelPicker::new(None),
+            picker,
             menu_open: false,
             agent_mode: false,
             reduce_motion: false,
             agent_in_flight: false,
             turn_approvals: 0,
             turn_cards_start: 0,
-            stream_glow: StreamGlow::new(),
+            stream_glow,
             agent_pill: LiquidPill::default(),
             status_avatar: AgentAvatar::new(0.0),
             gateway_connected: true,
@@ -728,6 +778,10 @@ impl ChatPanel {
             live_title: String::new(),
             live_created: epoch_now(),
             sessions_open: false,
+            welcome_anchor: None,
+            rings_on: false,
+            ring_anim: None,
+            beam: BorderBeam::new(),
         }
     }
 
@@ -773,13 +827,15 @@ impl ChatPanel {
     }
 
     /// Thread `ui.reduce_motion` (DESIGN_TOKENS.md §7.4) into the cards
-    /// and the presence widgets: pulse/spin/orbit become static dots.
+    /// and the presence widgets: pulse/spin/orbit become static dots and
+    /// the border beam freezes (REVAMP_SPEC §8.4).
     /// Called by the shell on settings load and on dialog adopt.
     pub fn set_reduce_motion(&mut self, on: bool) {
         self.reduce_motion = on;
         self.stream_glow.set_reduce_motion(on);
         self.agent_pill.set_reduce_motion(on);
         self.status_avatar.set_reduce_motion(on);
+        self.beam.set_reduce_motion(on);
     }
 
     /// Whether reduced motion is on (the shell's threading assertions).
@@ -1322,6 +1378,7 @@ impl ChatPanel {
             code_block_rects: frame.code_block_rects,
             copy_button_rects: frame.copy_button_rects,
             send_button_rect: frame.send_button_rect,
+            composer_card_rect: frame.composer_card_rect,
             model_row_rects: frame.model_row_rects,
             menu_item_rects: frame.menu_item_rects,
             cards_painted: frame.cards_painted,
@@ -1333,8 +1390,11 @@ impl ChatPanel {
         }
     }
 
-    /// The 40px header: "CHAT" label, the model picker trigger, the `⋯`
-    /// overflow trigger, and both dropdowns (anchored overlays).
+    /// The 40px header (REVAMP_SPEC §3): the 20px presence orb at the
+    /// left edge, the session switcher, the `⋯` overflow trigger, and the
+    /// two dropdowns (anchored overlays). The model picker and the
+    /// `agent` pill live on the composer card (§2.1); opening one of the
+    /// header's dropdowns still closes the picker.
     fn paint_header(&mut self, ui: &mut Ui, frame: &mut FrameArtifacts) {
         let (rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), HEADER_HEIGHT), Sense::hover());
@@ -1345,7 +1405,29 @@ impl ChatPanel {
             egui::Stroke::new(1.0, color::INK_HI),
         );
 
-        // -- session switcher (left) -------------------------------------------
+        // -- the presence orb (§3), left edge ------------------------------
+        // The same mapping as the status line over the same turn slice,
+        // so header and timeline never disagree; a disconnected gateway
+        // pauses the mapped state's phase-0 picture (the avatars-sleeping
+        // precedent).
+        let orb = header_orb(
+            self.agent_in_flight,
+            self.in_flight.is_some(),
+            &agent_cards::status_phase_for(self.turn_cards()),
+            agent_cards::status_running_tool(self.turn_cards()),
+            self.streaming_active(),
+            self.gateway_connected,
+            self.reduce_motion,
+        );
+        orb.paint(
+            ui,
+            Rect::from_min_size(
+                pos2(rect.left() + space::S3, rect.center().y - ORB_INLINE / 2.0),
+                Vec2::splat(ORB_INLINE),
+            ),
+        );
+
+        // -- session switcher (left of center, right of the orb) ----------
         // Phase R3: the session's title IS the header label (the static
         // "CHAT" went with it) — click for the sessions dropdown.
         let title = if self.live_title.is_empty() {
@@ -1360,8 +1442,7 @@ impl ChatPanel {
             if galley.size().x <= 140.0 || label.chars().count() <= 4 {
                 break galley;
             }
-            // Truncate to fit the left zone (the model picker owns the
-            // center).
+            // Truncate to fit the left zone.
             let keep = label.chars().count() - 1;
             let mut shortened: String = label.chars().take(keep.saturating_sub(1)).collect();
             shortened.push('…');
@@ -1370,7 +1451,10 @@ impl ChatPanel {
         let session_chevron = 12.0;
         let session_width = title_galley.size().x + session_chevron + 2.0 * space::S1;
         let session_rect = Rect::from_min_size(
-            pos2(rect.left() + space::S3, rect.top() + 8.0),
+            pos2(
+                rect.left() + space::S3 + ORB_INLINE + space::S2,
+                rect.top() + 8.0,
+            ),
             vec2(session_width, 24.0),
         );
         let session_response = ui.interact(
@@ -1411,16 +1495,6 @@ impl ChatPanel {
             self.picker.close();
         }
 
-        // -- model picker trigger (center) ---------------------------------
-        // Phase R0: the canonical picker's closed button, pinned to the
-        // header's center slot (the widget's `show_at` placement — its
-        // own filter + keyboard navigation come along).
-        let button_width = self.picker.closed_button_width(painter);
-        let button_rect = Rect::from_min_size(
-            pos2(rect.center().x - button_width / 2.0, rect.top() + 8.0),
-            vec2(button_width, model_picker::CLOSED_BUTTON_HEIGHT),
-        );
-
         // -- overflow trigger (right) ---------------------------------------
         let overflow_rect = Rect::from_min_size(
             pos2(rect.right() - 28.0, rect.top() + 8.0),
@@ -1441,53 +1515,11 @@ impl ChatPanel {
             egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
             color::FG_MUTED,
         );
-        let picker_was_open = self.picker.is_open();
         if overflow_response.clicked() {
             self.menu_open = !self.menu_open;
             self.picker.close();
             self.sessions_open = false;
         }
-
-        // -- agent-mode pill (UI_SPEC.md §4.2), left of the overflow ------
-        // Phase 6h: the LiquidPill port — the `--ok` dot slides into its
-        // slot with a goo trail while the background melts between
-        // `--ink-low` and `--ink-mid`. The pill's width is constant (the
-        // dot slot is always reserved — the gooey track).
-        let now = ui.ctx().input(|i| i.time);
-        self.agent_pill.set_on(self.agent_mode, now);
-        let pill = self.agent_pill.show(
-            ui,
-            pos2(overflow_rect.left() - space::S1, rect.top() + 8.0),
-            "agent",
-        );
-        if pill.clicked {
-            self.agent_mode = !self.agent_mode;
-        }
-        frame.agent_pill_rect = pill.rect;
-
-        // The picker itself (after the header's absolute zones): the
-        // closed trigger at `button_rect`, the dropdown anchored below it.
-        // Selecting a model flips the panel's label and the picker's row
-        // immediately; the shell persists the id.
-        for event in self.picker.show_at(ui, button_rect) {
-            match event {
-                ModelPickerEvent::Select(id) => {
-                    self.model = Some(id.clone());
-                    frame.events.push(ChatPanelEvent::SelectModel(id));
-                }
-                ModelPickerEvent::Refresh => {
-                    frame.events.push(ChatPanelEvent::RefreshModels);
-                }
-                ModelPickerEvent::Close => {}
-            }
-        }
-        // Opening the picker closes the other header dropdowns (the
-        // header's mutual exclusion, preserved from the inline dropdown).
-        if self.picker.is_open() && !picker_was_open {
-            self.menu_open = false;
-            self.sessions_open = false;
-        }
-        frame.model_row_rects = self.picker.last_geometry().rows;
 
         self.paint_overflow_menu(ui, &overflow_response, frame);
         self.paint_sessions_menu(ui, &session_rect, frame);
@@ -1760,6 +1792,18 @@ impl ChatPanel {
         let reduce_motion = self.reduce_motion;
         let in_flight = self.in_flight;
         let agent_in_flight = self.agent_in_flight;
+        // The welcome entrance's anchor (§4): armed on the first empty
+        // frame, cleared while the transcript is non-empty so a re-emptied
+        // panel (Clear, new_session, a restored empty session) re-runs
+        // the bloom. Read on the frame clock (`RawInput.time` drives it
+        // headlessly — the `presence/mod.rs` pattern).
+        let now = clock_s(ui.ctx());
+        let welcome_anchor = if self.entries.is_empty() {
+            Some(*self.welcome_anchor.get_or_insert(now))
+        } else {
+            self.welcome_anchor = None;
+            None
+        };
         egui::ScrollArea::vertical()
             .id_salt("selora_chat_transcript")
             .auto_shrink([false, false])
@@ -1767,21 +1811,30 @@ impl ChatPanel {
             .show(ui, |scroll| {
                 scroll.add_space(AREA_PADDING);
                 let content_width = scroll.available_width();
-                // The empty transcript's welcome (Phase R2): the mark, a
-                // prompt, and suggestions that prefill the composer.
+                // The empty transcript's welcome (§4): the 64px breathing
+                // hero orb, the heading, and the suggestion chips (prefill
+                // the composer on click), blooming in with an 80ms
+                // stagger from the anchor.
                 if self.entries.is_empty() {
                     let mut prefill: Option<&'static str> = None;
                     scroll.vertical_centered(|ui| {
                         ui.add_space(AREA_PADDING);
-                        let (mark_rect, _) =
-                            ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
-                        crate::brand::paint_mark(ui.painter(), mark_rect);
+                        let (hero_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(ORB_AVATAR), Sense::hover());
+                        // The hero breathes at rest (the §7.3 `pulse`);
+                        // the `--ok` satellite is the gateway's liveness
+                        // (presence contract #2). Under reduce-motion it
+                        // is the one static muted dot, satellite-free.
+                        ThinkingOrb::new(OrbState::Breathing, ORB_AVATAR)
+                            .liveness(self.gateway_connected)
+                            .reduce_motion(self.reduce_motion)
+                            .paint(ui, hero_rect);
                         ui.add_space(space::S3);
                         ui.label(
                             egui::RichText::new("Ask anything")
                                 .color(color::FG_DEFAULT)
                                 .font(egui::FontId::new(
-                                    type_scale::LG,
+                                    type_scale::XXL,
                                     font::family_sans_semibold(),
                                 )),
                         );
@@ -1795,37 +1848,73 @@ impl ChatPanel {
                             .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS)),
                         );
                         ui.add_space(space::S3);
-                        for suggestion in SUGGESTIONS {
+                        for (index, suggestion) in SUGGESTIONS.iter().enumerate() {
+                            // The bloom (§4's `bloom` glyph, kept under
+                            // reduce-motion per §7.4): alpha 0→1 and scale
+                            // 0.96→1.0 on --ease-precise, one 80ms
+                            // stagger step per chip. The text color is
+                            // baked into the galley so the bloom's alpha
+                            // rides it (job galleys ignore the paint-time
+                            // fallback).
+                            let eased = welcome_anchor
+                                .map(|anchor| bloom_progress(now, anchor, index))
+                                .unwrap_or(1.0);
+                            if eased < 1.0 {
+                                request_anim_frame(ui.ctx());
+                            }
+                            let chip_font = egui::FontId::new(type_scale::SM, font::FAMILY_SANS);
                             let galley = ui.painter().layout_no_wrap(
                                 (*suggestion).to_owned(),
-                                egui::FontId::new(type_scale::SM, font::FAMILY_SANS),
-                                color::FG_DEFAULT,
+                                chip_font.clone(),
+                                with_alpha(color::FG_MUTED, eased),
                             );
                             let chip = galley.size() + vec2(2.0 * space::S3, 0.0);
                             let (chip_rect, response) = ui.allocate_exact_size(
                                 vec2(chip.x, (28.0_f32).max(chip.y + 2.0 * space::S1)),
                                 Sense::click(),
                             );
-                            let fill = if response.hovered() {
-                                color::INK_MID
+                            let galley = if response.hovered() {
+                                ui.painter().layout_no_wrap(
+                                    (*suggestion).to_owned(),
+                                    chip_font,
+                                    with_alpha(color::FG_DEFAULT, eased),
+                                )
                             } else {
-                                color::INK_LOW
+                                galley
                             };
-                            ui.painter().rect_filled(chip_rect, radius::R1, fill);
-                            ui.painter().galley(
-                                pos2(
-                                    chip_rect.left() + space::S3,
-                                    chip_rect.center().y - galley.size().y / 2.0,
-                                ),
-                                galley,
-                                if response.hovered() {
-                                    color::FG_DEFAULT
+                            if eased > 0.0 {
+                                let scale = CHIP_BLOOM_FROM + (1.0 - CHIP_BLOOM_FROM) * eased;
+                                let painted = Rect::from_center_size(
+                                    chip_rect.center(),
+                                    chip_rect.size() * scale,
+                                );
+                                let (fill, border) = if response.hovered() {
+                                    (color::INK_MID, color::INK_RULE)
                                 } else {
-                                    color::FG_MUTED
-                                },
-                            );
+                                    (color::INK_LOW, color::INK_HI)
+                                };
+                                ui.painter().rect(
+                                    painted,
+                                    radius::R1,
+                                    with_alpha(fill, eased),
+                                    egui::Stroke::new(1.0, with_alpha(border, eased)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().galley(
+                                    pos2(
+                                        chip_rect.left() + space::S3,
+                                        chip_rect.center().y - galley.size().y / 2.0,
+                                    ),
+                                    galley,
+                                    if response.hovered() {
+                                        color::FG_DEFAULT
+                                    } else {
+                                        color::FG_MUTED
+                                    },
+                                );
+                            }
                             if response.clicked() {
-                                prefill = Some(suggestion);
+                                prefill = Some(*suggestion);
                             }
                             ui.add_space(space::S1);
                         }
@@ -1891,25 +1980,11 @@ impl ChatPanel {
                 if agent_in_flight {
                     // The 24px status line under the last entry (§4.2):
                     // the phase derives from this turn's card states.
-                    let phase = agent_cards::status_phase_for(
-                        self.entries[self.turn_cards_start.min(self.entries.len())..]
-                            .iter()
-                            .filter_map(|entry| match entry {
-                                TimelineEntry::Card(card) => Some(card),
-                                _ => None,
-                            }),
-                    );
+                    let phase = agent_cards::status_phase_for(self.turn_cards());
                     // Phase 6h: the status line's indicator is the
                     // ThinkingOrb (the loop state mapped per the module
                     // table) next to the AgentAvatar.
-                    let tool = agent_cards::status_running_tool(
-                        self.entries[self.turn_cards_start.min(self.entries.len())..]
-                            .iter()
-                            .filter_map(|entry| match entry {
-                                TimelineEntry::Card(card) => Some(card),
-                                _ => None,
-                            }),
-                    );
+                    let tool = agent_cards::status_running_tool(self.turn_cards());
                     let orb_state = orb_state_for(&phase, tool, self.streaming_active());
                     let status = agent_cards::status_line(
                         scroll,
@@ -1943,23 +2018,27 @@ impl ChatPanel {
             });
     }
 
-    /// The composer: a multiline auto-growing input (Phase R1) + the send
-    /// button (Stop while a plain stream runs) + the keyboard hint. While
-    /// the edit has focus it owns the keyboard: a plain Enter is consumed
-    /// here as the submit signal (the edit's return key is Shift+Enter,
-    /// so the newline lands at the caret), and on a one-line buffer the
-    /// arrows walk the history (multi-line buffers keep them as caret
-    /// moves). The Phase 6h StreamGlow rides the bar's bottom edge.
+    /// The hero composer (REVAMP_SPEC §2): the prompt card — `--ink-low`
+    /// fill, `--radius-2`, a 1px `--ink-hi` hairline that lifts to
+    /// `--ink-rule` on hover/focus, and the five focus glow rings — plus
+    /// the footer row (the model chip and the `agent` pill left, the key
+    /// hint right when it fits whole, §2.1). While the edit has focus it
+    /// owns the keyboard: a plain Enter is consumed here as the submit
+    /// signal (the edit's return key is Shift+Enter, so the newline
+    /// lands at the caret), and on a one-line buffer the arrows walk the
+    /// history (multi-line buffers keep them as caret moves). The border
+    /// beam rides the card's perimeter while a request is in flight
+    /// (§2.3/§8.6); the StreamGlow rides the card's bottom edge, arming
+    /// the ready shimmer while connected AND focused (§2.2).
     fn paint_composer(&mut self, ui: &mut Ui, frame: &mut FrameArtifacts) {
-        // The bar's rect (captured before any allocation shrinks it) —
-        // the StreamGlow's edge.
+        // The bar's rect (captured before any allocation shrinks it). The
+        // card sits inside it with 12px margins on all four sides — sized
+        // to the glow rings: ring 5's paint extent is 10.5px (§2.2), so
+        // the margins guarantee no panel-clip on any side.
         let bar_rect = ui.max_rect();
-        let composer_top = bar_rect.top();
-        ui.painter().hline(
-            ui.max_rect().x_range(),
-            composer_top,
-            egui::Stroke::new(1.0, color::INK_HI),
-        );
+        let card_rect = bar_rect.shrink2(vec2(space::S3, space::S3));
+        let inner_rect = card_rect.shrink2(vec2(space::S3, space::S3));
+        frame.composer_card_rect = card_rect;
         let want_focus = self.want_focus;
         let mut submit_now = false;
         let mut stop_clicked = false;
@@ -2016,85 +2095,172 @@ impl ChatPanel {
             }
         }
 
-        ui.add_space(AREA_PADDING);
-        ui.horizontal(|row| {
-            row.set_min_height(SEND_BUTTON_SIZE.y);
-            row.add_space(AREA_PADDING);
-            let rows = self.composer_rows(row.painter(), row.available_width());
-            let response = row.add(
-                egui::TextEdit::multiline(&mut self.composer)
-                    .id(egui::Id::new(COMPOSER_ID))
-                    .hint_text(COMPOSER_HINT)
-                    .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS))
-                    .desired_width(
-                        (row.available_width() - SEND_BUTTON_SIZE.x - 2.0 * AREA_PADDING).max(40.0),
-                    )
-                    .desired_rows(rows)
-                    // Shift+Enter is the newline key (Phase R1): plain
-                    // Enter was consumed above as the submit signal, so
-                    // the caret-accurate newline needs the modifier.
-                    .return_key(egui::KeyboardShortcut::new(
-                        egui::Modifiers::SHIFT,
-                        Key::Enter,
-                    )),
-            );
-            if want_focus {
-                response.request_focus();
-            }
-
-            // [⏎] send / [■] stop — send: --ink-faint, hover --ink-low,
-            // disabled (FG_DISABLED, no fill) when empty or mid-stream.
-            // While a plain stream runs the button is Stop (Phase R1):
-            // a painted square, `--err` on hover (the agent status
-            // line's Stop precedent).
-            let send_enabled = !self.composer.trim().is_empty() && self.in_flight.is_none();
-            let button_enabled = send_enabled || streaming_plain;
-            let (send_rect, send_response) =
-                row.allocate_exact_size(SEND_BUTTON_SIZE, Sense::click());
-            if button_enabled {
-                let fill = if send_response.hovered() {
-                    color::INK_LOW
-                } else {
-                    color::INK_FAINT
-                };
-                row.painter().rect_filled(send_rect, radius::R1, fill);
-            }
-            if streaming_plain {
-                row.painter().rect_filled(
-                    egui::Rect::from_center_size(
-                        send_rect.center(),
-                        vec2(STOP_SQUARE, STOP_SQUARE),
-                    ),
-                    radius::R0,
-                    if send_response.hovered() {
-                        color::ERR
-                    } else {
-                        color::FG_DEFAULT
-                    },
-                );
+        // -- card chrome (§2.2) -------------------------------------------
+        let now = clock_s(ui.ctx());
+        let card_hovered = ui.rect_contains_pointer(card_rect);
+        // The rings' entrance/exit: the `fade` glyph over --dur-quick on
+        // a frame-clock clock (the `LiquidPill::anim` pattern). Under
+        // reduce-motion they snap with focus (§11 bend #5 — the owner's
+        // glow rule overrides §7.4's fade-keep for glows).
+        if composer_focused != self.rings_on {
+            self.rings_on = composer_focused;
+            self.ring_anim = if self.reduce_motion {
+                None
             } else {
-                row.painter().text(
-                    send_rect.center(),
-                    Align2::CENTER_CENTER,
-                    SEND_GLYPH,
-                    egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
-                    if send_enabled {
-                        color::FG_DEFAULT
-                    } else {
-                        color::FG_DISABLED
-                    },
+                Some((now, composer_focused))
+            };
+        }
+        let ring_alpha = if self.reduce_motion {
+            if self.rings_on {
+                1.0
+            } else {
+                0.0
+            }
+        } else if let Some((started, appearing)) = self.ring_anim {
+            let t = ((now - started) as f32 / RING_FADE_S).clamp(0.0, 1.0);
+            if t >= 1.0 {
+                self.ring_anim = None;
+            }
+            let eased = motion::ease_bezier(motion::EASE_FADE, t);
+            if appearing {
+                eased
+            } else {
+                1.0 - eased
+            }
+        } else if self.rings_on {
+            1.0
+        } else {
+            0.0
+        };
+        if self.ring_anim.is_some() {
+            request_anim_frame(ui.ctx());
+        }
+
+        let painter = ui.painter();
+        // The glow rings (§2.2): ring i expands the card by 2·(i+1), the
+        // corner radius growing with it — stepped `--fg-faint` alpha, no
+        // blur, no new hue.
+        if ring_alpha > 0.0 {
+            for (i, alpha) in GLOW_RING_ALPHAS.iter().enumerate() {
+                let outset = GLOW_RING_STEP * (i as f32 + 1.0);
+                painter.rect(
+                    card_rect.expand(outset),
+                    radius::R2 + outset,
+                    egui::Color32::TRANSPARENT,
+                    egui::Stroke::new(1.0, with_alpha(color::FG_FAINT, alpha * ring_alpha)),
+                    egui::StrokeKind::Middle,
                 );
             }
-            frame.send_button_rect = send_rect;
-            if send_response.clicked() {
+        }
+        painter.rect(
+            card_rect,
+            radius::R2,
+            color::INK_LOW,
+            egui::Stroke::new(
+                1.0,
+                if composer_focused || card_hovered {
+                    color::INK_RULE
+                } else {
+                    color::INK_HI
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+
+        // The border beam (§2.3/§8.6): rides the card's perimeter while a
+        // request is in flight (a plain stream or an agent turn), painted
+        // over the card stroke, under the StreamGlow band. Inactive it
+        // freezes at its held phase and is simply not shown; a disconnect
+        // mid-flight does not freeze it (in-flight requests complete).
+        self.beam.set_active(self.in_flight.is_some());
+        if self.in_flight.is_some() {
+            self.beam.show(ui, card_rect);
+        }
+
+        // -- row 1: the frameless input + the send/stop button -------------
+        let (rows, pitch) = self.composer_rows(ui.painter(), bar_rect.width());
+        let input_row_height = (rows as f32 * pitch).max(SEND_BUTTON_SIZE.y);
+        let input_rect = Rect::from_min_size(
+            inner_rect.left_top(),
+            vec2(inner_rect.width(), input_row_height),
+        );
+        let mut input_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(input_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        // The edit is frameless (§2.1 — the splash precedent): egui's
+        // default edit frame would double-paint the card's fill and
+        // compete with the card's focus chrome.
+        let response = input_ui.add(
+            egui::TextEdit::multiline(&mut self.composer)
+                .id(egui::Id::new(COMPOSER_ID))
+                .hint_text(COMPOSER_HINT)
+                .font(egui::FontId::new(type_scale::MD, font::FAMILY_SANS))
+                .frame(egui::Frame::default())
+                .desired_width((inner_rect.width() - SEND_BUTTON_SIZE.x - space::S2).max(40.0))
+                .desired_rows(rows)
+                // Shift+Enter is the newline key (Phase R1): plain
+                // Enter was consumed above as the submit signal, so
+                // the caret-accurate newline needs the modifier.
+                .return_key(egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    Key::Enter,
+                )),
+        );
+        if want_focus {
+            response.request_focus();
+        }
+        input_ui.add_space(space::S2);
+
+        // [⏎] send / [■] stop (§2.2 arms) — send: --ink-mid, hover
+        // --ink-hi, disabled (FG_DISABLED, no fill) when empty or
+        // mid-stream. While a plain stream runs the button is Stop
+        // (Phase R1): a painted square, `--err` on hover (the agent
+        // status line's Stop precedent).
+        let send_enabled = !self.composer.trim().is_empty() && self.in_flight.is_none();
+        let button_enabled = send_enabled || streaming_plain;
+        let (send_rect, send_response) =
+            input_ui.allocate_exact_size(SEND_BUTTON_SIZE, Sense::click());
+        if button_enabled {
+            let fill = if send_response.hovered() {
+                color::INK_HI
+            } else {
+                color::INK_MID
+            };
+            input_ui.painter().rect_filled(send_rect, radius::R1, fill);
+        }
+        if streaming_plain {
+            input_ui.painter().rect_filled(
+                egui::Rect::from_center_size(send_rect.center(), vec2(STOP_SQUARE, STOP_SQUARE)),
+                radius::R0,
+                if send_response.hovered() {
+                    color::ERR
+                } else {
+                    color::FG_DEFAULT
+                },
+            );
+        } else {
+            input_ui.painter().text(
+                send_rect.center(),
+                Align2::CENTER_CENTER,
+                SEND_GLYPH,
+                egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
                 if send_enabled {
-                    submit_now = true;
-                } else if streaming_plain {
-                    stop_clicked = true;
-                }
+                    color::FG_DEFAULT
+                } else {
+                    color::FG_DISABLED
+                },
+            );
+        }
+        frame.send_button_rect = send_rect;
+        if send_response.clicked() {
+            if send_enabled {
+                submit_now = true;
+            } else if streaming_plain {
+                stop_clicked = true;
             }
-            row.add_space(AREA_PADDING);
-        });
+        }
         self.want_focus = false;
         // A recall's external text change can surrender the edit's focus
         // (egui resets the widget state when the buffer moves under it) —
@@ -2121,21 +2287,99 @@ impl ChatPanel {
             }
         }
 
-        ui.add_space(space::S1);
-        let (hint_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
-        ui.painter().text(
-            pos2(hint_rect.left() + AREA_PADDING, hint_rect.center().y),
-            Align2::LEFT_CENTER,
-            COMPOSER_KEY_HINT,
+        // -- row 2 (footer): the model chip + the `agent` pill left; the
+        // key hint right-aligned, whole or hidden (§2.1) -------------------
+        let footer_rect = Rect::from_min_size(
+            pos2(inner_rect.left(), input_rect.bottom() + space::S2),
+            vec2(inner_rect.width(), model_picker::CLOSED_BUTTON_HEIGHT),
+        );
+        let chip_width = self.picker.closed_button_width(ui.painter());
+        let chip_rect = Rect::from_min_size(
+            footer_rect.left_top(),
+            vec2(chip_width, footer_rect.height()),
+        );
+        // The picker's closed trigger + dropdown (moved from the header,
+        // §2.1 — the dropdown self-anchors upward when the bottom
+        // overflows). Selecting a model flips the picker's row
+        // immediately; the shell persists the id.
+        let picker_was_open = self.picker.is_open();
+        for event in self.picker.show_at(ui, chip_rect) {
+            match event {
+                ModelPickerEvent::Select(id) => {
+                    self.model = Some(id.clone());
+                    frame.events.push(ChatPanelEvent::SelectModel(id));
+                }
+                ModelPickerEvent::Refresh => {
+                    frame.events.push(ChatPanelEvent::RefreshModels);
+                }
+                ModelPickerEvent::Close => {}
+            }
+        }
+        // Opening the picker closes the header's dropdowns (the mutual
+        // exclusion, preserved from the header placement).
+        if self.picker.is_open() && !picker_was_open {
+            self.menu_open = false;
+            self.sessions_open = false;
+        }
+        frame.model_row_rects = self.picker.last_geometry().rows;
+
+        // The `agent` pill (UI_SPEC.md §4.2 — moved from the header; the
+        // `set_on` wiring is unchanged): constant width, right-aligned at
+        // its slot.
+        self.agent_pill.set_on(self.agent_mode, now);
+        let pill = self.agent_pill.show(
+            ui,
+            pos2(
+                chip_rect.right() + space::S2 + agent_pill_width(ui.painter()),
+                footer_rect.top(),
+            ),
+            "agent",
+        );
+        if pill.clicked {
+            self.agent_mode = !self.agent_mode;
+        }
+        frame.agent_pill_rect = pill.rect;
+
+        // The key hint: painted only whole (§2.1's fit-or-hide — never
+        // elided). The input's placeholder remains the primary affordance.
+        let hint_galley = ui.painter().layout_no_wrap(
+            COMPOSER_KEY_HINT.to_owned(),
             egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
             color::FG_FAINT,
         );
+        if pill.rect.right() + space::S2 + hint_galley.size().x <= footer_rect.right() {
+            ui.painter().galley(
+                pos2(
+                    footer_rect.right() - hint_galley.size().x,
+                    footer_rect.center().y - hint_galley.size().y / 2.0,
+                ),
+                hint_galley,
+                color::FG_FAINT,
+            );
+        }
 
-        // Phase 6h: the StreamGlow along the bar's bottom edge — rises
-        // with the delta rate; a running tool gathers it into the beam.
+        // §2.2: the StreamGlow rides the card's bottom edge — it rises
+        // with the delta rate, a running tool gathers it into the beam,
+        // and the ready shimmer arms while connected AND focused (a
+        // disconnected gateway paints none — the avatars-sleep
+        // precedent).
+        self.stream_glow
+            .set_ready(self.gateway_connected && composer_focused);
         let processing = self.agent_in_flight && self.turn_tool_running();
-        self.stream_glow.show(ui, bar_rect, processing);
+        self.stream_glow.show(ui, card_rect, processing);
+    }
+
+    /// The in-flight turn's cards (index ≥ the turn's start) — the
+    /// status line's and the header orb's shared slice: a previous turn's
+    /// latched card must never leak into the phase, so both derive it
+    /// from here each frame (§3's never-disagree rule).
+    fn turn_cards(&self) -> impl Iterator<Item = &agent_cards::ToolCard> {
+        self.entries[self.turn_cards_start.min(self.entries.len())..]
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Card(card) => Some(card),
+                _ => None,
+            })
     }
 
     /// Whether this turn has a tool executing right now (a resultless,
@@ -2234,26 +2478,39 @@ impl ChatPanel {
         }
     }
 
-    /// The composer's visible row count for the current buffer, at the
-    /// panel's inner width: wrapped lines counted (the same font the
-    /// edit paints with), capped at [`COMPOSER_MAX_ROWS`].
-    fn composer_rows(&self, painter: &egui::Painter, outer_width: f32) -> usize {
-        let wrap = (outer_width - SEND_BUTTON_SIZE.x - 2.0 * AREA_PADDING).max(40.0);
+    /// The composer's visible row count and its measured row pitch for
+    /// the current buffer at the panel's width: wrapped lines counted
+    /// (the same font and the same wrap expression the edit paints with,
+    /// §2.1), the count capped at [`COMPOSER_MAX_ROWS`]. The pitch is the
+    /// laid-out galley's per-row height — measured each frame, never
+    /// assumed (§2.1).
+    fn composer_rows(&self, painter: &egui::Painter, panel_width: f32) -> (usize, f32) {
+        let card_inner = panel_width - 2.0 * space::S3 - 2.0 * space::S3;
+        let wrap = (card_inner - SEND_BUTTON_SIZE.x - space::S2).max(40.0);
         let galley = painter.layout(
             self.composer.clone(),
             egui::FontId::new(type_scale::MD, font::FAMILY_SANS),
             color::FG_DEFAULT,
             wrap,
         );
-        let rows = galley.rows.len().max(1);
-        rows.clamp(1, COMPOSER_MAX_ROWS)
+        let laid_out = galley.rows.len().max(1);
+        let pitch = galley.size().y / laid_out as f32;
+        (laid_out.clamp(1, COMPOSER_MAX_ROWS), pitch)
     }
 
-    /// The composer bar's height this frame: the 60px base plus one row
-    /// pitch per wrapped line beyond the first (Phase R1's auto-grow).
+    /// The composer bar's height this frame (§2.1): the card (12px
+    /// padding both sides, the input row, 8px, the 24px footer) plus the
+    /// 12px card margins — `input_row + 80` where
+    /// `input_row = max(rows · pitch, 20)` (the edit row's min-height
+    /// clamp is real layout behavior, so it is in the formula).
     fn composer_height(&self, ui: &Ui) -> f32 {
-        let rows = self.composer_rows(ui.painter(), ui.available_width()) as f32;
-        COMPOSER_HEIGHT + (rows - 1.0) * COMPOSER_LINE_HEIGHT
+        let (rows, pitch) = self.composer_rows(ui.painter(), ui.available_width());
+        let input_row = (rows as f32 * pitch).max(SEND_BUTTON_SIZE.y);
+        input_row
+            + 2.0 * space::S3
+            + 2.0 * space::S3
+            + space::S2
+            + model_picker::CLOSED_BUTTON_HEIGHT
     }
 
     /// Retry a failed stream (Phase R2, the failed bubble's footer
@@ -2372,6 +2629,51 @@ fn orb_state_for(
             _ => OrbState::Searching,
         },
     }
+}
+
+/// The header orb (REVAMP_SPEC §3): the status line's mapping over the
+/// same turn slice, so header and timeline can never disagree — an agent
+/// turn maps per [`orb_state_for`]; a plain (non-agent) stream is
+/// `Connecting` while deltas flow and `Working` while the model thinks;
+/// idle is `Breathing`. A disconnected gateway pauses the *mapped*
+/// state's phase-0 picture (a paused `Working` still paints its three
+/// dots, statically — not a frozen breathing dot).
+fn header_orb(
+    agent_in_flight: bool,
+    in_flight: bool,
+    phase: &agent_cards::StatusPhase,
+    running_tool: Option<&str>,
+    streaming_active: bool,
+    gateway_connected: bool,
+    reduce_motion: bool,
+) -> ThinkingOrb {
+    let state = if agent_in_flight {
+        orb_state_for(phase, running_tool, streaming_active)
+    } else if in_flight {
+        if streaming_active {
+            OrbState::Connecting
+        } else {
+            OrbState::Working
+        }
+    } else {
+        OrbState::Breathing
+    };
+    ThinkingOrb::new(state, ORB_INLINE)
+        .paused(!gateway_connected)
+        .reduce_motion(reduce_motion)
+}
+
+/// The agent pill's constant width — the `LiquidPill` formula
+/// (S2 + dot + S1 + label + S2), with the dot diameter mirrored as
+/// [`AGENT_PILL_DOT`] (file-private there). The composer footer's
+/// fit-or-hide math (§2.1) needs the pill's width before it paints.
+fn agent_pill_width(painter: &egui::Painter) -> f32 {
+    let galley = painter.layout_no_wrap(
+        "agent".to_owned(),
+        egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
+        color::FG_MUTED,
+    );
+    space::S2 + AGENT_PILL_DOT + space::S1 + galley.size().x + space::S2
 }
 
 /// `""` for 1, `"s"` otherwise (the summary footer's wording).
@@ -3024,26 +3326,30 @@ mod tests {
         Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 600.0))
     }
 
-    /// A focused window's input carrying the given events (focus is what
-    /// makes egui deliver key events to the widgets at all).
-    fn raw_input_with(events: Vec<egui::Event>) -> egui::RawInput {
+    /// A focused window's input carrying the given events at the given
+    /// frame-clock time (focus is what makes egui deliver key events to
+    /// the widgets at all; the explicit time drives the presence
+    /// animations headlessly — the `presence/mod.rs` pattern).
+    fn raw_input_with(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
         egui::RawInput {
             focused: true,
             screen_rect: Some(test_screen()),
             events,
+            time: Some(time),
             ..Default::default()
         }
     }
 
-    /// One headless frame over a shared context; returns the outcome.
+    /// One headless frame over a shared context; returns the `FullOutput`
+    /// (the shape/repaint assertions need it) alongside the outcome.
     /// The bundled fonts are registered per frame (Phase R2's headings
     /// use the named SemiBold family; `set_fonts` is idempotent and the
     /// handful of test frames re-shaping galleys costs nothing).
-    fn frame(
+    fn frame_out(
         ctx: &egui::Context,
         input: egui::RawInput,
         panel: &mut ChatPanel,
-    ) -> ChatPanelOutcome {
+    ) -> (egui::FullOutput, ChatPanelOutcome) {
         crate::theme::set_fonts(ctx);
         let mut input = input;
         if input.screen_rect.is_none() {
@@ -3055,7 +3361,16 @@ mod tests {
             outcome = panel.show(ui);
         });
         output.textures_delta.clear();
-        outcome
+        (output, outcome)
+    }
+
+    /// One headless frame over a shared context; returns the outcome.
+    fn frame(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        panel: &mut ChatPanel,
+    ) -> ChatPanelOutcome {
+        frame_out(ctx, input, panel).1
     }
 
     /// Sweep a click grid (the four-frame move/move/press/release pattern
@@ -3099,7 +3414,7 @@ mod tests {
                     press,
                     release,
                 ] {
-                    last = Some(frame(ctx, raw_input_with(events), panel));
+                    last = Some(frame(ctx, raw_input_with(events, 0.0), panel));
                 }
                 if let Some(outcome) = last {
                     if want(&outcome, panel) {
@@ -3167,7 +3482,7 @@ mod tests {
         frame(&ctx, egui::RawInput::default(), &mut panel);
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            raw_input_with(vec![key_event(Key::Enter, Default::default())], 0.0),
             &mut panel,
         );
 
@@ -3199,7 +3514,7 @@ mod tests {
         frame(&ctx, egui::RawInput::default(), &mut panel);
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, egui::Modifiers::SHIFT)]),
+            raw_input_with(vec![key_event(Key::Enter, egui::Modifiers::SHIFT)], 0.0),
             &mut panel,
         );
 
@@ -3217,7 +3532,7 @@ mod tests {
         let ctx = egui::Context::default();
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            raw_input_with(vec![key_event(Key::Enter, Default::default())], 0.0),
             &mut panel,
         );
         assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
@@ -3233,7 +3548,7 @@ mod tests {
         frame(&ctx, egui::RawInput::default(), &mut panel);
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            raw_input_with(vec![key_event(Key::Enter, Default::default())], 0.0),
             &mut panel,
         );
         assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
@@ -3251,7 +3566,7 @@ mod tests {
         let ctx = egui::Context::default();
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         let center = outcome.send_button_rect.center();
-        let outcome = frame(&ctx, raw_input_with(click_at(center)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(center), 0.0), &mut panel);
 
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         assert!(matches!(&outcome.events[0], ChatPanelEvent::Send { text, .. } if text == "hello"));
@@ -3264,7 +3579,7 @@ mod tests {
         let ctx = egui::Context::default();
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         let center = outcome.send_button_rect.center();
-        let outcome = frame(&ctx, raw_input_with(click_at(center)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(center), 0.0), &mut panel);
         assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
         assert_eq!(panel.turn_count(), 0);
     }
@@ -3283,7 +3598,7 @@ mod tests {
         frame(&ctx, egui::RawInput::default(), &mut panel);
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            raw_input_with(vec![key_event(Key::Enter, Default::default())], 0.0),
             &mut panel,
         );
         assert!(outcome.events.is_empty(), "events: {:?}", outcome.events);
@@ -3292,7 +3607,7 @@ mod tests {
         // runs the button IS the Stop affordance (Phase R1): the click
         // aborts the stream instead of sending.
         let center = outcome.send_button_rect.center();
-        let outcome = frame(&ctx, raw_input_with(click_at(center)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(center), 0.0), &mut panel);
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         assert!(
             matches!(
@@ -3317,7 +3632,7 @@ mod tests {
         frame(&ctx, egui::RawInput::default(), &mut panel);
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![key_event(Key::Enter, Default::default())]),
+            raw_input_with(vec![key_event(Key::Enter, Default::default())], 0.0),
             &mut panel,
         );
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
@@ -3345,7 +3660,7 @@ mod tests {
         panel.focus_composer();
         let ctx = egui::Context::default();
         frame(&ctx, egui::RawInput::default(), &mut panel);
-        let press = |key: Key| raw_input_with(vec![key_event(key, Default::default())]);
+        let press = |key: Key| raw_input_with(vec![key_event(key, Default::default())], 0.0);
         let outcome = frame(&ctx, press(Key::ArrowUp), &mut panel);
         assert!(outcome.events.is_empty());
         assert_eq!(panel.composer_text(), "second");
@@ -3454,7 +3769,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::set_fonts(&ctx);
         for _ in 0..2 {
-            let mut output = ctx.run_ui(raw_input_with(vec![]), |ui| {
+            let mut output = ctx.run_ui(raw_input_with(vec![], 0.0), |ui| {
                 ui.set_min_size(vec2(360.0, 600.0));
                 panel.show(ui);
             });
@@ -3489,7 +3804,7 @@ mod tests {
                         },
                     ],
                 ] {
-                    let mut output = ctx.run_ui(raw_input_with(events), |ui| {
+                    let mut output = ctx.run_ui(raw_input_with(events, 0.0), |ui| {
                         ui.set_min_size(vec2(360.0, 600.0));
                         panel.show(ui);
                     });
@@ -3911,7 +4226,7 @@ mod tests {
 
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![egui::Event::PointerMoved(block_center)]),
+            raw_input_with(vec![egui::Event::PointerMoved(block_center)], 0.0),
             &mut panel,
         );
         assert!(
@@ -3921,7 +4236,7 @@ mod tests {
         let copy_center = outcome.copy_button_rects[0].center();
 
         // Frame 2: click it.
-        let outcome = frame(&ctx, raw_input_with(click_at(copy_center)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(copy_center), 0.0), &mut panel);
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         match &outcome.events[0] {
             ChatPanelEvent::CopyCode(code) => assert_eq!(code, "fn main() {}\n"),
@@ -3943,7 +4258,7 @@ mod tests {
         let block_center = outcome.code_block_rects[0].center();
         let outcome = frame(
             &ctx,
-            raw_input_with(vec![egui::Event::PointerMoved(block_center)]),
+            raw_input_with(vec![egui::Event::PointerMoved(block_center)], 0.0),
             &mut panel,
         );
         assert!(outcome.copy_button_rects.is_empty());
@@ -3986,7 +4301,7 @@ mod tests {
             .expect("clear menu item");
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(clear_rect.center())),
+            raw_input_with(click_at(clear_rect.center()), 0.0),
             &mut panel,
         );
 
@@ -4015,7 +4330,7 @@ mod tests {
             .expect("copy transcript menu item");
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(copy_rect.center())),
+            raw_input_with(click_at(copy_rect.center()), 0.0),
             &mut panel,
         );
 
@@ -4046,7 +4361,7 @@ mod tests {
             .expect("switch model menu item");
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(switch_rect.center())),
+            raw_input_with(click_at(switch_rect.center()), 0.0),
             &mut panel,
         );
         assert!(outcome.events.is_empty());
@@ -4078,7 +4393,11 @@ mod tests {
             .find(|(id, _)| id == "glm-5.3")
             .map(|(_, rect)| *rect)
             .expect("glm row");
-        let outcome = frame(&ctx, raw_input_with(click_at(target.center())), &mut panel);
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(target.center()), 0.0),
+            &mut panel,
+        );
 
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         match &outcome.events[0] {
@@ -4104,7 +4423,11 @@ mod tests {
         let refresh = panel
             .picker_refresh_rect()
             .expect("the refresh button painted");
-        let outcome = frame(&ctx, raw_input_with(click_at(refresh.center())), &mut panel);
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(refresh.center()), 0.0),
+            &mut panel,
+        );
 
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
         assert!(matches!(outcome.events[0], ChatPanelEvent::RefreshModels));
@@ -4212,13 +4535,7 @@ mod tests {
     /// One panel frame with its `FullOutput` kept (the presence tests
     /// inspect painted shapes; the shared `frame` helper drops them).
     fn paint_panel(ctx: &egui::Context, panel: &mut ChatPanel) -> egui::FullOutput {
-        crate::theme::set_fonts(ctx);
-        let mut output = ctx.run_ui(raw_input_with(vec![]), |ui| {
-            ui.set_min_size(vec2(360.0, 600.0));
-            panel.show(ui);
-        });
-        output.textures_delta.clear();
-        output
+        frame_out(ctx, raw_input_with(vec![], 0.0), panel).0
     }
 
     fn circles(output: &egui::FullOutput) -> usize {
@@ -4253,7 +4570,17 @@ mod tests {
         let id = send(&mut panel).expect("send");
         panel.push_assistant_delta(id, "");
         let output = paint_panel(&egui::Context::default(), &mut panel);
-        assert_eq!(circles(&output), 1, "the §7.4 static dot");
+        // Below the header (whose own orb freezes to one dot too, §3):
+        // exactly the bubble's §7.4 static dot.
+        let below_header = output
+            .shapes
+            .iter()
+            .filter(|s| match &s.shape {
+                egui::Shape::Circle(c) => c.center.y > HEADER_HEIGHT,
+                _ => false,
+            })
+            .count();
+        assert_eq!(below_header, 1, "the §7.4 static dot");
     }
 
     #[test]
@@ -4283,14 +4610,12 @@ mod tests {
         // Frame 1 starts the Default → Sleeping cross-fade; frame 2 (a
         // second later) is past it.
         let mut line_rect = Rect::ZERO;
-        let mut warm = ctx.run_ui(raw_input_with(vec![]), |ui| {
+        let mut warm = ctx.run_ui(raw_input_with(vec![], 0.0), |ui| {
             ui.set_min_size(vec2(360.0, 600.0));
             line_rect = panel.show(ui).status_line_rect.expect("status line");
         });
         warm.textures_delta.clear();
-        let mut input = raw_input_with(vec![]);
-        input.time = Some(1.0);
-        let mut output = ctx.run_ui(input, |ui| {
+        let mut output = ctx.run_ui(raw_input_with(vec![], 1.0), |ui| {
             ui.set_min_size(vec2(360.0, 600.0));
             line_rect = panel.show(ui).status_line_rect.expect("status line");
         });
@@ -4370,6 +4695,858 @@ mod tests {
         assert!(panel.stream_glow.spark_pending());
     }
 
+    // -- REVAMP_SPEC §2–§4: the hero composer, the header orb, the welcome ------
+
+    /// The rect shapes of one frame (the chrome assertions' view).
+    fn rect_shapes(output: &egui::FullOutput) -> Vec<&egui::epaint::RectShape> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The glow rings of one frame: stroked rects concentric with and
+    /// larger than the card, sorted inside-out.
+    fn ring_shapes(output: &egui::FullOutput, card: Rect) -> Vec<&egui::epaint::RectShape> {
+        let mut rings: Vec<&egui::epaint::RectShape> = rect_shapes(output)
+            .into_iter()
+            .filter(|r| {
+                r.stroke.width > 0.0
+                    && r.rect.width() > card.width()
+                    && r.rect.height() > card.height()
+                    && (r.rect.center().x - card.center().x).abs() < 0.01
+                    && (r.rect.center().y - card.center().y).abs() < 0.01
+            })
+            .collect();
+        rings.sort_by(|a, b| a.rect.width().total_cmp(&b.rect.width()));
+        rings
+    }
+
+    /// The frame's requested repaint delay (`Duration::MAX` = none).
+    fn repaint_delay(output: &egui::FullOutput) -> Duration {
+        output
+            .viewport_output
+            .values()
+            .next()
+            .map(|o| o.repaint_delay)
+            .unwrap_or(Duration::MAX)
+    }
+
+    /// The welcome chips' fill shapes (chip-sized: 28px tall at rest,
+    /// shrinking to 0.96× mid-bloom; wider than the footer widgets).
+    fn chip_fills(output: &egui::FullOutput) -> Vec<egui::epaint::RectShape> {
+        rect_shapes(output)
+            .into_iter()
+            .filter(|r| {
+                r.fill != egui::Color32::TRANSPARENT
+                    && r.rect.width() > 100.0
+                    && (24.0..=29.0).contains(&r.rect.height())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Circles in `--ok`'s hue. egui's `Color32` is premultiplied, so the
+    /// rgb channels scale with alpha — compare the hue ratio (the
+    /// `liquid.rs` test precedent), not the raw channels.
+    fn ok_hue_circles(output: &egui::FullOutput) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter(|s| {
+                matches!(&s.shape, egui::Shape::Circle(c)
+                    if c.fill.a() > 0 && c.fill.g() > c.fill.r() && c.fill.g() > c.fill.b())
+            })
+            .count()
+    }
+
+    #[test]
+    fn composer_card_paints_its_chrome_at_rest() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.set_composer_text("hello");
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        let card = outcome.composer_card_rect;
+        assert!(card.width() > 0.0, "the card rect is reported");
+
+        // The chrome: one `--ink-low` fill + a 1px `--ink-hi` inside
+        // stroke at the card rect, `--radius-2` corners (§2.1).
+        let chrome: Vec<_> = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| r.rect == card)
+            .collect();
+        assert_eq!(chrome.len(), 1, "exactly one shape at the card rect");
+        assert_eq!(chrome[0].fill, color::INK_LOW);
+        assert_eq!(chrome[0].stroke, egui::Stroke::new(1.0, color::INK_HI));
+        assert_eq!(
+            chrome[0].corner_radius,
+            egui::CornerRadius::same(radius::R2 as u8)
+        );
+
+        // The bar height is the §2.1 formula computed from the measured
+        // pitch (never a hardcoded total): input_row + 80.
+        let (rows, pitch) = {
+            let mut measured = (0usize, 0.0f32);
+            let mut out = ctx.run_ui(raw_input_with(vec![], 0.2), |ui| {
+                ui.set_min_size(vec2(360.0, 600.0));
+                measured = panel.composer_rows(ui.painter(), ui.available_width());
+            });
+            out.textures_delta.clear();
+            measured
+        };
+        assert!(
+            (16.0..=22.0).contains(&pitch),
+            "the measured --type-md pitch: {pitch}"
+        );
+        let input_row = (rows as f32 * pitch).max(SEND_BUTTON_SIZE.y);
+        let expected_bar = input_row
+            + 2.0 * space::S3
+            + 2.0 * space::S3
+            + space::S2
+            + model_picker::CLOSED_BUTTON_HEIGHT;
+        let mut out = ctx.run_ui(raw_input_with(vec![], 0.3), |ui| {
+            ui.set_min_size(vec2(360.0, 600.0));
+            let height = panel.composer_height(ui);
+            assert!(
+                (height - expected_bar).abs() < 1e-4,
+                "bar {height} == the formula's {expected_bar}"
+            );
+        });
+        out.textures_delta.clear();
+        // The painted card is the bar minus the 12px margins.
+        assert!(
+            (card.height() + 2.0 * space::S3 - expected_bar).abs() < 1e-4,
+            "card {} + margins == bar {expected_bar}",
+            card.height()
+        );
+    }
+
+    #[test]
+    fn focused_composer_paints_five_glow_rings() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.focus_composer();
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel); // grants focus
+        frame(&ctx, raw_input_with(vec![], 1.0), &mut panel); // focused: the fade starts
+                                                              // Past --dur-quick the rings are fully in.
+        let (output, outcome) = frame_out(
+            &ctx,
+            raw_input_with(vec![], 1.0 + RING_FADE_S as f64 + 0.05),
+            &mut panel,
+        );
+        let card = outcome.composer_card_rect;
+
+        let rings = ring_shapes(&output, card);
+        assert_eq!(rings.len(), GLOW_RING_ALPHAS.len(), "five glow rings");
+        for (i, ring) in rings.iter().enumerate() {
+            let outset = GLOW_RING_STEP * (i as f32 + 1.0);
+            assert_eq!(
+                ring.rect,
+                card.expand(outset),
+                "ring {i} expands by 2·(i+1)"
+            );
+            assert_eq!(ring.stroke.width, 1.0);
+            assert_eq!(
+                ring.stroke.color,
+                with_alpha(color::FG_FAINT, GLOW_RING_ALPHAS[i]),
+                "ring {i}'s stepped alpha"
+            );
+            assert_eq!(
+                ring.corner_radius,
+                egui::CornerRadius::same((radius::R2 + outset) as u8),
+                "ring {i}'s corner radius grows with the expansion"
+            );
+        }
+        // The card hairline lifts to --ink-rule while focused.
+        let chrome: Vec<_> = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| r.rect == card)
+            .collect();
+        assert_eq!(
+            chrome[0].stroke,
+            egui::Stroke::new(1.0, color::INK_RULE),
+            "the focused hairline"
+        );
+        // Ring 5's outer edge (outset 10 + a centered stroke's 0.5) stays
+        // inside the 12px card margins — the rings never meet the panel's
+        // clip bounds.
+        let bar = card.expand(space::S3);
+        assert!(
+            bar.contains_rect(rings[GLOW_RING_ALPHAS.len() - 1].rect.expand(0.5)),
+            "ring 5 paints at most 10.5px past the card"
+        );
+    }
+
+    #[test]
+    fn hover_without_focus_lifts_only_the_hairline() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        let (_, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        let card = outcome.composer_card_rect;
+        // The pointer rests on the card's padding (over no child widget);
+        // the edit never took focus.
+        let hover = pos2(card.left() + 2.0, card.top() + 2.0);
+        let (output, outcome) = frame_out(
+            &ctx,
+            raw_input_with(vec![egui::Event::PointerMoved(hover)], 0.1),
+            &mut panel,
+        );
+        let card = outcome.composer_card_rect;
+        let chrome: Vec<_> = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| r.rect == card)
+            .collect();
+        assert_eq!(chrome.len(), 1);
+        assert_eq!(
+            chrome[0].stroke,
+            egui::Stroke::new(1.0, color::INK_RULE),
+            "hover lifts the hairline"
+        );
+        assert!(
+            ring_shapes(&output, card).is_empty(),
+            "no rings without focus"
+        );
+    }
+
+    #[test]
+    fn disconnected_focus_paints_rings_but_no_shimmer() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.set_gateway_connected(false);
+        panel.focus_composer();
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel); // grants focus
+        frame(&ctx, raw_input_with(vec![], 1.0), &mut panel); // focused
+        let (output, outcome) = frame_out(
+            &ctx,
+            raw_input_with(vec![], 1.0 + RING_FADE_S as f64 + 0.05),
+            &mut panel,
+        );
+        let card = outcome.composer_card_rect;
+        assert_eq!(
+            ring_shapes(&output, card).len(),
+            GLOW_RING_ALPHAS.len(),
+            "the rings paint regardless of the gateway (§2.2)"
+        );
+        // No ready-shimmer band along the card's bottom edge (the
+        // avatars-sleep precedent): no wide hairline-height fill there.
+        let band = rect_shapes(&output).into_iter().any(|r| {
+            r.fill != egui::Color32::TRANSPARENT
+                && r.rect.height() <= 1.5
+                && r.rect.width() > card.width() / 2.0
+                && (r.rect.bottom() - card.bottom()).abs() < 1.0
+        });
+        assert!(!band, "disconnected: no shimmer band");
+    }
+
+    #[test]
+    fn send_button_arms_ink_mid() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+
+        // Empty buffer: no fill, the disabled glyph.
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        let send = outcome.send_button_rect;
+        assert!(
+            rect_shapes(&output)
+                .iter()
+                .all(|r| r.rect != send || r.fill == egui::Color32::TRANSPARENT),
+            "empty buffer: the send button has no fill"
+        );
+        let glyph = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if send.contains(t.pos) => Some(t),
+                _ => None,
+            })
+            .expect("the ⏎ glyph paints");
+        assert_eq!(glyph.fallback_color, color::FG_DISABLED);
+
+        // Text in the buffer: armed at --ink-mid...
+        panel.set_composer_text("hi");
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.1), &mut panel);
+        let send = outcome.send_button_rect;
+        let fill = rect_shapes(&output)
+            .into_iter()
+            .find(|r| r.rect == send && r.fill != egui::Color32::TRANSPARENT)
+            .map(|r| r.fill);
+        assert_eq!(fill, Some(color::INK_MID), "the armed send button");
+        let glyph = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if send.contains(t.pos) => Some(t),
+                _ => None,
+            })
+            .expect("the ⏎ glyph paints");
+        assert_eq!(glyph.fallback_color, color::FG_DEFAULT);
+
+        // ...and --ink-hi on hover.
+        let (output, outcome) = frame_out(
+            &ctx,
+            raw_input_with(vec![egui::Event::PointerMoved(send.center())], 0.2),
+            &mut panel,
+        );
+        let send = outcome.send_button_rect;
+        let fill = rect_shapes(&output)
+            .into_iter()
+            .find(|r| r.rect == send && r.fill != egui::Color32::TRANSPARENT)
+            .map(|r| r.fill);
+        assert_eq!(fill, Some(color::INK_HI), "the hovered send button");
+    }
+
+    #[test]
+    fn frameless_edit_paints_no_own_frame() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.focus_composer();
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel); // grants focus
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 1.0), &mut panel);
+        let card = outcome.composer_card_rect;
+
+        // Exactly one rounded stroke at the card rect (the card's own
+        // chrome; the rings live outside it).
+        let at_card = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| r.rect == card && r.stroke.width > 0.0)
+            .count();
+        assert_eq!(at_card, 1, "only the card's hairline at the card rect");
+        // No second `--ink-low` fill at the edit's scale inside the card
+        // (egui's own edit frame would be extreme_bg = --ink-low at the
+        // edit's rect; the pill's footer-sized fill stays excluded).
+        let edit_fills = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| {
+                r.fill == color::INK_LOW
+                    && card.contains_rect(r.rect)
+                    && r.rect != card
+                    && r.rect.width() > 200.0
+                    && r.rect.height() < 40.0
+            })
+            .count();
+        assert_eq!(edit_fills, 0, "the edit paints no own background");
+        // No egui-native focus stroke inside the card at the edit's scale
+        // (the chip/pill hairlines are footer-sized).
+        let inner_strokes = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| {
+                r.stroke.width > 0.0
+                    && r.rect != card
+                    && card.contains_rect(r.rect)
+                    && r.rect.width() > 200.0
+            })
+            .count();
+        assert_eq!(inner_strokes, 0, "the frameless edit strokes nothing");
+    }
+
+    #[test]
+    fn reduce_motion_composer_requests_no_frames() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.set_reduce_motion(true);
+        panel.focus_composer();
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel); // grants focus
+                                                              // The first focused frame: the rings snap on at full alpha (no
+                                                              // --dur-quick fade — §11 bend #5).
+        let (focus_frame, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.1), &mut panel);
+        let card = outcome.composer_card_rect;
+        let rings = ring_shapes(&focus_frame, card);
+        assert_eq!(rings.len(), GLOW_RING_ALPHAS.len(), "the rings snapped on");
+        for (i, ring) in rings.iter().enumerate() {
+            assert_eq!(
+                ring.stroke.color,
+                with_alpha(color::FG_FAINT, GLOW_RING_ALPHAS[i]),
+                "ring {i} at full alpha on the focus frame"
+            );
+        }
+        // A later focused frame paints the identical rings (settled).
+        let ring_key = |rings: &[&egui::epaint::RectShape]| {
+            rings.iter().map(|r| (r.rect, r.stroke)).collect::<Vec<_>>()
+        };
+        let (later, _) = frame_out(&ctx, raw_input_with(vec![], 0.3), &mut panel);
+        assert_eq!(
+            ring_key(&rings),
+            ring_key(&ring_shapes(&later, card)),
+            "snapped: identical shapes"
+        );
+
+        // Steady state, nothing focused: under reduce-motion nothing
+        // requests a frame. (A focused edit's text-cursor blink is egui's
+        // own scheduler — the UI_SPEC §3.2 exemption — so this is
+        // measured on an unfocused panel, on a fresh context: the first
+        // panel's focus memory must not leak in.)
+        let calm_ctx = egui::Context::default();
+        let mut calm = ChatPanel::new();
+        calm.set_reduce_motion(true);
+        for i in 0..3 {
+            frame(
+                &calm_ctx,
+                raw_input_with(vec![], 1.0 + i as f64 * 0.1),
+                &mut calm,
+            );
+        }
+        let (steady, _) = frame_out(&calm_ctx, raw_input_with(vec![], 1.5), &mut calm);
+        assert_eq!(
+            repaint_delay(&steady),
+            Duration::MAX,
+            "reduce-motion requests no frames"
+        );
+    }
+
+    #[test]
+    fn live_idle_chat_requests_animation_frames() {
+        // The §9 standing-cost lock: an idle open chat panel repaints at
+        // the ANIM_FRAME cadence (the header orb + the welcome hero
+        // breathe) — deliberate, and disconnected/reduce-motion are the
+        // bounds (covered by their own tests).
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        for i in 0..3 {
+            frame(&ctx, raw_input_with(vec![], i as f64 * 0.1), &mut panel);
+        }
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 0.4), &mut panel);
+        let anim_frame = Duration::from_millis(motion::DUR_LOOP_MS as u64 / 60);
+        assert!(
+            repaint_delay(&output) <= anim_frame,
+            "idle live chat repaints at the presence cadence: {:?}",
+            repaint_delay(&output)
+        );
+    }
+
+    #[test]
+    fn header_orb_matches_the_status_line_mapping() {
+        use agent_cards::StatusPhase;
+        // The §3 table (agent in flight): the status line's own mapping.
+        assert_eq!(
+            header_orb(
+                true,
+                true,
+                &StatusPhase::AwaitingApproval,
+                None,
+                false,
+                true,
+                false
+            )
+            .state(),
+            OrbState::Listening,
+            "parked on an approval"
+        );
+        assert_eq!(
+            header_orb(
+                true,
+                true,
+                &StatusPhase::Running("running cargo test".to_owned()),
+                Some("bash"),
+                false,
+                true,
+                false
+            )
+            .state(),
+            OrbState::Solving,
+            "running bash"
+        );
+        assert_eq!(
+            header_orb(
+                true,
+                true,
+                &StatusPhase::Running("reading src/main.rs".to_owned()),
+                Some("read_file"),
+                false,
+                true,
+                false
+            )
+            .state(),
+            OrbState::Searching,
+            "running a read tool"
+        );
+        assert_eq!(
+            header_orb(true, true, &StatusPhase::Thinking, None, true, true, false).state(),
+            OrbState::Connecting,
+            "thinking while deltas stream"
+        );
+        assert_eq!(
+            header_orb(true, true, &StatusPhase::Thinking, None, false, true, false).state(),
+            OrbState::Working,
+            "thinking between deltas"
+        );
+        // Plain (non-agent) streams: connecting while deltas flow,
+        // working while the model thinks.
+        assert_eq!(
+            header_orb(false, true, &StatusPhase::Thinking, None, true, true, false).state(),
+            OrbState::Connecting
+        );
+        assert_eq!(
+            header_orb(
+                false,
+                true,
+                &StatusPhase::Thinking,
+                None,
+                false,
+                true,
+                false
+            )
+            .state(),
+            OrbState::Working
+        );
+        // Idle: breathing.
+        assert_eq!(
+            header_orb(
+                false,
+                false,
+                &StatusPhase::Thinking,
+                None,
+                false,
+                true,
+                false
+            )
+            .state(),
+            OrbState::Breathing
+        );
+        // Disconnected: paused on the MAPPED state (a paused `Working`
+        // still paints its three dots, statically).
+        let paused = header_orb(
+            false,
+            true,
+            &StatusPhase::Thinking,
+            None,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(paused.state(), OrbState::Working);
+
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        panel.set_gateway_connected(false);
+        panel.set_composer_text("hi");
+        let _id = send(&mut panel).expect("send"); // plain in-flight, no deltas: Working
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        frame(&ctx, raw_input_with(vec![], 0.5), &mut panel);
+        let header_dots = |output: &egui::FullOutput| {
+            let mut dots: Vec<(i32, i32, i32, egui::Color32)> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Circle(c) if c.center.y < HEADER_HEIGHT => Some((
+                        (c.center.x * 100.0) as i32,
+                        (c.center.y * 100.0) as i32,
+                        (c.radius * 100.0) as i32,
+                        c.fill,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            dots.sort_by_key(|a| (a.0, a.1, a.2));
+            dots
+        };
+        let (a, _) = frame_out(&ctx, raw_input_with(vec![], 1.0), &mut panel);
+        let (b, _) = frame_out(&ctx, raw_input_with(vec![], 2.0), &mut panel);
+        assert_eq!(header_dots(&a).len(), 3, "the paused Working orb's dots");
+        assert_eq!(header_dots(&a), header_dots(&b), "paused: frozen in place");
+        // Disconnected pauses the orbs (§9's bound); the frames that
+        // remain are the in-flight beam's — §8.6 (owner's, verbatim): "a
+        // disconnect mid-flight does not freeze the beam (in-flight
+        // requests complete)". The beam rides at the ANIM_FRAME cadence
+        // (§8.3), which bounds the delay. (egui subtracts the predicted
+        // frame time from every delayed request, so the observed delay
+        // lands just under ANIM_FRAME.)
+        let anim_frame = Duration::from_millis(motion::DUR_LOOP_MS as u64 / 60);
+        assert!(
+            repaint_delay(&b) <= anim_frame,
+            "disconnected pauses the orbs — only the in-flight beam requests frames (§8.6/§9): {:?}",
+            repaint_delay(&b)
+        );
+    }
+
+    #[test]
+    fn welcome_hero_is_the_64px_breathing_orb() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        // The hero's breathing dot (radius 0.12 · 64 · (1..1.08) ≈ 7.7–8.3)
+        // — the 20px header orb's dot is a third of that.
+        let hero_dots = output
+            .shapes
+            .iter()
+            .filter(
+                |s| matches!(&s.shape, egui::Shape::Circle(c) if (6.0..=10.0).contains(&c.radius)),
+            )
+            .count();
+        assert_eq!(hero_dots, 1, "the 64px hero's breathing dot");
+        // Connected: the `--ok` liveness satellite paints (§4 contract #2).
+        assert_eq!(ok_hue_circles(&output), 1, "the liveness satellite");
+        // Liveness off: the satellite is gone, the hero keeps breathing.
+        panel.set_gateway_connected(false);
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 0.1), &mut panel);
+        assert_eq!(ok_hue_circles(&output), 0, "liveness(false): no satellite");
+        let hero_dots = output
+            .shapes
+            .iter()
+            .filter(
+                |s| matches!(&s.shape, egui::Shape::Circle(c) if (6.0..=10.0).contains(&c.radius)),
+            )
+            .count();
+        assert_eq!(hero_dots, 1, "the hero still breathes");
+    }
+
+    #[test]
+    fn welcome_chips_bloom_in_three_staggered_steps() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        // The anchor arms on the first empty frame (t=1.0): every chip is
+        // still at alpha 0.
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 1.0), &mut panel);
+        assert!(chip_fills(&output).is_empty(), "the bloom starts at zero");
+        // 40ms later: chip 0 is mid-bloom; chips 1 and 2 haven't started.
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 1.04), &mut panel);
+        let chips = chip_fills(&output);
+        assert_eq!(chips.len(), 1, "only chip 0 has started");
+        let alpha = chips[0].fill.a();
+        assert!(alpha > 0 && alpha < 255, "chip 0 mid-bloom (alpha {alpha})");
+        // Well past the last chip's end: all three settled at full alpha.
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 2.0), &mut panel);
+        let chips = chip_fills(&output);
+        assert_eq!(chips.len(), 3, "all three chips bloomed");
+        assert!(chips.iter().all(|c| c.fill.a() == 255));
+
+        // A turn pushed and cleared re-arms the entrance from the top.
+        panel.push_user("hi");
+        frame(&ctx, raw_input_with(vec![], 2.5), &mut panel);
+        panel.clear();
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 3.0), &mut panel);
+        assert!(
+            chip_fills(&output).is_empty(),
+            "the re-emptied panel re-runs the entrance"
+        );
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 3.04), &mut panel);
+        assert_eq!(chip_fills(&output).len(), 1, "and it staggers again");
+    }
+
+    #[test]
+    fn welcome_chips_paint_the_1px_border() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        frame(&ctx, raw_input_with(vec![], 0.0), &mut panel); // arm the anchor
+                                                              // Past the bloom: the settled chips carry the §4 chrome — an
+                                                              // `--ink-low` fill with a 1px `--ink-hi` border.
+        let (output, _) = frame_out(&ctx, raw_input_with(vec![], 1.0), &mut panel);
+        let chips: Vec<_> = rect_shapes(&output)
+            .into_iter()
+            .filter(|r| {
+                (27.5..=28.5).contains(&r.rect.height())
+                    && r.rect.width() > 100.0
+                    && r.stroke.width > 0.0
+            })
+            .collect();
+        assert_eq!(chips.len(), SUGGESTIONS.len(), "three chipped suggestions");
+        for chip in chips {
+            assert_eq!(chip.fill, color::INK_LOW);
+            assert_eq!(chip.stroke, egui::Stroke::new(1.0, color::INK_HI));
+            assert_eq!(
+                chip.corner_radius,
+                egui::CornerRadius::same(radius::R1 as u8)
+            );
+        }
+    }
+
+    /// One frame at a custom panel width (the footer's fit-or-hide test)
+    /// — `frame_out`'s shape with a wider/narrower surface.
+    fn frame_wide(
+        ctx: &egui::Context,
+        width: f32,
+        panel: &mut ChatPanel,
+    ) -> (egui::FullOutput, ChatPanelOutcome) {
+        crate::theme::set_fonts(ctx);
+        let input = egui::RawInput {
+            focused: true,
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 600.0))),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut outcome = ChatPanelOutcome::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.set_min_size(vec2(width, 600.0));
+            outcome = panel.show(ui);
+        });
+        output.textures_delta.clear();
+        (output, outcome)
+    }
+
+    /// The composer card's footer row (the bottom 24px inside the card
+    /// padding, §2.1).
+    fn composer_footer(card: Rect) -> Rect {
+        Rect::from_min_size(
+            pos2(
+                card.left() + space::S3,
+                card.bottom() - space::S3 - model_picker::CLOSED_BUTTON_HEIGHT,
+            ),
+            vec2(
+                card.width() - 2.0 * space::S3,
+                model_picker::CLOSED_BUTTON_HEIGHT,
+            ),
+        )
+    }
+
+    /// Whether the key hint painted in this frame.
+    fn hint_painted(output: &egui::FullOutput) -> bool {
+        output.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == COMPOSER_KEY_HINT),
+        )
+    }
+
+    #[test]
+    fn footer_layout_and_hint_fit_or_hide() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new(); // no model: the shortest chip label
+
+        // 360px default: the cluster (chip + --space-2 + pill) paints
+        // inside the footer; the hint stays hidden — the fit-or-hide
+        // rule needs ~357px of card inner width for this cluster + hint
+        // (measured on the bundled Space Grotesk) and 360px has 312.
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        let footer = composer_footer(outcome.composer_card_rect);
+        let chip = panel.picker.last_geometry().toggle;
+        assert!(chip.width() > 0.0, "the model chip paints");
+        assert!(footer.contains_rect(chip), "the chip sits in the footer");
+        let pill = outcome.agent_pill_rect;
+        assert!(
+            footer.contains_rect(pill),
+            "the agent pill sits in the footer"
+        );
+        assert!(
+            (pill.left() - (chip.right() + space::S2)).abs() < 0.01,
+            "the pill follows the chip by --space-2 (pins the mirrored width formula)"
+        );
+        assert!(
+            !hint_painted(&output),
+            "360px: the hint hides whole (never elided)"
+        );
+
+        // 240px minimum: the hint still hides; the cluster is intact.
+        let (output, outcome) = frame_wide(&ctx, 240.0, &mut panel);
+        let footer = composer_footer(outcome.composer_card_rect);
+        assert!(!hint_painted(&output), "240px: the hint hides");
+        let chip = panel.picker.last_geometry().toggle;
+        assert!(footer.contains_rect(chip), "240px: the chip holds");
+        assert!(
+            footer.contains_rect(outcome.agent_pill_rect),
+            "240px: the pill holds"
+        );
+
+        // 440px: the footer genuinely fits — the hint paints,
+        // right-aligned in the row.
+        let (output, outcome) = frame_wide(&ctx, 440.0, &mut panel);
+        let footer = composer_footer(outcome.composer_card_rect);
+        let hint = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == COMPOSER_KEY_HINT => Some(t),
+                _ => None,
+            })
+            .expect("440px: the hint paints");
+        assert_eq!(hint.fallback_color, color::FG_FAINT);
+        assert!(
+            (hint.pos.x + hint.galley.size().x - footer.right()).abs() < 0.5,
+            "the hint is right-aligned in the footer"
+        );
+        assert!(
+            (hint.pos.y + hint.galley.size().y / 2.0 - footer.center().y).abs() < 0.5,
+            "and vertically centered in it"
+        );
+    }
+
+    // -- the border beam (REVAMP_SPEC §8; the §2.3 composer hook) --------
+
+    /// The border beam's segments in one frame: 2px line segments of a
+    /// gray (`--fg-default` hue — premultiplied alpha keeps r == g == b)
+    /// whose endpoints hug the card's perimeter. The StreamGlow's own 2px
+    /// segments ride the bottom edge's interior band (and its spark is
+    /// `--ok`-green), so neither passes the perimeter + hue filter; the
+    /// icons' 1.5px strokes fail the width.
+    fn beam_segments(output: &egui::FullOutput, card: Rect) -> Vec<(egui::Pos2, egui::Pos2)> {
+        // A point on the rounded-rect path is on the rect's outline —
+        // never deeper than the corner arc (R2 · (1 − 1/√2) ≈ 1.17px).
+        let on_perimeter =
+            |p: egui::Pos2| card.distance_to_pos(p) <= 1.5 && !card.shrink(1.5).contains(p);
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.width == 2.0
+                        && stroke.color.r() == stroke.color.g()
+                        && stroke.color.g() == stroke.color.b()
+                        && stroke.color.a() > 0
+                        && on_perimeter(points[0])
+                        && on_perimeter(points[1]) =>
+                {
+                    Some((points[0], points[1]))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_flight_composer_paints_the_beam() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+
+        // Idle: the card's perimeter carries no beam (§8.6).
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.0), &mut panel);
+        let card = outcome.composer_card_rect;
+        assert!(
+            beam_segments(&output, card).is_empty(),
+            "idle: no beam on the card's perimeter"
+        );
+
+        // In flight (a plain stream): 2px `--fg-default`-hue segments
+        // ride the perimeter.
+        panel.begin_stream(ChatId::next());
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.2), &mut panel);
+        let card = outcome.composer_card_rect;
+        let segments = beam_segments(&output, card);
+        assert!(
+            !segments.is_empty(),
+            "in flight: the beam rides the card's perimeter"
+        );
+        // The lap advances: a frame 600ms later paints the arc elsewhere
+        // (the eased phase's authority is beam.rs's own test).
+        let (later, _) = frame_out(&ctx, raw_input_with(vec![], 0.8), &mut panel);
+        let moved = beam_segments(&later, card);
+        assert!(!moved.is_empty(), "the beam still rides mid-lap");
+        assert_ne!(segments, moved, "the beam travels over 600ms");
+    }
+
+    #[test]
+    fn beam_stops_when_the_stream_completes() {
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new();
+        let id = ChatId::next();
+        panel.begin_stream(id);
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.2), &mut panel);
+        assert!(
+            !beam_segments(&output, outcome.composer_card_rect).is_empty(),
+            "in flight: the beam rides"
+        );
+
+        panel.complete_stream(id);
+        let (output, outcome) = frame_out(&ctx, raw_input_with(vec![], 0.4), &mut panel);
+        assert!(
+            beam_segments(&output, outcome.composer_card_rect).is_empty(),
+            "the beam dies with the stream"
+        );
+        // No repaint assertion here: `complete_stream` fires the
+        // StreamGlow's one-shot `--ok` spark (`--dur-long`) and the
+        // connected header orb breathes regardless (§9) — only the beam
+        // shapes' absence is this test's business.
+    }
+
     // -- Agent Mode (Phase 5d) ------------------------------------------------
 
     /// Submit with agent mode on (mirrors the Enter path's agent branch).
@@ -4438,9 +5615,17 @@ mod tests {
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         let pill = outcome.agent_pill_rect;
         assert!(pill.width() > 0.0, "the pill paints in the header");
-        frame(&ctx, raw_input_with(click_at(pill.center())), &mut panel);
+        frame(
+            &ctx,
+            raw_input_with(click_at(pill.center()), 0.0),
+            &mut panel,
+        );
         assert!(panel.is_agent_mode(), "the pill click toggles on");
-        frame(&ctx, raw_input_with(click_at(pill.center())), &mut panel);
+        frame(
+            &ctx,
+            raw_input_with(click_at(pill.center()), 0.0),
+            &mut panel,
+        );
         assert!(!panel.is_agent_mode(), "and back off");
     }
 
@@ -4617,7 +5802,7 @@ mod tests {
             .expect("Deny button paints");
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(deny_rect.center())),
+            raw_input_with(click_at(deny_rect.center()), 0.0),
             &mut panel,
         );
         assert_eq!(outcome.events.len(), 1, "events: {:?}", outcome.events);
@@ -4637,7 +5822,7 @@ mod tests {
         // The latch: no buttons next frame, no double-fire.
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(deny_rect.center())),
+            raw_input_with(click_at(deny_rect.center()), 0.0),
             &mut panel,
         );
         assert!(outcome.decision_button_rects.is_empty());
@@ -4655,7 +5840,7 @@ mod tests {
         // No card parked yet: Stop names Uuid::nil().
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         let stop = outcome.stop_button_rect.expect("Stop paints").center();
-        let outcome = frame(&ctx, raw_input_with(click_at(stop)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(stop), 0.0), &mut panel);
         match &outcome.events[0] {
             ChatPanelEvent::AgentDecision {
                 approval_id,
@@ -4680,7 +5865,7 @@ mod tests {
         );
         let outcome = frame(&ctx, egui::RawInput::default(), &mut panel);
         let stop = outcome.stop_button_rect.expect("Stop paints").center();
-        let outcome = frame(&ctx, raw_input_with(click_at(stop)), &mut panel);
+        let outcome = frame(&ctx, raw_input_with(click_at(stop), 0.0), &mut panel);
         match &outcome.events[0] {
             ChatPanelEvent::AgentDecision {
                 approval_id: got,
@@ -4714,7 +5899,7 @@ mod tests {
             .expect("clear menu item");
         let outcome = frame(
             &ctx,
-            raw_input_with(click_at(clear_rect.center())),
+            raw_input_with(click_at(clear_rect.center()), 0.0),
             &mut panel,
         );
 
@@ -4859,7 +6044,11 @@ mod tests {
             .find(|(label, _)| *label == "Approve")
             .map(|(_, rect)| *rect)
             .expect("Approve paints");
-        let outcome = frame(&ctx, raw_input_with(click_at(approve.center())), &mut panel);
+        let outcome = frame(
+            &ctx,
+            raw_input_with(click_at(approve.center()), 0.0),
+            &mut panel,
+        );
         assert!(matches!(
             outcome.events[0],
             ChatPanelEvent::AgentDecision {

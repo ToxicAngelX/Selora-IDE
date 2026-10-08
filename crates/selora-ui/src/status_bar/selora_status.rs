@@ -30,11 +30,16 @@ use egui::{Id, Sense, Ui};
 use selora_ai::SeloraStatus;
 
 use crate::presence::orb::{OrbState, ThinkingOrb, ORB_INLINE};
-use crate::theme::{color, font, space, type_scale};
+use crate::theme::{color, font, radius, space, type_scale};
 
 /// The run's id — one interactive element per frame, so a plain constant
 /// (the LSP-status restart targets in shell.rs use the same scheme).
 const ID: &str = "selora_connection_status";
+
+/// The clickable run's hover-target vertical pad (REVAMP_SPEC.md §7): the
+/// galley bounds expanded by (`--space-1`, 2px), `--radius-1`,
+/// `--ink-faint` fill + `--fg-default` text on hover.
+const RUN_PAD_V: f32 = 2.0;
 
 /// The dot glyph of the connected run (UI_SPEC.md §1.2).
 const DOT_CONNECTED: &str = "●";
@@ -160,34 +165,47 @@ pub fn show(
             .paint(ui, orb_rect);
     }
 
-    // The full run in its base color, laid out once — the overlays below
+    // The full run laid out once with a PLACEHOLDER color, so the
+    // per-state color is applied at paint time (`Painter::galley` treats
+    // it as a fallback — the editor tabs' pattern); the overlays below
     // reuse offsets measured with the same font, the same technique as
     // the shell's --warn dirty-dot overlay.
-    let galley = painter.layout_no_wrap(text.clone(), run_font.clone(), color::FG_MUTED);
+    let galley = painter.layout_no_wrap(text.clone(), run_font.clone(), egui::Color32::PLACEHOLDER);
+    let run_size = galley.size();
+    let run_pos = egui::pos2(right.0 - run_size.x, right.1 - run_size.y / 2.0);
     let run_rect = egui::Rect::from_min_size(
-        egui::pos2(right.0 - galley.size().x, rect.top()),
-        egui::vec2(galley.size().x, rect.height()),
+        egui::pos2(right.0 - run_size.x, rect.top()),
+        egui::vec2(run_size.x, rect.height()),
     );
 
     match status {
         SeloraStatus::Connected { latency_ms, .. } => {
             // One --ok run (UI_SPEC.md §1.2); not a click target. The ping
             // latency rides along as the hover tooltip.
-            painter.galley(
-                egui::pos2(right.0 - galley.size().x, right.1 - galley.size().y / 2.0),
-                galley,
-                color::OK,
-            );
+            painter.galley(run_pos, galley, color::OK);
             let response = ui.interact(run_rect, Id::new(ID), Sense::hover());
             response.on_hover_text(format!("gateway latency: {latency_ms} ms"));
         }
         SeloraStatus::Disconnected => {
             // Muted base run with the "connect" word lifted to
-            // --fg-default (the click affordance, UI_SPEC.md §1.2).
+            // --fg-default (the click affordance, UI_SPEC.md §1.2). The
+            // defined hover target (REVAMP_SPEC.md §7): the galley bounds
+            // expanded by (--space-1, 2px), --radius-1, --ink-faint fill +
+            // the whole run in --fg-default on hover.
+            let target = egui::Rect::from_min_size(run_pos, run_size)
+                .expand2(egui::vec2(space::S1, RUN_PAD_V));
+            let response = ui.interact(target, Id::new(ID), Sense::click());
+            if response.hovered() {
+                painter.rect_filled(target, radius::R1, color::INK_FAINT);
+            }
             painter.galley(
-                egui::pos2(right.0 - galley.size().x, right.1 - galley.size().y / 2.0),
+                run_pos,
                 galley,
-                color::FG_MUTED,
+                if response.hovered() {
+                    color::FG_DEFAULT
+                } else {
+                    color::FG_MUTED
+                },
             );
             let connect = painter.layout_no_wrap("connect".to_owned(), run_font, color::FG_DEFAULT);
             painter.galley(
@@ -195,33 +213,24 @@ pub fn show(
                 connect,
                 color::FG_DEFAULT,
             );
-            // The whole run is the click target (a 24px line is a small
-            // enough surface that the word alone would be a cruel hit
-            // area); the click opens Settings → Selora.
-            let response = ui.interact(run_rect, Id::new(ID), Sense::click());
             if response.clicked() {
                 return vec![StatusEvent::OpenConnect];
             }
         }
         SeloraStatus::Connecting => {
             // Transient: muted, not interactive.
-            painter.galley(
-                egui::pos2(right.0 - galley.size().x, right.1 - galley.size().y / 2.0),
-                galley,
-                color::FG_MUTED,
-            );
+            painter.galley(run_pos, galley, color::FG_MUTED);
         }
         // The gateway's own words (already inside the base galley via
         // `label`) stay muted; only the "○ selora error ·" prefix runs hot
-        // (--err, the one saturated use here).
+        // (--err, the one saturated use here) as an overlay — the same
+        // technique as the dirty-dot overlay.
         SeloraStatus::Error(_) => {
+            painter.galley(run_pos, galley, color::FG_MUTED);
             let prefix = format!("{DOT_OFF} selora error · ");
             let prefix_galley = painter.layout_no_wrap(prefix, run_font, color::ERR);
             painter.galley(
-                egui::pos2(
-                    right.0 - galley.size().x,
-                    right.1 - prefix_galley.size().y / 2.0,
-                ),
+                egui::pos2(run_pos.x, right.1 - prefix_galley.size().y / 2.0),
                 prefix_galley,
                 color::ERR,
             );
@@ -434,6 +443,72 @@ mod tests {
             latency_ms: 12,
         };
         assert!(click_run(&status).is_empty());
+    }
+
+    /// REVAMP_SPEC.md §7: the connect affordance's hover target is the
+    /// run's galley bounds expanded by (`--space-1`, 2px), `--radius-1`,
+    /// `--ink-faint` fill — and the run's text lifts to `--fg-default`.
+    #[test]
+    fn connect_run_hover_paints_the_defined_target() {
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, vec2(400.0, 24.0));
+        let raw = |events: Vec<egui::Event>| RawInput {
+            focused: true,
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let paint = |events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(raw(events), |ui| {
+                ui.set_min_size(screen.size());
+                let _ = show(ui, &SeloraStatus::Disconnected, None, None, false);
+            });
+            output.textures_delta.clear();
+            output
+        };
+
+        // Frame 1: settle; recover the run's galley bounds from its text
+        // shape.
+        let output = paint(vec![]);
+        let galley_rect = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("disconnected") => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .expect("the disconnected run paints its galley");
+
+        // Frame 2: the pointer parked on the run paints the hover target.
+        let output = paint(vec![egui::Event::PointerMoved(galley_rect.center())]);
+        let target = galley_rect.expand2(egui::vec2(space::S1, RUN_PAD_V));
+        let hover_fill = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Rect(shape)
+                    if shape.fill == color::INK_FAINT
+                        && (shape.rect.left() - target.left()).abs() < 0.5
+                        && (shape.rect.right() - target.right()).abs() < 0.5
+                        && (shape.rect.top() - target.top()).abs() < 0.5
+                        && (shape.rect.bottom() - target.bottom()).abs() < 0.5
+            )
+        });
+        assert!(
+            hover_fill,
+            "hover paints --ink-faint at the galley bounds + (--space-1, 2px)"
+        );
+        let lifted = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Text(text)
+                    if text.galley.text().contains("disconnected")
+                        && text.fallback_color == color::FG_DEFAULT
+            )
+        });
+        assert!(lifted, "the hovered run's text lifts to --fg-default");
     }
 
     #[test]

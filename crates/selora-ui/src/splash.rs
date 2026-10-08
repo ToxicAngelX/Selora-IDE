@@ -233,8 +233,15 @@ impl Splash {
         );
         cursor += type_scale::MD + space::S6;
 
-        // The key input (360px, masked, --ink-low fill, 1px --ink-hi
-        // border, --radius-1, 12px padding — UI_SPEC.md §7).
+        // The key input (360px, masked, --ink-low fill, --radius-1, 12px
+        // padding — UI_SPEC.md §7). Border: --border-focus (1px
+        // --fg-default) while focused, --ink-hi otherwise (REVAMP_SPEC
+        // §6). The focus state is read pre-paint from the edit's explicit
+        // id (the inner edit's Response doesn't exist yet at stroke-paint
+        // time; the one-frame lag is egui-inherent — the composer reads
+        // focus pre-paint the same way).
+        let input_id = egui::Id::new("selora_splash_key_input");
+        let input_focused = ui.ctx().memory(|m| m.focused() == Some(input_id));
         let input_rect = egui::Rect::from_min_size(
             egui::pos2(rect.center().x - INPUT_WIDTH / 2.0, cursor),
             egui::vec2(INPUT_WIDTH, INPUT_HEIGHT),
@@ -243,12 +250,20 @@ impl Splash {
         let connecting = matches!(self.status, SeloraStatus::Connecting);
         let frame = egui::Frame::default()
             .fill(color::INK_LOW)
-            .stroke(egui::Stroke::new(1.0, color::INK_HI))
+            .stroke(egui::Stroke::new(
+                1.0,
+                if input_focused {
+                    color::FG_DEFAULT
+                } else {
+                    color::INK_HI
+                },
+            ))
             .corner_radius(radius::R1)
             .inner_margin(egui::Margin::same(space::S3 as i8));
         frame.show(&mut input_ui, |ui| {
             ui.set_min_width(INPUT_WIDTH - 2.0 * space::S3);
             let edit = egui::TextEdit::singleline(&mut self.api_key)
+                .id(input_id)
                 .password(true)
                 .hint_text(egui::RichText::new("Paste your sk-gw-… API key").color(color::FG_FAINT))
                 .text_color(color::FG_DEFAULT)
@@ -499,13 +514,24 @@ mod tests {
             Self { ctx }
         }
 
-        fn frame(&self, splash: &mut Splash, events: Vec<egui::Event>) -> Vec<SplashEvent> {
+        /// One frame at frame-clock `time` (REVAMP_SPEC §0.1's harness
+        /// rule: an `Area`'s first frame is an invisible sizing pass and
+        /// the Area then fades in on `RawInput.time` — exact-color
+        /// assertions need a settled frame at ≥ +0.2s; the chat panel's
+        /// `raw_input_with` time parameter is the in-repo precedent).
+        fn frame(
+            &self,
+            splash: &mut Splash,
+            time: f64,
+            events: Vec<egui::Event>,
+        ) -> Vec<SplashEvent> {
             let input = egui::RawInput {
                 focused: true,
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(1280.0, 800.0),
                 )),
+                time: Some(time),
                 events,
                 ..Default::default()
             };
@@ -518,15 +544,42 @@ mod tests {
             out
         }
 
+        /// A frame that keeps the paint output (shape assertions).
+        fn frame_full(
+            &self,
+            splash: &mut Splash,
+            time: f64,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let input = egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut out = self.ctx.run_ui(input, |ui| {
+                splash.show(ui.ctx(), test_rect());
+            });
+            out.textures_delta.clear();
+            out
+        }
+
         /// A real click (the status-bar click-test pattern, plus one extra
         /// settle frame: an `Area`'s layer bounds land one frame after its
         /// first paint, so the hover needs two frames to register before
-        /// the press). Returns the release frame's events.
-        fn click(&self, splash: &mut Splash, pos: egui::Pos2) -> Vec<SplashEvent> {
-            self.frame(splash, vec![egui::Event::PointerMoved(pos)]);
-            self.frame(splash, vec![egui::Event::PointerMoved(pos)]);
+        /// the press). The four sub-frames advance the clock 50ms each —
+        /// §0.1's monotonically advancing headless clock. Returns the
+        /// release frame's events.
+        fn click(&self, splash: &mut Splash, time: f64, pos: egui::Pos2) -> Vec<SplashEvent> {
+            self.frame(splash, time, vec![egui::Event::PointerMoved(pos)]);
+            self.frame(splash, time + 0.05, vec![egui::Event::PointerMoved(pos)]);
             self.frame(
                 splash,
+                time + 0.10,
                 vec![egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
@@ -536,6 +589,7 @@ mod tests {
             );
             self.frame(
                 splash,
+                time + 0.15,
                 vec![egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
@@ -588,7 +642,7 @@ mod tests {
         let harness = Harness::new();
         let mut splash = Splash::new();
         let (_, _, skip) = layout_centers();
-        let events = harness.click(&mut splash, skip);
+        let events = harness.click(&mut splash, 0.0, skip);
         assert_eq!(events, vec![SplashEvent::Skip]);
     }
 
@@ -598,7 +652,7 @@ mod tests {
         let mut splash = Splash::new();
         splash.api_key = "sk-gw-test".to_owned();
         let (_, connect, _) = layout_centers();
-        let events = harness.click(&mut splash, connect);
+        let events = harness.click(&mut splash, 0.0, connect);
         assert_eq!(events, vec![SplashEvent::Connect("sk-gw-test".to_owned())]);
     }
 
@@ -607,7 +661,7 @@ mod tests {
         let harness = Harness::new();
         let mut splash = Splash::new();
         let (_, connect, _) = layout_centers();
-        let events = harness.click(&mut splash, connect);
+        let events = harness.click(&mut splash, 0.0, connect);
         assert!(events.is_empty());
     }
 
@@ -617,11 +671,12 @@ mod tests {
         let mut splash = Splash::new();
         let (input, _, _) = layout_centers();
         // Focus the field with a real click.
-        let events = harness.click(&mut splash, input);
+        let events = harness.click(&mut splash, 0.0, input);
         assert!(events.is_empty());
         // Type (with a stray space — the field strips whitespace).
         let events = harness.frame(
             &mut splash,
+            0.2,
             vec![
                 egui::Event::Text("sk-gw-".to_owned()),
                 egui::Event::Text("abc ".to_owned()),
@@ -632,6 +687,7 @@ mod tests {
         // Enter submits.
         let events = harness.frame(
             &mut splash,
+            0.4,
             vec![egui::Event::Key {
                 key: egui::Key::Enter,
                 physical_key: None,
@@ -650,7 +706,40 @@ mod tests {
         splash.api_key = "sk-gw-test".to_owned();
         splash.set_status(SeloraStatus::Connecting);
         let (_, connect, _) = layout_centers();
-        let events = harness.click(&mut splash, connect);
+        let events = harness.click(&mut splash, 0.0, connect);
         assert!(events.is_empty());
+    }
+
+    /// A 1px rect stroke in `stroke_color` (the key input's outer frame
+    /// border is the only `--fg-default` stroke on the splash).
+    fn has_border(out: &egui::FullOutput, stroke_color: egui::Color32) -> bool {
+        out.shapes.iter().any(|s| {
+            matches!(&s.shape, egui::Shape::Rect(r)
+                if r.stroke.width == 1.0 && r.stroke.color == stroke_color)
+        })
+    }
+
+    #[test]
+    fn focused_key_input_paints_the_focus_border() {
+        let harness = Harness::new();
+        let mut splash = Splash::new();
+        // §0.1: the Area's first frame is an invisible sizing pass (every
+        // shape a Noop) and the Area then fades in on the frame clock —
+        // settle one frame, then assert on frames ≥ +0.2s so the colors
+        // are exact.
+        harness.frame_full(&mut splash, 0.0, vec![]);
+        // Unfocused: the border is --ink-hi, never --fg-default.
+        let out = harness.frame_full(&mut splash, 0.3, vec![]);
+        assert!(has_border(&out, color::INK_HI));
+        assert!(!has_border(&out, color::FG_DEFAULT));
+        // Focus the field with a real click; the next frame's pre-paint
+        // memory read sees the explicit id focused.
+        let (input, _, _) = layout_centers();
+        harness.click(&mut splash, 0.4, input);
+        let out = harness.frame_full(&mut splash, 0.7, vec![]);
+        assert!(
+            has_border(&out, color::FG_DEFAULT),
+            "focused: --border-focus (1px --fg-default)"
+        );
     }
 }

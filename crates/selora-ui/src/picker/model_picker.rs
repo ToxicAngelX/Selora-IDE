@@ -154,6 +154,11 @@ pub struct ModelPicker {
     open: bool,
     /// The filter input's text.
     filter: String,
+    /// REVAMP_SPEC §2.1: the closed trigger lives on the composer card
+    /// (`--ink-low`), where the header tuning would invert — the on-card
+    /// states step one ink rung up and carry a 1px hairline (see
+    /// [`paint_toggle`](Self::paint_toggle)).
+    on_card: bool,
     // -- last painted geometry (see [`ModelPicker::last_geometry`]) ------
     toggle_rect: Rect,
     popup_rect: Option<Rect>,
@@ -171,6 +176,7 @@ impl ModelPicker {
             models: Vec::new(),
             open: false,
             filter: String::new(),
+            on_card: false,
             toggle_rect: Rect::NOTHING,
             popup_rect: None,
             refresh_rect: None,
@@ -221,6 +227,16 @@ impl ModelPicker {
     pub fn close(&mut self) {
         self.open = false;
         self.filter.clear();
+    }
+
+    /// Paint the closed trigger for the composer card (REVAMP_SPEC §2.1):
+    /// rest carries a 1px `--ink-hi` hairline instead of the header's
+    /// transparent rest, hover lifts to `--ink-mid` (a true one-step lift
+    /// from the card's `--ink-low`), open is `--ink-hi` + `--ink-rule`.
+    /// The label/chevron colors, the width math, and the dropdown are
+    /// untouched.
+    pub fn set_on_card(&mut self, on_card: bool) {
+        self.on_card = on_card;
     }
 
     /// The last painted geometry (the headless-test seam).
@@ -377,16 +393,33 @@ impl ModelPicker {
         text_color: egui::Color32,
     ) -> egui::Response {
         // Open = --ink-low (the open state of the token state matrix),
-        // hover = --ink-faint; --radius-1, no border.
-        let background = if self.open {
-            Some(color::INK_LOW)
+        // hover = --ink-faint; --radius-1, no border. On the composer
+        // card (--ink-low, REVAMP_SPEC §2.1) that inverts, so the on-card
+        // tuning steps one ink rung up and carries a 1px hairline: rest =
+        // border only, hover = --ink-mid, open = --ink-hi + --ink-rule.
+        let (background, border) = if self.on_card {
+            if self.open {
+                (Some(color::INK_HI), Some(color::INK_RULE))
+            } else if response.hovered() {
+                (Some(color::INK_MID), Some(color::INK_HI))
+            } else {
+                (None, Some(color::INK_HI))
+            }
+        } else if self.open {
+            (Some(color::INK_LOW), None)
         } else if response.hovered() {
-            Some(color::INK_FAINT)
+            (Some(color::INK_FAINT), None)
         } else {
-            None
+            (None, None)
         };
-        if let Some(fill) = background {
-            ui.painter().rect_filled(rect, radius::R1, fill);
+        if background.is_some() || border.is_some() {
+            ui.painter().rect(
+                rect,
+                radius::R1,
+                background.unwrap_or(egui::Color32::TRANSPARENT),
+                border.map_or(egui::Stroke::NONE, |color| Stroke::new(1.0, color)),
+                egui::StrokeKind::Inside,
+            );
         }
 
         let text_pos = pos2(
@@ -1175,5 +1208,86 @@ mod tests {
         assert_eq!(picker.active_model(), Some("kimi-k3"));
         picker.set_active_model(None);
         assert_eq!(picker.active_model(), None);
+    }
+
+    // -- the on-card trigger (REVAMP_SPEC §2.1) ----------------------------
+
+    /// One picker frame with the `FullOutput` kept (the chrome assertions
+    /// need the painted shapes; `run_frame` drops them).
+    fn paint_frame(
+        ctx: &Context,
+        picker: &mut ModelPicker,
+        events: Vec<Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            RawInput {
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_min_size(vec2(360.0, 600.0));
+                picker.show(ui);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    /// The chrome painted at the toggle's rect: (fill, stroke).
+    fn toggle_chrome(output: &egui::FullOutput, toggle: Rect) -> Option<(egui::Color32, Stroke)> {
+        output.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(r) if r.rect == toggle => Some((r.fill, r.stroke)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn on_card_toggle_paints_the_card_chrome() {
+        let ctx = test_ctx();
+        let mut picker = ModelPicker::new(None);
+        picker.set_on_card(true);
+        let _ = paint_frame(&ctx, &mut picker, vec![]);
+        let toggle = picker.last_geometry().toggle;
+
+        // Rest: no fill, the 1px --ink-hi hairline.
+        let out = paint_frame(&ctx, &mut picker, vec![]);
+        let (fill, stroke) = toggle_chrome(&out, toggle).expect("the on-card rest border");
+        assert_eq!(fill, egui::Color32::TRANSPARENT);
+        assert_eq!(stroke, Stroke::new(1.0, color::INK_HI));
+
+        // Hover: the fill lifts one rung to --ink-mid, border unchanged.
+        let out = paint_frame(
+            &ctx,
+            &mut picker,
+            vec![Event::PointerMoved(toggle.center())],
+        );
+        let (fill, stroke) = toggle_chrome(&out, toggle).expect("the hover chrome");
+        assert_eq!(fill, color::INK_MID);
+        assert_eq!(stroke, Stroke::new(1.0, color::INK_HI));
+
+        // Open: --ink-hi fill, --ink-rule border (outranking hover — the
+        // pointer is still parked on the toggle from the hover frame).
+        picker.open();
+        let out = paint_frame(&ctx, &mut picker, vec![]);
+        let (fill, stroke) = toggle_chrome(&out, toggle).expect("the open chrome");
+        assert_eq!(fill, color::INK_HI);
+        assert_eq!(stroke, Stroke::new(1.0, color::INK_RULE));
+
+        // The header tuning (the default) is untouched: no chrome shape
+        // at rest. (The pointer is parked off the toggle — it persists
+        // across frames and would otherwise hover it.)
+        let mut header_picker = ModelPicker::new(None);
+        let _ = paint_frame(&ctx, &mut header_picker, vec![]);
+        let header_toggle = header_picker.last_geometry().toggle;
+        let out = paint_frame(
+            &ctx,
+            &mut header_picker,
+            vec![Event::PointerMoved(pos2(600.0, 700.0))],
+        );
+        assert!(
+            toggle_chrome(&out, header_toggle).is_none(),
+            "the header trigger still paints no rest chrome"
+        );
     }
 }

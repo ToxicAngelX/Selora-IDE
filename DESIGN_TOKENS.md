@@ -239,8 +239,9 @@ The motion vocabulary is the Selora glyph vocabulary: **orbit, pulse, spark, wav
 | `--dur-base` | 240ms | Modal open, dropdown |
 | `--dur-loop` | 1200ms | Status pulse, live dot, "thinking" indicator |
 | `--dur-long` | 1800ms | Splash fade, first-run welcome |
+| `--dur-lap` | 2400ms | Border-beam perimeter lap (REVAMP_SPEC §8.3; exactly 2 × `--dur-loop`) |
 
-**No duration under 80ms.** No duration over 2000ms.
+**No duration under 80ms.** No duration over 2000ms — the one exception is `--dur-lap` (2400ms), the owner-authorized border-beam perimeter lap (REVAMP_SPEC §11 bend 6a: at 824px of composer perimeter a 1200ms lap reads hurried, and this cap forbids tuning past 2000ms without a token). Every other duration stays ≤ 2000ms.
 
 ### 7.3 Animation vocabulary (the 8 glyphs)
 
@@ -500,6 +501,8 @@ pub mod motion {
     pub const DUR_BASE_MS: u32    = 240;
     pub const DUR_LOOP_MS: u32    = 1200;
     pub const DUR_LONG_MS: u32    = 1800;
+    // §7.2's one >2000ms exception: border-beam perimeter lap (bend §11.6a).
+    pub const DUR_LAP_MS: u32     = 2400;
 
     // easing curves as tuples for egui / manual interpolation
     pub const EASE_PRECISE: (f32, f32, f32, f32) = (0.2, 0.0, 0.0, 1.0);

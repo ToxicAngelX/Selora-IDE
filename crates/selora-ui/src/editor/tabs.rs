@@ -347,11 +347,16 @@ pub fn tab_bar_at(ui: &Ui, tabs: &mut TabsState, rect: Rect, id: Id) -> TabBarRe
 
         let tab_resp = ui.interact(tab_rect, id.with(("tab", index)), Sense::click());
         let hovered = tab_resp.hovered();
+        let pressed = tab_resp.is_pointer_button_down_on();
         let active = tabs.active_index() == Some(index);
         let dirty = tabs.tab(index).is_some_and(|tab| tab.dirty);
 
-        // Inactive hover: one ink-step lift (UI_SPEC.md §3.1).
-        if hovered && !active {
+        // Pressed: `--ink-low` (the §10 active/pressed row); inactive
+        // hover: one ink-step lift (UI_SPEC.md §3.1). The active tab
+        // itself carries no fill — its bottom line is the mark.
+        if pressed {
+            painter.rect_filled(tab_rect, radius::R0, color::INK_LOW);
+        } else if hovered && !active {
             painter.rect_filled(tab_rect, radius::R0, color::INK_FAINT);
         }
         // Active tab: 1px --fg-default bottom line — the one place a light
@@ -425,9 +430,12 @@ pub fn tab_bar_at(ui: &Ui, tabs: &mut TabsState, rect: Rect, id: Id) -> TabBarRe
         }
     }
 
-    // "+" at the right: opens quick-open (wired by the shell).
+    // "+" at the right: opens quick-open (wired by the shell). Hover
+    // `--ink-faint`, pressed `--ink-low` (the §10 matrix).
     let plus_resp = ui.interact(plus_rect, id.with("plus"), Sense::click());
-    if plus_resp.hovered() {
+    if plus_resp.is_pointer_button_down_on() {
+        painter.rect_filled(plus_rect, radius::R0, color::INK_LOW);
+    } else if plus_resp.hovered() {
         painter.rect_filled(plus_rect, radius::R0, color::INK_FAINT);
     }
     let plus_color = if plus_resp.hovered() {

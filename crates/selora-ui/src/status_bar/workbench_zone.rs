@@ -11,8 +11,13 @@
 
 use selora_lsp::{LanguageId, ServerStatus};
 
-use crate::theme::{color, font, space, type_scale};
+use crate::theme::{color, font, radius, space, type_scale};
 use selora_editor::Language;
+
+/// The clickable runs' hover-target vertical pad (REVAMP_SPEC.md §7): the
+/// run's galley bounds expanded by (`--space-1`, 2px), `--radius-1`,
+/// `--ink-faint` fill + `--fg-default` text on hover.
+const RUN_PAD_V: f32 = 2.0;
 
 /// The left zone's git summary (`None` outside a repository).
 #[derive(Clone, Debug, Default)]
@@ -138,27 +143,49 @@ pub fn show(ui: &egui::Ui, input: &WorkbenchInput) -> Vec<WorkbenchEvent> {
             _ => color::FG_MUTED,
         };
         let font = sans();
-        let galley = painter.layout_no_wrap(text.clone(), font.clone(), status_color);
-        let text_rect = egui::Rect::from_min_size(
-            egui::pos2(status_x, rect.top()),
-            egui::vec2(galley.size().x + space::S3, rect.height()),
-        );
-        painter.galley(
-            egui::pos2(status_x, rect.center().y - galley.size().y / 2.0),
-            galley,
-            status_color,
-        );
-        if matches!(status, ServerStatus::Dead(_)) {
-            let response = ui.interact(
-                text_rect,
+        // PLACEHOLDER-baked galley: the per-state color is applied at
+        // paint time (`Painter::galley` treats it as a fallback — the
+        // editor tabs' pattern).
+        let galley = painter.layout_no_wrap(text.clone(), font.clone(), egui::Color32::PLACEHOLDER);
+        let galley_pos = egui::pos2(status_x, rect.center().y - galley.size().y / 2.0);
+        let run = egui::Rect::from_min_size(galley_pos, galley.size());
+        let galley_width = galley.size().x;
+
+        // A dead server's run is a click target for `Effect::Lsp(Restart)`
+        // (§5.6), with the defined hover target (REVAMP_SPEC.md §7): the
+        // galley bounds expanded by (`--space-1`, 2px), `--radius-1`,
+        // `--ink-faint` fill + `--fg-default` text on hover.
+        let response = matches!(status, ServerStatus::Dead(_)).then(|| {
+            ui.interact(
+                run.expand2(egui::vec2(space::S1, RUN_PAD_V)),
                 egui::Id::new(("lsp_restart", language)),
                 egui::Sense::click(),
+            )
+        });
+        let hovered = response.as_ref().is_some_and(|response| response.hovered());
+        if hovered {
+            painter.rect_filled(
+                run.expand2(egui::vec2(space::S1, RUN_PAD_V)),
+                radius::R1,
+                color::INK_FAINT,
             );
+        }
+        painter.galley(
+            galley_pos,
+            galley,
+            if hovered {
+                color::FG_DEFAULT
+            } else {
+                status_color
+            },
+        );
+        if let Some(response) = response {
             if response.clicked() {
                 events.push(WorkbenchEvent::RestartServer(*language));
             }
         }
-        status_x = text_rect.right() + space::S3;
+        // The next run starts `--space-3` past this run's trailing pad.
+        status_x += galley_width + 2.0 * space::S3;
     }
 
     // Center: cursor line:col + language of the active tab, and the LSP
@@ -247,6 +274,17 @@ mod tests {
         output.textures_delta.clear();
     }
 
+    /// One headless frame, keeping the `FullOutput` for shape assertions.
+    fn run_full(
+        ctx: &egui::Context,
+        raw: egui::RawInput,
+        f: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw, f);
+        output.textures_delta.clear();
+        output
+    }
+
     /// The zones paint headlessly with a dirty repo + dead server (the
     /// shell's smoke test previously covered this inline).
     #[test]
@@ -265,10 +303,13 @@ mod tests {
         let ctx = egui::Context::default();
         // The dead-server run starts after the git run: 12px inset + the
         // "main ● 3  " run. Sweep the zone right of it; the first
-        // successful click must carry the language id.
+        // successful click must carry the language id. The run paints at
+        // the rect's vertical center (the hover target is the galley
+        // bounds + (--space-1, 2px), REVAMP_SPEC.md §7), so the probe's
+        // dy straddles the 800px test rect's middle.
         let mut got: Option<LanguageId> = None;
         'probe: for dx in (60..=340).step_by(8) {
-            for dy in [4.0, 8.0, 12.0] {
+            for dy in [394.0, 397.0, 400.0, 403.0, 406.0] {
                 let pos = egui::pos2(dx as f32, dy);
                 let frames = [
                     vec![egui::Event::PointerMoved(pos)],
@@ -320,5 +361,55 @@ mod tests {
         assert_eq!(language_name(None), "Plain Text");
         assert_eq!(language_name(Some(Language::Rust)), "Rust");
         assert_eq!(language_name(Some(Language::Markdown)), "Markdown");
+    }
+
+    /// REVAMP_SPEC.md §10: a clickable run's hover target is the run's
+    /// galley bounds expanded by (`--space-1`, 2px), `--radius-1`,
+    /// `--ink-faint` fill. Hovering the dead server's run paints exactly
+    /// that rect.
+    #[test]
+    fn clickable_run_hover_uses_the_defined_target() {
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+
+        // Frame 1: settle; recover the dead-server run's galley bounds
+        // from its text shape.
+        let output = run_full(&ctx, screen(), |ui| {
+            let _ = show(ui, &input());
+        });
+        let galley_rect = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("dead") => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .expect("the dead-server run paints its galley");
+
+        // Frame 2: pointer parked on the run — the hover target paints.
+        let mut raw = screen();
+        raw.focused = true;
+        raw.events = vec![egui::Event::PointerMoved(galley_rect.center())];
+        let output = run_full(&ctx, raw, |ui| {
+            let _ = show(ui, &input());
+        });
+        let target = galley_rect.expand2(egui::vec2(space::S1, RUN_PAD_V));
+        let hover_fill = output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Rect(shape)
+                    if shape.fill == color::INK_FAINT
+                        && (shape.rect.left() - target.left()).abs() < 0.5
+                        && (shape.rect.right() - target.right()).abs() < 0.5
+                        && (shape.rect.top() - target.top()).abs() < 0.5
+                        && (shape.rect.bottom() - target.bottom()).abs() < 0.5
+            )
+        });
+        assert!(
+            hover_fill,
+            "hovering the dead-server run paints --ink-faint at the galley bounds + (--space-1, 2px)"
+        );
     }
 }

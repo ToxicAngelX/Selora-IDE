@@ -162,7 +162,8 @@ impl FindBar {
                                     .id(egui::Id::new(QUERY_ID))
                                     .hint_text("Find")
                                     .font(egui::FontId::new(type_scale::SM, font::FAMILY_SANS))
-                                    .desired_width(150.0),
+                                    .desired_width(150.0)
+                                    .frame(field_frame(query_focused)),
                             );
                             if self.want_focus {
                                 query_response.request_focus();
@@ -170,7 +171,8 @@ impl FindBar {
                             if query_response.changed() {
                                 events.push(FindBarEvent::Query(self.query.clone()));
                             }
-                            // The match count.
+                            // The match count: `--fg-muted`, the §10
+                            // idle-row readout tone (DESIGN_TOKENS.md §10).
                             row.painter().text(
                                 pos2(
                                     query_response.rect.right() + space::S2,
@@ -183,11 +185,12 @@ impl FindBar {
                                     format!("{active} of {matches}")
                                 },
                                 egui::FontId::new(type_scale::XS, font::FAMILY_SANS),
-                                color::FG_FAINT,
+                                color::FG_MUTED,
                             );
                             row.add_space(space::S1);
-                            // The `Aa` case toggle (active: fg default +
-                            // fill; idle: muted).
+                            // The `Aa` case toggle: active = the §10
+                            // selected row (`--ink-low`), hover
+                            // `--ink-faint`, pressed `--ink-low`.
                             let galley = row.painter().layout_no_wrap(
                                 "Aa".to_owned(),
                                 egui::FontId::new(type_scale::XS, font::FAMILY_MONO),
@@ -200,7 +203,7 @@ impl FindBar {
                                 ),
                                 Sense::click(),
                             );
-                            if self.case_sensitive {
+                            if self.case_sensitive || response.is_pointer_button_down_on() {
                                 row.painter().rect_filled(rect, radius::R1, color::INK_LOW);
                             } else if response.hovered() {
                                 row.painter()
@@ -241,7 +244,8 @@ impl FindBar {
                                         .id(egui::Id::new(REPLACE_ID))
                                         .hint_text("Replace")
                                         .font(egui::FontId::new(type_scale::SM, font::FAMILY_SANS))
-                                        .desired_width(150.0),
+                                        .desired_width(150.0)
+                                        .frame(field_frame(replace_focused)),
                                 );
                                 if small_button(row, "Replace", "find_replace").clicked() {
                                     events.push(FindBarEvent::Replace(self.replacement.clone()));
@@ -259,7 +263,8 @@ impl FindBar {
 }
 
 /// A small text button for the bar's controls (the cards' one-liner
-/// affordance style: XS text, hover fill).
+/// affordance style: XS text, hover fill). §10 matrix: hover
+/// `--ink-faint`, pressed `--ink-low` (REVAMP_SPEC.md §7).
 fn small_button(ui: &mut Ui, label: &str, _salt: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -269,8 +274,10 @@ fn small_button(ui: &mut Ui, label: &str, _salt: &str) -> egui::Response {
     let width = galley.size().x + 2.0 * space::S1;
     let (rect, response) =
         ui.allocate_exact_size(vec2(width, ROW_HEIGHT - 2.0 * space::S1), Sense::click());
-    if response.hovered() {
+    if response.is_pointer_button_down_on() {
         ui.painter().rect_filled(rect, radius::R1, color::INK_LOW);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, radius::R1, color::INK_FAINT);
     }
     ui.painter().text(
         rect.center(),
@@ -286,22 +293,67 @@ fn small_button(ui: &mut Ui, label: &str, _salt: &str) -> egui::Response {
     response
 }
 
+/// The field frame's vertical text inset — egui's own TextEdit default
+/// (`Margin::symmetric(4, 2)`, egui 0.36 `text_edit/builder.rs:136`),
+/// kept so the explicit frame leaves the field's geometry unchanged. Off
+/// the 4px spacing grid by necessity: it mirrors egui, not a token.
+const FIELD_MARGIN_V: i8 = 2;
+
+/// The find/replace field frame (REVAMP_SPEC.md §7): the §10 Focused row —
+/// `--ink-low` fill, 1px `--fg-default` border while focused, `--ink-hi`
+/// otherwise. An explicit frame on the edit (not egui's default frame) so
+/// every state's stroke is a token; the focus read happens pre-paint in
+/// [`FindBar::show`] (the splash key-input precedent — the inner
+/// `Response` doesn't exist at stroke-paint time, the one-frame lag is
+/// egui-inherent). The margin keeps egui's own text-edit inset
+/// (`--space-1` × [`FIELD_MARGIN_V`]) so the field's geometry is unchanged.
+fn field_frame(focused: bool) -> egui::Frame {
+    egui::Frame::default()
+        .fill(color::INK_LOW)
+        .stroke(egui::Stroke::new(
+            1.0,
+            if focused {
+                color::FG_DEFAULT
+            } else {
+                color::INK_HI
+            },
+        ))
+        .corner_radius(radius::R1)
+        .inner_margin(egui::Margin::symmetric(space::S1 as i8, FIELD_MARGIN_V))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn screen() -> egui::RawInput {
+    /// The headless viewport at frame-clock time `time` (seconds). The
+    /// clock must advance across frames of one test: the bar's `Area`
+    /// fades in over `animation_time`, premultiplying every paint, so an
+    /// exact-color assertion only holds once `time` clears the fade
+    /// (REVAMP_SPEC.md §0.1 — the `raw_input_with` time parameter is the
+    /// chat panel's precedent).
+    fn screen(time: f64) -> egui::RawInput {
         egui::RawInput {
             focused: true,
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1280.0, 800.0),
             )),
+            time: Some(time),
             ..Default::default()
         }
     }
 
     fn run(ctx: &egui::Context, raw: egui::RawInput, bar: &mut FindBar) -> Vec<FindBarEvent> {
+        run_full(ctx, raw, bar).1
+    }
+
+    /// One headless frame, keeping the `FullOutput` for shape assertions.
+    fn run_full(
+        ctx: &egui::Context,
+        raw: egui::RawInput,
+        bar: &mut FindBar,
+    ) -> (egui::FullOutput, Vec<FindBarEvent>) {
         let mut events = Vec::new();
         let mut output = ctx.run_ui(raw, |ui| {
             ui.set_min_size(vec2(1280.0, 800.0));
@@ -309,7 +361,7 @@ mod tests {
             events = bar.show(ui, anchor, 3, 1);
         });
         output.textures_delta.clear();
-        events
+        (output, events)
     }
 
     /// The bar opens, the query field takes focus, Esc closes (no other
@@ -323,12 +375,10 @@ mod tests {
         assert!(bar.open);
 
         // Frame 1 grants focus; frame 2 presses Esc.
-        let _ = run(&ctx, screen(), &mut bar);
+        let _ = run(&ctx, screen(0.0), &mut bar);
         let events = run(
             &ctx,
             egui::RawInput {
-                focused: true,
-                screen_rect: screen().screen_rect,
                 events: vec![egui::Event::Key {
                     key: Key::Escape,
                     physical_key: None,
@@ -336,14 +386,14 @@ mod tests {
                     repeat: false,
                     modifiers: Default::default(),
                 }],
-                ..Default::default()
+                ..screen(0.0)
             },
             &mut bar,
         );
         assert!(events.contains(&FindBarEvent::Close));
         bar.close();
         assert!(!bar.open);
-        let events = run(&ctx, screen(), &mut bar);
+        let events = run(&ctx, screen(0.0), &mut bar);
         assert!(events.is_empty(), "a closed bar emits nothing");
     }
 
@@ -354,11 +404,9 @@ mod tests {
         crate::theme::set_fonts(&ctx);
         let mut bar = FindBar::default();
         bar.open_for_find();
-        let _ = run(&ctx, screen(), &mut bar); // focus frame
+        let _ = run(&ctx, screen(0.0), &mut bar); // focus frame
 
         let press = |shift: bool| egui::RawInput {
-            focused: true,
-            screen_rect: screen().screen_rect,
             events: vec![egui::Event::Key {
                 key: Key::Enter,
                 physical_key: None,
@@ -370,11 +418,11 @@ mod tests {
                     Default::default()
                 },
             }],
-            ..Default::default()
+            ..screen(0.0)
         };
         let events = run(&ctx, press(false), &mut bar);
         assert!(events.contains(&FindBarEvent::Next));
-        let _ = run(&ctx, screen(), &mut bar); // settle
+        let _ = run(&ctx, screen(0.0), &mut bar); // settle
         let events = run(&ctx, press(true), &mut bar);
         assert!(events.contains(&FindBarEvent::Prev));
     }
@@ -388,7 +436,67 @@ mod tests {
         let mut bar = FindBar::default();
         bar.open_for_replace();
         assert!(bar.replace_mode);
-        let events = run(&ctx, screen(), &mut bar);
+        let events = run(&ctx, screen(0.0), &mut bar);
         assert!(events.is_empty());
+    }
+
+    /// REVAMP_SPEC.md §7: the fields take the §10 Focused row — a 1px
+    /// `--fg-default` border while focused (`--ink-hi` otherwise).
+    #[test]
+    fn focused_query_field_paints_the_focus_border() {
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+        let mut bar = FindBar::default();
+        bar.open_for_find();
+
+        // Frame 1 is the Area's sizing pass (its shapes come back as
+        // Noop) and grants the field's focus via `want_focus`. Frame 2's
+        // pre-paint memory read sees the focus and flips the stroke —
+        // and its clock time must sit past the Area's fade-in, which
+        // premultiplies every paint by `quadratic_out(age /
+        // animation_time)`: only at age ≥ animation_time (egui's
+        // default ≈ 0.083s) are the fill/stroke the exact tokens
+        // (REVAMP_SPEC.md §0.1).
+        let _ = run(&ctx, screen(0.0), &mut bar);
+        let (output, _) = run_full(&ctx, screen(0.2), &mut bar);
+        let focus_border = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Rect(shape)
+                        if shape.fill == color::INK_LOW
+                            && shape.stroke == egui::Stroke::new(1.0, color::FG_DEFAULT)
+                )
+            })
+        };
+        assert!(
+            focus_border(&output),
+            "the focused query field paints its 1px --fg-default border"
+        );
+
+        // Focus surrendered (Escape clears egui's widget focus during
+        // input processing): the border falls back to --ink-hi. The
+        // clock keeps advancing so this negative assertion is exact
+        // rather than fade-dimmed.
+        let events = run(
+            &ctx,
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..screen(0.3)
+            },
+            &mut bar,
+        );
+        assert!(events.contains(&FindBarEvent::Close));
+        let (output, _) = run_full(&ctx, screen(0.4), &mut bar);
+        assert!(
+            !focus_border(&output),
+            "unfocused: no --fg-default border on the fields"
+        );
     }
 }

@@ -6,7 +6,9 @@
 //! - a 24px "FILES" header (`--type-xs`, `--fg-faint`, wide tracking),
 //! - virtualization-ready rows from [`FileTreeView::rows`] (22px tall,
 //!   12px indent per level, disclosure chevron in `--fg-faint`,
-//!   folder/file icons painted in code per DESIGN_TOKENS.md §8),
+//!   folder/file icons painted in code per DESIGN_TOKENS.md §8; the
+//!   selected row takes `--ink-low` plus the 2×14 leading edge mark,
+//!   REVAMP_SPEC.md §7),
 //! - the right-click context menu (New File, New Folder, Rename, Delete,
 //!   Copy Path, Reveal in Explorer) on an `--ink-mid` / 1px `--ink-hi` /
 //!   `--radius-2` popup,
@@ -47,6 +49,13 @@ pub const INDENT_PER_LEVEL: f32 = 12.0;
 pub const FOOTER_HEIGHT: f32 = 24.0;
 /// The panel's sidebar label (UI_SPEC.md §2.2).
 pub const HEADER_LABEL: &str = "FILES";
+
+/// The selected row's leading edge mark (REVAMP_SPEC.md §1 `EDGE_MARK`):
+/// 2×14, `--radius-1`, `--fg-muted`, at the row's left edge, vertically
+/// centered — a painted accent rect, not a border (the §11 bend-3
+/// sign-off; row borders stay forbidden, DESIGN_TOKENS.md §5.2).
+const EDGE_MARK_W: f32 = 2.0;
+const EDGE_MARK_H: f32 = 14.0;
 
 /// Row font: `--type-sm` in the mono family (DESIGN_TOKENS.md §2.1 —
 /// the file tree is a `--font-mono` surface).
@@ -314,7 +323,9 @@ impl FileTreePanel {
 
         // Row background: hover --ink-faint, selected --ink-low, otherwise
         // nothing (the canvas shows through). No row borders
-        // (DESIGN_TOKENS.md §5.2).
+        // (DESIGN_TOKENS.md §5.2). The selected row also paints the 2×14
+        // leading edge mark (REVAMP_SPEC.md §7) — a painted accent, not a
+        // border.
         let bg = if selected {
             Some(color::INK_LOW)
         } else if hovered && is_node {
@@ -324,6 +335,13 @@ impl FileTreePanel {
         };
         if let Some(fill) = bg {
             ui.painter().rect_filled(rect, radius::R0, fill);
+        }
+        if selected {
+            let mark = Rect::from_min_size(
+                pos2(rect.left(), rect.center().y - EDGE_MARK_H / 2.0),
+                vec2(EDGE_MARK_W, EDGE_MARK_H),
+            );
+            ui.painter().rect_filled(mark, radius::R1, color::FG_MUTED);
         }
 
         // Icon color follows the row's text color (currentColor,
@@ -654,6 +672,73 @@ mod tests {
             let outcome = panel.show(ui);
             assert_eq!(outcome.rows_painted, 0);
         });
+    }
+
+    /// REVAMP_SPEC.md §10: the selected row paints the 2×14 `--fg-muted`
+    /// edge mark at the row's left edge, vertically centered; unselected
+    /// rows paint none.
+    #[test]
+    fn selected_row_paints_the_edge_mark() {
+        let ctx = egui::Context::default();
+        crate::theme::set_fonts(&ctx);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 400.0));
+
+        let mut panel = FileTreePanel::new();
+        panel.set_tree(fixture_tree());
+        panel.view.select(Path::new("/proj/Cargo.toml"));
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_min_size(screen.size());
+                let outcome = panel.show(ui);
+                assert_eq!(outcome.rows_painted, 3);
+            },
+        );
+        output.textures_delta.clear();
+
+        // The selected row: the one 22px-tall `--ink-low` fill.
+        let row = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(shape)
+                    if shape.fill == color::INK_LOW
+                        && (shape.rect.height() - ROW_HEIGHT).abs() < 0.5 =>
+                {
+                    Some(shape.rect)
+                }
+                _ => None,
+            })
+            .expect("the selected row paints its --ink-low fill");
+
+        let marks: Vec<Rect> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(shape)
+                    if shape.fill == color::FG_MUTED
+                        && (shape.rect.width() - EDGE_MARK_W).abs() < 0.5
+                        && (shape.rect.height() - EDGE_MARK_H).abs() < 0.5 =>
+                {
+                    Some(shape.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marks.len(), 1, "exactly one edge mark (selected only)");
+        let mark = marks[0];
+        assert!(
+            (mark.left() - row.left()).abs() < 0.5,
+            "the mark is flush with the row's left edge: {mark:?} vs {row:?}"
+        );
+        assert!(
+            (mark.center().y - row.center().y).abs() < 0.5,
+            "the mark is vertically centered on the row: {mark:?} vs {row:?}"
+        );
     }
 
     #[test]

@@ -15,19 +15,27 @@
 //! `--fg-faint` / `--fg-muted` — the §12-lawful analogue of the web
 //! version's blur (no smooth gradient). The envelope is attack/release,
 //! tuned to §7.2: each delta is one attack step; the release decays to
-//! zero over one `--dur-loop`. The band's end caps follow the composer
-//! input's corner radius, auto-detected from the style (the web version
-//! reads the host element's `border-radius`).
+//! zero over one `--dur-loop`. The band's end caps follow the host card's
+//! corner radius — [`set_cap_radius`](Self::set_cap_radius) when the
+//! caller knows it (the composer card is `--radius-2`), else the style's
+//! widget radius, capped at `--radius-2` (the web version reads the host
+//! element's `border-radius`).
+//!
+//! The rest state (REVAMP_SPEC §2.2): while the composer is focused and
+//! the gateway connected but nothing streams (`set_ready`), the line band
+//! breathes a low-alpha shimmer (alpha 0.06↔0.12 — the §7.3 `pulse`
+//! glyph at low alpha, one `--dur-loop`).
 //!
 //! Reduce-motion (§7.4): the rise/decay is fade-family (kept); the
 //! traveling beam freezes to a static centered segment; the spark becomes
-//! a static flash (a `--dur-quick` full-alpha hold).
+//! a static flash (a `--dur-quick` full-alpha hold); the ready shimmer
+//! freezes to a static α0.08 line.
 
 use egui::{pos2, vec2, CornerRadius, Rect, Stroke, Ui};
 
 use crate::theme::{color, motion, radius};
 
-use super::{clock_s, ping_pong, request_anim_frame, with_alpha, LOOP_S};
+use super::{clock_s, ping_pong, pulse_eased, request_anim_frame, with_alpha, LOOP_S};
 
 /// One delta's attack step: ~8 deltas in a frame saturate the envelope.
 const ATTACK: f32 = 0.125;
@@ -45,6 +53,13 @@ const SPARK_LEN: f32 = 0.12;
 const LINE_H: f32 = 1.0;
 const MID_H: f32 = 2.0;
 const TOP_H: f32 = 3.0;
+
+/// The ready shimmer's breathing alpha bounds (REVAMP_SPEC §2.2 — a
+/// `pulse` at low alpha, never louder than the streaming envelope).
+const READY_SHIMMER_MIN: f32 = 0.06;
+const READY_SHIMMER_MAX: f32 = 0.12;
+/// The ready shimmer's static alpha under reduce-motion (§2.2).
+const READY_SHIMMER_STATIC: f32 = 0.08;
 
 /// The composer's streaming-activity glow. The panel owns one; deltas and
 /// turn completions are noted through [`note_delta`](Self::note_delta) /
@@ -67,6 +82,13 @@ pub struct StreamGlow {
     pending_spark: bool,
     /// The spark's start (frame-clock seconds).
     spark_at: Option<f64>,
+    /// The §2.2 ready shimmer: the composer is focused and the gateway
+    /// connected — the idle band breathes.
+    ready: bool,
+    /// The band end caps' corner radius when the caller knows the host
+    /// card's radius (§2.2 — the composer card is `--radius-2`); `None`
+    /// falls back to the style's widget radius.
+    cap_radius: Option<f32>,
     reduce_motion: bool,
 }
 
@@ -77,6 +99,20 @@ impl StreamGlow {
 
     pub fn set_reduce_motion(&mut self, on: bool) {
         self.reduce_motion = on;
+    }
+
+    /// REVAMP_SPEC §2.2: while `ready` (the composer is focused and the
+    /// gateway connected), the otherwise-idle band breathes the low-alpha
+    /// ready shimmer.
+    pub fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+    }
+
+    /// REVAMP_SPEC §2.2: the band's end caps follow the host card's corner
+    /// radius (the composer passes `--radius-2` so the caps match the
+    /// card's corners); unset = the style's widget radius.
+    pub fn set_cap_radius(&mut self, r: f32) {
+        self.cap_radius = Some(r);
     }
 
     /// One streamed delta arrived (an attack step, applied at the next
@@ -120,7 +156,7 @@ impl StreamGlow {
         self.level
     }
 
-    /// Paint along `edge`'s bottom border (the composer bar's rect).
+    /// Paint along `edge`'s bottom border (the composer card's rect).
     /// `processing` is "a tool is running": the glow gathers into the
     /// traveling beam.
     pub fn show(&mut self, ui: &Ui, edge: Rect, processing: bool) {
@@ -131,15 +167,17 @@ impl StreamGlow {
             self.spark_at = Some(now);
         }
         let spark = self.spark_frame(now);
-        if self.level <= 0.001 && !processing && spark.is_none() {
-            return; // idle: nothing painted, no frames requested
-        }
 
-        let painter = ui.painter();
-        // The band's end caps follow the composer input's corner radius
-        // (auto-detected from the style; capped at --radius-2).
-        let widget_radius = ui.visuals().widgets.inactive.corner_radius;
-        let cap = f32::from(widget_radius.sw.max(widget_radius.se)).min(radius::R2);
+        // The band's end caps follow the host card's corner radius —
+        // `set_cap_radius` when set (the composer card is --radius-2),
+        // else the style's widget radius; capped at --radius-2.
+        let cap = self
+            .cap_radius
+            .unwrap_or_else(|| {
+                let widget_radius = ui.visuals().widgets.inactive.corner_radius;
+                f32::from(widget_radius.sw.max(widget_radius.se))
+            })
+            .min(radius::R2);
         let end_caps = CornerRadius {
             nw: 0,
             ne: 0,
@@ -147,6 +185,13 @@ impl StreamGlow {
             se: cap as u8,
         };
 
+        if self.level <= 0.001 && !processing && spark.is_none() {
+            // Idle: only the §2.2 ready shimmer may paint.
+            self.paint_ready_shimmer(ui, edge, end_caps, now);
+            return;
+        }
+
+        let painter = ui.painter();
         let bottom = edge.bottom();
         let band = |height_up: f32, height: f32| {
             Rect::from_min_size(
@@ -222,6 +267,32 @@ impl StreamGlow {
         let animating =
             self.level > 0.001 || spark.is_some() || (processing && !self.reduce_motion);
         if animating {
+            request_anim_frame(ui.ctx());
+        }
+    }
+
+    /// The §2.2 ready shimmer: with the composer focused and connected but
+    /// idle, the `LINE_H` band breathes alpha 0.06↔0.12 on the §7.3
+    /// `pulse` (one `--dur-loop`). Reduce-motion: a static α0.08 line, no
+    /// repaints. Not ready: nothing painted, no frames requested (the
+    /// pre-revamp idle contract).
+    fn paint_ready_shimmer(&self, ui: &Ui, edge: Rect, end_caps: CornerRadius, now: f64) {
+        if !self.ready {
+            return;
+        }
+        let alpha = if self.reduce_motion {
+            READY_SHIMMER_STATIC
+        } else {
+            let phase = now as f32 / LOOP_S;
+            READY_SHIMMER_MIN + (READY_SHIMMER_MAX - READY_SHIMMER_MIN) * pulse_eased(phase)
+        };
+        let band = Rect::from_min_size(
+            pos2(edge.left(), edge.bottom() - LINE_H),
+            vec2(edge.width(), LINE_H),
+        );
+        ui.painter()
+            .rect_filled(band, end_caps, with_alpha(color::FG_MUTED, alpha));
+        if !self.reduce_motion {
             request_anim_frame(ui.ctx());
         }
     }
@@ -469,5 +540,104 @@ mod tests {
             }),
             "the bottom corners follow the widget radius (2 = --radius-1)"
         );
+    }
+
+    #[test]
+    fn ready_shimmer_breathes_within_bounds() {
+        let ctx = egui::Context::default();
+        let mut glow = StreamGlow::new();
+        glow.set_ready(true);
+        let band_alpha = |out: &egui::FullOutput| {
+            out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => Some(r.fill.a()),
+                _ => None,
+            })
+        };
+        // Sweep one --dur-loop: the shimmer band is always present, its
+        // alpha stays inside 0.06..0.12, and it actually breathes.
+        let mut min = u8::MAX;
+        let mut max = u8::MIN;
+        for i in 0..12 {
+            let out = frame(&ctx, i as f64 * 0.1, &mut glow, false);
+            let a = band_alpha(&out).expect("the ready shimmer band paints");
+            min = min.min(a);
+            max = max.max(a);
+            let delay = out.viewport_output.values().next().map(|o| o.repaint_delay);
+            assert!(
+                delay.is_some_and(|d| d <= crate::presence::ANIM_FRAME),
+                "the breathing shimmer requests animation frames"
+            );
+        }
+        // with_alpha rounds: 0.06·255 ≈ 15, 0.12·255 ≈ 31.
+        assert!(min >= 15, "never below the 0.06 floor: {min}");
+        assert!(max <= 31, "never above the 0.12 ceiling: {max}");
+        assert!(max > min, "the shimmer breathes (min {min}, max {max})");
+    }
+
+    #[test]
+    fn ready_shimmer_freezes_under_reduce_motion() {
+        let ctx = egui::Context::default();
+        let mut glow = StreamGlow::new();
+        glow.set_ready(true);
+        glow.set_reduce_motion(true);
+        for _ in 0..3 {
+            frame(&ctx, 0.0, &mut glow, false);
+        }
+        let band_alpha = |out: &egui::FullOutput| {
+            out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => Some(r.fill.a()),
+                _ => None,
+            })
+        };
+        let a = frame(&ctx, 1.0, &mut glow, false);
+        let b = frame(&ctx, 5.0, &mut glow, false);
+        let expected = (READY_SHIMMER_STATIC * 255.0).round() as u8;
+        assert_eq!(band_alpha(&a), Some(expected), "the static α0.08 line");
+        assert_eq!(band_alpha(&b), Some(expected), "static: no breathing");
+        let delay = a.viewport_output.values().next().map(|o| o.repaint_delay);
+        assert_eq!(
+            delay,
+            Some(std::time::Duration::MAX),
+            "reduce-motion requests no animation frames"
+        );
+    }
+
+    #[test]
+    fn band_caps_follow_the_set_cap_radius() {
+        // §2.2: the composer passes --radius-2 so the caps match the
+        // card's corners (the style default is 2, the card is 4).
+        let ctx = egui::Context::default();
+        let mut glow = StreamGlow::new();
+        glow.set_ready(true);
+        glow.set_cap_radius(radius::R2);
+        let out = frame(&ctx, 0.0, &mut glow, false);
+        let band = out.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => Some(r.corner_radius),
+            _ => None,
+        });
+        assert_eq!(
+            band,
+            Some(CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: radius::R2 as u8,
+                se: radius::R2 as u8
+            }),
+            "the caps follow set_cap_radius, not the style"
+        );
+    }
+
+    #[test]
+    fn not_ready_idle_still_paints_nothing() {
+        // The pre-shimmer idle contract is untouched while `ready` is unset.
+        let ctx = egui::Context::default();
+        let mut glow = StreamGlow::new();
+        for _ in 0..3 {
+            frame(&ctx, 0.0, &mut glow, false);
+        }
+        let out = frame(&ctx, 5.0, &mut glow, false);
+        assert_eq!(filled_bands(&out), 0);
+        let delay = out.viewport_output.values().next().map(|o| o.repaint_delay);
+        assert_eq!(delay, Some(std::time::Duration::MAX));
     }
 }

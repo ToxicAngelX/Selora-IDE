@@ -117,6 +117,15 @@ pub mod motion {
     pub const DUR_LOOP_MS: u32 = 1200;
     pub const DUR_LONG_MS: u32 = 1800;
 
+    /// One perimeter lap of the border beam (DESIGN_TOKENS.md §7.2, the
+    /// revamp's one new duration — REVAMP_SPEC §8.3). The beam's lap is a
+    /// loop, so DESIGN_TOKENS §12's ≥1200ms loop floor makes it a *duration*;
+    /// at 824px of composer perimeter a 1200ms lap reads hurried, and §7.2's
+    /// 2000ms ceiling forbids tuning past it without a token. Exactly
+    /// 2 × `DUR_LOOP_MS`; the one owner-authorized >2000ms duration
+    /// (REVAMP_SPEC §11 bend 6a).
+    pub const DUR_LAP_MS: u32 = 2400;
+
     // easing curves as tuples for egui / manual interpolation
     pub const EASE_PRECISE: (f32, f32, f32, f32) = (0.2, 0.0, 0.0, 1.0);
     pub const EASE_CALM: (f32, f32, f32, f32) = (0.4, 0.0, 0.2, 1.0);
@@ -146,5 +155,22 @@ pub mod motion {
             }
         }
         coordinate((low + high) / 2.0, y1, y2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// REVAMP_SPEC §10: the border beam's lap is a loop, so it obeys
+    /// DESIGN_TOKENS §12's ≥1200ms loop floor, and the owner authorized
+    /// exactly 2 × `DUR_LOOP_MS` (§11 bend 6a) — no other value.
+    #[test]
+    fn dur_lap_is_exactly_two_dur_loops() {
+        assert_eq!(crate::motion::DUR_LAP_MS, 2 * crate::motion::DUR_LOOP_MS);
+        // The §12 loop-floor pin is a constant relationship, so it is
+        // checked at compile time (clippy's assertions_on_constants
+        // resolution): a violation fails the build, not just the test.
+        const {
+            assert!(crate::motion::DUR_LAP_MS >= crate::motion::DUR_LOOP_MS);
+        }
     }
 }
