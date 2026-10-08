@@ -11,6 +11,8 @@ members = [
     "crates/selora-tokens",
     "crates/selora-ui",
     "crates/selora-app",
+    "crates/selora-protocol",
+    "apps/selora-desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -29,6 +31,8 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+url = "2"
+selora-protocol = { path = "crates/selora-protocol" }
 # Networking (selora-ai): reqwest with rustls only — no OpenSSL on Windows (PLAN.md §4.7).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }

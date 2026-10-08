@@ -12,3 +12,6 @@ installer/output/
 .claude/
 .zcode/
 graphify-out/
+
+# MSYS shell redirect artifacts (`> nul` creates a real file on Windows)
+nul

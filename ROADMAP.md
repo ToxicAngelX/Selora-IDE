@@ -14,6 +14,19 @@ This is the build contract. Each phase below is a discrete unit of work a single
 
 ---
 
+## Reference repositories (owner directive, 2026-10-07)
+
+Two upstream projects are the standing idea sources for Selora — many already-shipped features take their cues from them. Consult them before designing anything in the phases below. **Study ideas and behavior — never copy code** (license note at the end of this section).
+
+| Repo | What it is | What Selora takes from it | Where it shows up |
+|---|---|---|---|
+| https://github.com/zai-org/ZCode | Z.ai's coding agent harness (Apache-2.0; TypeScript/Electron desktop + web + TUI over one shared backend and React/Zustand UI package) | **The UI/UX benchmark and the feature-rich agent window**: agent session experience, tool/approval cards, composer behavior, dynamic workflows, plan mode / todos / escalations, presence & motion language | Phase R (Premium UX Revamp), Phase 5 (Agent Mode), Phase 8 (Workflows), Phase 9 (Agent Workbench) |
+| https://github.com/zed-industries/zed | Zed Industries' high-performance multiplayer editor (Rust workspace; GPUI, rope/sum-tree text buffers, Tree-sitter; the Atom/Tree-sitter creators) | **The fast-and-light engine reference**: rope-based buffer design, incremental parse/highlight, GPU-oriented UI architecture, performance budgets, edit-prediction efficiency | selora-editor (ropey buffer, tree-sitter), Phase 2 (editor core), Phase 4d (ghost text), any performance work |
+
+**License rule:** Selora is MIT. ZCode is Apache-2.0 (compatible, but still prefer ideas over code). Zed is **GPL-3.0** — study its architecture and technique only; copying its code would contaminate Selora's license. Treat both as design references, never as vendored sources.
+
+---
+
 ## Phase 0 — Foundation
 
 **Goal:** Repo skeleton, CI green, Selora design tokens compiled in, hello-window with a title that says "Selora IDE".
@@ -577,7 +590,7 @@ ACCEPTANCE:
 
 **Why its own phase:** it is the largest trust and complexity surface since Agent Mode — an embedded scripting engine (a controlled, deliberate exception to §17.2's "no eval" rule), a subagent scheduler over the Phase 5 loop, a run journal, and a new panel. It is also the feature that closes the biggest parity gap with ZCode/Cursor-class tools.
 
-**Reference implementation studied:** ZCode's dynamic-workflows (skill + facade + patterns catalogue). The anatomy that matters, mapped to Selora seams:
+**Reference implementation studied:** ZCode's dynamic-workflows (skill + facade + patterns catalogue — repo: https://github.com/zai-org/ZCode, see "Reference repositories"). The anatomy that matters, mapped to Selora seams:
 
 | ZCode piece | Selora counterpart |
 |---|---|
@@ -635,7 +648,7 @@ ACCEPTANCE:
 
 **Goal:** Upgrade Agent Mode from "chat with tool cards" to a real agent workbench: a dedicated agent session window with **plan mode** (nothing writes until you approve the plan), a **live todo list** as the session's spine, **structured escalation questions**, **subagents** (spawn, steer, run in background, get notified), **resumable sessions with context compaction**, and session-scoped permission modes. This plus Phase 8 is what "agent mode like ZCode / VS Code's agent window / Claude Code ultracode-class runs" actually means.
 
-**Why its own phase:** Phase 5 delivered the loop; this delivers the *experience layer* around it — all interaction model, no new trust primitives (plan-gating rides 5b's existing plan/apply split; questions park on the §17.4 channel; subagent writes still card). Reference studied: the ZCode app itself (its resource bundle + observable behavior; no source repo exists on disk — noted honestly), the DSH/VS Code agent-window pattern, and the Claude Code orchestration style.
+**Why its own phase:** Phase 5 delivered the loop; this delivers the *experience layer* around it — all interaction model, no new trust primitives (plan-gating rides 5b's existing plan/apply split; questions park on the §17.4 channel; subagent writes still card). Reference studied: the ZCode app itself (its resource bundle + observable behavior — the source repo at https://github.com/zai-org/ZCode is now a standing reference, see "Reference repositories" above), the DSH/VS Code agent-window pattern, and the Claude Code orchestration style.
 
 **The reference inventory, mapped to Selora seams:**
 
