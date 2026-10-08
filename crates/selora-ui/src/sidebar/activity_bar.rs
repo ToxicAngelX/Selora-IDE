@@ -16,7 +16,7 @@
 use egui::{vec2, Align, Layout, Pos2, Rect, Sense, Ui, Vec2};
 
 use crate::sidebar::icons;
-use crate::theme::{color, radius, space};
+use crate::theme::{color, radius, space, type_scale};
 
 /// The strip width the shell should allocate (UI_SPEC.md §2.1).
 pub const STRIP_WIDTH: f32 = 48.0;
@@ -162,27 +162,30 @@ impl ActivityBar {
                 activity.paint_icon(ui.painter(), icon, icon_color);
 
                 // The problems badge (Phase R6): the count on the icon's
-                // bottom-right corner.
+                // bottom-right corner. The type floor is --type-xs (§4);
+                // the badge is one grid cell tall (S4), the text centered.
                 if matches!(activity, Activity::Problems) && self.problems_badge > 0 {
                     let badge_text = if self.problems_badge > 99 {
                         "99+".to_owned()
                     } else {
                         self.problems_badge.to_string()
                     };
-                    let badge_font = egui::FontId::new(9.0, crate::theme::font::FAMILY_MONO);
+                    let badge_font =
+                        egui::FontId::new(type_scale::XS, crate::theme::font::FAMILY_MONO);
                     let badge_galley = ui.painter().layout_no_wrap(
                         badge_text,
                         badge_font,
                         crate::theme::color::FG_DEFAULT,
                     );
-                    let badge_rect = Rect::from_min_max(
-                        Pos2::new(rect.right() - badge_galley.size().x, rect.bottom() - 11.0),
-                        Pos2::new(rect.right(), rect.bottom()),
+                    let badge_size = vec2(badge_galley.size().x + space::S2, space::S4);
+                    let badge_rect = Rect::from_min_size(
+                        Pos2::new(rect.right() - badge_size.x, rect.bottom() - badge_size.y),
+                        badge_size,
                     );
                     ui.painter()
                         .rect_filled(badge_rect, radius::R1, crate::theme::color::INK_MID);
                     ui.painter().galley(
-                        Pos2::new(badge_rect.left(), badge_rect.center().y - 4.5),
+                        badge_rect.center() - badge_galley.size() / 2.0,
                         badge_galley,
                         crate::theme::color::FG_DEFAULT,
                     );

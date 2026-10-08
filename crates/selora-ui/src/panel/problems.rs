@@ -18,8 +18,11 @@ use crate::theme::{color, font, radius, space, type_scale};
 const ROW_HEIGHT: f32 = 24.0;
 /// A file group's header height.
 const GROUP_HEIGHT: f32 = 24.0;
-/// The glyph slot.
-const GLYPH_WIDTH: f32 = 18.0;
+/// The glyph slot: one 16px grid cell (an 11px mono glyph is ~7px wide).
+const GLYPH_WIDTH: f32 = 16.0;
+/// The reserve for the trailing `line N` column ("line 1234" at
+/// `--type-xs` mono is ~55px).
+const LINE_COL_WIDTH: f32 = 64.0;
 
 /// What the panel asks the shell for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,7 +87,11 @@ pub fn show(
                 glyph_color,
             );
             // The message, elided to the row.
-            let message = elide(ui, &diagnostic.message, width - GLYPH_WIDTH - 64.0);
+            let message = elide(
+                ui,
+                &diagnostic.message,
+                width - GLYPH_WIDTH - LINE_COL_WIDTH,
+            );
             ui.painter().text(
                 pos2(row.left() + space::S3 + GLYPH_WIDTH, row.center().y),
                 Align2::LEFT_CENTER,

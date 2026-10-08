@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use egui::Context;
 
-use crate::theme::{color, font, radius, space, type_scale};
+use crate::theme::{color, font, motion, radius, space, type_scale};
 
 /// Toast severity (UI_SPEC.md §13): info dismisses after 4s, error after 8s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,16 +73,17 @@ pub fn show(ctx: &Context, toasts: &mut Vec<Toast>) {
             ui.set_max_width(MAX_WIDTH);
             ui.spacing_mut().item_spacing.y = space::S2;
             for (index, toast) in toasts.iter().enumerate() {
-                // Phase R7: the fade — in over 240ms on arrival, out over
-                // the last 400ms (fades are the reduce-motion survivors,
-                // §7.4).
+                // Phase R7: the fade — symmetric, `--dur-base` in on
+                // arrival and `--dur-base` out at the end (fades are the
+                // reduce-motion survivors, §7.4).
+                let fade = motion::DUR_BASE_MS as f32 / 1000.0;
                 let total = toast.severity.lifetime().as_secs_f32();
                 let remaining = toast
                     .expires_at
                     .saturating_duration_since(now)
                     .as_secs_f32();
-                let fade_in = ((total - remaining) / 0.24).clamp(0.0, 1.0);
-                let fade_out = (remaining / 0.40).clamp(0.0, 1.0);
+                let fade_in = ((total - remaining) / fade).clamp(0.0, 1.0);
+                let fade_out = (remaining / fade).clamp(0.0, 1.0);
                 let opacity = fade_in.min(fade_out);
                 let (glyph, color) = match toast.severity {
                     Severity::Info => ("i", color::INFO),
