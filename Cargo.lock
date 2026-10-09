@@ -4977,6 +4977,7 @@ dependencies = [
  "egui",
  "keyring",
  "selora-core",
+ "selora-protocol",
  "serde",
  "serde_json",
 ]

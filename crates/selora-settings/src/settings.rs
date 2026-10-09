@@ -111,6 +111,15 @@ pub struct Settings {
     #[serde(default)]
     pub keybinds: KeybindsSettings,
 
+    /// `layout.*` (Phase Z2, docs/ui/PHASE_Z2_ARCHITECTURE.md §4.2) — the
+    /// Tauri shell's workbench layout. Additive and serde-defaulted: a
+    /// pre-Z2 settings.json (no `layout` key) loads unchanged with the
+    /// §1.1 defaults, so `_v` stays 1. The egui app's own layout state
+    /// (`ui.sidebar_width` / `ui.chat_sidebar_width`) is untouched —
+    /// reconciling the two at cutover is a Z6 decision.
+    #[serde(default)]
+    pub layout: LayoutSettings,
+
     /// `agent.*` (ARCHITECTURE.md §17.3, §17.5) — the loop caps and the
     /// bash tool's shell/allowlist. Defaults are the spec's; every field
     /// is serde-defaulted so pre-Phase-5 settings.json loads unchanged.
@@ -252,6 +261,134 @@ pub struct AgentSettings {
     pub brave_search_api_key: Option<String>,
 }
 
+/// `layout.*` — the Tauri shell's workbench layout (Phase Z2, docs/ui/
+/// PHASE_Z2_ARCHITECTURE.md §4.2). Global in Z2; the workspace-picker slice
+/// adds per-workspace overrides (§4.5 of that contract). Every field is
+/// serde-defaulted so a pre-Z2 settings.json loads unchanged, and the
+/// defaults delegate to the protocol's §1.1 constants, which are the single
+/// source of truth. The JSON spellings are the protocol's snake_case wire
+/// names (`"bottom_view": "output"`), so the file and the wire share one
+/// vocabulary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutSettings {
+    #[serde(default = "default_primary_sidebar_width_px")]
+    pub primary_sidebar_width_px: f32,
+
+    #[serde(default = "default_agent_dock_width_px")]
+    pub agent_dock_width_px: f32,
+
+    #[serde(default = "default_agent_dock_open")]
+    pub agent_dock_open: bool,
+
+    #[serde(default = "default_bottom_dock_height_px")]
+    pub bottom_dock_height_px: f32,
+
+    #[serde(default)]
+    pub bottom_dock_open: bool,
+
+    #[serde(default = "default_bottom_view")]
+    pub bottom_view: selora_protocol::SurfaceId,
+
+    #[serde(default = "default_editor_splits")]
+    pub editor_splits: u8,
+
+    #[serde(default = "default_activity_view")]
+    pub activity_view: selora_protocol::SurfaceId,
+
+    #[serde(default = "default_primary_sidebar_open")]
+    pub primary_sidebar_open: bool,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            primary_sidebar_width_px: default_primary_sidebar_width_px(),
+            agent_dock_width_px: default_agent_dock_width_px(),
+            agent_dock_open: default_agent_dock_open(),
+            bottom_dock_height_px: default_bottom_dock_height_px(),
+            bottom_dock_open: false,
+            bottom_view: default_bottom_view(),
+            editor_splits: default_editor_splits(),
+            activity_view: default_activity_view(),
+            primary_sidebar_open: default_primary_sidebar_open(),
+        }
+    }
+}
+
+/// The load direction: the persisted section as a protocol DTO. The desktop
+/// state sanitizes it (protocol §4.3) before use.
+impl From<LayoutSettings> for selora_protocol::LayoutDto {
+    fn from(settings: LayoutSettings) -> Self {
+        Self {
+            primary_sidebar_width_px: settings.primary_sidebar_width_px,
+            agent_dock_width_px: settings.agent_dock_width_px,
+            agent_dock_open: settings.agent_dock_open,
+            bottom_dock_height_px: settings.bottom_dock_height_px,
+            bottom_dock_open: settings.bottom_dock_open,
+            bottom_view: settings.bottom_view,
+            editor_splits: settings.editor_splits,
+            activity_view: settings.activity_view,
+            primary_sidebar_open: settings.primary_sidebar_open,
+        }
+    }
+}
+
+/// The save direction: the authoritative in-memory DTO as the persisted
+/// section.
+impl From<selora_protocol::LayoutDto> for LayoutSettings {
+    fn from(layout: selora_protocol::LayoutDto) -> Self {
+        Self {
+            primary_sidebar_width_px: layout.primary_sidebar_width_px,
+            agent_dock_width_px: layout.agent_dock_width_px,
+            agent_dock_open: layout.agent_dock_open,
+            bottom_dock_height_px: layout.bottom_dock_height_px,
+            bottom_dock_open: layout.bottom_dock_open,
+            bottom_view: layout.bottom_view,
+            editor_splits: layout.editor_splits,
+            activity_view: layout.activity_view,
+            primary_sidebar_open: layout.primary_sidebar_open,
+        }
+    }
+}
+
+// --- layout defaults: delegates to the protocol's §1.1 constants (§4.2), so
+// the serde defaults, `LayoutSettings::default()`, and the constants can
+// never diverge. The open-state literals are §1.1's first-run column. ---
+
+fn default_primary_sidebar_width_px() -> f32 {
+    selora_protocol::PRIMARY_SIDEBAR_DEFAULT_PX
+}
+
+fn default_agent_dock_width_px() -> f32 {
+    selora_protocol::AGENT_DOCK_DEFAULT_PX
+}
+
+fn default_agent_dock_open() -> bool {
+    // §1.1's first-run state: closed.
+    false
+}
+
+fn default_bottom_dock_height_px() -> f32 {
+    selora_protocol::BOTTOM_DOCK_DEFAULT_PX
+}
+
+fn default_bottom_view() -> selora_protocol::SurfaceId {
+    selora_protocol::SurfaceId::Output
+}
+
+fn default_editor_splits() -> u8 {
+    selora_protocol::EDITOR_SPLITS_MIN
+}
+
+fn default_activity_view() -> selora_protocol::SurfaceId {
+    selora_protocol::SurfaceId::Files
+}
+
+fn default_primary_sidebar_open() -> bool {
+    // §1.1's first-run state: open.
+    true
+}
+
 fn default_agent_max_iterations() -> u32 {
     25
 }
@@ -303,6 +440,7 @@ impl Default for Settings {
             lsp: LspSettings::default(),
             selora: SeloraSettings::default(),
             keybinds: KeybindsSettings::default(),
+            layout: LayoutSettings::default(),
             agent: Box::new(AgentSettings::default()),
         }
     }
@@ -661,6 +799,170 @@ pub(crate) mod tests {
         assert!(!s.ui.reduce_motion);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Phase Z2 (§10): `LayoutSettings::default()` equals the protocol §1.1
+    /// values exactly (240 / 360-closed / 200-closed) — the divergence guard
+    /// between the serde defaults, the `Default` impl, and the §1.1 constants
+    /// (tokens.css intentionally carries no region values).
+    #[test]
+    fn layout_settings_default_equals_the_protocol_constants() {
+        let layout = LayoutSettings::default();
+        assert_eq!(
+            layout.primary_sidebar_width_px,
+            selora_protocol::PRIMARY_SIDEBAR_DEFAULT_PX
+        );
+        assert_eq!(
+            layout.agent_dock_width_px,
+            selora_protocol::AGENT_DOCK_DEFAULT_PX
+        );
+        assert!(!layout.agent_dock_open, "agent dock closed first-run");
+        assert_eq!(
+            layout.bottom_dock_height_px,
+            selora_protocol::BOTTOM_DOCK_DEFAULT_PX
+        );
+        assert!(!layout.bottom_dock_open, "bottom dock closed first-run");
+        assert_eq!(layout.bottom_view, selora_protocol::SurfaceId::Output);
+        assert_eq!(layout.editor_splits, selora_protocol::EDITOR_SPLITS_MIN);
+        assert_eq!(layout.activity_view, selora_protocol::SurfaceId::Files);
+        assert!(layout.primary_sidebar_open, "sidebar open first-run");
+        // The table, verbatim, so a constant drift fails here too.
+        assert_eq!(layout.primary_sidebar_width_px, 240.0);
+        assert_eq!(layout.agent_dock_width_px, 360.0);
+        assert_eq!(layout.bottom_dock_height_px, 200.0);
+    }
+
+    /// Phase Z2 (§10): the `layout` section round-trips through the file, and
+    /// a save preserves all other sections.
+    #[test]
+    fn layout_section_round_trips_and_preserves_other_sections() {
+        let dir = temp_settings_dir("z2-round-trip");
+        let path = dir.join(SETTINGS_FILE_NAME);
+
+        let mut settings = Settings::default();
+        settings.editor.font_size = 18;
+        settings.agent.max_iterations = 7;
+        settings.ui.reduce_motion = true;
+        settings.layout = LayoutSettings {
+            primary_sidebar_width_px: 411.5,
+            agent_dock_width_px: 500.25,
+            agent_dock_open: true,
+            bottom_dock_height_px: 640.0,
+            bottom_dock_open: true,
+            bottom_view: selora_protocol::SurfaceId::Problems,
+            editor_splits: 2,
+            activity_view: selora_protocol::SurfaceId::Git,
+            primary_sidebar_open: false,
+        };
+
+        settings.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.layout, settings.layout, "layout round-trips");
+        assert_eq!(loaded.editor.font_size, 18, "editor section survives");
+        assert_eq!(loaded.agent.max_iterations, 7, "agent section survives");
+        assert!(loaded.ui.reduce_motion, "ui section survives");
+        assert_eq!(loaded.keybinds.toggle_chat, "Ctrl+L", "keybinds survive");
+
+        // The on-disk spellings are the protocol's wire names.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains(r#""bottom_view": "problems""#));
+        assert!(text.contains(r#""activity_view": "git""#));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Phase Z2 (§10): the ARCHITECTURE.md §8.1 example file (no `layout`
+    /// key) loads unchanged with the §1.1 layout defaults.
+    #[test]
+    fn pre_z2_architect_example_file_loads_with_layout_defaults() {
+        let dir = temp_settings_dir("z2-pre-z2-file");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            &path,
+            r#"{
+  "_v": 1,
+  "editor": {
+    "font_family": "JetBrains Mono",
+    "font_size": 14,
+    "tab_size": 4,
+    "line_numbers": true,
+    "minimap": false,
+    "word_wrap": false
+  },
+  "ui": {
+    "theme": "selora-dark",
+    "sidebar_width": 240,
+    "chat_sidebar_width": 360
+  },
+  "lsp": {
+    "rust_analyzer_path": null,
+    "typescript_server_path": null
+  },
+  "selora": {
+    "base_url": "https://api.selora.lol",
+    "active_model": null
+  },
+  "keybinds": {
+    "command_palette": "Ctrl+Shift+P",
+    "fuzzy_find": "Ctrl+P",
+    "toggle_chat": "Ctrl+L",
+    "save": "Ctrl+S"
+  }
+}"#,
+        )
+        .expect("write pre-Z2 file");
+
+        let s = Settings::load_from(&path).expect("pre-Z2 file must load");
+        assert_eq!(s.layout, LayoutSettings::default());
+        assert_eq!(s.ui.sidebar_width, 240, "legacy egui keys untouched");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Phase Z2: a partial `layout` section fills the missing fields with the
+    /// serde defaults (the additive-sections compatibility mechanism §4.2
+    /// cites, settings.rs' own §6 header note).
+    #[test]
+    fn partial_layout_section_loads_with_defaults() {
+        let dir = temp_settings_dir("z2-partial-layout");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            &path,
+            br#"{"_v":1,"layout":{"primary_sidebar_width_px":300.0,"agent_dock_open":true}}"#,
+        )
+        .expect("write partial layout file");
+
+        let s = Settings::load_from(&path).expect("partial layout must load");
+        assert_eq!(s.layout.primary_sidebar_width_px, 300.0);
+        assert!(s.layout.agent_dock_open, "the present field survives");
+        assert_eq!(s.layout.agent_dock_width_px, 360.0);
+        assert_eq!(s.layout.bottom_dock_height_px, 200.0);
+        assert!(!s.layout.bottom_dock_open);
+        assert_eq!(s.layout.activity_view, selora_protocol::SurfaceId::Files);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Phase Z2: the protocol conversions are field-for-field in both
+    /// directions (the §4.5 `LayoutStore` seam's building blocks).
+    #[test]
+    fn layout_settings_and_layout_dto_convert_losslessly() {
+        let settings = LayoutSettings {
+            primary_sidebar_width_px: 411.5,
+            agent_dock_width_px: 500.25,
+            agent_dock_open: true,
+            bottom_dock_height_px: 640.0,
+            bottom_dock_open: true,
+            bottom_view: selora_protocol::SurfaceId::TerminalPlaceholder,
+            editor_splits: 4,
+            activity_view: selora_protocol::SurfaceId::Search,
+            primary_sidebar_open: false,
+        };
+        let dto: selora_protocol::LayoutDto = settings.clone().into();
+        let back: LayoutSettings = dto.into();
+        assert_eq!(settings, back);
     }
 
     #[test]

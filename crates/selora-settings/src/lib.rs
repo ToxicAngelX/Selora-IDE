@@ -29,6 +29,11 @@ mod settings;
 pub use detect::{find_in_dirs, find_on_path};
 pub use keybind::{keybind_matches, Keybind};
 pub use settings::{
-    AgentSettings, EditorSettings, KeybindsSettings, LspSettings, SeloraSettings, Settings,
-    UiSettings, CONFIG_DIR, SCHEMA_VERSION, SETTINGS_DIR_ENV, SETTINGS_FILE_NAME,
+    AgentSettings, EditorSettings, KeybindsSettings, LayoutSettings, LspSettings, SeloraSettings,
+    Settings, UiSettings, CONFIG_DIR, SCHEMA_VERSION, SETTINGS_DIR_ENV, SETTINGS_FILE_NAME,
 };
+
+/// Re-exported so downstream shells (the Tauri desktop crate) can name the
+/// error type of [`Settings::load`] / [`Settings::save`] without taking a
+/// direct dependency on selora-core.
+pub use selora_core::SeloraError;

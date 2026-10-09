@@ -1,0 +1,199 @@
+/* ==========================================================================
+   Selora IDE — Phase Z2 design tokens (web shell)
+   --------------------------------------------------------------------------
+   The CSS mirror of DESIGN_TOKENS.md and crates/selora-tokens/src/lib.rs.
+   Every value below is traceable to a token in one of those two files;
+   the only additions are the "Web chrome metrics" block, which
+   PHASE_Z_TAURI_PROMPT.md §6 requires ("Do not use layout values as
+   hardcoded magic numbers … document any new spacing, radius, or motion
+   values before using them"). Those additions are documented, with sources,
+   in docs/ui/PHASE_Z2_DESIGN.md §11.
+
+   Deliberately NOT defined here (single source of truth — see
+   docs/ui/PHASE_Z2_DESIGN.md §11 and PHASE_Z2_ARCHITECTURE.md §1.1):
+   region bounds, region defaults, and the resize hit-zone minimum. Rust
+   owns them (protocol constants + LayoutDto defaults — the Z1 stub values
+   in state.rs change to the unified 240/360/200 set in Z2) and delivers
+   them in bootstrap.layout_constraints / bootstrap.layout; the shell
+   writes runtime region sizes into CSS as inline custom properties on
+   the grid container (ARCHITECTURE §3.1). A --region-* token here would
+   be a second copy of the same numbers and could drift from Rust.
+
+   Rules that bind every consumer (DESIGN_TOKENS.md §12, PHASE_Z §9):
+   - no gradients on chrome, no box-shadows, no background images;
+   - saturated color only via --ok / --warn / --err / --info, and only where
+     the color carries meaning (status, diagnostics, diff +/-);
+   - no duration below 80ms; none above 2000ms except --dur-lap (2400ms,
+     the owner-authorized border-beam lap, DESIGN_TOKENS.md §7.2);
+   - no font-weight above 600; no font size below 11px; no emoji.
+
+   This file declares custom properties ONLY. Element defaults live in
+   base.css; component CSS belongs to the frontend developer and must read
+   these variables.
+   ========================================================================== */
+
+:root {
+  /* --- 1. Color tokens -------------------------------------------------- */
+
+  /* 1.1 The ink ramp (DESIGN_TOKENS.md §1.1; selora-tokens/src/lib.rs:22-27) */
+  --ink-canvas: #000000; /* window background, editor canvas */
+  --ink-faint: #0a0a0a; /* subtle surface lift, hovered rows */
+  --ink-low: #141414; /* panel surfaces, sidebar, status bar */
+  --ink-mid: #1f1f1f; /* modal, dropdown, command palette */
+  --ink-hi: #2a2a2a; /* borders, dividers, focused surfaces */
+  --ink-rule: #3a3a3a; /* stronger rule, ghost text, disabled text */
+
+  /* 1.2 Foreground (DESIGN_TOKENS.md §1.2; lib.rs:29-32) */
+  --fg-default: #e5e5e5; /* body text, code */
+  --fg-muted: #8a8a8a; /* secondary text, labels */
+  --fg-faint: #5a5a5a; /* tertiary text, line numbers, ghost text */
+  --fg-disabled: #3a3a3a; /* disabled controls, placeholders */
+
+  /* 1.3 Functional green — status/liveness/OK only (§1.3; lib.rs:34) */
+  --ok: #22c55e;
+
+  /* 1.4 Status colors — small badges/dots only (§1.4; lib.rs:35-37) */
+  --warn: #d4a017; /* warnings, dirty, attention */
+  --err: #dc2626; /* errors, diagnostics, invalid */
+  --info: #6b7280; /* informational, indexing, queued */
+
+  /* 1.5 Syntax palette, mono-tinted (§1.5; lib.rs:49-57) */
+  --syn-default: #e5e5e5;
+  --syn-keyword: #cfcfcf;
+  --syn-fn: #ffffff;
+  --syn-type: #b8b8b8;
+  --syn-string: #9a9a9a;
+  --syn-number: #d0d0d0;
+  --syn-comment: #5a5a5a; /* italics per §2.5 */
+  --syn-punct: #8a8a8a;
+  --syn-var: #e5e5e5;
+  --syn-attr: #a8a8a8;
+
+  /* 1.6 Diagnostic squiggles (§1.6) */
+  --diag-err: #dc2626;
+  --diag-warn: #d4a017;
+  --diag-info: #6b7280;
+
+  /* 1.7 Overlay scrim — the one sanctioned backdrop dim (§1.7;
+     lib.rs:46 stores it premultiplied as rgba(0,0,0,153) = 60% alpha) */
+  --scrim: rgb(0 0 0 / 0.6);
+
+  /* --- 2. Typography ---------------------------------------------------- */
+
+  /* 2.1 Families (§2.1; lib.rs:89-90). Faces are bundled in
+     public/fonts/ and declared in base.css — we never download fonts and
+     never depend on the OS having them; the fallbacks only cover the
+     font-display: swap window and a missing-file fault. */
+  --font-sans: "Space Grotesk", system-ui, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+
+  /* 2.2 Type scale — size / line-height pairs (§2.2; lib.rs:78-84) */
+  --type-xs: 11px;
+  --type-xs-lh: 16px; /* status bar, micro-labels, tooltips */
+  --type-sm: 12px;
+  --type-sm-lh: 18px; /* file tree rows, secondary UI */
+  --type-md: 13px;
+  --type-md-lh: 20px; /* default body, editor text, menus */
+  --type-lg: 15px;
+  --type-lg-lh: 24px; /* headings, modal titles, panel titles */
+  --type-xl: 18px;
+  --type-xl-lh: 26px; /* app title in the title bar, splash */
+  --type-xxl: 24px;
+  --type-xxl-lh: 32px; /* first-run / agent welcome heading */
+
+  /* 2.3 Weights (§2.3). There is no 700 anywhere in the IDE. */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* 2.4 Letter-spacing (§2.4) */
+  --tracking-tight: -0.01em; /* app title — a Space Grotesk hallmark */
+  --tracking-normal: 0;
+  --tracking-wide: 0.04em; /* uppercase micro-labels: "FILES", "AGENT" */
+
+  /* --- 3. Spacing — 4px base grid (§3; lib.rs:61-67) --------------------- */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* --- 4. Radii (§4; lib.rs:71-74) -------------------------------------- */
+  --radius-0: 0; /* panels, sidebars, status bar, editor canvas */
+  --radius-1: 2px; /* buttons, inputs, chips, tabs */
+  --radius-2: 4px; /* modals, command palette, dropdowns */
+  --radius-pill: 999px; /* status dots, badges (very few) */
+
+  /* --- 5. Borders — all borders are 1px; there are no shadows (§5, §6) -- */
+  --hairline: 1px;
+  --border-hairline: 1px solid var(--ink-hi); /* default panel divider */
+  --border-focus: 1px solid var(--fg-default); /* inverse light line on dark */
+  --border-error: 1px solid var(--err); /* invalid input */
+
+  /* --- 7. Motion -------------------------------------------------------- */
+
+  /* 7.1 Curves (§7.1; lib.rs:130-133) */
+  --ease-precise: cubic-bezier(0.2, 0, 0, 1); /* snappy UI: press, panel open */
+  --ease-calm: cubic-bezier(0.4, 0, 0.2, 1); /* default */
+  --ease-orbital: cubic-bezier(0.65, 0, 0.35, 1); /* loops: pulse, beam lap */
+  --ease-fade: cubic-bezier(0.4, 0, 0.6, 1); /* in/out fades */
+
+  /* 7.2 Durations (§7.2; lib.rs:114-127). Nothing below 80ms, nothing
+     above 2000ms — except --dur-lap, exactly 2 × --dur-loop, the one
+     owner-authorized exception (REVAMP_SPEC.md §11 bend 6a). */
+  --dur-instant: 80ms; /* hover state, button press feedback */
+  --dur-quick: 160ms; /* tooltip appear, panel toggle */
+  --dur-base: 240ms; /* modal open, dropdown, bloom */
+  --dur-loop: 1200ms; /* slowest layer: status pulse, thinking, spin */
+  --dur-long: 1800ms; /* splash fade, first-run welcome, spark */
+  --dur-lap: 2400ms; /* border-beam perimeter lap (composer only) */
+
+  /* 7.4 Reduced-motion flag. 1 = loops may run, 0 = loops must render a
+     static representative frame. Read by JS/canvas effects via
+     getComputedStyle(document.documentElement).getPropertyValue(
+     '--motion-loops'); CSS keyframe loops are stopped by base.css.
+     Durations are never rewritten — loops are stopped, never sped up. */
+  --motion-loops: 1;
+
+  /* --- Web chrome metrics (Phase Z §6 additions — NOT in DESIGN_TOKENS.md)
+     Presentational chrome only, each derived from UI_SPEC.md /
+     REVAMP_SPEC.md and documented with its source in
+     docs/ui/PHASE_Z2_DESIGN.md §11. Region sizes/bounds and the resize
+     hit-zone minimum are NOT here — Rust owns them (see the header
+     note). -- */
+  --chrome-titlebar-h: 32px; /* UI_SPEC.md §1.1 */
+  --chrome-statusbar-h: 24px; /* UI_SPEC.md §1.2 */
+  --chrome-activitybar-w: 48px; /* UI_SPEC.md §2.1 */
+  --chrome-activity-pill: 28px; /* REVAMP_SPEC.md §7 (28×28 selected pill) */
+  --chrome-edge-mark-w: 2px; /* REVAMP_SPEC.md §7 (2px leading edge mark) */
+  --chrome-panel-header-h: 24px; /* UI_SPEC.md §2.2 sidebar header */
+  --chrome-tabbar-h: 32px; /* UI_SPEC.md §3.1 */
+  --chrome-agent-header-h: 40px; /* REVAMP_SPEC.md §3 chat header */
+}
+
+/* --------------------------------------------------------------------------
+   Reduced-motion override strategy (documented in PHASE_Z2_DESIGN.md §8):
+
+   Reduced motion is active when EITHER the OS asks for it
+   (prefers-reduced-motion: reduce — always honored, cannot be overridden
+   by the app) OR the in-app `ui.reduce_motion` setting is on, which the
+   shell reflects as <html data-reduced-motion="true"> (DESIGN_TOKENS.md
+   §7.4; PHASE_Z_TAURI_PROMPT.md §5; PHASE_Z2_ARCHITECTURE.md §8.3).
+
+   Both paths only flip --motion-loops to 0. One-shot durations stay
+   canonical: fade and bloom are kept under reduced motion per §7.4, so
+   collapsing durations would be wrong. Loops are frozen by base.css
+   (animation-iteration-count: 1, which parks every loop on its resting
+   frame) and by JS/canvas effects reading the flag.
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-loops: 0;
+  }
+}
+
+:root[data-reduced-motion="true"] {
+  --motion-loops: 0;
+}

@@ -18,3 +18,9 @@ keyring.workspace = true
 # stable Phase 1 leaf crate — depending on it here adds no parallel-build
 # conflict (noted as a deviation from the brief's dependency list).
 selora-core.workspace = true
+
+# Phase Z2 (docs/ui/PHASE_Z2_ARCHITECTURE.md §4.2): the `layout.*` section
+# reuses the protocol's SurfaceId and delegates its defaults to the protocol's
+# region constants (the single source of truth). No dependency cycle —
+# selora-protocol depends only on serde/serde_json/url.
+selora-protocol.workspace = true

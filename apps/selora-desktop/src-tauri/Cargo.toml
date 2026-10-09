@@ -18,6 +18,11 @@ uuid.workspace = true
 selora-protocol.workspace = true
 selora-settings.workspace = true
 
+# Z2 state tests drive `dispatch`'s emit path with `tauri::test::mock_app`
+# (MockRuntime); the feature is an empty gate on the tauri crate itself.
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 [[bin]]
 name = "selora-desktop"
 path = "src/main.rs"

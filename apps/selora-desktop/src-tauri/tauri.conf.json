@@ -14,13 +14,14 @@
     "windows": [
       {
         "label": "main",
-        "title": "Selora IDE · Phase Z diagnostic shell",
+        "title": "Selora IDE",
         "width": 1440,
         "height": 900,
         "minWidth": 960,
         "minHeight": 640,
         "resizable": true,
-        "create": false
+        "create": false,
+        "decorations": false
       }
     ],
     "security": {

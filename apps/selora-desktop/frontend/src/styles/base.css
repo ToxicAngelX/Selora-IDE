@@ -1,0 +1,226 @@
+/* ==========================================================================
+   Selora IDE — Phase Z2 base layer
+   --------------------------------------------------------------------------
+   Element defaults only, built entirely on ./tokens.css. Component CSS is
+   the frontend developer's and must consume the tokens — never hardcode a
+   color, pixel, or duration (DESIGN_TOKENS.md §12; PHASE_Z §6/§9).
+
+   Import order: main.tsx imports this file only; tokens arrive via the
+   @import below so the variables always precede their first use.
+   ========================================================================== */
+
+@import "./tokens.css";
+
+/* --- Bundled fonts --------------------------------------------------------
+   Space Grotesk (UI text) and JetBrains Mono (code) ship with the app in
+   public/fonts/ (copied from assets/fonts/); we never download fonts at
+   runtime and the CSP already restricts font-src to 'self'
+   (apps/selora-desktop/src-tauri/tauri.conf.json:30-31).
+
+   Licenses (SIL Open Font License 1.1, copies ship beside the files):
+   - fonts/LICENSE-SpaceGrotesk.txt — Copyright 2020 The Space Grotesk
+     Project Authors (https://github.com/floriankarsten/space-grotesk)
+   - fonts/LICENSE-JetBrainsMono.txt — Copyright 2020 The JetBrains Mono
+     Project Authors (https://github.com/JetBrains/JetBrainsMono)
+
+   Weight mapping is 1:1 with the token ramp (400/500/600 only — there is
+   no 700 in the IDE, DESIGN_TOKENS.md §2.3). Only Regular/Medium cuts of
+   JetBrains Mono are bundled, and Space Grotesk ships no italic cut; the
+   two sanctioned italics (§2.5: syntax comments, empty-state placeholders)
+   therefore render as synthesized oblique — recorded as an open decision
+   in docs/ui/PHASE_Z2_DESIGN.md §14.
+   ------------------------------------------------------------------------ */
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/SpaceGrotesk-Regular.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/SpaceGrotesk-Medium.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/SpaceGrotesk-SemiBold.ttf") format("truetype");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono-Regular.ttf") format("truetype");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono-Medium.ttf") format("truetype");
+}
+
+/* --- Reset --------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+* {
+  margin: 0;
+}
+html,
+body,
+#root {
+  height: 100%;
+}
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+button {
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+ul,
+ol {
+  padding: 0;
+  list-style: none;
+}
+a {
+  color: inherit;
+}
+svg {
+  display: block;
+}
+
+/* --- Root defaults -------------------------------------------------------- */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--ink-canvas); /* UI_SPEC.md §1.3 — the true-black canvas */
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-md);
+  font-weight: var(--weight-regular);
+  line-height: var(--type-md-lh);
+  overflow: hidden; /* the shell grid owns all scrolling regions */
+  overscroll-behavior: none;
+  -webkit-font-smoothing: antialiased;
+  /* Weight 700 is forbidden (§2.3/§12): never let the engine fake it.
+     Style synthesis is left enabled because the two §2.5-sanctioned
+     italics have no bundled italic cuts (see the font note above). */
+  font-synthesis-weight: none;
+}
+
+/* Code and numeric surfaces ride the mono family (§2.1). */
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  background: var(--ink-mid); /* UI_SPEC.md §3.2 — one ink-step lift */
+  color: var(--fg-default);
+}
+
+::placeholder {
+  color: var(--fg-faint);
+  opacity: 1; /* keep fg-faint exact; do not let the engine dim it further */
+}
+
+/* Modal backdrops painted by <dialog> use the one sanctioned scrim (§1.7). */
+dialog::backdrop {
+  background: var(--scrim);
+}
+
+/* --- Focus ring ------------------------------------------------------------
+   Default ring for borderless controls: the inverse light line, drawn as a
+   1px outline 2px off the control so it never shifts layout (border-focus,
+   DESIGN_TOKENS.md §5). fg-default on any ink step exceeds 9.9:1 contrast.
+
+   Controls that already carry a 1px border (inputs, cards) use form A
+   instead: swap border-color to var(--fg-default) on :focus-visible and
+   suppress the outline locally. Never remove the outline without that
+   replacement — PHASE_Z2_DESIGN.md §7.
+   ------------------------------------------------------------------------ */
+:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 2px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* --- Scrollbars — ink, square, no buttons ---------------------------------
+   8px (= --space-2) square thumbs in --ink-hi on a transparent track;
+   hover lifts one ink step to --ink-rule. No saturated accent, no radius
+   (radius-0 — the brand is sharp, §4).
+   ------------------------------------------------------------------------ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink-hi) transparent;
+}
+::-webkit-scrollbar {
+  width: var(--space-2);
+  height: var(--space-2);
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink-hi);
+  border: 0;
+  border-radius: var(--radius-0);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-rule);
+}
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* --- Reduced motion ---------------------------------------------------------
+   Two entry points, both also flip --motion-loops in tokens.css:
+   1. the OS preference (always honored, no app override);
+   2. the in-app ui.reduce_motion setting, reflected by the shell as
+      <html data-reduced-motion="true"> (DESIGN_TOKENS.md §7.4 names the
+      setting; PHASE_Z §5 requires the mode).
+
+   The rule freezes every looping animation by forcing a single iteration:
+   all eight §7.3 glyphs (orbit, pulse, wave, spin, comet) are authored so
+   0% and 100% are the same resting frame, so one iteration parks the loop
+   exactly at rest. One-shot fade/bloom/spark already run once and are
+   untouched — §7.4's keep-list is preserved by construction. Canvas/rAF
+   effects (BorderBeam, VoiceBeam, MetalFx, orbs) must read --motion-loops
+   and paint a single static frame instead; see PHASE_Z2_DESIGN.md §8.
+   ------------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-iteration-count: 1 !important;
+  }
+}
+
+:root[data-reduced-motion="true"] *,
+:root[data-reduced-motion="true"] *::before,
+:root[data-reduced-motion="true"] *::after {
+  animation-iteration-count: 1 !important;
+}

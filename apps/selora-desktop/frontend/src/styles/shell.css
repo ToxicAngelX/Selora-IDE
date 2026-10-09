@@ -1,0 +1,998 @@
+/* ==========================================================================
+   Selora IDE — Phase Z2 component styles (frontend-owned).
+
+   Everything here reads the designer-owned token layer (tokens.css via
+   base.css). No hex literals; no raw px outside layout arithmetic on
+   --space-* (the 0px track fallbacks are structural — DESIGN §1: collapsed,
+   not a magic size); no box-shadow; no gradient; no font-weight above 600;
+   no animation shorter than --dur-instant or longer than --dur-long.
+   Region sizes are inline custom properties written from React state
+   (DESIGN §1) — never CSS constants.
+   ========================================================================== */
+
+/* --- 1. The seven-region grid ------------------------------------------- */
+
+.shell {
+  height: 100%;
+  display: grid;
+  grid-template-rows: var(--chrome-titlebar-h) 1fr var(--chrome-statusbar-h);
+  background: var(--ink-canvas);
+  color: var(--fg-default);
+}
+
+/* Zero IPC during a drag also means zero text selection (DESIGN §4). */
+.shell.is-dragging {
+  user-select: none;
+}
+
+.workbench {
+  min-height: 0;
+  display: grid;
+  grid-template-columns:
+    var(--chrome-activitybar-w)      /* 2 · activity bar — fixed, token */
+    var(--sidebar-w, 0px)            /* 3 · primary sidebar, 0 when collapsed */
+    var(--hit-zone-sidebar, 0px)     /* sidebar resize handle track */
+    1fr                              /* 4+6 · center column */
+    var(--hit-zone-agent, 0px)       /* agent-dock resize handle track */
+    var(--agent-w, 0px);             /* 5 · agent dock, 0 when collapsed */
+}
+
+.activitybar {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  background: var(--ink-canvas);
+  border-right: var(--border-hairline);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.primary-sidebar-slot {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.handle-track {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.handle-track-sidebar {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.handle-track-agent {
+  grid-column: 5;
+  grid-row: 1;
+}
+
+.center {
+  grid-column: 4;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows:
+    1fr                            /* 4 · editor region */
+    var(--hit-zone-bottom, 0px)    /* bottom-dock resize handle track */
+    var(--bottom-h, 0px);          /* 6 · bottom dock, 0 when collapsed */
+}
+
+.editor-region-slot {
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.handle-track-bottom {
+  grid-row: 2;
+}
+
+.bottom-dock-slot {
+  grid-row: 3;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.agent-dock-slot {
+  grid-column: 6;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+/* --- 2. Resize handles (DESIGN §4) --------------------------------------- */
+
+.region-handle {
+  flex: 1;
+  position: relative;
+  touch-action: none;
+  background: transparent;
+}
+
+.region-handle-vertical {
+  cursor: col-resize;
+}
+
+.region-handle-horizontal {
+  cursor: row-resize;
+}
+
+/* The lit 1px line at the boundary center. Transparent at rest — the
+   adjacent region's own hairline is the visual boundary; hover lifts it one
+   ink step; keyboard focus or active drag lights it --fg-default. That lit
+   line IS the focus indicator: the outline is suppressed here on purpose
+   (DESIGN §4 — never an outline around a 6px strip). */
+.region-handle::before {
+  content: "";
+  position: absolute;
+  background: transparent;
+  transition: background-color var(--dur-instant) var(--ease-calm);
+}
+
+.region-handle-vertical::before {
+  left: calc(50% - var(--hairline) / 2);
+  top: 0;
+  bottom: 0;
+  width: var(--hairline);
+}
+
+.region-handle-horizontal::before {
+  top: calc(50% - var(--hairline) / 2);
+  left: 0;
+  right: 0;
+  height: var(--hairline);
+}
+
+.region-handle:hover::before {
+  background: var(--ink-rule);
+}
+
+.region-handle:focus-visible {
+  outline: none; /* replaced by the lit line — see the block comment above */
+}
+
+.region-handle:focus-visible::before,
+.region-handle.is-dragging::before {
+  background: var(--fg-default);
+}
+
+/* --- 3. Title bar (DESIGN §3.1) ------------------------------------------ */
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+  background: var(--ink-canvas);
+  min-width: 0;
+}
+
+.titlebar-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.titlebar-mark {
+  display: flex;
+  color: var(--fg-default);
+}
+
+.titlebar-title {
+  font-size: var(--type-xl);
+  line-height: var(--type-xl-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-default);
+  white-space: nowrap;
+}
+
+.titlebar-menus {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-3);
+}
+
+.titlebar-menu {
+  position: relative;
+}
+
+.titlebar-menu-button {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-1);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-muted);
+  transition: background-color var(--dur-instant) var(--ease-calm), color var(--dur-instant) var(--ease-calm);
+}
+
+.titlebar-menu-button:hover {
+  background: var(--ink-faint);
+  color: var(--fg-default);
+}
+
+.titlebar-menu-button.is-open {
+  background: var(--ink-low);
+  color: var(--fg-default);
+}
+
+.titlebar-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 40;
+  min-width: calc(var(--space-4) * 18);
+  max-height: calc(var(--space-4) * 20);
+  overflow-y: auto;
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-2);
+  padding: var(--space-1) 0;
+}
+
+.titlebar-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  width: 100%;
+  min-height: var(--chrome-activity-pill);
+  padding: 0 var(--space-3);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-muted);
+  text-align: left;
+}
+
+.titlebar-menu-item:hover:not([disabled]) {
+  background: var(--ink-faint);
+  color: var(--fg-default);
+}
+
+.titlebar-menu-item[disabled] {
+  color: var(--fg-disabled);
+  cursor: default;
+}
+
+.titlebar-menu-key {
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+}
+
+.titlebar-window-controls {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+}
+
+.window-control {
+  width: calc(var(--space-1) * 11); /* 44px keeps the 4px grid (DESIGN §3.1) */
+  height: var(--chrome-titlebar-h);
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+  transition: background-color var(--dur-instant) var(--ease-calm), color var(--dur-instant) var(--ease-calm);
+}
+
+.window-control:hover {
+  background: var(--ink-faint);
+  color: var(--fg-default);
+}
+
+/* No red close-hover — DESIGN §3.1's deliberate deviation from the Windows
+   convention; the close button gets the same treatment as its neighbors. */
+
+/* --- 4. Activity bar (DESIGN §3.2) --------------------------------------- */
+
+.activity-button {
+  position: relative;
+  width: var(--chrome-activity-pill);
+  height: var(--chrome-activity-pill);
+  border-radius: var(--radius-1);
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+  transition: background-color var(--dur-instant) var(--ease-calm), color var(--dur-instant) var(--ease-calm);
+}
+
+.activity-button:hover {
+  background: var(--ink-faint);
+  color: var(--fg-default);
+}
+
+.activity-button.is-selected {
+  background: var(--ink-low);
+  color: var(--fg-default);
+}
+
+/* The 2×16 painted leading edge mark (REVAMP_SPEC §7 bend 3 — a rect, not
+   a border), at x = --space-1 (4px from the BAR's left edge — hence the
+   negative offset out of the centered pill), vertically centered. */
+.activity-button.is-selected::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--space-1) - (var(--chrome-activitybar-w) - var(--chrome-activity-pill)) / 2);
+  top: calc(50% - var(--space-4) / 2);
+  width: var(--chrome-edge-mark-w);
+  height: var(--space-4);
+  background: var(--fg-muted);
+  border-radius: var(--radius-1);
+}
+
+.activity-spacer {
+  flex: 1;
+}
+
+/* --- 5. Primary sidebar (DESIGN §3.3) ------------------------------------- */
+
+.primary-sidebar {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-low);
+  border-right: var(--border-hairline);
+}
+
+.sidebar-header {
+  height: var(--chrome-panel-header-h);
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-4);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+}
+
+.sidebar-search-input {
+  width: 100%;
+  padding: var(--space-2);
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-1);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-default);
+}
+
+.sidebar-search-input[disabled] {
+  color: var(--fg-disabled);
+  border-color: var(--ink-hi);
+  cursor: default;
+}
+
+.sidebar-settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.settings-echo {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.settings-echo-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.settings-echo-row dt {
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-muted);
+}
+
+.settings-echo-row dd {
+  font-family: var(--font-mono);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-default);
+}
+
+.settings-later {
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-faint);
+}
+
+/* --- 6. Editor region (DESIGN §3.4) --------------------------------------- */
+
+.editor-region {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-canvas);
+}
+
+.editor-tabbar {
+  height: var(--chrome-tabbar-h);
+  border-bottom: var(--border-hairline);
+  background: var(--ink-canvas);
+}
+
+.editor-canvas {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: var(--space-6);
+}
+
+/* --- 7. Agent dock (DESIGN §3.5) ------------------------------------------- */
+
+.agent-dock {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-low);
+  border-left: var(--border-hairline);
+}
+
+.agent-header {
+  height: var(--chrome-agent-header-h);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border-bottom: var(--border-hairline);
+}
+
+.agent-presence-slot {
+  width: calc(var(--space-1) * 5); /* the 20px Z3 orb slot (DESIGN §3.5) */
+  height: calc(var(--space-1) * 5);
+  display: grid;
+  place-items: center;
+}
+
+.agent-presence-dot {
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--fg-muted);
+}
+
+.agent-session-label {
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-muted);
+}
+
+.agent-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3);
+  display: grid;
+  place-items: center;
+}
+
+.agent-dock .empty-heading {
+  font-size: var(--type-xxl);
+  line-height: var(--type-xxl-lh);
+  font-weight: var(--weight-semibold);
+}
+
+.agent-status-line {
+  display: block;
+  margin-top: var(--space-2);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-style: normal;
+  color: var(--fg-faint);
+}
+
+.agent-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+
+.agent-chip {
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: var(--border-hairline);
+  border-radius: var(--radius-1);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-disabled);
+  cursor: default;
+}
+
+/* The composer card visual (REVAMP_SPEC §2.1): --ink-mid fill lifts one ink
+   step off the dock; inert in Z2 — the border beam mount point is Z3's. */
+.agent-composer {
+  margin: var(--space-3);
+  padding: var(--space-3);
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-2);
+}
+
+.agent-composer-placeholder {
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  font-style: italic;
+  color: var(--fg-faint);
+}
+
+/* --- 8. Bottom dock (DESIGN §3.6) ------------------------------------------ */
+
+.bottom-dock {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-canvas);
+  border-top: var(--border-hairline);
+}
+
+.bottom-tabstrip {
+  height: var(--chrome-tabbar-h);
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-4);
+  padding: 0 var(--space-3);
+  border-bottom: var(--border-hairline);
+}
+
+.bottom-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-1);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  transition: color var(--dur-instant) var(--ease-calm);
+}
+
+.bottom-tab:hover {
+  color: var(--fg-muted);
+}
+
+.bottom-tab.is-active {
+  color: var(--fg-default);
+}
+
+.bottom-tab.is-active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--hairline);
+  background: var(--fg-default);
+}
+
+.bottom-close {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  padding: 0 var(--space-1);
+  color: var(--fg-faint);
+  transition: color var(--dur-instant) var(--ease-calm);
+}
+
+.bottom-close:hover {
+  color: var(--fg-default);
+}
+
+.bottom-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  place-items: center;
+  padding: var(--space-3);
+}
+
+/* --- 9. Status bar (DESIGN §3.7) ------------------------------------------- */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
+  background: var(--ink-low);
+  border-top: var(--border-hairline);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  min-width: 0;
+}
+
+.statusbar-zone {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.statusbar-workspace {
+  color: var(--fg-muted);
+}
+
+.statusbar-center {
+  flex: 1;
+}
+
+.statusbar-right {
+  margin-left: auto;
+}
+
+.statusbar-epoch {
+  font-family: var(--font-mono);
+  color: var(--fg-faint);
+}
+
+.statusbar-connection {
+  color: var(--fg-muted);
+}
+
+.statusbar-connection.is-connected {
+  color: var(--ok);
+}
+
+.statusbar-dot {
+  font-family: var(--font-mono);
+}
+
+.statusbar-connect {
+  padding: var(--space-1);
+  border-radius: var(--radius-1);
+  color: var(--fg-default);
+}
+
+.statusbar-connect[disabled] {
+  color: var(--fg-disabled);
+  cursor: default;
+}
+
+/* --- 10. Empty states (DESIGN §6) ------------------------------------------ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-3);
+  max-width: calc(var(--space-4) * 25);
+}
+
+.empty-heading {
+  font-size: var(--type-lg);
+  line-height: var(--type-lg-lh);
+  font-weight: var(--weight-regular);
+  color: var(--fg-default);
+}
+
+.empty-hint {
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-muted);
+}
+
+.empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+/* UI_SPEC §12's button: --ink-mid fill, 32px tall, --radius-1. */
+.empty-action {
+  height: calc(var(--space-4) * 2);
+  padding: 0 var(--space-4);
+  background: var(--ink-mid);
+  color: var(--fg-default);
+  border-radius: var(--radius-1);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  transition: background-color var(--dur-instant) var(--ease-calm), color var(--dur-instant) var(--ease-calm);
+}
+
+.empty-action:hover:not([disabled]) {
+  background: var(--ink-hi);
+}
+
+.empty-action[disabled] {
+  color: var(--fg-disabled);
+  cursor: default;
+}
+
+.empty-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.key-chip {
+  padding: var(--space-1) var(--space-2);
+  background: var(--ink-mid);
+  border-radius: var(--radius-1);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-muted);
+}
+
+/* --- 11. Command palette (UI_SPEC §5, DESIGN §7.2) ------------------------- */
+
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--scrim);
+  display: flex;
+  justify-content: center;
+}
+
+.palette {
+  /* Top 25% of the workbench (UI_SPEC §5), measured from the workbench's
+     own top edge — chrome tokens only. */
+  margin-top: calc(
+    (100vh - var(--chrome-titlebar-h) - var(--chrome-statusbar-h)) * 0.25 + var(--chrome-titlebar-h)
+  );
+  width: calc(var(--space-4) * 35);  /* 560px (UI_SPEC §5) on the 4px grid */
+  max-height: calc(var(--space-4) * 20); /* 320px (UI_SPEC §5) */
+  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-2);
+  overflow: hidden;
+  animation: bloom var(--dur-base) var(--ease-precise);
+}
+
+/* DESIGN_TOKENS §7.3's bloom, verbatim. */
+@keyframes bloom {
+  from {
+    transform: scale(0.96);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.palette-input-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+}
+
+.palette-prefix {
+  display: grid;
+  place-items: center;
+  color: var(--fg-faint);
+}
+
+.palette-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: none; /* the palette card is the focus surface; the input is always focused while open */
+  font-size: var(--type-lg);
+  line-height: var(--type-lg-lh);
+  color: var(--fg-default);
+}
+
+.palette-input::placeholder {
+  color: var(--fg-faint);
+  opacity: 1;
+}
+
+.palette-list {
+  max-height: calc(var(--space-4) * 20 - var(--space-5) * 2);
+  overflow-y: auto;
+  padding-bottom: var(--space-2);
+}
+
+.palette-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  height: var(--chrome-activity-pill); /* 28px rows (UI_SPEC §5) */
+  padding: 0 var(--space-3);
+  cursor: pointer;
+}
+
+.palette-option.is-active {
+  background: var(--ink-low);
+}
+
+.palette-option-label {
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-default);
+}
+
+.palette-option-key {
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+}
+
+.palette-empty {
+  padding: var(--space-3);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-muted);
+}
+
+/* --- 12. Toasts (UI_SPEC §13, DESIGN §8.2) --------------------------------- */
+
+.toast-viewport {
+  position: fixed;
+  right: var(--space-3);
+  bottom: calc(var(--chrome-statusbar-h) + var(--space-3));
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: calc(var(--space-4) * 22);
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-1);
+  animation: fade var(--dur-base) var(--ease-fade);
+}
+
+.toast.is-leaving {
+  animation: fade var(--dur-base) var(--ease-fade) reverse;
+}
+
+/* DESIGN_TOKENS §7.3's fade, verbatim. */
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.toast-severity {
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+}
+
+.toast-severity-info {
+  color: var(--info);
+}
+
+.toast-severity-success {
+  color: var(--ok);
+}
+
+.toast-severity-warning {
+  color: var(--warn);
+}
+
+.toast-severity-error {
+  color: var(--err);
+}
+
+.toast-message {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-default);
+  overflow-wrap: break-word;
+}
+
+.toast-dismiss {
+  display: grid;
+  place-items: center;
+  padding: var(--space-1);
+  border-radius: var(--radius-1);
+  color: var(--fg-faint);
+  transition: color var(--dur-instant) var(--ease-calm);
+}
+
+.toast-dismiss:hover {
+  color: var(--fg-default);
+}
+
+/* --- 13. Boot screens -------------------------------------------------------- */
+
+.boot-screen {
+  height: 100%;
+  display: grid;
+  place-content: center;
+  gap: var(--space-3);
+  text-align: center;
+  background: var(--ink-canvas);
+  color: var(--fg-muted);
+  font-size: var(--type-lg);
+  line-height: var(--type-lg-lh);
+}
+
+.boot-error {
+  color: var(--fg-default);
+}
+
+.boot-title {
+  font-size: var(--type-xl);
+  line-height: var(--type-xl-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+}
+
+.boot-error-message {
+  color: var(--fg-muted);
+  max-width: calc(var(--space-4) * 25);
+}
+
+.boot-screen .empty-action {
+  justify-self: center;
+}
+
+/* --- 14. Utilities ------------------------------------------------------------ */
+
+.visually-hidden {
+  position: absolute;
+  width: var(--hairline);
+  height: var(--hairline);
+  margin: calc(var(--hairline) * -1);
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

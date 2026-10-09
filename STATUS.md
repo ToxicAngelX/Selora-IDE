@@ -1,7 +1,158 @@
-# Status — 2026-10-07 (Phase R in flight — Premium UX Revamp; Phase 6 remains code-complete, release still the owner's gate)
+# Status — 2026-10-09 (Phase Z2 shell layout merged; Phase R merged; Phase 6 release still the owner's gate)
 
 > Restart point. Read this, then AGENT_ORCHESTRATION.md §10. RESUME_PROMPT.md
 > at the repo root is the copy-paste prompt for a fresh orchestrator session.
+
+## 2026-10-09 — Phase Z2 (premium shell layout): merged; contract review passed
+
+The first user-facing Tauri/WebView2 slice. The seven-region shell (title
+bar, activity bar, primary sidebar, editor region, agent dock, bottom dock,
+status bar) is implemented against the two Z2 contracts, both of which
+survived two reviewer rounds before implementation began:
+`docs/ui/PHASE_Z2_ARCHITECTURE.md` (implementation contract) and
+`docs/ui/PHASE_Z2_DESIGN.md` (layout/token spec, shipped with the
+designer's `styles/tokens.css` + `base.css` and the bundled OFL fonts in
+`public/fonts/`).
+
+**What is real** (structure verified in the tree this session):
+
+| Item | Where |
+|---|---|
+| Seven-region grid — bottom dock spans the editor column only; sidebar + agent dock full height | `frontend/src/layout/` (ShellGrid, TitleBar, ActivityBar, PrimarySidebar, EditorRegion, AgentDock, BottomDock, StatusBar, ResizeHandle) |
+| Drag + keyboard resize (6px handle tracks; Arrow ±4px, Shift ±16px, Home/End, double-click reset; 160–480 / 240–600 / 120–min(800, 50%)) | bounds arrive via `bootstrap.layout_constraints` — no JS literals |
+| Layout persistence (global `layout` section in settings.json, serde-defaulted, old files load unchanged) + Rust close-time save on CloseRequested | `LayoutStore` read-modify-write seam, `state.rs:25-77`; `from_settings_path` at `state.rs:93` |
+| Keyboard toggles + palette (Ctrl+B/L/J, Ctrl+Shift+E/F/G/M/P, Ctrl+,; eleven `selora.*` commands) | `frontend/src/features/keymap/` + `components/CommandPalette.tsx` |
+| Toast surface (bottom-right stack, 4s/8s bands, fade) + the boot settings-wipe toast | `components/ToastViewport.tsx` + `features/toasts/toast-store.ts` |
+| Replay gate: `get_events_after` command, null-seeded, 1024-event ring | `commands.rs` + `state.rs`; frontend applies `workspace_layout_changed` only after stale/gap validation |
+
+**What is still placeholder** (later slices — every other `FrontendCommand`
+still returns `unsupported_phase_slice`, `adapter.rs:3-9`): the editor
+bridge (CodeMirror, Z4), real file-tree/search/Git/diagnostics data (Z4),
+agent streaming and the composer's behavior contract (Z3 — the agent dock's
+chrome, empty state, and composer card ship **inert**: nothing in the dock
+dispatches a command), Libraries.dev packages (Z3/Z5 — none installed),
+workspace opening (`OpenFolder` unsupported; workspace id stays
+`"no-workspace"`).
+
+**Gates** — implementer-reported green and contract acceptance approved;
+re-run by the orchestrator at commit time (full workspace, not just the
+touched crates):
+- `cargo test --workspace --no-fail-fast` → **all suites green** — but only
+  after one orchestrator fix recorded below (`static_vc_runtime(false)`:
+  tauri-build's static-VC-runtime stub `msvcrt.lib` in OUT_DIR otherwise
+  poisons `/defaultlib:msvcrt` for every doctest cargo links in the same
+  workspace session — the selora-editor doctest died with 68 unresolved
+  externals; per-crate gates never see it).
+- `cargo clippy --workspace --all-targets -- -D warnings` → clean.
+- `cargo fmt --all --check` → clean.
+- `npm run typecheck` → clean; `npm run test` → **9 test files, 106 tests
+  passed**; `npm run build` → green (~195KB JS / ~19KB CSS, fonts in
+  `dist/fonts/`).
+- **NOT run** (needs a human at the app, per the frontend implementer's
+  report and confirmed here — nothing in this session can launch the app):
+  the §10 manual walkthrough: production-CSP drag-resize inside the real
+  WebView2, restart persistence, and the visual reduced-motion check. The
+  packaging slice should also verify the production CSP
+  (`style-src 'self'`, no `unsafe-inline`) against WebView2's handling of
+  CSSOM `setProperty` writes — Z2's resize path deliberately routes region
+  sizes through CSS custom properties set via `el.style.setProperty`
+  (ARCHITECTURE §6.2), the CSP-safest pattern, but only a real window
+  proves it.
+
+**Rust deviations (implementer-reported; each verified in the code this
+session):**
+
+- `build.rs:9` uses `WindowsAttributes::new()` (tauri-build's default
+  Common-Controls v6 manifest) instead of `new_without_app_manifest()`:
+  without it every binary of this crate dies at process start with
+  STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) — tauri's default
+  `common-controls-v6` feature imports `TaskDialogIndirect` and no manifest
+  means comctl32 v5 loads. The implementer verified this was **pre-existing
+  by git-stashing the changes and building/running the pristine tree**
+  (exit code -1073741511): `cargo test` passed at Z1 only because the test
+  profile never linked the windowing code — the Z2 mock-app tests and the
+  production exe both do. The contract does not mention the manifest; the
+  fix was required for the named gate `cargo test -p selora-desktop` to
+  pass and repairs a previously unlaunchable app.
+- `build.rs` also sets `.static_vc_runtime(false)` (orchestrator, at commit
+  time): the config default (true) makes tauri-build's `static_vcruntime`
+  write a stub COFF object NAMED `msvcrt.lib` into OUT_DIR and register
+  that dir as a native link path (`tauri-build-2.7.1/src/
+  static_vcruntime.rs`). Cargo propagates build-script link-search paths to
+  every doctest compiled in the same workspace session, so
+  `cargo test --workspace` links selora-editor's doctest with that path;
+  link.exe picks the stub for `/defaultlib:msvcrt`, rejects it (LNK4003
+  invalid library format), and the real C runtime never resolves — 68
+  unresolved externals. Dynamic CRT instead: the release binary wants
+  vcruntime140.dll, which the Windows packaging slice owns alongside the
+  WebView2 prerequisite policy.
+- `state.rs` `dispatch`/`record_event`/`push_event` are generic over
+  `R: tauri::Runtime` (`state.rs:209`, `:363`, `:376`) instead of the
+  concrete `&tauri::AppHandle` sketched in the contract — required so
+  hermetic tests drive the real emit path via `tauri::test::mock_app()`
+  (MockRuntime, `state.rs:430`). The Tauri command itself is exactly
+  `app: tauri::AppHandle` (`commands.rs:25`), which is where the contract
+  specifies the parameter.
+- `crates/selora-protocol` gained three DEFAULT constants
+  (`PRIMARY_SIDEBAR_DEFAULT_PX` 240, `AGENT_DOCK_DEFAULT_PX` 360,
+  `BOTTOM_DOCK_DEFAULT_PX` 200 — `lib.rs:256/262/272`) beyond the
+  contract §1.1 MIN/MAX block: §4.2 requires the settings defaults to
+  "delegate to the §1.1 protocol constants" and §1.1's table carries the
+  Default column, so the defaults needed a protocol home to avoid a second
+  source of truth.
+- `LayoutStore::persist_layout` is a `&self` method holding the settings
+  path (parameterized for hermetic tempdir tests), otherwise the contract
+  §4.5's exact `(&mut Settings, &LayoutDto)` shape; the save re-reads
+  settings.json from disk (read-modify-write through the seam) rather than
+  keeping a full `Settings` copy in `DesktopState` — that is what makes the
+  §10 "a save preserves all other sections" guarantee robust and testable.
+- `crates/selora-settings/src/lib.rs:39` re-exports
+  `selora_core::SeloraError` so selora-desktop can name the persistence
+  error type without taking a direct selora-core dependency (additive
+  re-export; the ownership map lets the persistence decision touch this
+  crate).
+- `DesktopState::with_settings` changed signature
+  (`SettingsViewDto` → `selora_settings::Settings`) and is now
+  `#[cfg(test)]` (`state.rs:118`): Z1's `new()` called it, but Z2's `new()`
+  routes through `from_settings_path`, so it has no production caller —
+  kept as the tests' no-IO constructor instead of carrying dead code.
+  `events.rs`, `security.rs`, `adapter.rs` are untouched, exactly as the
+  ownership map requires (git status confirms).
+
+**Frontend deviations (implementer-reported):**
+
+- Toast severity markers: UI_SPEC §13 specifies `i`/`!` text glyphs, but
+  DESIGN §10 forbids text glyphs outside the ●/○/key-chord precedents and
+  ARCH §9's icon subset has no info/warning glyph — the shapes follow UI_SPEC
+  §13 with its `--info`/`--warn`/`--err` colors, drawn as inline SVG in
+  DESIGN §10's 16×16 / 1.5px-stroke system (success uses the subset's check
+  in `--ok`). Both contracts honored in shape and color; only the drawing
+  medium reconciles them.
+- Reduced-motion transitions: the implementer's ask said "every transition
+  must collapse per the design doc", but the design doc itself (DESIGN §8)
+  keeps one-shot hover/press transitions (≤ `--dur-quick`) and the
+  fade/bloom one-shots under reduced motion, freezing only loops. The
+  design doc was followed: zero looping animations authored (base.css's
+  loop-freezing is a no-op for Z2 chrome), hover/press and fade/bloom stay
+  at token durations.
+- File anatomy followed the implementer's ask (matching the brief §4 tree):
+  `features/keymap/`, `features/layout/layout-store.ts`,
+  `features/toasts/toast-store.ts`, with CommandPalette/ToastViewport/
+  EmptyState in `components/` — instead of ARCH §9's illustrative names
+  (`features/shortcuts.ts`, `features/palette/`, `features/toasts/`).
+- devDependencies `happy-dom`, `@testing-library/react`,
+  `@testing-library/dom` (`package.json:18-23`) were added for tests —
+  explicitly permitted; zero runtime dependencies added.
+- Not run (cannot run here): the §10 manual acceptance walkthrough
+  (production-CSP drag-resize inside the real WebView2, restart
+  persistence, visual reduced-motion) requires launching the Tauri app. The
+  three gate commands the implementer's ask names were run and pass.
+
+**Next**: Z3 — the agent dock vertical slice (session header, model picker,
+transcript, composer contract, ChatDelta batching with stale-event handling,
+tool cards, diffs, approvals, stop, retry, cost footer, and the five
+Libraries.dev mounts). What it can rely on is recorded in
+`docs/ui/PHASE_Z_MIGRATION.md`.
 
 ## 2026-10-07 — Phase R (Premium UX Revamp): the plan + R0 merged
 

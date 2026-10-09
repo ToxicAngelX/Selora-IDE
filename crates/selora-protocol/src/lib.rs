@@ -89,10 +89,17 @@ stable_id!(MessageId);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolValidationError {
     EmptyId,
-    IdTooLong { max: usize },
+    IdTooLong {
+        max: usize,
+    },
     IdContainsControlCharacter,
     InvalidExternalUrl,
     InvalidWorkspacePath,
+    /// A region size that is not a finite number (Phase Z2, ARCHITECTURE
+    /// §1.1). Unreachable from the wire — JSON has no NaN/±Inf spelling and
+    /// serde_json rejects out-of-range number literals at the parse boundary —
+    /// so the check stands as a Rust-internal invariant for non-wire callers.
+    InvalidRegionSize,
 }
 impl fmt::Display for ProtocolValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -104,6 +111,7 @@ impl fmt::Display for ProtocolValidationError {
             }
             Self::InvalidExternalUrl => f.write_str("external URL must be an absolute HTTPS URL"),
             Self::InvalidWorkspacePath => f.write_str("path must be workspace-relative and safe"),
+            Self::InvalidRegionSize => f.write_str("region size must be a finite number"),
         }
     }
 }
@@ -227,6 +235,91 @@ pub enum RegionId {
     PrimarySidebar,
     AgentDock,
     BottomDock,
+}
+
+// ---------------------------------------------------------------------------
+// Phase Z2 — shell layout geometry (docs/ui/PHASE_Z2_ARCHITECTURE.md §1.1).
+//
+// These constants are the single source of truth for region bounds and
+// defaults: `bootstrap.layout_constraints` carries the bounds to the frontend
+// (no bound is ever a JS literal) and `selora-settings`' `layout.*` defaults
+// delegate to the same constants (§4.2). tokens.css intentionally carries no
+// region values for exactly this reason. Sources: bounds 160/480, 240/600 and
+// the 400px editor floor from UI_SPEC §2's region table; defaults 240/360/200
+// and the closed first-run agent/bottom states from the same table.
+// ---------------------------------------------------------------------------
+
+/// Primary sidebar width bounds (UI_SPEC §2).
+pub const PRIMARY_SIDEBAR_MIN_PX: f32 = 160.0;
+pub const PRIMARY_SIDEBAR_MAX_PX: f32 = 480.0;
+/// Primary sidebar stored default (§1.1's table: 240px, open first-run).
+pub const PRIMARY_SIDEBAR_DEFAULT_PX: f32 = 240.0;
+
+/// Agent dock width bounds (UI_SPEC §2).
+pub const AGENT_DOCK_MIN_PX: f32 = 240.0;
+pub const AGENT_DOCK_MAX_PX: f32 = 600.0;
+/// Agent dock stored default (§1.1's table: 360px, closed first-run).
+pub const AGENT_DOCK_DEFAULT_PX: f32 = 360.0;
+
+/// Bottom dock height bounds. UI_SPEC §2's "min 0" meant *hidden*, which the
+/// protocol models as `bottom_dock_open: false`; an open dock gets a usable
+/// 120px floor (Z2 decision, §1.1). Rust enforces the static 800px ceiling —
+/// the 50%-of-workbench rule is dynamic and cannot be validated in Rust, so
+/// the frontend additionally clamps to it before dispatching (§1.1, §2.3).
+pub const BOTTOM_DOCK_MIN_PX: f32 = 120.0;
+pub const BOTTOM_DOCK_MAX_PX: f32 = 800.0;
+/// Bottom dock stored default (§1.1's table: 200px, closed first-run).
+pub const BOTTOM_DOCK_DEFAULT_PX: f32 = 200.0;
+
+/// Bottom-dock ceiling as a fraction of the measured workbench height
+/// (frontend-side clamp; Rust does not know the webview's workbench height).
+pub const BOTTOM_DOCK_MAX_WORKBENCH_RATIO: f32 = 0.5;
+
+/// The editor region never goes below this width (UI_SPEC §2 region ②'s min).
+/// A frontend-enforced derived constraint — no protocol validation.
+pub const EDITOR_MIN_WIDTH_PX: f32 = 400.0;
+
+/// Resize handle hit-zone width (the brief §6's ≥6px rule).
+pub const RESIZE_HIT_ZONE_MIN_PX: f32 = 6.0;
+
+/// Editor split count bounds (UI_SPEC §3.3).
+pub const EDITOR_SPLITS_MIN: u8 = 1;
+pub const EDITOR_SPLITS_MAX: u8 = 4;
+
+/// The surfaces the primary sidebar can show (§2.2's routing table).
+/// `Problems` is a bottom-dock view in Z2, so it is excluded here
+/// (ARCHITECTURE §4.3 — brief §2's sidebar parenthetical is superseded).
+pub const ACTIVITY_VIEWS: [SurfaceId; 4] = [
+    SurfaceId::Files,
+    SurfaceId::Search,
+    SurfaceId::Git,
+    SurfaceId::Settings,
+];
+
+/// The surfaces the bottom dock can show (§2.2's routing table).
+pub const BOTTOM_VIEWS: [SurfaceId; 3] = [
+    SurfaceId::Output,
+    SurfaceId::TerminalPlaceholder,
+    SurfaceId::Problems,
+];
+
+/// Clamp a ResizeRegion value into the region's bounds (§1.1). Finite
+/// out-of-range values are clamped, never rejected (drag-end values
+/// routinely land a fraction past a bound). The non-finite check is a
+/// Rust-internal invariant guard: JSON cannot carry NaN/±Inf and serde_json
+/// rejects out-of-range number literals at the parse boundary, so no wire
+/// input can reach it — it exists for future non-wire callers, not as a wire
+/// threat model.
+pub fn clamp_region_size(region: RegionId, size_px: f32) -> Result<f32, ProtocolValidationError> {
+    if !size_px.is_finite() {
+        return Err(ProtocolValidationError::InvalidRegionSize);
+    }
+    let (min, max) = match region {
+        RegionId::PrimarySidebar => (PRIMARY_SIDEBAR_MIN_PX, PRIMARY_SIDEBAR_MAX_PX),
+        RegionId::AgentDock => (AGENT_DOCK_MIN_PX, AGENT_DOCK_MAX_PX),
+        RegionId::BottomDock => (BOTTOM_DOCK_MIN_PX, BOTTOM_DOCK_MAX_PX),
+    };
+    Ok(size_px.clamp(min, max))
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsPatchDto {
@@ -412,20 +505,171 @@ pub enum ConnectionStatus {
     Connecting,
     Disconnected,
 }
+/// Mirrors `Keybind::parse`'s default grammar spelling for the rebindable
+/// pair (the same values as selora-settings' `default_command_palette` /
+/// `default_toggle_chat`, settings.rs). String constants, not settings
+/// types — the protocol crate stays settings-free.
+fn default_keybind_command_palette() -> String {
+    "Ctrl+Shift+P".into()
+}
+fn default_keybind_toggle_chat() -> String {
+    "Ctrl+L".into()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsViewDto {
     pub reduced_motion: bool,
     pub theme: String,
+    /// §7.1's rebindable pair, populated from `settings.keybinds` (§5.1) so a
+    /// user's egui-side rebind carries into the web shell. The other two
+    /// settings keybinds (`fuzzy_find`, `save`) are not exposed until their
+    /// slices use them.
+    #[serde(default = "default_keybind_command_palette")]
+    pub keybind_command_palette: String,
+    #[serde(default = "default_keybind_toggle_chat")]
+    pub keybind_toggle_chat: String,
 }
+/// Phase Z2 serde defaults (§5.1 / §4.2): every field is defaulted so a
+/// partial or pre-Z2 `LayoutDto` JSON deserializes — the values are §1.1's
+/// table. These functions are also `sanitized()`'s fallbacks, so the wire
+/// defaults and the sanitization floors cannot diverge.
+fn default_primary_sidebar_width_px() -> f32 {
+    PRIMARY_SIDEBAR_DEFAULT_PX
+}
+fn default_agent_dock_width_px() -> f32 {
+    AGENT_DOCK_DEFAULT_PX
+}
+fn default_agent_dock_open() -> bool {
+    false
+}
+fn default_bottom_dock_height_px() -> f32 {
+    BOTTOM_DOCK_DEFAULT_PX
+}
+fn default_bottom_dock_open() -> bool {
+    false
+}
+fn default_bottom_view() -> SurfaceId {
+    SurfaceId::Output
+}
+fn default_editor_splits() -> u8 {
+    EDITOR_SPLITS_MIN
+}
+fn default_activity_view() -> SurfaceId {
+    SurfaceId::Files
+}
+fn default_primary_sidebar_open() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDto {
+    #[serde(default = "default_primary_sidebar_width_px")]
     pub primary_sidebar_width_px: f32,
+    #[serde(default = "default_agent_dock_width_px")]
     pub agent_dock_width_px: f32,
+    #[serde(default = "default_agent_dock_open")]
     pub agent_dock_open: bool,
+    #[serde(default = "default_bottom_dock_height_px")]
     pub bottom_dock_height_px: f32,
+    #[serde(default = "default_bottom_dock_open")]
     pub bottom_dock_open: bool,
+    #[serde(default = "default_bottom_view")]
     pub bottom_view: SurfaceId,
+    #[serde(default = "default_editor_splits")]
     pub editor_splits: u8,
+    /// The activity bar's active view (§5.1 — brief §6's "active activity
+    /// view"). `bottom_view` above covers the bottom dock's active view.
+    #[serde(default = "default_activity_view")]
+    pub activity_view: SurfaceId,
+    /// Rust-owned sidebar open state (§5.1 — a collapsed sidebar must
+    /// restore; `Ctrl+B` toggling needs it).
+    #[serde(default = "default_primary_sidebar_open")]
+    pub primary_sidebar_open: bool,
+}
+
+impl LayoutDto {
+    /// §4.3 load-time sanitization: clamp all sizes into the §1.1 bounds
+    /// (non-finite persisted values fall to the defaults), clamp
+    /// `editor_splits` into `EDITOR_SPLITS_MIN..=EDITOR_SPLITS_MAX`, and
+    /// reset `activity_view` / `bottom_view` if they name a surface outside
+    /// the valid sets — a persisted value can never wedge the shell. Runs on
+    /// settings load and after every accepted resize.
+    pub fn sanitized(self) -> Self {
+        Self {
+            primary_sidebar_width_px: sanitize_region_size(
+                RegionId::PrimarySidebar,
+                self.primary_sidebar_width_px,
+                default_primary_sidebar_width_px(),
+            ),
+            agent_dock_width_px: sanitize_region_size(
+                RegionId::AgentDock,
+                self.agent_dock_width_px,
+                default_agent_dock_width_px(),
+            ),
+            bottom_dock_height_px: sanitize_region_size(
+                RegionId::BottomDock,
+                self.bottom_dock_height_px,
+                default_bottom_dock_height_px(),
+            ),
+            agent_dock_open: self.agent_dock_open,
+            bottom_dock_open: self.bottom_dock_open,
+            bottom_view: if BOTTOM_VIEWS.contains(&self.bottom_view) {
+                self.bottom_view
+            } else {
+                default_bottom_view()
+            },
+            editor_splits: self
+                .editor_splits
+                .clamp(EDITOR_SPLITS_MIN, EDITOR_SPLITS_MAX),
+            activity_view: if ACTIVITY_VIEWS.contains(&self.activity_view) {
+                self.activity_view
+            } else {
+                default_activity_view()
+            },
+            primary_sidebar_open: self.primary_sidebar_open,
+        }
+    }
+}
+
+/// Clamp a persisted size, falling to the default for non-finite values
+/// (§4.3: "non-finite persisted values to the defaults" — an error, as
+/// `clamp_region_size` treats it, would have nowhere to go here).
+fn sanitize_region_size(region: RegionId, value: f32, fallback: f32) -> f32 {
+    clamp_region_size(region, value).unwrap_or(fallback)
+}
+
+/// Field-for-field mirror of the §1.1 constants, delivered in
+/// `bootstrap.layout_constraints` so no bound is ever a JS literal (§5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayoutConstraintsDto {
+    pub primary_sidebar_min_px: f32,
+    pub primary_sidebar_max_px: f32,
+    pub agent_dock_min_px: f32,
+    pub agent_dock_max_px: f32,
+    pub bottom_dock_min_px: f32,
+    pub bottom_dock_max_px: f32,
+    pub bottom_dock_max_workbench_ratio: f32,
+    pub editor_min_width_px: f32,
+    pub resize_hit_zone_min_px: f32,
+}
+
+impl LayoutConstraintsDto {
+    /// The only constructor — field-for-field from the §1.1 constants, so the
+    /// DTO and the constants cannot drift (§10's protocol test asserts
+    /// exactly this).
+    pub fn from_constants() -> Self {
+        Self {
+            primary_sidebar_min_px: PRIMARY_SIDEBAR_MIN_PX,
+            primary_sidebar_max_px: PRIMARY_SIDEBAR_MAX_PX,
+            agent_dock_min_px: AGENT_DOCK_MIN_PX,
+            agent_dock_max_px: AGENT_DOCK_MAX_PX,
+            bottom_dock_min_px: BOTTOM_DOCK_MIN_PX,
+            bottom_dock_max_px: BOTTOM_DOCK_MAX_PX,
+            bottom_dock_max_workbench_ratio: BOTTOM_DOCK_MAX_WORKBENCH_RATIO,
+            editor_min_width_px: EDITOR_MIN_WIDTH_PX,
+            resize_hit_zone_min_px: RESIZE_HIT_ZONE_MIN_PX,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitStatusDto {
@@ -472,6 +716,10 @@ pub struct BootstrapState {
     pub chat: ChatStateDto,
     pub settings: SettingsViewDto,
     pub layout: LayoutDto,
+    /// §5.1: the §1.1 bounds as delivered to the frontend — no bound is ever
+    /// a JS literal. No serde default: the bootstrap is always generated
+    /// whole.
+    pub layout_constraints: LayoutConstraintsDto,
     pub git: GitStatusDto,
     pub diagnostics: Vec<DiagnosticDto>,
     pub feature_flags: FeatureFlagsDto,
@@ -796,16 +1044,24 @@ mod tests {
             settings: SettingsViewDto {
                 reduced_motion: false,
                 theme: "selora-dark".into(),
+                keybind_command_palette: "Ctrl+Shift+P".into(),
+                keybind_toggle_chat: "Ctrl+L".into(),
             },
+            // §1.1: the Z1 stub values (280/220, agent dock open) were
+            // diagnostic placeholders — Z2's fixture carries the table's
+            // values (240 / 360-closed / 200-closed).
             layout: LayoutDto {
-                primary_sidebar_width_px: 280.0,
-                agent_dock_width_px: 360.0,
-                agent_dock_open: true,
-                bottom_dock_height_px: 220.0,
+                primary_sidebar_width_px: PRIMARY_SIDEBAR_DEFAULT_PX,
+                agent_dock_width_px: AGENT_DOCK_DEFAULT_PX,
+                agent_dock_open: false,
+                bottom_dock_height_px: BOTTOM_DOCK_DEFAULT_PX,
                 bottom_dock_open: false,
                 bottom_view: SurfaceId::Output,
                 editor_splits: 1,
+                activity_view: SurfaceId::Files,
+                primary_sidebar_open: true,
             },
+            layout_constraints: LayoutConstraintsDto::from_constants(),
             git: GitStatusDto {
                 branch: None,
                 changed_paths: vec![],
@@ -858,6 +1114,237 @@ mod tests {
             serde_json::to_string(&FrontendCommand::OpenFolder).unwrap(),
             r#"{"type":"open_folder"}"#
         );
+    }
+    #[test]
+    fn z2_command_wire_shapes_are_stable() {
+        // §2.1's exact spellings, verified against the serde envelope.
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::ToggleSurface {
+                surface: SurfaceId::Agent
+            })
+            .unwrap(),
+            r#"{"type":"toggle_surface","payload":{"surface":"agent"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::ResizeRegion {
+                region: RegionId::PrimarySidebar,
+                size_px: 240.0
+            })
+            .unwrap(),
+            r#"{"type":"resize_region","payload":{"region":"primary_sidebar","size_px":240.0}}"#
+        );
+        // A unit variant: no `payload` key (same shape as `open_folder`).
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::SaveLayout).unwrap(),
+            r#"{"type":"save_layout"}"#
+        );
+    }
+    #[test]
+    fn z2_event_wire_shapes_are_stable() {
+        let event = FrontendEvent::WorkspaceLayoutChanged(LayoutDto {
+            primary_sidebar_width_px: 240.0,
+            agent_dock_width_px: 360.0,
+            agent_dock_open: false,
+            bottom_dock_height_px: 200.0,
+            bottom_dock_open: false,
+            bottom_view: SurfaceId::Output,
+            editor_splits: 1,
+            activity_view: SurfaceId::Files,
+            primary_sidebar_open: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"workspace_layout_changed","payload":{"primary_sidebar_width_px":240.0,"agent_dock_width_px":360.0,"agent_dock_open":false,"bottom_dock_height_px":200.0,"bottom_dock_open":false,"bottom_view":"output","editor_splits":1,"activity_view":"files","primary_sidebar_open":true}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::Toast(ToastDto {
+                severity: ToastSeverity::Info,
+                message: "saved".into(),
+            }))
+            .unwrap(),
+            r#"{"type":"toast","payload":{"severity":"info","message":"saved"}}"#
+        );
+    }
+    #[test]
+    fn z2_command_serde_boundary_rejects_malformed_payloads() {
+        // Unknown surface/region spellings fail enum deserialization (§2.3
+        // item 4) — the rejection happens at the serde boundary, before any
+        // Rust arm runs.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"toggle_surface","payload":{"surface":"nonexistent"}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"resize_region","payload":{"region":"sidebar"}}"#
+        )
+        .is_err());
+        // `size_px: null` is a type error at the same boundary.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"resize_region","payload":{"region":"primary_sidebar","size_px":null}}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn layout_dto_round_trip_includes_new_fields() {
+        let layout = LayoutDto {
+            primary_sidebar_width_px: 320.5,
+            agent_dock_width_px: 411.25,
+            agent_dock_open: true,
+            bottom_dock_height_px: 333.75,
+            bottom_dock_open: true,
+            bottom_view: SurfaceId::Problems,
+            editor_splits: 3,
+            activity_view: SurfaceId::Git,
+            primary_sidebar_open: false,
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        assert_eq!(serde_json::from_str::<LayoutDto>(&json).unwrap(), layout);
+        // The two new fields really ride the wire.
+        assert!(json.contains(r#""activity_view":"git""#));
+        assert!(json.contains(r#""primary_sidebar_open":false"#));
+    }
+    #[test]
+    fn pre_z2_and_partial_layout_json_load_with_defaults() {
+        // A pre-Z2 persisted layout (the seven old fields) deserializes with
+        // the §4.2 defaults for the two new fields.
+        let pre_z2 = serde_json::from_str::<LayoutDto>(
+            r#"{"primary_sidebar_width_px":240.0,"agent_dock_width_px":360.0,"agent_dock_open":false,"bottom_dock_height_px":200.0,"bottom_dock_open":false,"bottom_view":"output","editor_splits":1}"#,
+        )
+        .unwrap();
+        assert_eq!(pre_z2.activity_view, SurfaceId::Files);
+        assert!(pre_z2.primary_sidebar_open);
+        // A partial (or empty) layout JSON fills every missing field with the
+        // §4.2 defaults (§5.1: "every existing LayoutDto field gains a serde
+        // default").
+        let partial =
+            serde_json::from_str::<LayoutDto>(r#"{"primary_sidebar_width_px":300.0}"#).unwrap();
+        assert_eq!(
+            partial,
+            LayoutDto {
+                primary_sidebar_width_px: 300.0,
+                ..default_layout()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<LayoutDto>(r#"{}"#).unwrap(),
+            default_layout()
+        );
+    }
+    #[test]
+    fn clamp_region_size_bounds_table_and_non_finite() {
+        use RegionId::*;
+        // (region, input, expected) — finite out-of-range values are clamped,
+        // never rejected; in-range values pass through exactly.
+        for (region, input, expected) in [
+            (PrimarySidebar, 100.0, PRIMARY_SIDEBAR_MIN_PX),
+            (PrimarySidebar, 240.0, 240.0),
+            (PrimarySidebar, 9999.0, PRIMARY_SIDEBAR_MAX_PX),
+            (AgentDock, 100.0, AGENT_DOCK_MIN_PX),
+            (AgentDock, 550.5, 550.5),
+            (AgentDock, 600.0, AGENT_DOCK_MAX_PX),
+            (BottomDock, 0.0, BOTTOM_DOCK_MIN_PX),
+            (BottomDock, 200.0, 200.0),
+            (BottomDock, 80_000.0, BOTTOM_DOCK_MAX_PX),
+        ] {
+            assert_eq!(clamp_region_size(region, input).unwrap(), expected);
+        }
+        // Non-finite values are rejected (the Rust-internal invariant guard).
+        for region in [PrimarySidebar, AgentDock, BottomDock] {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert_eq!(
+                    clamp_region_size(region, value),
+                    Err(ProtocolValidationError::InvalidRegionSize)
+                );
+            }
+        }
+    }
+    #[test]
+    fn sanitized_fixes_out_of_range_and_out_of_set_values() {
+        let wedged = LayoutDto {
+            primary_sidebar_width_px: f32::NAN,
+            agent_dock_width_px: 9000.0,
+            agent_dock_open: true,
+            bottom_dock_height_px: 1.0,
+            bottom_dock_open: true,
+            // `agent` is not an activity view; `files` is not a bottom view.
+            bottom_view: SurfaceId::Files,
+            editor_splits: 0,
+            activity_view: SurfaceId::Agent,
+            primary_sidebar_open: true,
+        };
+        let sanitized = wedged.clone().sanitized();
+        assert_eq!(sanitized.primary_sidebar_width_px, 240.0, "NaN → default");
+        assert_eq!(sanitized.agent_dock_width_px, 600.0, "clamped to max");
+        assert_eq!(sanitized.bottom_dock_height_px, 120.0, "clamped to min");
+        assert_eq!(sanitized.bottom_view, SurfaceId::Output, "reset into set");
+        assert_eq!(sanitized.editor_splits, EDITOR_SPLITS_MIN);
+        assert_eq!(sanitized.activity_view, SurfaceId::Files, "reset into set");
+        // Open flags are semantics, not sizes — untouched.
+        assert!(sanitized.agent_dock_open);
+        assert!(sanitized.bottom_dock_open);
+        // A clean layout is a fixed point.
+        assert_eq!(default_layout().clone().sanitized(), default_layout());
+        // editor_splits clamps from above too.
+        let splits = LayoutDto {
+            editor_splits: 9,
+            ..default_layout()
+        };
+        assert_eq!(splits.sanitized().editor_splits, EDITOR_SPLITS_MAX);
+    }
+    #[test]
+    fn layout_constraints_dto_matches_constants() {
+        let constraints = LayoutConstraintsDto::from_constants();
+        assert_eq!(constraints.primary_sidebar_min_px, PRIMARY_SIDEBAR_MIN_PX);
+        assert_eq!(constraints.primary_sidebar_max_px, PRIMARY_SIDEBAR_MAX_PX);
+        assert_eq!(constraints.agent_dock_min_px, AGENT_DOCK_MIN_PX);
+        assert_eq!(constraints.agent_dock_max_px, AGENT_DOCK_MAX_PX);
+        assert_eq!(constraints.bottom_dock_min_px, BOTTOM_DOCK_MIN_PX);
+        assert_eq!(constraints.bottom_dock_max_px, BOTTOM_DOCK_MAX_PX);
+        assert_eq!(
+            constraints.bottom_dock_max_workbench_ratio,
+            BOTTOM_DOCK_MAX_WORKBENCH_RATIO
+        );
+        assert_eq!(constraints.editor_min_width_px, EDITOR_MIN_WIDTH_PX);
+        assert_eq!(constraints.resize_hit_zone_min_px, RESIZE_HIT_ZONE_MIN_PX);
+    }
+    #[test]
+    fn protocol_constants_are_the_documented_table() {
+        // §1.1's table, verbatim — the single source of truth everything else
+        // (settings defaults, the Z2 state bootstrap) delegates to.
+        assert_eq!(PRIMARY_SIDEBAR_MIN_PX, 160.0);
+        assert_eq!(PRIMARY_SIDEBAR_MAX_PX, 480.0);
+        assert_eq!(PRIMARY_SIDEBAR_DEFAULT_PX, 240.0);
+        assert_eq!(AGENT_DOCK_MIN_PX, 240.0);
+        assert_eq!(AGENT_DOCK_MAX_PX, 600.0);
+        assert_eq!(AGENT_DOCK_DEFAULT_PX, 360.0);
+        assert_eq!(BOTTOM_DOCK_MIN_PX, 120.0);
+        assert_eq!(BOTTOM_DOCK_MAX_PX, 800.0);
+        assert_eq!(BOTTOM_DOCK_DEFAULT_PX, 200.0);
+        assert_eq!(BOTTOM_DOCK_MAX_WORKBENCH_RATIO, 0.5);
+        assert_eq!(EDITOR_MIN_WIDTH_PX, 400.0);
+        assert_eq!(RESIZE_HIT_ZONE_MIN_PX, 6.0);
+        assert_eq!(EDITOR_SPLITS_MIN, 1);
+        assert_eq!(EDITOR_SPLITS_MAX, 4);
+        // §4.3's valid sets.
+        assert!(ACTIVITY_VIEWS.contains(&SurfaceId::Files));
+        assert!(!ACTIVITY_VIEWS.contains(&SurfaceId::Problems));
+        assert!(BOTTOM_VIEWS.contains(&SurfaceId::Problems));
+        assert!(!BOTTOM_VIEWS.contains(&SurfaceId::Files));
+    }
+
+    /// The §1.1-table default layout (§4.2's "wire shape of a full section").
+    fn default_layout() -> LayoutDto {
+        LayoutDto {
+            primary_sidebar_width_px: 240.0,
+            agent_dock_width_px: 360.0,
+            agent_dock_open: false,
+            bottom_dock_height_px: 200.0,
+            bottom_dock_open: false,
+            bottom_view: SurfaceId::Output,
+            editor_splits: 1,
+            activity_view: SurfaceId::Files,
+            primary_sidebar_open: true,
+        }
     }
     #[test]
     fn event_order_rejects_stale_gap_epoch() {
