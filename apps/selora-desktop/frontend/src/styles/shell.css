@@ -382,6 +382,7 @@
 }
 
 .sidebar-search-input[disabled] {
+  background: transparent;
   color: var(--fg-disabled);
   border-color: var(--ink-hi);
   cursor: default;
@@ -734,7 +735,13 @@
   background: var(--ink-hi);
 }
 
+/* The disabled state must be unmistakable, not just fainter text: owner
+   testing read the ink-mid fill + --fg-disabled text as a clickable button.
+   Disabled drops the fill to the ghost look (transparent + hairline),
+   matching the agent-chip disabled family. */
 .empty-action[disabled] {
+  background: transparent;
+  border: var(--border-hairline);
   color: var(--fg-disabled);
   cursor: default;
 }

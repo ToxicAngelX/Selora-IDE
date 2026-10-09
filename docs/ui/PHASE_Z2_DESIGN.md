@@ -444,6 +444,18 @@ with its later-slice caption (ARCH §8.1) and gains wiring only when a
 protocol command exists for it. UI_SPEC §12's editor-with-folder row
 keeps its two-action form for the workspace-open slice.
 
+**Disabled-state amendment (2026-10-09, owner-test finding):** the
+original disabled state — `--fg-disabled` text and no hover, per the §10
+state matrix — proved imperceptible on *filled* controls: the owner read
+the ink-mid "Open Folder" button as clickable and reported the whole app
+as "nothing is clickable" (a disabled control suppresses
+mousedown/mouseup/click in Chromium while pointer events still fire,
+which briefly looked like a WebView2 input-layer bug — it never was one).
+Disabled filled controls therefore drop the fill: transparent background
++ hairline border + `--fg-disabled` text, the agent-chip disabled family;
+disabled inputs drop their fill the same way. No new tokens, §12-clean,
+and every disabled control carries an explanatory `title`.
+
 ## 7. Focus rings
 
 - Two sanctioned forms, both the `--border-focus` token (1px

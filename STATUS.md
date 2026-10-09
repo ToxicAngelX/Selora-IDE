@@ -59,6 +59,29 @@ touched crates):
   (ARCHITECTURE §6.2), the CSP-safest pattern, but only a real window
   proves it.
 
+**2026-10-09, owner smoke test — "nothing is clickable" — investigated
+to root cause and fixed.** The owner's report that only the left-side
+(activity-bar) buttons responded was reproduced with instrumented OS-level
+clicks against a live webview (CDP, `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=
+--remote-debugging-port`). The "dead" controls (Open Folder, agent chips,
+status-bar connect, sidebar search input) received `pointerdown`/`pointerup`
+but never `mousedown`/`click`; the "working" controls always got the full
+sequence. Injected plain buttons at the same coordinates worked, including
+with `cursor:pointer` and the app's own class. Root cause: **every dead
+control was rendered `disabled`** — Chromium suppresses mouse compatibility
+events on disabled form controls while pointer events still fire, which
+masqueraded as an input-layer bug (a `decorations(false)`-at-creation
+workaround was tested and reverted — the undecorated input path was proven
+clean by the always-working title-bar/activity-bar buttons). The real
+defect was the disabled *affordance*: `--fg-disabled` text on an ink-mid
+fill reads as a clickable button. Fix (commit): disabled filled controls
+drop the fill (transparent + hairline + `--fg-disabled` — the agent-chip
+family), disabled inputs drop their fill, and every disabled control
+carries an explanatory `title`; the amendment is recorded in
+PHASE_Z2_DESIGN.md §6. The deeper gap the smoke test exposed — key
+connection, model picker, and a writable composer are Z3+ scope, not
+bugs — stands as the next slice's job.
+
 **Rust deviations (implementer-reported; each verified in the code this
 session):**
 

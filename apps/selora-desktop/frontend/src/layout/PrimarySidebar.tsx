@@ -43,6 +43,7 @@ function SearchView() {
         type="text"
         placeholder="Search the workspace"
         disabled
+        title="Workspace search arrives in a later slice"
       />
     </div>
   );

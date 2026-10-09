@@ -31,7 +31,13 @@ export function AgentDock() {
         >
           <div className="agent-suggestions" aria-label="Suggested prompts">
             {SUGGESTIONS.map((suggestion) => (
-              <button key={suggestion} type="button" className="agent-chip" disabled>
+              <button
+                key={suggestion}
+                type="button"
+                className="agent-chip"
+                disabled
+                title="The composer arrives in a later slice"
+              >
                 {suggestion}
               </button>
             ))}
