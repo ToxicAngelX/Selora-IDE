@@ -98,13 +98,99 @@ export type BootstrapState = {
 
 export type ProtocolError = { code: string; message: string; retryable: boolean };
 
+export type ConnectResult = {
+  connected: boolean;
+  models_count: number;
+  active_model_id: string | null;
+  base_url: string;
+};
+
+export type ApiKeyStatus = {
+  connected: boolean;
+  has_key: boolean;
+  source: string;
+  base_url: string;
+  key_hint: string | null;
+  active_model_id: string | null;
+};
+
+export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'stop';
+export type AgentMode = 'execute' | 'explore';
+export type AgentPhase = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
+
+export type ToolCallStartedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  call_id: string;
+  tool_name: string;
+  args_json: string;
+};
+
+export type ToolResultPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  call_id: string;
+  result_summary: string;
+  is_err: boolean;
+};
+
+export type ApprovalNeededPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  approval_id: Id;
+  tool_name: string;
+  path_or_command: string;
+  diff_or_input?: string;
+};
+
+export type AgentStateChangedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  state: AgentPhase;
+  tool_name?: string;
+};
+
+export type AgentTurnDonePayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  total_tokens: number;
+  cost_usd: number;
+  num_tools: number;
+  approved: number;
+  denied: number;
+  completed: boolean;
+  end_message: string;
+};
+
+export type ChatCompletedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  message_id: Id;
+  text: string;
+  total_tokens: number;
+  cost_usd: number;
+};
+
 export type FrontendCommand =
   | { type: 'get_bootstrap_state' }
   | { type: 'open_folder' }
   | { type: 'open_file'; payload: { path: string } }
   | { type: 'toggle_surface'; payload: { surface: SurfaceId } }
   | { type: 'resize_region'; payload: { region: RegionId; size_px: number } }
-  | { type: 'save_layout' };
+  | { type: 'save_layout' }
+  | { type: 'send_chat'; payload: { request_id: Id; request: { session_id: Id; message: string; model_id: string | null } } }
+  | { type: 'stop_chat'; payload: { request_id: Id } }
+  | { type: 'send_agent'; payload: { request_id: Id; request: { session_id: Id; prompt: string; model_id: string | null; mode: AgentMode; reasoning_effort?: 'quick' | 'standard' | 'max'; system_instructions?: string; temperature?: number } } }
+  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
+  | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
+  | { type: 'switch_session'; payload: { session_id: Id } }
+  | { type: 'new_session' };
 
 export type RequestEnvelope = {
   protocol_version: number;
@@ -121,8 +207,13 @@ export type RequestEnvelope = {
 export type FrontendEvent =
   | { type: 'bootstrap_state'; payload: BootstrapState }
   | { type: 'chat_delta'; payload: { request_id: Id; session_id: Id; turn_id: Id; message_id: Id; sequence: number; text: string } }
-  | { type: 'chat_completed'; payload: { request_id: Id; session_id: Id; turn_id: Id; message_id: Id; text: string } }
+  | { type: 'chat_completed'; payload: ChatCompletedPayload }
   | { type: 'chat_failed'; payload: { request_id: Id; session_id: Id; turn_id: Id; error: ProtocolError } }
+  | { type: 'tool_call_started'; payload: ToolCallStartedPayload }
+  | { type: 'tool_result'; payload: ToolResultPayload }
+  | { type: 'approval_needed'; payload: ApprovalNeededPayload }
+  | { type: 'agent_state_changed'; payload: AgentStateChangedPayload }
+  | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'file_tree_changed'; payload: { root: FileTreeNode | null } }
@@ -232,8 +323,124 @@ export const resizeRegion = (region: RegionId, sizePx: number, ctx: EnvelopeCont
 export const saveLayout = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'save_layout' }, ctx);
 
+export const sendChat = (
+  message: string,
+  modelId: string | null,
+  ctx: EnvelopeContext,
+): { requestId: string; promise: Promise<unknown> } => {
+  const requestId = newRequestId();
+  const sessionId = ctx.session_id ?? 'sess_default';
+  return {
+    requestId,
+    promise: dispatchZ2Command(
+      {
+        type: 'send_chat',
+        payload: {
+          request_id: requestId,
+          request: {
+            session_id: sessionId,
+            message,
+            model_id: modelId,
+          },
+        },
+      },
+      ctx,
+    ),
+  };
+};
+
+export const stopChat = (requestId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'stop_chat', payload: { request_id: requestId } }, ctx);
+
+export const sendAgent = (
+  prompt: string,
+  mode: AgentMode,
+  modelId: string | null,
+  ctx: EnvelopeContext,
+  options?: {
+    reasoningEffort?: 'quick' | 'standard' | 'max';
+    systemInstructions?: string;
+    temperature?: number;
+  },
+): { requestId: string; promise: Promise<unknown> } => {
+  const requestId = newRequestId();
+  const sessionId = ctx.session_id ?? 'sess_default';
+  const request: {
+    session_id: Id;
+    prompt: string;
+    model_id: string | null;
+    mode: AgentMode;
+    reasoning_effort?: 'quick' | 'standard' | 'max';
+    system_instructions?: string;
+    temperature?: number;
+  } = {
+    session_id: sessionId,
+    prompt,
+    model_id: modelId,
+    mode,
+  };
+  if (options?.reasoningEffort !== undefined) {
+    request.reasoning_effort = options.reasoningEffort;
+  }
+  if (options?.systemInstructions !== undefined && options.systemInstructions.trim() !== '') {
+    request.system_instructions = options.systemInstructions.trim();
+  }
+  if (options?.temperature !== undefined) {
+    request.temperature = options.temperature;
+  }
+  return {
+    requestId,
+    promise: dispatchZ2Command(
+      {
+        type: 'send_agent',
+        payload: {
+          request_id: requestId,
+          request,
+        },
+      },
+      ctx,
+    ),
+  };
+};
+
+export const agentDecision = (
+  requestId: Id,
+  approvalId: Id,
+  decision: Decision,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    {
+      type: 'agent_decision',
+      payload: {
+        request_id: requestId,
+        approval_id: approvalId,
+        decision,
+      },
+    },
+    ctx,
+  );
+
+export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'switch_session', payload: { session_id: sessionId } }, ctx);
+
+export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'new_session' }, ctx);
+
 export const getEventsAfter = (afterSequence: number): Promise<EventEnvelope[]> =>
   invoke('get_events_after', { afterSequence });
+
+export const connectApiKey = (apiKey: string, baseUrl?: string): Promise<ConnectResult> =>
+  invoke<ConnectResult>('connect_api_key', { apiKey, baseUrl: baseUrl || null });
+
+export const disconnectApiKey = (): Promise<void> =>
+  invoke<void>('disconnect_api_key');
+
+export const getApiKeyStatus = (): Promise<ApiKeyStatus> =>
+  invoke<ApiKeyStatus>('get_api_key_status');
+
+export const fetchModels = (): Promise<Model[]> =>
+  invoke<Model[]>('fetch_models');
 
 // --- Event validation (unchanged from Z1; ARCHITECTURE §3.4) -----------------
 

@@ -227,6 +227,15 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// A successful tool result.
+    pub fn success(id: impl Into<ToolCallId>, content: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ok: true,
+            content: content.into(),
+        }
+    }
+
     /// An error result (guard rejection, failure, denial).
     pub fn error(id: impl Into<ToolCallId>, content: impl Into<String>) -> Self {
         Self {

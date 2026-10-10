@@ -28,7 +28,20 @@ const ACTIVITIES: Activity[] = [
 
 const SETTINGS: Activity = { surface: 'settings', label: 'Settings', icon: 'settings' };
 
-function ActivityButton({ activity, selected }: { activity: Activity; selected: boolean }) {
+export type ActivityBarProps = {
+  viewMode?: 'agent' | 'split' | 'editor';
+  onSelectViewMode?: (mode: 'agent' | 'split' | 'editor') => void;
+};
+
+function ActivityButton({
+  activity,
+  selected,
+  onClick,
+}: {
+  activity: Activity;
+  selected: boolean;
+  onClick: () => void;
+}) {
   return (
     <button
       type="button"
@@ -36,7 +49,7 @@ function ActivityButton({ activity, selected }: { activity: Activity; selected: 
       aria-pressed={selected}
       aria-label={activity.label}
       title={activity.label}
-      onClick={() => void layoutStore.toggle(activity.surface)}
+      onClick={onClick}
     >
       <span className="activity-icon">
         <Icon name={activity.icon} />
@@ -45,10 +58,27 @@ function ActivityButton({ activity, selected }: { activity: Activity; selected: 
   );
 }
 
-export function ActivityBar() {
+export function ActivityBar({ viewMode, onSelectViewMode }: ActivityBarProps = {}) {
   const state: LayoutState = useSyncExternalStore(subscribeLayout, getLayoutSnapshot);
   const layout = state.layout;
   if (!layout) return null;
+
+  const handleActivityClick = (surface: SurfaceId) => {
+    if (surface === 'agent') {
+      if (onSelectViewMode && viewMode === 'editor') {
+        onSelectViewMode('split');
+      }
+      void layoutStore.toggle('agent');
+    } else if (surface === 'settings') {
+      void layoutStore.toggle('settings');
+    } else {
+      if (viewMode === 'agent' && onSelectViewMode) {
+        onSelectViewMode('split');
+      }
+      void layoutStore.toggle(surface);
+    }
+  };
+
   return (
     <>
       {ACTIVITIES.map((activity) => (
@@ -56,12 +86,19 @@ export function ActivityBar() {
           key={activity.surface}
           activity={activity}
           selected={
-            activity.surface === 'agent' ? layout.agent_dock_open : layout.primary_sidebar_open && layout.activity_view === activity.surface
+            activity.surface === 'agent'
+              ? (viewMode === 'agent' || layout.agent_dock_open)
+              : layout.primary_sidebar_open && layout.activity_view === activity.surface
           }
+          onClick={() => handleActivityClick(activity.surface)}
         />
       ))}
       <div className="activity-spacer" aria-hidden="true" />
-      <ActivityButton activity={SETTINGS} selected={layout.primary_sidebar_open && layout.activity_view === 'settings'} />
+      <ActivityButton
+        activity={SETTINGS}
+        selected={layout.primary_sidebar_open && layout.activity_view === 'settings'}
+        onClick={() => handleActivityClick('settings')}
+      />
     </>
   );
 }

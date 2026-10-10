@@ -1,7 +1,7 @@
 use selora_protocol::{
     clamp_region_size, BootstrapState, CoreInstanceId, EventEnvelope, FrontendCommand,
     FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto, RegionId, RequestEnvelope,
-    SettingsViewDto, SurfaceId, ToastDto, ToastSeverity, PROTOCOL_VERSION,
+    SessionId, SettingsViewDto, SurfaceId, ToastDto, ToastSeverity, PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
@@ -10,6 +10,8 @@ use std::{
 };
 use tauri::Emitter;
 use uuid::Uuid;
+
+use crate::sessions::{ApiKeySource, EngineConfig, SessionEngine};
 
 /// §3.4 (docs/ui/PHASE_Z2_ARCHITECTURE.md): keep the most recent 1024
 /// events; a replay request older than the oldest retained event simply
@@ -61,13 +63,114 @@ impl LayoutStore {
         settings.layout = LayoutSettings::from(layout.clone());
         settings.save_to(&self.settings_path)
     }
+
+    pub(crate) fn save_settings(
+        &self,
+        settings: &selora_settings::Settings,
+    ) -> Result<(), selora_settings::SeloraError> {
+        settings.save_to(&self.settings_path)
+    }
+}
+
+/// The monotonic event log behind `selora://event` (§2.4/§3.4): one global
+/// sequence, the 1024-event replay ring, and the emit path. Extracted in
+/// Z3 so the session relays ([`crate::sessions`]) record through the same
+/// seam the layout commands do — every event, layout or agent, rides one
+/// monotonic sequence.
+pub(crate) struct EventLog {
+    core_instance_id: CoreInstanceId,
+    sequence: Mutex<u64>,
+    events: Mutex<Vec<EventEnvelope<FrontendEvent>>>,
+}
+
+impl EventLog {
+    pub(crate) fn new(core_instance_id: CoreInstanceId) -> Self {
+        Self {
+            core_instance_id,
+            sequence: Mutex::new(0),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn core_instance_id(&self) -> CoreInstanceId {
+        self.core_instance_id.clone()
+    }
+
+    /// The bootstrap's `snapshot_sequence`: every event recorded so far.
+    pub(crate) fn snapshot_sequence(&self) -> u64 {
+        *self.sequence.lock().expect("sequence lock")
+    }
+
+    /// Record and emit (the envelope's session id stays `None`).
+    pub fn record<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+    ) {
+        let event = self.push(payload, request_id, None);
+        let _ = app.emit("selora://event", &event);
+    }
+
+    /// Record and emit with the session on the envelope — the Z3 session
+    /// events (`ChatDelta` and the agent stream) name their session so the
+    /// frontend can route by it without opening every payload.
+    pub fn record_session<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: SessionId,
+    ) {
+        let event = self.push(payload, request_id, Some(session_id));
+        let _ = app.emit("selora://event", &event);
+    }
+
+    /// Record without emitting — the §4.4 boot toast is recorded during
+    /// `DesktopState` construction, before any `AppHandle` exists; the
+    /// replay flow (§3.4) delivers it.
+    pub(crate) fn push(
+        &self,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: Option<SessionId>,
+    ) -> EventEnvelope<FrontendEvent> {
+        let mut sequence = self.sequence.lock().expect("sequence lock");
+        *sequence = sequence.saturating_add(1);
+        let mut events = self.events.lock().expect("event lock");
+        let event = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            workspace_id: None,
+            core_instance_id: self.core_instance_id.clone(),
+            sequence: *sequence,
+            request_id,
+            session_id,
+            payload,
+        };
+        events.push(event.clone());
+        if events.len() > EVENT_RETENTION_CAP {
+            // Keep the most recent 1024; the sequences keep counting.
+            let overflow = events.len() - EVENT_RETENTION_CAP;
+            events.drain(0..overflow);
+        }
+        event
+    }
+
+    /// §3.4's replay backing store for the `get_events_after` command.
+    pub fn events_after(&self, sequence: u64) -> Vec<EventEnvelope<FrontendEvent>> {
+        self.events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
 pub struct DesktopState {
-    core_instance_id: CoreInstanceId,
-    sequence: Arc<Mutex<u64>>,
-    events: Arc<Mutex<Vec<EventEnvelope<FrontendEvent>>>>,
+    log: Arc<EventLog>,
     settings: SettingsViewDto,
     /// §2.4: the authoritative in-memory layout, seeded at startup from
     /// settings (§4) and mutated only by accepted `ToggleSurface` /
@@ -76,13 +179,27 @@ pub struct DesktopState {
     layout: Arc<Mutex<LayoutDto>>,
     /// The persistence seam (§4.5).
     layout_store: Arc<LayoutStore>,
+    /// The Z3 session engine (chat + agent turns) behind the agent dock.
+    sessions: Arc<SessionEngine>,
 }
 
 impl DesktopState {
     /// The production constructor: `%APPDATA%\selora-ide\settings.json` (or
     /// the `SELORA_SETTINGS_DIR` override).
     pub fn new() -> Self {
-        Self::from_settings_path(selora_settings::Settings::default_path())
+        let state = Self::from_settings_path(selora_settings::Settings::default_path());
+        // Z3's stand-in for the Z4 folder picker: point the agent's tools at
+        // a real tree via `SELORA_WORKSPACE_ROOT` (an existing directory).
+        // Without it `SendAgent` answers the typed `no_workspace` error.
+        if let Ok(root) = std::env::var("SELORA_WORKSPACE_ROOT") {
+            let root = PathBuf::from(root.trim());
+            if !root.as_os_str().is_empty() && root.is_dir() {
+                state.sessions().set_workspace_root(Some(root));
+            }
+        } else if let Ok(root) = std::env::current_dir() {
+            state.sessions().set_workspace_root(Some(root));
+        }
+        state
     }
 
     /// Hermetic constructor: an explicit settings path. The §4.4 boot toast
@@ -98,13 +215,14 @@ impl DesktopState {
             Ok(settings) => (settings, None),
             Err(error) => (selora_settings::Settings::default(), Some(error)),
         };
-        let state = Self::from_parts(settings, layout_store);
+        let state = Self::from_parts(settings, layout_store, ApiKeySource::Keyring);
         if let Some(error) = load_error {
-            state.push_event(
+            state.log.push(
                 FrontendEvent::Toast(ToastDto {
                     severity: ToastSeverity::Error,
                     message: format!("Settings could not be loaded: {error}"),
                 }),
+                None,
                 None,
             );
         }
@@ -114,21 +232,38 @@ impl DesktopState {
     /// The no-IO constructor for the state tests: settings provided directly,
     /// store at the default path. No test that uses it ever persists, so the
     /// default path is never written; the round-trip tests use
-    /// [`DesktopState::from_settings_path`] with a tempdir instead.
+    /// [`DesktopState::from_settings_path`] with a tempdir instead. The
+    /// session engine gets a fixed test key (and the gateway follows
+    /// `settings.selora.base_url`, so a loopback mock gateway is just a
+    /// settings field) — no test ever touches the real Credential Manager.
     #[cfg(test)]
     pub fn with_settings(settings: selora_settings::Settings) -> Self {
         Self::from_parts(
             settings,
             Arc::new(LayoutStore::new(selora_settings::Settings::default_path())),
+            ApiKeySource::Fixed(Some("sk-gw-desktop-test-key".into())),
         )
     }
 
-    fn from_parts(settings: selora_settings::Settings, layout_store: Arc<LayoutStore>) -> Self {
+    /// The absent-key twin (the first-run `not_connected` path).
+    #[cfg(test)]
+    pub fn with_settings_no_key(settings: selora_settings::Settings) -> Self {
+        Self::from_parts(
+            settings,
+            Arc::new(LayoutStore::new(selora_settings::Settings::default_path())),
+            ApiKeySource::Fixed(None),
+        )
+    }
+
+    fn from_parts(
+        settings: selora_settings::Settings,
+        layout_store: Arc<LayoutStore>,
+        key_source: ApiKeySource,
+    ) -> Self {
+        let core_instance_id =
+            CoreInstanceId::new(Uuid::new_v4().to_string()).expect("uuid is valid");
         Self {
-            core_instance_id: CoreInstanceId::new(Uuid::new_v4().to_string())
-                .expect("uuid is valid"),
-            sequence: Arc::new(Mutex::new(0)),
-            events: Arc::new(Mutex::new(Vec::new())),
+            log: Arc::new(EventLog::new(core_instance_id)),
             settings: SettingsViewDto {
                 reduced_motion: settings.ui.reduce_motion,
                 theme: settings.ui.theme.clone(),
@@ -141,40 +276,68 @@ impl DesktopState {
             // sanitization runs on load.
             layout: Arc::new(Mutex::new(LayoutStore::load_layout(&settings))),
             layout_store,
+            sessions: Arc::new(SessionEngine::new(EngineConfig {
+                base_url: settings.selora.base_url.clone(),
+                active_model: settings.selora.active_model.clone(),
+                agent: (*settings.agent).clone(),
+                key_source,
+            })),
         }
     }
 
     /// Core epoch accessor retained for reconnect/event adapter wiring.
     #[allow(dead_code)]
     pub fn core_instance_id(&self) -> CoreInstanceId {
-        self.core_instance_id.clone()
+        self.log.core_instance_id()
+    }
+
+    /// The Z3 seams the boot probe and tests reach in through.
+    pub(crate) fn event_log(&self) -> Arc<EventLog> {
+        Arc::clone(&self.log)
+    }
+    pub(crate) fn sessions(&self) -> Arc<SessionEngine> {
+        Arc::clone(&self.sessions)
+    }
+
+    pub fn update_selora_settings(
+        &self,
+        base_url: Option<String>,
+        active_model: Option<String>,
+    ) -> Result<(), selora_settings::SeloraError> {
+        let mut settings = self.layout_store.load_settings().unwrap_or_default();
+        if let Some(url) = base_url {
+            settings.selora.base_url = url;
+        }
+        if let Some(model) = active_model {
+            settings.selora.active_model = Some(model);
+        }
+        self.layout_store.save_settings(&settings)
     }
 
     pub fn bootstrap(&self) -> BootstrapState {
+        let ws_root = self.sessions.workspace_root();
+        let display_name = ws_root
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "No workspace open".into());
+        let root_str = ws_root.map(|p| p.to_string_lossy().to_string());
         BootstrapState {
             protocol_version: PROTOCOL_VERSION,
-            core_instance_id: self.core_instance_id.clone(),
-            snapshot_sequence: *self.sequence.lock().expect("sequence lock"),
+            core_instance_id: self.log.core_instance_id(),
+            snapshot_sequence: self.log.snapshot_sequence(),
             workspace: selora_protocol::WorkspaceDto {
                 id: selora_protocol::WorkspaceId::new("no-workspace").expect("valid id"),
-                core_instance_id: self.core_instance_id.clone(),
-                root: None,
-                display_name: "No workspace open".into(),
+                core_instance_id: self.log.core_instance_id(),
+                root: root_str,
+                display_name,
             },
             buffers: Vec::new(),
             active_buffer_id: None,
             file_tree: selora_protocol::FileTreeDto { root: None },
-            models: Vec::new(),
-            active_model_id: None,
-            connection: selora_protocol::ConnectionStatus::Disconnected,
-            chat: selora_protocol::ChatStateDto {
-                sessions: Vec::new(),
-                messages: Vec::new(),
-                active_session_id: None,
-                active_request_id: None,
-                active_turn_id: None,
-                pending_approval: None,
-            },
+            models: self.sessions.models_dto(),
+            active_model_id: self.sessions.active_model_id(),
+            connection: self.sessions.connection(),
+            chat: self.sessions.chat_state(),
             settings: self.settings.clone(),
             // §1.1: the Z1 stub values (280/220, agent dock open) were
             // diagnostic placeholders — the layout now comes from the
@@ -190,22 +353,19 @@ impl DesktopState {
             },
             diagnostics: Vec::new(),
             feature_flags: selora_protocol::FeatureFlagsDto {
-                agent: false,
+                // Z3: the agent dock is live (chat + agent turns + approvals).
+                agent: true,
                 git: false,
                 search: false,
                 editor: false,
-                later_slices: vec![
-                    "workspace-picker".into(),
-                    "editor-bridge".into(),
-                    "agent-dock".into(),
-                ],
+                later_slices: vec!["workspace-picker".into(), "editor-bridge".into()],
             },
         }
     }
 
     /// The Z1-era envelope validation (§2.3 steps 1–3), unchanged, then the
-    /// Z2 command arms. The response remains a full `BootstrapState` — used
-    /// for error inspection, not state (§2.4).
+    /// Z2 layout arms and the Z3 session arms. The response remains a full
+    /// `BootstrapState` — used for error inspection, not state (§2.4).
     pub fn dispatch<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
@@ -218,19 +378,30 @@ impl DesktopState {
                 retryable: false,
             });
         }
-        if envelope.core_instance_id.as_ref() != Some(&self.core_instance_id) {
+        if envelope.core_instance_id.as_ref() != Some(&self.log.core_instance_id()) {
             return Err(ProtocolErrorDto {
                 code: "stale_core_instance".into(),
                 message: "Request a fresh bootstrap snapshot.".into(),
                 retryable: true,
             });
         }
+        // The Z3 session commands carry their session in the payload; the
+        // envelope's session id is allowed for them (and validated against
+        // the payload inside the engine). Every other command keeps the
+        // Z1/Z2 rule: no session on the envelope.
+        let session_scoped = matches!(
+            envelope.payload,
+            FrontendCommand::SendChat { .. }
+                | FrontendCommand::StopChat { .. }
+                | FrontendCommand::SendAgent { .. }
+                | FrontendCommand::AgentDecision { .. }
+        );
         if envelope
             .workspace_id
             .as_ref()
             .map(selora_protocol::WorkspaceId::as_str)
             != Some("no-workspace")
-            || envelope.session_id.is_some()
+            || (envelope.session_id.is_some() && !session_scoped)
         {
             return Err(ProtocolErrorDto {
                 code: "stale_workspace_or_session".into(),
@@ -241,6 +412,57 @@ impl DesktopState {
         let request_id = envelope.request_id.clone();
         match envelope.payload {
             FrontendCommand::GetBootstrapState => Ok(self.bootstrap()),
+            // The session commands carry their own request identity (the
+            // `request_id` field on the variant — stable across the
+            // request's lifetime, the id `StopChat`/`AgentDecision` name
+            // and every stream event echoes). The envelope's request id
+            // stays transport-level: it correlates the invoke's rejection.
+            FrontendCommand::SendChat {
+                request_id: command_request,
+                request: payload,
+            } => {
+                self.sessions.send_chat(
+                    self.event_log(),
+                    app.clone(),
+                    envelope.session_id,
+                    command_request,
+                    payload,
+                )?;
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::StopChat {
+                request_id: command_request,
+            } => {
+                self.sessions
+                    .stop_chat(&command_request, envelope.session_id)?;
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::SendAgent {
+                request_id: command_request,
+                request: payload,
+            } => {
+                self.sessions.send_agent(
+                    self.event_log(),
+                    app.clone(),
+                    envelope.session_id,
+                    command_request,
+                    payload,
+                )?;
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::AgentDecision {
+                request_id: command_request,
+                approval_id,
+                decision,
+            } => {
+                self.sessions.agent_decision(
+                    &command_request,
+                    &approval_id,
+                    decision,
+                    envelope.session_id,
+                )?;
+                Ok(self.bootstrap())
+            }
             FrontendCommand::ToggleSurface { surface } => {
                 // §2.2: the region a surface acts on is determined in Rust,
                 // never by the frontend. Every accepted toggle changes state,
@@ -356,58 +578,33 @@ impl DesktopState {
         self.layout_store.persist_layout(&mut settings, &layout)
     }
 
-    /// The §2.4 emitter: records the event (monotonic sequence, retention
-    /// cap) and emits it on `selora://event`. Runtime-generic so hermetic
-    /// tests can drive it with `tauri::test`'s mock runtime while the Tauri
-    /// command passes the real `AppHandle`.
+    /// The §2.4 emitter, now a delegation to the shared [`EventLog`] (Z3:
+    /// the session relays record through the same seam). Runtime-generic
+    /// so hermetic tests can drive it with `tauri::test`'s mock runtime
+    /// while the Tauri command passes the real `AppHandle`.
     pub fn record_event<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
     ) {
-        let event = self.push_event(payload, request_id);
-        let _ = app.emit("selora://event", &event);
+        self.log.record(app, payload, request_id);
     }
 
-    /// Record without emitting — the §4.4 boot toast is recorded during
-    /// `DesktopState` construction, before any `AppHandle` exists; the
-    /// replay flow (§3.4) delivers it.
+    /// Record without emitting — the Z2 state tests' seam (the §4.4 boot
+    /// toast path; the log's own `push` carries the session id).
+    #[cfg(test)]
     fn push_event(
         &self,
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
     ) -> EventEnvelope<FrontendEvent> {
-        let mut sequence = self.sequence.lock().expect("sequence lock");
-        *sequence = sequence.saturating_add(1);
-        let mut events = self.events.lock().expect("event lock");
-        let event = EventEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            workspace_id: None,
-            core_instance_id: self.core_instance_id.clone(),
-            sequence: *sequence,
-            request_id,
-            session_id: None,
-            payload,
-        };
-        events.push(event.clone());
-        if events.len() > EVENT_RETENTION_CAP {
-            // Keep the most recent 1024; the sequences keep counting.
-            let overflow = events.len() - EVENT_RETENTION_CAP;
-            events.drain(0..overflow);
-        }
-        event
+        self.log.push(payload, request_id, None)
     }
 
     /// §3.4's replay backing store for the `get_events_after` command.
     pub fn events_after(&self, sequence: u64) -> Vec<EventEnvelope<FrontendEvent>> {
-        self.events
-            .lock()
-            .expect("event lock")
-            .iter()
-            .filter(|event| event.sequence > sequence)
-            .cloned()
-            .collect()
+        self.log.events_after(sequence)
     }
 }
 

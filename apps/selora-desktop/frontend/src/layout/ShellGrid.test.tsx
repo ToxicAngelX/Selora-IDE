@@ -153,4 +153,23 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
     expect(shell!.style.getPropertyValue('--hit-zone-agent')).toBe('6px');
     expect(shell!.style.getPropertyValue('--hit-zone-bottom')).toBe('0px');
   });
+
+  it('workbench carries data attributes for open states and responds to agent view mode', () => {
+    const { container, getByRole } = renderShell(
+      makeLayout({ primary_sidebar_open: false, agent_dock_open: true, bottom_dock_open: false })
+    );
+    const workbench = container.querySelector<HTMLElement>('.workbench');
+    expect(workbench).not.toBeNull();
+    expect(workbench!.getAttribute('data-sidebar-open')).toBe('false');
+    expect(workbench!.getAttribute('data-bottom-open')).toBe('false');
+    expect(workbench!.getAttribute('data-agent-open')).toBe('true');
+
+    // Switch to agent view mode via titlebar pill
+    const agentPill = getByRole('button', { name: 'Agent View' });
+    expect(agentPill).toBeTruthy();
+    act(() => {
+      agentPill.click();
+    });
+    expect(workbench!.getAttribute('data-view-mode')).toBe('agent');
+  });
 });

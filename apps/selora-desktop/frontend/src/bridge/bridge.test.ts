@@ -8,13 +8,23 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
 
 import { invoke } from '@tauri-apps/api/core';
 import {
+  agentDecision,
+  connectApiKey,
+  disconnectApiKey,
   dispatchCommand,
+  fetchModels,
+  getApiKeyStatus,
   getBootstrapState,
   getEventsAfter,
+  newSession,
   onBridgeCommandError,
   PROTOCOL_VERSION,
   resizeRegion,
   saveLayout,
+  sendAgent,
+  sendChat,
+  stopChat,
+  switchSession,
   toggleSurface,
   validateEvent,
   type BootstrapState,
@@ -91,6 +101,115 @@ describe('Z2 command wire shapes (ARCHITECTURE §2.1)', () => {
   it('getBootstrapState sends the protocol version as camelCase', async () => {
     await getBootstrapState();
     expect(invokeMock).toHaveBeenCalledWith('get_bootstrap_state', { protocolVersion: 1 });
+  });
+});
+
+describe('Z3 command wire shapes (ARCHITECTURE §2.1 & selora-protocol)', () => {
+  it('send_agent serializes to the exact contract JSON', async () => {
+    const { requestId, promise } = sendAgent('fix it', 'execute', null, {
+      ...CONTEXT,
+      session_id: 'session-1',
+    });
+    await promise;
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'send_agent',
+      payload: {
+        request_id: requestId,
+        request: {
+          session_id: 'session-1',
+          prompt: 'fix it',
+          model_id: null,
+          mode: 'execute',
+        },
+      },
+    });
+  });
+
+  it('send_agent includes reasoning_effort, system_instructions, and temperature when configured', async () => {
+    const { requestId, promise } = sendAgent(
+      'fix it with deep reasoning',
+      'execute',
+      'deepseek-reasoner',
+      {
+        ...CONTEXT,
+        session_id: 'session-1',
+      },
+      {
+        reasoningEffort: 'max',
+        systemInstructions: 'Verify types',
+        temperature: 0.2,
+      },
+    );
+    await promise;
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'send_agent',
+      payload: {
+        request_id: requestId,
+        request: {
+          session_id: 'session-1',
+          prompt: 'fix it with deep reasoning',
+          model_id: 'deepseek-reasoner',
+          mode: 'execute',
+          reasoning_effort: 'max',
+          system_instructions: 'Verify types',
+          temperature: 0.2,
+        },
+      },
+    });
+  });
+
+  it('fetchModels calls fetch_models Tauri invoke', async () => {
+    invokeMock.mockResolvedValueOnce([{ id: 'model-1', display_name: 'Model 1', available: true }]);
+    const models = await fetchModels();
+    expect(invokeMock).toHaveBeenCalledWith('fetch_models');
+    expect(models).toEqual([{ id: 'model-1', display_name: 'Model 1', available: true }]);
+  });
+
+  it('send_chat serializes to the exact contract JSON', async () => {
+    const { requestId, promise } = sendChat('hello', 'glm-5', {
+      ...CONTEXT,
+      session_id: 'session-1',
+    });
+    await promise;
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'send_chat',
+      payload: {
+        request_id: requestId,
+        request: {
+          session_id: 'session-1',
+          message: 'hello',
+          model_id: 'glm-5',
+        },
+      },
+    });
+  });
+
+  it('stop_chat serializes to the exact contract JSON', async () => {
+    await stopChat('request-1', CONTEXT);
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'stop_chat',
+      payload: {
+        request_id: 'request-1',
+      },
+    });
+  });
+
+  it('agent_decision serializes to the exact contract JSON', async () => {
+    await agentDecision('request-1', 'approval-1', 'approve_all_this_turn', CONTEXT);
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'agent_decision',
+      payload: {
+        request_id: 'request-1',
+        approval_id: 'approval-1',
+        decision: 'approve_all_this_turn',
+      },
+    });
   });
 });
 
@@ -193,5 +312,58 @@ describe('event validation gate (ARCHITECTURE §3.4)', () => {
     const snapshot = makeBootstrap({ snapshot_sequence: 3 });
     const bootToast = makeEvent(1, BOOT_TOAST_PAYLOAD);
     expect(validateEvent(bootToast, snapshot, snapshot.snapshot_sequence)).toBe('stale');
+  });
+});
+
+describe('API key and provider bridge commands', () => {
+  it('connectApiKey invokes connect_api_key with apiKey and baseUrl', async () => {
+    invokeMock.mockResolvedValueOnce({
+      connected: true,
+      models_count: 5,
+      active_model_id: 'glm-4',
+      base_url: 'https://open.bigmodel.cn/api/paas/v4',
+    });
+    const result = await connectApiKey('my-secret-key', 'https://open.bigmodel.cn/api/paas/v4');
+    expect(invokeMock).toHaveBeenCalledWith('connect_api_key', {
+      apiKey: 'my-secret-key',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    });
+    expect(result.connected).toBe(true);
+    expect(result.models_count).toBe(5);
+  });
+
+  it('connectApiKey passes null baseUrl when omitted', async () => {
+    invokeMock.mockResolvedValueOnce({
+      connected: true,
+      models_count: 2,
+      active_model_id: null,
+      base_url: 'https://api.selora.lol',
+    });
+    await connectApiKey('my-secret-key');
+    expect(invokeMock).toHaveBeenCalledWith('connect_api_key', {
+      apiKey: 'my-secret-key',
+      baseUrl: null,
+    });
+  });
+
+  it('disconnectApiKey invokes disconnect_api_key', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await disconnectApiKey();
+    expect(invokeMock).toHaveBeenCalledWith('disconnect_api_key');
+  });
+
+  it('getApiKeyStatus invokes get_api_key_status and returns status', async () => {
+    invokeMock.mockResolvedValueOnce({
+      connected: true,
+      has_key: true,
+      source: 'keyring',
+      base_url: 'https://api.selora.lol',
+      key_hint: 'sk-••••1234',
+      active_model_id: 'glm-4',
+    });
+    const status = await getApiKeyStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_api_key_status');
+    expect(status.has_key).toBe(true);
+    expect(status.key_hint).toBe('sk-••••1234');
   });
 });

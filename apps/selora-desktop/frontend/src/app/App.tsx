@@ -4,7 +4,7 @@
 // seven-region shell once `bootstrap` lands, with the command palette and
 // toast viewport as overlays. Command execution lives in the keymap feature
 // (runCommandAction) so this component stays free of business logic.
-import { useCallback, useMemo, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { getAppSnapshot, retryBootstrap, subscribeApp } from './app-store';
 import { AppRuntime } from './providers';
 import { ShellGrid } from '../layout/ShellGrid';
@@ -13,6 +13,7 @@ import { ToastViewport } from '../components/ToastViewport';
 import { useShortcuts } from '../features/keymap/use-shortcuts';
 import { buildCommandList, runCommandAction, type CommandId, type CommandSpec } from '../features/keymap/commands';
 import { layoutStore } from '../features/layout/layout-store';
+import { ConnectModal } from '../features/auth/ConnectModal';
 import type { Layout, SettingsView, SurfaceId } from '../bridge/bridge';
 
 function ConnectingScreen() {
@@ -38,6 +39,7 @@ function ErrorScreen({ error, onRetry }: { error: string; onRetry: () => void })
 function AppInner() {
   const app = useSyncExternalStore(subscribeApp, getAppSnapshot);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [connectModalOpen, setConnectModalOpen] = useState(false);
 
   const settings = app.bootstrap?.settings ?? null;
   const commands: CommandSpec[] = useMemo(() => buildCommandList(settings), [settings]);
@@ -60,6 +62,12 @@ function AppInner() {
   );
   const onClosePalette = useCallback(() => setPaletteOpen(false), []);
 
+  useEffect(() => {
+    const handler = () => setConnectModalOpen(true);
+    window.addEventListener('selora:open-connect', handler);
+    return () => window.removeEventListener('selora:open-connect', handler);
+  }, []);
+
   useShortcuts({ settings, enabled: app.phase === 'ready', paletteOpen, onCommand, onClosePalette });
 
   if (app.phase === 'error') {
@@ -71,8 +79,18 @@ function AppInner() {
 
   return (
     <>
-      <ShellGrid bootstrap={app.bootstrap} commands={commands} onRunCommand={onCommand} />
+      <ShellGrid
+        bootstrap={app.bootstrap}
+        commands={commands}
+        onRunCommand={onCommand}
+        onOpenConnect={() => setConnectModalOpen(true)}
+      />
       <CommandPalette open={paletteOpen} commands={commands} onRun={onCommand} onClose={onClosePalette} />
+      <ConnectModal
+        open={connectModalOpen}
+        onClose={() => setConnectModalOpen(false)}
+        bootstrap={app.bootstrap}
+      />
       <ToastViewport />
     </>
   );

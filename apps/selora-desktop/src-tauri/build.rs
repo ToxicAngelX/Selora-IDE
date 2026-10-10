@@ -29,9 +29,11 @@ fn main() {
             .app_manifest(tauri_build::AppManifest::new().commands(&[
                 "get_bootstrap_state",
                 "dispatch_command",
-                // Phase Z2 §3.4: the replay command (the only Tauri
-                // command Z2 adds).
                 "get_events_after",
+                "connect_api_key",
+                "disconnect_api_key",
+                "get_api_key_status",
+                "fetch_models",
             ])),
     )
     .expect("Tauri configuration and capability manifest must be valid");

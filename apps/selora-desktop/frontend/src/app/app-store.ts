@@ -17,6 +17,7 @@ import {
 } from '../bridge/bridge';
 import { layoutStore } from '../features/layout/layout-store';
 import { toastStore } from '../features/toasts/toast-store';
+import { agentStore } from '../features/agent/agent-store';
 
 export type AppPhase = 'connecting' | 'ready' | 'error';
 export type AppState = { phase: AppPhase; bootstrap: BootstrapState | null; error: string | null };
@@ -71,6 +72,22 @@ export async function retryBootstrap(): Promise<void> {
   await runBootstrapFlow();
 }
 
+/** Refresh the bootstrap snapshot (e.g. after API key connect/disconnect). */
+export async function refreshBootstrap(): Promise<BootstrapState | null> {
+  try {
+    const bootstrap = await getBootstrapState();
+    state = { ...state, bootstrap, phase: 'ready' };
+    applyReducedMotion(bootstrap.settings.reduced_motion);
+    layoutStore.hydrate(bootstrap);
+    agentStore.hydrate(bootstrap);
+    notify();
+    return bootstrap;
+  } catch (err) {
+    console.error('refreshBootstrap failed:', err);
+    return null;
+  }
+}
+
 async function runBootstrapFlow(): Promise<void> {
   const gen = ++generation;
   state = { phase: 'connecting', bootstrap: null, error: null };
@@ -83,6 +100,7 @@ async function runBootstrapFlow(): Promise<void> {
     state = { phase: 'ready', bootstrap, error: null };
     applyReducedMotion(bootstrap.settings.reduced_motion);
     layoutStore.hydrate(bootstrap);
+    agentStore.hydrate(bootstrap);
     notify();
 
     // 2. Subscribe, buffering events until the replay has run.
@@ -164,6 +182,60 @@ function reduceEvent(event: EventEnvelope): void {
     case 'error':
       toastStore.pushProtocolError(event.sequence, payload.payload);
       return;
+    case 'chat_delta':
+      agentStore.handleChatDelta(payload.payload);
+      return;
+    case 'chat_completed':
+      agentStore.handleChatCompleted(payload.payload);
+      return;
+    case 'chat_failed':
+      agentStore.handleChatFailed(payload.payload);
+      return;
+    case 'tool_call_started':
+      agentStore.handleToolCallStarted(payload.payload);
+      return;
+    case 'tool_result':
+      agentStore.handleToolResult(payload.payload);
+      return;
+    case 'approval_needed':
+      agentStore.handleApprovalNeeded(payload.payload);
+      return;
+    case 'agent_state_changed':
+      agentStore.handleAgentStateChanged(payload.payload);
+      return;
+    case 'agent_turn_done':
+      agentStore.handleAgentTurnDone(payload.payload);
+      return;
+    case 'agent_event':
+      agentStore.handleAgentEvent(payload.payload);
+      return;
+    case 'selora_status_changed':
+      if (state.bootstrap) {
+        state.bootstrap = {
+          ...state.bootstrap,
+          connection: payload.payload.status,
+          active_model_id: payload.payload.active_model_id ?? state.bootstrap.active_model_id,
+        };
+        if (payload.payload.active_model_id) {
+          agentStore.setSelectedModel(payload.payload.active_model_id);
+        }
+        notify();
+      }
+      return;
+    case 'models_changed':
+      if (state.bootstrap) {
+        state.bootstrap = {
+          ...state.bootstrap,
+          models: payload.payload.models,
+          active_model_id: payload.payload.active_model_id ?? state.bootstrap.active_model_id,
+        };
+        if (payload.payload.active_model_id) {
+          agentStore.setSelectedModel(payload.payload.active_model_id);
+        }
+        agentStore.setAvailableModels(payload.payload.models);
+        notify();
+      }
+      return;
     default:
       return; // explicitly ignored in Z2 (ARCHITECTURE §2.5)
   }
@@ -177,6 +249,7 @@ function discardHeldState(): void {
   unlisten = null;
   toastStore.clearAll();
   layoutStore.reset();
+  agentStore.reset();
   state = { phase: 'connecting', bootstrap: null, error: null };
   notify();
 }

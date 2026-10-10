@@ -32,19 +32,68 @@ fn entry_for(service: &str, user: &str) -> Result<keyring::Entry, SeloraError> {
         .map_err(|err| SeloraError::Config(format!("keyring unavailable: {err}")))
 }
 
+use std::path::PathBuf;
+
+fn fallback_path(user: &str) -> Option<PathBuf> {
+    crate::Settings::settings_dir().ok().and_then(|dir| {
+        let filename = match user {
+            ENTRY => ".api_key",
+            BRAVE_ENTRY => ".brave_key",
+            _ => return None,
+        };
+        Some(dir.join(filename))
+    })
+}
+
+fn fallback_get(user: &str) -> Option<String> {
+    let path = fallback_path(user)?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn fallback_set(user: &str, key: &str) {
+    if let Some(path) = fallback_path(user) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, key.trim());
+    }
+}
+
+fn fallback_delete(user: &str) {
+    if let Some(path) = fallback_path(user) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Read the stored API key. `Ok(None)` = nothing stored yet (first run,
 /// or after Disconnect).
 pub fn api_key_get() -> Result<Option<String>, SeloraError> {
     match entry(SERVICE)?.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(SeloraError::Config(format!("keyring read failed: {err}"))),
+        Ok(key) if !key.trim().is_empty() => {
+            fallback_set(ENTRY, &key);
+            Ok(Some(key))
+        }
+        _ => {
+            if let Some(key) = fallback_get(ENTRY) {
+                // Opportunistically restore back into OS keyring
+                if let Ok(ent) = entry(SERVICE) {
+                    let _ = ent.set_password(&key);
+                }
+                Ok(Some(key))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
 /// Store (overwrite) the API key — the Connect flow's final step, after
 /// validation succeeded.
 pub fn api_key_set(key: &str) -> Result<(), SeloraError> {
+    fallback_set(ENTRY, key);
     entry(SERVICE)?
         .set_password(key)
         .map_err(|err| SeloraError::Config(format!("keyring write failed: {err}")))
@@ -55,15 +104,27 @@ pub fn api_key_set(key: &str) -> Result<(), SeloraError> {
 /// turn-request seam; settings.json never carries it.
 pub fn brave_key_get() -> Result<Option<String>, SeloraError> {
     match entry_for(SERVICE, BRAVE_ENTRY)?.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(SeloraError::Config(format!("keyring read failed: {err}"))),
+        Ok(key) if !key.trim().is_empty() => {
+            fallback_set(BRAVE_ENTRY, &key);
+            Ok(Some(key))
+        }
+        _ => {
+            if let Some(key) = fallback_get(BRAVE_ENTRY) {
+                if let Ok(ent) = entry_for(SERVICE, BRAVE_ENTRY) {
+                    let _ = ent.set_password(&key);
+                }
+                Ok(Some(key))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
 /// Store (overwrite) the Brave Search API key — the Agent section's
 /// field, on commit.
 pub fn brave_key_set(key: &str) -> Result<(), SeloraError> {
+    fallback_set(BRAVE_ENTRY, key);
     entry_for(SERVICE, BRAVE_ENTRY)?
         .set_password(key)
         .map_err(|err| SeloraError::Config(format!("keyring write failed: {err}")))
@@ -71,6 +132,7 @@ pub fn brave_key_set(key: &str) -> Result<(), SeloraError> {
 
 /// Remove the stored Brave Search API key. A missing entry is a no-op.
 pub fn brave_key_delete() -> Result<(), SeloraError> {
+    fallback_delete(BRAVE_ENTRY);
     match entry_for(SERVICE, BRAVE_ENTRY)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(SeloraError::Config(format!("keyring delete failed: {err}"))),
@@ -79,6 +141,7 @@ pub fn brave_key_delete() -> Result<(), SeloraError> {
 
 /// Remove the stored API key (Disconnect). A missing entry is a no-op.
 pub fn api_key_delete() -> Result<(), SeloraError> {
+    fallback_delete(ENTRY);
     match entry(SERVICE)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(SeloraError::Config(format!("keyring delete failed: {err}"))),

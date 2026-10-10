@@ -13,15 +13,25 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["custom-protocol", "devtools"] }
 uuid.workspace = true
 selora-protocol.workspace = true
 selora-settings.workspace = true
+# Phase Z3 (agent dock vertical slice): the chat stream + agent turn loop
+# (selora-ai) and the channels the relays ride (tokio sync — the tasks
+# themselves spawn on tauri::async_runtime). selora-core names the shared
+# error type the relays map into typed protocol errors.
+selora-ai.workspace = true
+selora-core.workspace = true
+tokio.workspace = true
 
 # Z2 state tests drive `dispatch`'s emit path with `tauri::test::mock_app`
 # (MockRuntime); the feature is an empty gate on the tauri crate itself.
+# Z3 adds wiremock (the selora-ai test pattern): a loopback mock gateway so
+# the streaming/approval seams are proven end-to-end without a network.
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+wiremock.workspace = true
 
 [[bin]]
 name = "selora-desktop"

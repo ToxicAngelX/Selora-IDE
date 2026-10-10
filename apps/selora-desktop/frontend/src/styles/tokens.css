@@ -78,6 +78,29 @@
      lib.rs:46 stores it premultiplied as rgba(0,0,0,153) = 60% alpha) */
   --scrim: rgb(0 0 0 / 0.6);
 
+  /* 1.8 Selora Monochrome Space System (Website parity — E:\Projects\Selora) */
+  --space-deep: #040405; /* true-black cosmic depth */
+  --space-bg: #070709; /* main cosmic background */
+  --space-bg-alt: #0b0b0f;
+  --space-mid: #0e0e13;
+  --space-lift: #121218;
+  --space-raised: #17171f;
+
+  --surface-1: #0d0d12; /* monochrome elevation surfaces */
+  --surface-2: #121218;
+  --surface-3: #181820;
+  --surface-hover: #1d1d27;
+
+  --moonlight-200: #f2f5fa; /* moonlight white accents */
+  --moonlight-300: #e4e9f2;
+  --moonlight-400: #cdd6e4;
+  --moonlight-500: #eef1f7;
+  --moonlight-600: #aab6cc;
+  --moonlight-700: #8b9ab5;
+
+  --hairline-faint: rgba(255, 255, 255, 0.07);
+  --hairline-active: rgba(255, 255, 255, 0.16);
+
   /* --- 2. Typography ---------------------------------------------------- */
 
   /* 2.1 Families (§2.1; lib.rs:89-90). Faces are bundled in

@@ -10,21 +10,46 @@ use crate::chat_types::{ToolCall, ToolSpec};
 /// Identifier of a model on the gateway (e.g. `"claude-opus-5-5"`).
 pub type ModelId = String;
 
+fn deserialize_lenient_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_u64().unwrap_or(128_000) as u32),
+        Some(serde_json::Value::String(s)) => Ok(s.parse::<u32>().unwrap_or(128_000)),
+        _ => Ok(128_000),
+    }
+}
+
+fn deserialize_lenient_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_f64().unwrap_or(0.0)),
+        Some(serde_json::Value::String(s)) => Ok(s.parse::<f64>().unwrap_or(0.0)),
+        _ => Ok(0.0),
+    }
+}
+
 /// A model offered by the gateway (`GET /v1/models`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
+    #[serde(default, alias = "model")]
     pub id: ModelId,
     /// Human-facing name. Falls back to `id` when the gateway omits it.
     #[serde(default, alias = "name", alias = "displayName")]
     pub display_name: String,
     /// Maximum context length in tokens.
-    #[serde(default, alias = "context_length", alias = "contextWindow")]
+    #[serde(default, alias = "context_length", alias = "contextWindow", deserialize_with = "deserialize_lenient_u32")]
     pub context_window: u32,
     /// USD per 1k input tokens.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
     pub price_per_1k_input: f64,
     /// USD per 1k output tokens.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
     pub price_per_1k_output: f64,
     #[serde(default = "default_true")]
     pub supports_streaming: bool,
@@ -124,6 +149,8 @@ pub struct ChatRequest {
     /// the full fixed manifest; plain chat sends `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl ChatRequest {
@@ -137,7 +164,20 @@ impl ChatRequest {
             max_tokens: None,
             stream: false,
             tools: None,
+            reasoning_effort: None,
         }
+    }
+
+    /// Builder-style override of temperature.
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// Builder-style override of reasoning effort.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
     }
 
     /// Builder-style override of the `stream` flag.

@@ -9,7 +9,7 @@
 // preview writes the same properties through `el.style.setProperty`
 // (ARCHITECTURE §6.2's CSP-safe path). Handle tracks collapse to 0
 // together with their region.
-import { useEffect, useRef, useSyncExternalStore, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import type { BootstrapState, RegionId } from '../bridge/bridge';
 import {
   displayedSize,
@@ -43,13 +43,15 @@ export type ShellGridProps = {
   bootstrap: BootstrapState;
   commands: CommandSpec[];
   onRunCommand: (id: CommandSpec['id']) => void;
+  onOpenConnect?: () => void;
 };
 
-export function ShellGrid({ bootstrap, commands, onRunCommand }: ShellGridProps) {
+export function ShellGrid({ bootstrap, commands, onRunCommand, onOpenConnect }: ShellGridProps) {
   const state: LayoutState = useSyncExternalStore(subscribeLayout, getLayoutSnapshot);
   const shellRef = useRef<HTMLDivElement>(null);
   const workbenchRef = useRef<HTMLDivElement>(null);
   const activityBarRef = useRef<HTMLDivElement>(null);
+  const [viewMode, setViewMode] = useState<'agent' | 'split' | 'editor'>('split');
 
   // Measured geometry feeds the clamping math (the editor-floor and the
   // 50%-of-workbench ceiling). The activity bar width is measured from the
@@ -98,14 +100,39 @@ export function ShellGrid({ bootstrap, commands, onRunCommand }: ShellGridProps)
 
   return (
     <div ref={shellRef} className={`shell${state.dragging !== null ? ' is-dragging' : ''}`} style={style}>
-      <TitleBar commands={commands} onRunCommand={onRunCommand} />
-      <div className="workbench" ref={workbenchRef}>
+      <TitleBar
+        commands={commands}
+        onRunCommand={onRunCommand}
+        viewMode={agentOpen ? viewMode : 'editor'}
+        onSelectViewMode={(mode) => {
+          setViewMode(mode);
+          if ((mode === 'agent' || mode === 'split') && !agentOpen) {
+            void layoutStore.toggle('agent');
+          }
+        }}
+      />
+      <div
+        className="workbench"
+        ref={workbenchRef}
+        data-view-mode={agentOpen ? viewMode : 'editor'}
+        data-sidebar-open={sidebarOpen ? 'true' : 'false'}
+        data-bottom-open={bottomOpen ? 'true' : 'false'}
+        data-agent-open={agentOpen ? 'true' : 'false'}
+      >
         <nav className="activitybar" aria-label="Activity bar" ref={activityBarRef}>
-          <ActivityBar />
+          <ActivityBar
+            viewMode={agentOpen ? viewMode : 'editor'}
+            onSelectViewMode={(mode) => {
+              setViewMode(mode);
+              if ((mode === 'agent' || mode === 'split') && !agentOpen) {
+                void layoutStore.toggle('agent');
+              }
+            }}
+          />
         </nav>
         {sidebarOpen ? (
           <aside className="primary-sidebar-slot" aria-label="Primary sidebar">
-            <PrimarySidebar bootstrap={bootstrap} />
+            <PrimarySidebar bootstrap={bootstrap} onOpenConnect={onOpenConnect} />
           </aside>
         ) : null}
         {sidebarOpen ? (
@@ -135,11 +162,11 @@ export function ShellGrid({ bootstrap, commands, onRunCommand }: ShellGridProps)
         ) : null}
         {agentOpen ? (
           <aside className="agent-dock-slot" aria-label="Agent dock">
-            <AgentDock />
+            <AgentDock bootstrap={bootstrap} />
           </aside>
         ) : null}
       </div>
-      <StatusBar bootstrap={bootstrap} />
+      <StatusBar bootstrap={bootstrap} onOpenConnect={onOpenConnect} />
     </div>
   );
 }

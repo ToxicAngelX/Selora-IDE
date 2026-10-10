@@ -31,11 +31,23 @@ pub fn validate_external(value: &str) -> Result<(), ProtocolValidationError> {
 }
 
 pub fn allow_shell_navigation(url: &tauri::Url) -> bool {
-    (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"))
+    let host = url.host_str().unwrap_or_default();
+    let scheme = url.scheme();
+    let allowed = ((scheme == "http" || scheme == "https" || scheme == "tauri")
+        && (host == "tauri.localhost" || host == "localhost" || host.is_empty()))
         || (cfg!(debug_assertions)
-            && url.scheme() == "http"
-            && url.host_str() == Some("localhost")
-            && url.port() == Some(1420))
+            && scheme == "http"
+            && (host == "localhost" || host == "127.0.0.1")
+            && url.port() == Some(1420));
+
+    let log_msg = format!("NAV: url={}, allowed={}\n", url, allowed);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("selora_nav.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, log_msg.as_bytes()));
+
+    allowed
 }
 
 #[cfg(test)]

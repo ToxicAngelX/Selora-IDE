@@ -80,20 +80,92 @@ impl SeloraClient {
         }
     }
 
+    fn models_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") || base.ends_with("/v4") {
+            format!("{base}/models")
+        } else {
+            format!("{base}/v1/models")
+        }
+    }
+
+    fn chat_completions_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") || base.ends_with("/v4") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        }
+    }
+
     /// `GET {base_url}/v1/models` — the model catalog, bearer-authenticated.
     pub async fn list_models(&self) -> Result<Vec<Model>, SeloraError> {
-        let url = format!("{}/v1/models", self.base_url);
-        let response = self
-            .send_with_retry(|| self.http.get(&url).bearer_auth(&self.api_key))
-            .await?;
+        let url = self.models_url();
+        let api_key = self.api_key.clone();
+        let http = self.http.clone();
 
-        let body: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|err| SeloraError::Ai(format!("invalid models response: {err}")))?;
+        let response_res = self
+            .send_with_retry(|| {
+                let mut req = http.get(&url);
+                if !api_key.trim().is_empty() {
+                    req = req.bearer_auth(&api_key);
+                }
+                req.header("HTTP-Referer", "https://selora.ide")
+                    .header("X-Title", "Selora IDE")
+                    .header("User-Agent", "Selora-IDE/0.1.0")
+            })
+            .await;
 
-        let mut models = body.data;
+        let text = match response_res {
+            Ok(resp) => {
+                resp.text()
+                    .await
+                    .map_err(|err| SeloraError::Ai(format!("invalid models response: {err}")))?
+            }
+            Err(err) => {
+                // If standard /v1/models failed, check if this is an Ollama host and try /api/tags
+                let base = self.base_url.trim_end_matches('/');
+                if base.contains("11434") || base.contains("ollama") {
+                    let tags_url = format!("{base}/api/tags");
+                    if let Ok(resp) = self.http.get(&tags_url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(tags_text) = resp.text().await {
+                                let models = parse_models_from_json(&tags_text);
+                                if !models.is_empty() {
+                                    return Ok(models);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        if let Err(json_err) = serde_json::from_str::<serde_json::Value>(&text) {
+            return Err(SeloraError::Ai(format!("invalid models response: {json_err}")));
+        }
+
+        let mut models = parse_models_from_json(&text);
+        // Fallback check for Ollama /api/tags if /v1/models gave an empty list
+        if models.is_empty() {
+            let base = self.base_url.trim_end_matches('/');
+            if base.contains("11434") || base.contains("ollama") {
+                let tags_url = format!("{base}/api/tags");
+                if let Ok(resp) = self.http.get(&tags_url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(tags_text) = resp.text().await {
+                            models = parse_models_from_json(&tags_text);
+                        }
+                    }
+                }
+            }
+        }
+
         for model in &mut models {
+            if model.id.is_empty() && !model.display_name.is_empty() {
+                model.id = model.display_name.clone();
+            }
             if model.display_name.is_empty() {
                 model.display_name = model.id.clone();
             }
@@ -118,11 +190,21 @@ impl SeloraClient {
     ) -> Result<ChatReceipt, SeloraError> {
         let request_id = Uuid::new_v4();
         let started = Instant::now();
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.chat_completions_url();
         let body = req.clone().with_stream(true);
 
         let response = match self
-            .send_with_retry(|| self.http.post(&url).bearer_auth(&self.api_key).json(&body))
+            .send_with_retry(|| {
+                let mut http_req = self.http.post(&url);
+                if !self.api_key.trim().is_empty() {
+                    http_req = http_req.bearer_auth(&self.api_key);
+                }
+                http_req
+                    .header("HTTP-Referer", "https://selora.ide")
+                    .header("X-Title", "Selora IDE")
+                    .header("User-Agent", "Selora-IDE/0.1.0")
+                    .json(&body)
+            })
             .await
         {
             Ok(response) => response,
@@ -137,6 +219,7 @@ impl SeloraClient {
         let prompt_chars: usize = req.messages.iter().map(|m| m.content.chars().count()).sum();
         let mut usage: Option<Usage> = None;
         let mut completion_chars: usize = 0;
+        let mut in_reasoning = false;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
@@ -165,6 +248,9 @@ impl SeloraClient {
                             continue; // fieldless/comment-only event
                         };
                         if data == DONE_SENTINEL {
+                            if in_reasoning {
+                                let _ = send_event(&tx, ChatEvent::Delta("</think>\n\n".to_owned()));
+                            }
                             let receipt = build_receipt(
                                 &req,
                                 request_id,
@@ -179,6 +265,13 @@ impl SeloraClient {
                         let chunk: ChatChunk = match serde_json::from_str(&data) {
                             Ok(chunk) => chunk,
                             Err(err) => {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    if let Some(msg) = val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                                        let error = SeloraError::Ai(format!("gateway error: {msg}"));
+                                        let _ = send_event(&tx, ChatEvent::Error(duplicate_error(&error)));
+                                        return Err(error);
+                                    }
+                                }
                                 let error =
                                     SeloraError::Ai(format!("malformed stream chunk: {err}"));
                                 let _ = send_event(&tx, ChatEvent::Error(duplicate_error(&error)));
@@ -188,19 +281,43 @@ impl SeloraClient {
                         if let Some(chunk_usage) = chunk.usage {
                             usage = Some(chunk_usage);
                         }
-                        let Some(delta) = chunk
-                            .choices
-                            .first()
-                            .and_then(|choice| choice.delta.as_ref())
-                        else {
+                        let first_choice = chunk.choices.first();
+                        let delta = first_choice.and_then(|choice| choice.delta.as_ref());
+
+                        let reasoning_opt = delta
+                            .and_then(|d| d.reasoning_content.as_deref())
+                            .or_else(|| delta.and_then(|d| d.reasoning.as_deref()))
+                            .or_else(|| delta.and_then(|d| d.thought.as_deref()))
+                            .filter(|s| !s.is_empty());
+
+                        let content_opt = delta
+                            .and_then(|d| d.content.as_deref())
+                            .or_else(|| delta.and_then(|d| d.text.as_deref()))
+                            .or_else(|| first_choice.and_then(|c| c.text.as_deref()))
+                            .or_else(|| first_choice.and_then(|c| c.message.as_ref().and_then(|m| m.content.as_deref())))
+                            .filter(|s| !s.is_empty());
+
+                        if let Some(reasoning) = reasoning_opt {
+                            if !in_reasoning {
+                                in_reasoning = true;
+                                send_event(&tx, ChatEvent::Delta("<think>".to_owned()))?;
+                            }
+                            completion_chars += reasoning.chars().count();
+                            send_event(&tx, ChatEvent::Delta(reasoning.to_owned()))?;
+                        }
+
+                        if let Some(content) = content_opt {
+                            if in_reasoning {
+                                in_reasoning = false;
+                                send_event(&tx, ChatEvent::Delta("</think>\n\n".to_owned()))?;
+                            }
+                            completion_chars += content.chars().count();
+                            send_event(&tx, ChatEvent::Delta(content.to_owned()))?;
+                        }
+
+                        let Some(delta) = delta else {
                             continue;
                         };
-                        if let Some(content) = delta.content.as_deref() {
-                            if !content.is_empty() {
-                                completion_chars += content.chars().count();
-                                send_event(&tx, ChatEvent::Delta(content.to_owned()))?;
-                            }
-                        }
                         if let Some(fragments) = delta.tool_calls.as_deref() {
                             for fragment in fragments {
                                 let function = fragment.function.as_ref();
@@ -259,7 +376,7 @@ impl SeloraClient {
         model: &str,
         prompt: &str,
     ) -> Result<Option<String>, SeloraError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.chat_completions_url();
         let body = ChatRequest::new(
             model,
             vec![
@@ -302,7 +419,7 @@ impl SeloraClient {
         &self,
         req: ChatRequest,
     ) -> Result<Option<ChatMessage>, SeloraError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.chat_completions_url();
         let body = req.with_stream(false);
 
         let response = self
@@ -485,7 +602,98 @@ fn build_receipt(
 
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
+    #[serde(default, alias = "models")]
     data: Vec<Model>,
+}
+
+/// Lenient multi-format parser for model catalogs.
+pub fn parse_models_from_json(text: &str) -> Vec<Model> {
+    // 1. Try ModelsResponse ({ data: [...] } or { models: [...] })
+    if let Ok(resp) = serde_json::from_str::<ModelsResponse>(text) {
+        if !resp.data.is_empty() {
+            return resp.data;
+        }
+    }
+    // 2. Try raw array of Model
+    if let Ok(list) = serde_json::from_str::<Vec<Model>>(text) {
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    // 3. Fallback: inspect arbitrary JSON Value
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        let items_opt = if let Some(arr) = v.as_array() {
+            Some(arr)
+        } else if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            Some(arr)
+        } else if let Some(arr) = v.get("models").and_then(|m| m.as_array()) {
+            Some(arr)
+        } else {
+            None
+        };
+
+        if let Some(items) = items_opt {
+            let mut result = Vec::new();
+            for item in items {
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("name"))
+                    .or_else(|| item.get("model"))
+                    .and_then(|v| v.as_str());
+                if let Some(id_str) = id {
+                    let id_str = id_str.trim();
+                    if id_str.is_empty() {
+                        continue;
+                    }
+                    let display_name = item
+                        .get("display_name")
+                        .or_else(|| item.get("displayName"))
+                        .or_else(|| item.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id_str)
+                        .trim();
+
+                    let context_window = item
+                        .get("context_window")
+                        .or_else(|| item.get("context_length"))
+                        .or_else(|| item.get("max_context_length"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(128_000) as u32;
+
+                    let family = if id_str.contains("claude") {
+                        "claude".to_string()
+                    } else if id_str.contains("gpt") || id_str.contains("o1") || id_str.contains("o3") {
+                        "gpt".to_string()
+                    } else if id_str.contains("deepseek") {
+                        "deepseek".to_string()
+                    } else if id_str.contains("glm") {
+                        "glm".to_string()
+                    } else if id_str.contains("llama") {
+                        "llama".to_string()
+                    } else {
+                        "default".to_string()
+                    };
+
+                    result.push(Model {
+                        id: id_str.to_string(),
+                        display_name: if display_name.is_empty() {
+                            id_str.to_string()
+                        } else {
+                            display_name.to_string()
+                        },
+                        context_window,
+                        price_per_1k_input: 0.0,
+                        price_per_1k_output: 0.0,
+                        supports_streaming: true,
+                        supports_tools: true,
+                        family,
+                    });
+                }
+            }
+            return result;
+        }
+    }
+    Vec::new()
 }
 
 /// One streamed chat chunk (OpenAI-compatible shape).
@@ -525,12 +733,24 @@ struct CompletionMessage {
 struct ChunkChoice {
     #[serde(default)]
     delta: Option<ChunkDelta>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    message: Option<CompletionMessage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thought: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
     /// Streaming tool-call fragments (the OpenAI `delta.tool_calls[]`
     /// array) — emitted as [`ChatEvent::ToolCallDelta`] for the caller's
     /// [`crate::ToolCallAccumulator`] to reassemble.
@@ -709,6 +929,33 @@ mod tests {
         assert!(!receipt.estimated, "gateway sent exact usage");
         assert!(!receipt.request_id.is_nil());
         assert!(matches!(events.last(), Some(ChatEvent::Done(done)) if *done == receipt));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_reasoning_content_wrapped_in_think_tags() {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking step 1\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"direct answer\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _receipt = client
+            .stream_chat(chat_request(), tx)
+            .await
+            .expect("stream_chat succeeds");
+
+        let events = drain(&mut rx);
+        let joined: String = deltas(&events).join("");
+        assert!(joined.contains("<think>thinking step 1</think>\n\ndirect answer"));
     }
 
     #[tokio::test]

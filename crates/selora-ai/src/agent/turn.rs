@@ -403,6 +403,8 @@ pub struct TurnInput {
     /// The fixed §17.1 manifest. Defaults to `router::tool_manifest()`
     /// (5b's); tests pass their own fixture.
     pub manifest: Vec<ToolSpec>,
+    pub temperature: Option<f64>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl TurnInput {
@@ -415,6 +417,8 @@ impl TurnInput {
             model,
             caps,
             manifest: router::tool_manifest(),
+            temperature: None,
+            reasoning_effort: None,
         }
     }
 
@@ -428,6 +432,18 @@ impl TurnInput {
     /// Builder-style manifest override.
     pub fn with_manifest(mut self, manifest: Vec<ToolSpec>) -> Self {
         self.manifest = manifest;
+        self
+    }
+
+    /// Builder-style temperature override.
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    /// Builder-style reasoning effort override.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(reasoning_effort.into());
         self
     }
 }
@@ -748,8 +764,14 @@ where
             end = Some(TurnEnd::Failed("agent event receiver dropped".into()));
             break 'turn;
         }
-        let request = ChatRequest::new(model.id.clone(), conversation.clone())
+        let mut request = ChatRequest::new(model.id.clone(), conversation.clone())
             .with_tools(input.manifest.clone());
+        if let Some(temp) = input.temperature {
+            request = request.with_temperature(temp as f32);
+        }
+        if let Some(ref effort) = input.reasoning_effort {
+            request = request.with_reasoning_effort(Some(effort.clone()));
+        }
         let round = stream_round_gated(&mut chat, request, &events, &mut decisions, deadline).await;
         ui_gone |= round.ui_gone;
 

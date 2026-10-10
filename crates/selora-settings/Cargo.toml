@@ -10,17 +10,17 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 egui.workspace = true
-# OS keyring get/set for the API key (PLAN.md §5; ARCHITECTURE.md §7).
-keyring.workspace = true
-
-# The workspace error model (PLAN.md §8): load/save return
-# `Result<T, SeloraError>`, which is defined in selora-core. selora-core is a
-# stable Phase 1 leaf crate — depending on it here adds no parallel-build
-# conflict (noted as a deviation from the brief's dependency list).
 selora-core.workspace = true
-
-# Phase Z2 (docs/ui/PHASE_Z2_ARCHITECTURE.md §4.2): the `layout.*` section
-# reuses the protocol's SurfaceId and delegates its defaults to the protocol's
-# region constants (the single source of truth). No dependency cycle —
-# selora-protocol depends only on serde/serde_json/url.
 selora-protocol.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native-sync-persistent"] }
+
+[target.'cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))'.dependencies]
+keyring.workspace = true

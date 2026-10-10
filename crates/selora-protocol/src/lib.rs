@@ -190,11 +190,33 @@ pub struct ChatRequestDto {
     pub message: String,
     pub model_id: Option<String>,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentRequestDto {
     pub session_id: SessionId,
     pub prompt: String,
     pub model_id: Option<String>,
+    /// Phase Z3: the agent dock's permission mode. `execute` is the default
+    /// (and pre-Z3 wire value) — the full §17.1 manifest with approvals
+    /// gating side effects. `explore` arms the read-only tools only (the
+    /// model cannot request a write). Plan-mode UX beyond this rides
+    /// Phase 9's plan/apply split.
+    #[serde(default)]
+    pub mode: AgentModeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+/// The `SendAgent` permission mode (Phase Z3). Serde-rejected spellings
+/// never reach a Rust arm — the boundary is the validator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModeDto {
+    #[default]
+    Execute,
+    Explore,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -731,16 +753,36 @@ pub struct ChatDeltaDto {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub message_id: MessageId,
+    /// The ordinal of this delta within the streaming message (1-based,
+    /// reset per `message_id`) — an in-request ordering check under the
+    /// envelope's global monotonic `sequence`. Phase Z3 pins the
+    /// semantics: before Z3 no producer existed.
     pub sequence: u64,
     pub text: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Phase Z3 serde defaults: a pre-Z3 `ChatCompletedDto` JSON (the four
+/// id-and-text fields) deserializes with zeroed metering — the cost footer
+/// reads 0 tokens / $0 rather than failing to load.
+fn default_tokens() -> u64 {
+    0
+}
+fn default_cost_usd() -> f64 {
+    0.0
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletedDto {
     pub request_id: RequestId,
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub message_id: MessageId,
     pub text: String,
+    /// Phase Z3: the completion's metering (the receipt's token total and
+    /// cost — gateway-reported when present, else the chars/4 estimate the
+    /// client applies) so the frontend's cost footer needs no second event.
+    #[serde(default = "default_tokens")]
+    pub total_tokens: u64,
+    #[serde(default = "default_cost_usd")]
+    pub cost_usd: f64,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatFailedDto {
@@ -748,6 +790,96 @@ pub struct ChatFailedDto {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub error: ProtocolErrorDto,
+}
+// ---------------------------------------------------------------------------
+// Phase Z3 — the agent dock's event payloads (docs/ui/PHASE_Z_MIGRATION.md).
+//
+// Every DTO carries the routing triple (request_id, session_id, turn_id) the
+// same way `ChatDeltaDto` does, so the frontend's stale-request dropping is
+// one rule across chat and agent events. `call_id` is the model's tool-call
+// id (the `ToolCall.id` string), not a protocol stable-id type: the model
+// generates it, Rust only relays it.
+// ---------------------------------------------------------------------------
+
+/// The loop started one tool call — the tool card header.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallStartedDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub call_id: String,
+    pub tool_name: String,
+    /// The call's `arguments` JSON, verbatim as the model produced it.
+    pub args_json: String,
+}
+/// One tool finished (executed, denied, or errored) — the tool card body.
+/// `result_summary` carries the tool's full output (reads ≤4MB, bash/fetch
+/// capped at 256KB by the router); "summary" is the Z3 brief's wire name.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolResultDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub call_id: String,
+    pub result_summary: String,
+    pub is_err: bool,
+}
+/// The loop parked on an approval card (§17.4) — the approval card.
+/// `approval_id` is single-use: Rust validates and consumes it before the
+/// decision reaches the turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalNeededDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub approval_id: ApprovalId,
+    pub tool_name: String,
+    /// The card's target: a workspace-relative path for write/edit/delete,
+    /// the full command line for bash.
+    pub path_or_command: String,
+    /// The unified diff for write/edit cards (`None` for delete/bash — a
+    /// bash card has no diff and a delete needs none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_or_input: Option<String>,
+}
+/// The agent status line's phase (drives the dock's ThinkingOrb state).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    /// Streaming the model's reply.
+    Thinking,
+    /// Executing one tool (`tool_name` names it).
+    RunningTool,
+    /// Parked on an approval card.
+    AwaitingApproval,
+    /// The turn ended.
+    Done,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentStateDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub state: AgentPhase,
+    /// The running tool's name — present only in `running_tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+/// The turn's summary footer: token/cost totals, tool counts, and how it
+/// ended (`completed: false` follows a partial answer — cap, failure, or
+/// the Stop button; `end_message` is the toast-ready reason).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentTurnDoneDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub num_tools: u32,
+    pub approved: u32,
+    pub denied: u32,
+    pub completed: bool,
+    pub end_message: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentEventDto {
@@ -810,6 +942,22 @@ pub struct ProtocolErrorDto {
     pub message: String,
     pub retryable: bool,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectResultDto {
+    pub connected: bool,
+    pub models_count: usize,
+    pub active_model_id: Option<String>,
+    pub base_url: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApiKeyStatusDto {
+    pub connected: bool,
+    pub has_key: bool,
+    pub source: String,
+    pub base_url: String,
+    pub key_hint: Option<String>,
+    pub active_model_id: Option<String>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -818,6 +966,14 @@ pub enum FrontendEvent {
     ChatCompleted(ChatCompletedDto),
     ChatFailed(ChatFailedDto),
     AgentEvent(AgentEventDto),
+    // Phase Z3 — the agent dock's stream. `AgentEvent` above is the Z1-era
+    // generic carrier; it never had a producer and is superseded by the
+    // typed payloads below (kept additively — protocol_version stays 1).
+    ToolCallStarted(ToolCallStartedDto),
+    ToolResult(ToolResultDto),
+    ApprovalNeeded(ApprovalNeededDto),
+    AgentStateChanged(AgentStateDto),
+    AgentTurnDone(AgentTurnDoneDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     FileTreeChanged(FileTreeDto),
     BufferSnapshot(BufferSnapshotDto),
@@ -1370,6 +1526,186 @@ mod tests {
             validate_event_order(&event, PROTOCOL_VERSION, &cid("core-2"), None),
             Err(EventValidationError::CoreInstanceMismatch { .. })
         ));
+    }
+    #[test]
+    fn z3_command_wire_shapes_are_stable() {
+        // The four agent-dock commands, exact spellings (the Z3 contract
+        // Antigravity's bridge types are built against).
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::SendChat {
+                request_id: rid("request-1"),
+                request: ChatRequestDto {
+                    session_id: sid("session-1"),
+                    message: "hello".into(),
+                    model_id: Some("glm-5.3".into()),
+                },
+            })
+            .unwrap(),
+            r#"{"type":"send_chat","payload":{"request_id":"request-1","request":{"session_id":"session-1","message":"hello","model_id":"glm-5.3"}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::StopChat {
+                request_id: rid("request-1"),
+            })
+            .unwrap(),
+            r#"{"type":"stop_chat","payload":{"request_id":"request-1"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::SendAgent {
+                request_id: rid("request-1"),
+                request: AgentRequestDto {
+                    session_id: sid("session-1"),
+                    prompt: "fix it".into(),
+                    model_id: None,
+                    mode: AgentModeDto::Execute,
+                    reasoning_effort: None,
+                    system_instructions: None,
+                    temperature: None,
+                },
+            })
+            .unwrap(),
+            r#"{"type":"send_agent","payload":{"request_id":"request-1","request":{"session_id":"session-1","prompt":"fix it","model_id":null,"mode":"execute"}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::AgentDecision {
+                request_id: rid("request-1"),
+                approval_id: aid("approval-1"),
+                decision: DecisionDto::ApproveAllThisTurn,
+            })
+            .unwrap(),
+            r#"{"type":"agent_decision","payload":{"request_id":"request-1","approval_id":"approval-1","decision":"approve_all_this_turn"}}"#
+        );
+    }
+    #[test]
+    fn z3_event_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::ToolCallStarted(ToolCallStartedDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+            }))
+            .unwrap(),
+            r#"{"type":"tool_call_started","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","call_id":"call_1","tool_name":"read_file","args_json":"{\"path\":\"src/main.rs\"}"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::ToolResult(ToolResultDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                call_id: "call_1".into(),
+                result_summary: "fn main() {}".into(),
+                is_err: false,
+            }))
+            .unwrap(),
+            r#"{"type":"tool_result","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","call_id":"call_1","result_summary":"fn main() {}","is_err":false}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::ApprovalNeeded(ApprovalNeededDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                approval_id: aid("approval-1"),
+                tool_name: "write_file".into(),
+                path_or_command: "src/main.rs".into(),
+                diff_or_input: Some("+fn main() {}".into()),
+            }))
+            .unwrap(),
+            r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"src/main.rs","diff_or_input":"+fn main() {}"}}"#
+        );
+        // A bash card: no diff (the `diff_or_input` key is absent, not null).
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::ApprovalNeeded(ApprovalNeededDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                approval_id: aid("approval-1"),
+                tool_name: "bash".into(),
+                path_or_command: "cargo test".into(),
+                diff_or_input: None,
+            }))
+            .unwrap(),
+            r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::AgentStateChanged(AgentStateDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                state: AgentPhase::RunningTool,
+                tool_name: Some("bash".into()),
+            }))
+            .unwrap(),
+            r#"{"type":"agent_state_changed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","state":"running_tool","tool_name":"bash"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::AgentStateChanged(AgentStateDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                state: AgentPhase::Thinking,
+                tool_name: None,
+            }))
+            .unwrap(),
+            r#"{"type":"agent_state_changed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","state":"thinking"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendEvent::AgentTurnDone(AgentTurnDoneDto {
+                request_id: rid("request-1"),
+                session_id: sid("session-1"),
+                turn_id: tid("turn-1"),
+                total_tokens: 12400,
+                cost_usd: 0.041,
+                num_tools: 6,
+                approved: 3,
+                denied: 1,
+                completed: true,
+                end_message: "agent turn complete".into(),
+            }))
+            .unwrap(),
+            r#"{"type":"agent_turn_done","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","total_tokens":12400,"cost_usd":0.041,"num_tools":6,"approved":3,"denied":1,"completed":true,"end_message":"agent turn complete"}}"#
+        );
+    }
+    #[test]
+    fn z3_serde_boundaries_reject_malformed_payloads() {
+        // An unknown mode spelling fails at the boundary, before any Rust arm.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"send_agent","payload":{"request_id":"r","request":{"session_id":"s","prompt":"p","mode":"plan"}}}"#
+        )
+        .is_err());
+        // An unknown decision spelling likewise.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"agent_decision","payload":{"request_id":"r","approval_id":"a","decision":"maybe"}}"#
+        )
+        .is_err());
+        // The new event spellings round-trip through the full enum.
+        let event = FrontendEvent::AgentStateChanged(AgentStateDto {
+            request_id: rid("request-1"),
+            session_id: sid("session-1"),
+            turn_id: tid("turn-1"),
+            state: AgentPhase::AwaitingApproval,
+            tool_name: None,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
+    }
+    #[test]
+    fn pre_z3_chat_completed_and_agent_request_load_with_defaults() {
+        // A pre-Z3 ChatCompletedDto (no metering) deserializes with zeros.
+        let completed = serde_json::from_str::<ChatCompletedDto>(
+            r#"{"request_id":"r","session_id":"s","turn_id":"t","message_id":"m","text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(completed.total_tokens, 0);
+        assert_eq!(completed.cost_usd, 0.0);
+        // A pre-Z3 AgentRequestDto (no mode) defaults to execute.
+        let request = serde_json::from_str::<AgentRequestDto>(
+            r#"{"session_id":"s","prompt":"p","model_id":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.mode, AgentModeDto::Execute));
     }
     #[test]
     fn approval_is_bound_and_consumed_once() {

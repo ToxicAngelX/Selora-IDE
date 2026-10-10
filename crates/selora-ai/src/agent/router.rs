@@ -390,6 +390,19 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
             result.id = call.id.clone();
             Ok(ToolOutcome::Ready(result))
         }
+        "manage_todo" => {
+            let todos_str = args
+                .get("todos")
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_else(|| "[]".to_string());
+            Ok(ToolOutcome::Ready(ToolResult::success(
+                &call.id,
+                format!("Progress and to-do list updated: {todos_str}"),
+            )))
+        }
 
         // -- §17.1: the manifest is closed --------------------------------
         unknown => Err(format!(

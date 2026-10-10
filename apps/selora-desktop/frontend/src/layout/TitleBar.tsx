@@ -9,6 +9,7 @@
 // controls; double-click toggles maximize natively.
 import { useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { Bot, Columns, Code2, GitBranch } from '../components/icons';
 import { Icon } from '../components/Icon';
 import { SeloraMark } from '../components/SeloraMark';
 import { paletteCommands, type CommandSpec } from '../features/keymap/commands';
@@ -181,9 +182,11 @@ function withCurrentWindow(action: (win: ReturnType<typeof getCurrentWindow>) =>
 export type TitleBarProps = {
   commands: CommandSpec[];
   onRunCommand: (id: CommandSpec['id']) => void;
+  viewMode?: 'agent' | 'split' | 'editor';
+  onSelectViewMode?: (mode: 'agent' | 'split' | 'editor') => void;
 };
 
-export function TitleBar({ commands, onRunCommand }: TitleBarProps) {
+export function TitleBar({ commands, onRunCommand, viewMode = 'split', onSelectViewMode }: TitleBarProps) {
   return (
     <header className="titlebar" data-tauri-drag-region="">
       <div className="titlebar-identity">
@@ -200,6 +203,55 @@ export function TitleBar({ commands, onRunCommand }: TitleBarProps) {
         <TitleBarMenu kind="view" commands={commands} onRunCommand={onRunCommand} />
         <TitleBarMenu kind="help" commands={commands} onRunCommand={onRunCommand} />
       </nav>
+
+      {/* Modern Agentic Center Bar (ZCode / Codex Benchmark) */}
+      <div className="titlebar-center" data-tauri-drag-region="">
+        <div className="titlebar-session-badge" title="Active agent workspace session">
+          <span className="session-status-dot" />
+          <span className="session-title-text">Agent Workspace</span>
+        </div>
+
+        <div className="titlebar-git-pill" title="Current git branch">
+          <GitBranch size={12} className="git-icon" />
+          <span className="git-branch-text">main</span>
+        </div>
+
+        {onSelectViewMode && (
+          <div className="titlebar-view-switcher" role="radiogroup" aria-label="Workbench View Mode">
+            <button
+              type="button"
+              className={`view-mode-pill ${viewMode === 'agent' ? 'is-active' : ''}`}
+              onClick={() => onSelectViewMode('agent')}
+              title="Agent Workbench View"
+              aria-label="Agent View"
+            >
+              <Bot size={13} />
+              <span>Agent</span>
+            </button>
+            <button
+              type="button"
+              className={`view-mode-pill ${viewMode === 'split' ? 'is-active' : ''}`}
+              onClick={() => onSelectViewMode('split')}
+              title="Split Agent and Editor View"
+              aria-label="Split View"
+            >
+              <Columns size={13} />
+              <span>Split</span>
+            </button>
+            <button
+              type="button"
+              className={`view-mode-pill ${viewMode === 'editor' ? 'is-active' : ''}`}
+              onClick={() => onSelectViewMode('editor')}
+              title="Editor View"
+              aria-label="Editor View"
+            >
+              <Code2 size={13} />
+              <span>Editor</span>
+            </button>
+          </div>
+        )}
+      </div>
+
       <WindowControls />
     </header>
   );
