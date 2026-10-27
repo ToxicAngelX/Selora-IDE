@@ -1,0 +1,24 @@
+[package]
+name = "selora-workflow"
+description = "Workflow engine core: boa sandbox, facade, schema validation (ARCHITECTURE.md §18, ROADMAP.md 8a)"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ToxicAngelX/Selora-IDE"
+publish = false
+
+# Phase 8 wave 2: this crate is now a root-workspace member (see the root
+# Cargo.toml). Its dependencies stay declared explicitly rather than inheriting
+# from `[workspace.dependencies]`, so the hardened engine surface (pinned boa
+# with default features off) is stated at the point of use.
+
+[dependencies]
+# The engine (ARCHITECTURE.md §18.1): pure Rust, no C toolchain. Default
+# features are off so the ambient surface stays minimal — no `Temporal`
+# (default feature: wall-clock), no `Intl`/ICU, no float16/xsum. `Date` is also
+# deleted from the realm at startup (see src/sandbox.rs::harden_realm).
+boa_engine = { version = "0.22", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }

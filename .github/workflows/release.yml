@@ -1,0 +1,502 @@
+# Selora IDE - release pipeline (RELEASE.md section 4.2).
+#
+# Trigger: push a tag matching v*.*.*. Produces a DRAFT GitHub Release with
+# the Inno Setup installer and its SHA256 checksum attached; the owner
+# smoke-tests the installer on a clean Windows VM and publishes manually
+# (the draft step is deliberate).
+#
+# A tag is not a merge: this workflow re-runs the merge gate itself instead of
+# trusting that ci.yml passed. It fails unless the tagged commit is an
+# ancestor of origin/main and unless fmt, clippy, and cargo-deny are clean.
+#
+# Code signing (RELEASE.md section 3) is optional and off until the owner
+# provides a certificate. Add two repository secrets to enable it:
+#   SIGNING_CERT_BASE64   - the Authenticode PFX, base64-encoded
+#   SIGNING_CERT_PASSWORD - its password
+# The signing steps are skipped while SIGNING_CERT_BASE64 is empty. Set the
+# repository variable SIGNING_REQUIRED=true to turn a missing certificate into
+# a hard failure instead of a skipped step (use it once releases are public).
+#
+# Pinned actions: release tags are deliberate. Bump them together with a CI
+# run; do not switch to floating refs.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+      SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+      SIGNING_REQUIRED: ${{ vars.SIGNING_REQUIRED }}
+    steps:
+      # fetch-depth 0: the merge gate below needs full history and
+      # origin/main. persist-credentials false: nothing here pushes, so the
+      # token must not be left in .git/config for later steps.
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The release gate. ci.yml runs on tags too, but a tag bypasses branch
+      # protection: this is what actually proves the tagged commit is merged.
+      - name: Verify the tag commit is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet origin/main > /dev/null; then
+            echo "::error::origin/main is not present in this checkout; the merge gate cannot run."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of origin/main."
+            echo "::error::Release tags must point at a commit that is already merged to main and passed CI."
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME ($GITHUB_SHA) is contained in origin/main."
+
+      - name: Resolve and validate the version
+        id: version
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Tag '$env:GITHUB_REF_NAME' is not numeric vX.Y.Z (Inno Setup's AppVersion must be numeric)."
+          }
+
+          $cargoRaw = & (Join-Path $PWD 'installer\read-version.ps1')
+          $cargo = if ($null -eq $cargoRaw) { '' } else { ("$cargoRaw").Trim() }
+          if (-not $cargo) {
+            throw 'Could not read [workspace.package].version from Cargo.toml.'
+          }
+          if ($cargo -ne $version) {
+            throw "Tag is v$version but Cargo.toml [workspace.package] version is $cargo. Bump the version before tagging."
+          }
+
+          $tauri = (Get-Content -LiteralPath 'apps\selora-desktop\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
+          if ($tauri -ne $version) {
+            throw "Tag is v$version but tauri.conf.json version is $tauri. Keep the two in sync."
+          }
+
+          # The About dialog reports the frontend package version, so it is
+          # user-visible metadata even though Cargo.toml stays authoritative.
+          $frontend = (Get-Content -LiteralPath 'apps\selora-desktop\frontend\package.json' -Raw | ConvertFrom-Json).version
+          if ($frontend -ne $version) {
+            throw "Tag is v$version but apps/selora-desktop/frontend/package.json version is $frontend. Keep it in sync (the About dialog reads it)."
+          }
+
+          # RELEASE.md section 4.3 step 2: the Unreleased entries move into a
+          # versioned section before tagging.
+          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw
+          $heading = '(?m)^##\s*\[' + [regex]::Escape($version) + '\]'
+          if ($changelog -notmatch $heading) {
+            throw "CHANGELOG.md has no '## [$version]' section. Move the Unreleased entries into a versioned section before tagging."
+          }
+
+          "VERSION=$version" >> $env:GITHUB_OUTPUT
+          "Validated version $version (Cargo.toml + tauri.conf.json + frontend package.json + CHANGELOG.md)."
+
+      # Optional signing: no secrets means unsigned builds, and that stays a
+      # warning. SIGNING_REQUIRED=true makes it a hard failure instead.
+      - name: Check signing prerequisites
+        shell: pwsh
+        run: |
+          if ($env:SIGNING_REQUIRED -eq 'true') {
+            if (-not $env:SIGNING_CERT_BASE64) {
+              throw 'SIGNING_REQUIRED is true but SIGNING_CERT_BASE64 is empty. Add the signing secrets or unset the variable.'
+            }
+            if (-not $env:SIGNING_CERT_PASSWORD) {
+              throw 'SIGNING_REQUIRED is true but SIGNING_CERT_PASSWORD is empty.'
+            }
+            'Signing is required for this release and both certificate secrets are present.'
+          }
+          elseif ($env:SIGNING_CERT_BASE64) {
+            if (-not $env:SIGNING_CERT_PASSWORD) {
+              throw 'SIGNING_CERT_BASE64 is set but SIGNING_CERT_PASSWORD is empty.'
+            }
+            'Signing is enabled (SIGNING_CERT_BASE64 is present).'
+          }
+          else {
+            'Signing is disabled (SIGNING_CERT_BASE64 is empty); the installer will be unsigned.'
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/selora-desktop/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/selora-desktop/frontend
+        run: npm ci
+
+      - name: Typecheck frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm run typecheck
+
+      - name: Test frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm test
+
+      - name: Build frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm run build
+
+      - name: Verify frontend bundle
+        shell: pwsh
+        run: |
+          $index = 'apps\selora-desktop\frontend\dist\index.html'
+          if (-not (Test-Path -LiteralPath $index)) {
+            throw "Frontend build did not produce $index; tauri-build embeds this directory."
+          }
+          "Frontend bundle: $((Get-Item -LiteralPath $index).Length) byte index.html"
+
+      # Pinned to the stable channel on purpose: rust-toolchain.toml pins the
+      # toolchain the project builds with and requests rustfmt + clippy.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2.7.5
+        with:
+          shared-key: release-windows
+          cache-on-failure: true
+
+      # Same Rust gate as ci.yml: a tag must not be able to skip it.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # cargo-deny-action is a container action, which GitHub cannot run on
+      # windows-latest. Install it natively, pinned so a new cargo-deny release
+      # cannot change the gate under a shipping tag.
+      - name: Install cargo-deny
+        shell: pwsh
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-deny failed with $LASTEXITCODE" }
+
+      - name: cargo-deny (licenses + advisories)
+        run: cargo deny check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release -p selora-desktop --locked
+
+      - name: Verify release binary
+        shell: pwsh
+        run: |
+          $exe = 'target\release\selora-desktop.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Release binary not found at $exe."
+          }
+          $size = [math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)
+          "Release binary: $exe ($size MiB)"
+
+      # The app links the dynamic CRT (src-tauri/build.rs sets
+      # static_vc_runtime(false)). Derive the DLL set from dumpbin's import
+      # table - VCRUNTIME140*, MSVCP140*, CONCRT140, VCOMP140 - and stage it
+      # beside the exe. The list is passed to the installer as /DMyCrtDlls so
+      # its post-install check verifies exactly what was staged.
+      - name: Stage Visual C++ runtime DLLs
+        id: crt
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw 'vswhere.exe not found; the windows-latest image should include Visual Studio Build Tools.'
+          }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) {
+            throw 'No Visual Studio installation with the MSVC x64 toolset was found.'
+          }
+
+          $redist = Join-Path $vs 'VC\Redist\MSVC'
+          $crt = $null
+          $crtVersion = $null
+          foreach ($candidate in (Get-ChildItem -LiteralPath $redist -Directory |
+              Where-Object { $_.Name -match '^\d+\.' } |
+              Sort-Object { [version]$_.Name } -Descending)) {
+            $x64 = Join-Path $candidate.FullName 'x64'
+            if (-not (Test-Path -LiteralPath $x64)) { continue }
+            $dir = Get-ChildItem -LiteralPath $x64 -Directory -Filter 'Microsoft.VC*.CRT' -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'vcruntime140.dll') } |
+              Select-Object -First 1
+            if ($dir) {
+              $crt = $dir
+              $crtVersion = $candidate
+              break
+            }
+          }
+          if (-not $crt) {
+            throw "MSVC x64 CRT redist not found under $redist."
+          }
+
+          # concrt140.dll and vcomp140.dll live in sibling folders
+          # (Microsoft.VC*.OpenMP), not in the CRT folder, so search the whole
+          # x64 redist directory.
+          $redistDirs = @($crt.FullName) + @(
+            Get-ChildItem -LiteralPath (Join-Path $crtVersion.FullName 'x64') -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+          )
+
+          $tools = Get-ChildItem -LiteralPath (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+            Where-Object { $_.Name -match '^\d+\.' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-not $tools) {
+            throw "No MSVC toolset found under $(Join-Path $vs 'VC\Tools\MSVC')."
+          }
+          $dumpbin = Join-Path $tools.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          if (-not (Test-Path -LiteralPath $dumpbin)) {
+            throw "dumpbin.exe not found at $dumpbin."
+          }
+
+          $exe = 'target\release\selora-desktop.exe'
+          $imports = (& $dumpbin /nologo /dependents $exe) -join "`n"
+          if ($LASTEXITCODE -ne 0) {
+            throw "dumpbin failed on $exe with $LASTEXITCODE."
+          }
+          if ($imports -notmatch 'VCRUNTIME140\.dll') {
+            throw 'The release binary does not import VCRUNTIME140.dll. If the CRT became static, update installer/selora-ide.iss before shipping.'
+          }
+
+          # The escaped dot matters: MSVCP140.dll must not match
+          # MSVCP140Xdll. Case-insensitive to match dumpbin's upper-case names.
+          $crtPattern = '^(vcruntime140|vcruntime140_1|msvcp140|msvcp140_[a-z0-9_]+|concrt140|vcomp140)\.dll$'
+          $dlls = [System.Collections.Generic.List[string]]::new()
+          foreach ($required in @('vcruntime140.dll', 'vcruntime140_1.dll')) {
+            $dlls.Add($required)
+          }
+          foreach ($token in ($imports -split '\s+')) {
+            $name = $token.Trim().ToLowerInvariant()
+            if ($name -match $crtPattern -and -not $dlls.Contains($name)) {
+              $dlls.Add($name)
+            }
+          }
+
+          # Keep the installer honest: a staged DLL with no [Files] entry is
+          # staged and then silently not shipped.
+          $installerScript = Get-Content -LiteralPath 'installer\selora-ide.iss' -Raw
+          foreach ($dll in $dlls) {
+            if ($installerScript -notmatch [regex]::Escape($dll)) {
+              throw "installer/selora-ide.iss has no [Files] entry for $dll; add one before shipping."
+            }
+          }
+
+          foreach ($dll in $dlls) {
+            $source = $null
+            foreach ($dir in $redistDirs) {
+              $candidatePath = Join-Path $dir $dll
+              if (Test-Path -LiteralPath $candidatePath) {
+                $source = $candidatePath
+                break
+              }
+            }
+            if (-not $source) {
+              throw "The MSVC redist at $($crtVersion.FullName) has no $dll, but $exe imports it."
+            }
+            Copy-Item -LiteralPath $source -Destination 'target\release' -Force
+          }
+
+          "DLLS=$($dlls -join ',')" >> $env:GITHUB_OUTPUT
+          "Staged beside the exe: $($dlls -join ', ') (from $($crtVersion.FullName))"
+
+      # Microsoft's x64 Evergreen Bootstrapper. The installer runs it only
+      # when its registry check finds no WebView2 runtime. go.microsoft.com
+      # redirects to a CDN and transient failures are common, so retry like
+      # installer\prebuild.bat does and never keep a partial file.
+      - name: Fetch WebView2 Evergreen bootstrapper
+        shell: pwsh
+        run: |
+          $out = 'target\release\MicrosoftEdgeWebview2Setup.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $uri = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+          $attempts = 3
+          $downloaded = $false
+
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            try {
+              Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+              Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $out -TimeoutSec 120 -ErrorAction Stop
+
+              $signature = Get-AuthenticodeSignature -FilePath $out
+              if ($signature.Status -ne 'Valid') {
+                throw "signature status is $($signature.Status), expected Valid"
+              }
+              if ($signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+                throw "signer is unexpected: $($signature.SignerCertificate.Subject)"
+              }
+
+              $downloaded = $true
+              break
+            }
+            catch {
+              Write-Warning "WebView2 bootstrapper attempt $attempt of $attempts failed: $($_.Exception.Message)"
+              Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+              if ($attempt -lt $attempts) { Start-Sleep -Seconds 3 }
+            }
+          }
+
+          if (-not $downloaded) {
+            throw "Could not download and verify the WebView2 Evergreen bootstrapper after $attempts attempts."
+          }
+          "WebView2 bootstrapper: $((Get-Item -LiteralPath $out).Length) bytes, signed by $((Get-AuthenticodeSignature -FilePath $out).SignerCertificate.Subject)"
+
+      # Pinned to a known Inno Setup 6.x build so a future 7.x package in
+      # Chocolatey cannot silently change the compiler under a release.
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with $LASTEXITCODE" }
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "Inno Setup installed but ISCC.exe is not at $iscc."
+          }
+          "ISCC version $((Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion)"
+
+      - name: Sign application binary (optional)
+        if: env.SIGNING_CERT_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'selora-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
+
+            $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signtool = Get-ChildItem -LiteralPath $sdkBin -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) { throw 'signtool.exe was not found in the Windows SDK.' }
+
+            $target = 'target\release\selora-desktop.exe'
+            & $signtool.FullName sign /f $pfx /p $env:SIGNING_CERT_PASSWORD `
+              /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 `
+              /d 'Selora IDE' /du 'https://github.com/ToxicAngelX/Selora-IDE' `
+              $target
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with $LASTEXITCODE" }
+
+            # An unverifiable signature is worse than no signature: verify the
+            # file we are about to package, including the timestamp chain.
+            & $signtool.FullName verify /pa /v $target
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with $LASTEXITCODE" }
+            "Signed and verified: $target"
+          }
+          finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          CRT_DLLS: ${{ steps.crt.outputs.DLLS }}
+        run: |
+          if (-not $env:CRT_DLLS) {
+            throw 'The CRT staging step produced no DLL list; refusing to compile an installer without the runtime.'
+          }
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          & $iscc "/DMyAppVersion=$env:VERSION" "/DMyCrtDlls=$env:CRT_DLLS" 'installer\selora-ide.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+          $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+          if (-not (Test-Path -LiteralPath $installer)) {
+            throw "Installer not found at $installer."
+          }
+          "Installer: $installer ($([math]::Round((Get-Item -LiteralPath $installer).Length / 1MB, 1)) MiB)"
+
+      - name: Sign installer (optional)
+        if: env.SIGNING_CERT_BASE64 != ''
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'selora-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
+
+            $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signtool = Get-ChildItem -LiteralPath $sdkBin -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) { throw 'signtool.exe was not found in the Windows SDK.' }
+
+            $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+            & $signtool.FullName sign /f $pfx /p $env:SIGNING_CERT_PASSWORD `
+              /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 `
+              /d 'Selora IDE Installer' /du 'https://github.com/ToxicAngelX/Selora-IDE' `
+              $installer
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with $LASTEXITCODE" }
+
+            & $signtool.FullName verify /pa /v $installer
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with $LASTEXITCODE" }
+            "Signed and verified: $installer"
+          }
+          finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $name = Split-Path -Leaf $installer
+          $checksum = "$installer.sha256"
+          Set-Content -LiteralPath $checksum -Value "$hash  $name" -Encoding ascii
+          Get-Content -LiteralPath $checksum
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: selora-ide-setup-${{ steps.version.outputs.VERSION }}
+          path: |
+            installer/output/Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe
+            installer/output/Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Draft GitHub release
+        uses: softprops/action-gh-release@v2.2.0
+        with:
+          name: Selora IDE v${{ steps.version.outputs.VERSION }}
+          tag_name: ${{ github.ref_name }}
+          files: |
+            installer/output/Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe
+            installer/output/Selora-IDE-Setup-${{ steps.version.outputs.VERSION }}.exe.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: true

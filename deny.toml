@@ -1,0 +1,54 @@
+# cargo-deny configuration for Selora IDE.
+# NOTE: the file name `deny.toml` is what cargo-deny auto-discovers (not
+# `cargo-deny.toml`, despite what RELEASE.md §7.1 says — one-line doc fix
+# pending).
+# The license gate is part of the merge gate (AGENT_ORCHESTRATION.md §5):
+# any crate with a non-MIT-compatible license fails the build (RISKS.md §9).
+
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained-crate advisories disabled: ttf-parser (transitive via egui's
+# ab_glyph) is unmaintained but not vulnerable, and we can't swap egui's
+# text stack. Vulnerability + yanked advisories still deny.
+unmaintained = "none"
+
+[licenses]
+version = 2
+# MIT-compatible / permissive only. Anything not on this list fails CI.
+# (Keep this list exact: unused entries are warnings that fail the gate.)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # nucleo-matcher (PLAN.md §4.4 mandates this crate): MPL-2.0 is
+    # file-level copyleft — its terms apply only to nucleo's own files and
+    # do not infect our MIT code. Fine as a dependency.
+    "MPL-2.0",
+    # epaint_default_fonts: egui's bundled default font data (we register our
+    # own fonts but the defaults are still compiled in). Font-data licenses.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    # webpki-roots (via rustls): the Mozilla CA certificate bundle, a
+    # permissive data license.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Multiple versions of the same crate are noisy but not fatal; duplicates = warn.
+multiple-versions = "warn"
+# Wildcards are versionless deps — in this workspace that means ONLY the
+# `selora-*` path dependencies (verified: every wildcard above resolves to a
+# crates/ path). External deps all carry versions, so the protection holds.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

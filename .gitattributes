@@ -1,0 +1,15 @@
+# Normalize to LF in the repo; Windows checkouts get LF too (editor is LF-native).
+* text=auto eol=lf
+
+# Windows-specific binaries
+*.png binary
+*.ico binary
+*.ttf binary
+*.exe binary
+
+# Batch/PowerShell scripts must be checked out with CRLF. cmd.exe mishandles
+# LF-only .bat/.cmd files (goto labels, parenthesised blocks, line continuations),
+# and Windows PowerShell 5.1 is the interpreter installer\prebuild.bat calls.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

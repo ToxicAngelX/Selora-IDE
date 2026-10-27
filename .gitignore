@@ -1,0 +1,26 @@
+# Build output
+/target
+
+# Rust backup files
+**/*.rs.bk
+.claude/worktrees/
+
+# Installer output
+installer/output/
+
+# Agent tooling (local session state - never published)
+.claude/
+.zcode/
+graphify-out/
+
+# MSYS shell redirect artifacts (`> nul` creates a real file on Windows)
+nul
+
+# Local gate/resume logs (root of the repo, written by the build gate)
+*.log
+
+# Scratch files that must never be published
+/New Text Document.txt
+service.json
+/.selora/
+crates/selora-workflow/target/

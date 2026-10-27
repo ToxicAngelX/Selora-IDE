@@ -1,0 +1,15 @@
+[package]
+name = "selora-git"
+description = "git2 wrapper: status, diff, stage/unstage, commit (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+git2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Real-repo unit tests: each test inits a repository in a temp dir.
+tempfile = "3"

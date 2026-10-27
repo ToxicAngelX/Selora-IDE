@@ -1,0 +1,39 @@
+[package]
+name = "selora-app"
+description = "Selora IDE application binary: wires the workspace crates together (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+# Phase 1c: the multi-threaded runtime the gateway workers are spawned onto
+# (ARCHITECTURE.md §1.4), and the mpsc channel drained each frame (§2).
+tokio.workspace = true
+
+selora-core.workspace = true
+selora-fs.workspace = true
+selora-editor.workspace = true
+selora-lsp.workspace = true
+selora-git.workspace = true
+selora-ai.workspace = true
+selora-settings.workspace = true
+selora-ui.workspace = true
+
+# Phase 2: chat request ids in Effect::SeloraChat (ARCHITECTURE.md §2.2).
+uuid.workspace = true
+rfd = "0.17.2"
+# Phase 2 shell: workspace.json persistence (ARCHITECTURE.md §8.2).
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "selora-app"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Mock gateway for the headless end-to-end wiring tests (Phase 1c).
+wiremock.workspace = true
+uuid.workspace = true

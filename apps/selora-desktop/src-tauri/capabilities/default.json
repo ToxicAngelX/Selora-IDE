@@ -1,0 +1,26 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Local capabilities for the Selora diagnostic shell",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "allow-get-bootstrap-state",
+    "allow-dispatch-command",
+    "allow-get-events-after",
+    "allow-connect-api-key",
+    "allow-disconnect-api-key",
+    "allow-get-api-key-status",
+    "allow-fetch-models",
+    "allow-pick-folder",
+    "allow-open-external",
+    "allow-update-settings",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
+  ]
+}

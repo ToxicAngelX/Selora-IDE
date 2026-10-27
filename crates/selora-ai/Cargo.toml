@@ -1,0 +1,30 @@
+[package]
+name = "selora-ai"
+description = "Selora gateway client: models, streaming chat, ghost text, cost meter (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+selora-core.workspace = true
+# The agent module composes selora-fs (ARCHITECTURE.md §17.6): list_dir
+# (tree node), fuzzy_find, and search_files run over its implementations.
+selora-fs.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+# Test-only: `#[tokio::test(start_paused = true)]` for the time-cap test —
+# the paused clock fires the deadline without real sleeping.
+tokio = { workspace = true, features = ["test-util"] }
+# Test-only: proving the `agent.*` settings drive the loop caps
+# (TurnCaps). A dev-dependency keeps selora-ai's runtime contract
+# "selora-core + the networking stack" (lib.rs docs) unchanged; the
+# production settings → TurnCaps mapping lives in the app shell.
+selora-settings.workspace = true

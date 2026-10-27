@@ -1,0 +1,77 @@
+[package]
+name = "selora-desktop"
+description = "Tauri 2/WebView2 shell for Selora IDE (Z0/Z1 scaffold)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["custom-protocol", "devtools"] }
+# A second launch must focus the running window instead of competing for the
+# one WebView2 user-data profile (which fails setup with 0x8007139F).
+tauri-plugin-single-instance = "2"
+uuid.workspace = true
+selora-protocol.workspace = true
+selora-settings.workspace = true
+# Phase Z3 (agent dock vertical slice): the chat stream + agent turn loop
+# (selora-ai) and the channels the relays ride (tokio sync — the tasks
+# themselves spawn on tauri::async_runtime). selora-core names the shared
+# error type the relays map into typed protocol errors.
+selora-ai.workspace = true
+selora-core.workspace = true
+tokio.workspace = true
+# Phase Z4 (editor & workbench parity): the workspace service reads trees and
+# searches through selora-fs, and the Git panel rides selora-git's vendored
+# libgit2 through the same typed errors the Rust workbench already uses.
+selora-fs.workspace = true
+selora-git.workspace = true
+# Phase Z4b: the LSP manager (hover / definition / completion / diagnostics).
+selora-lsp.workspace = true
+# Phase 8 wave 2: the workflow engine (boa sandbox + facade + schema). No
+# commands consume it yet; the wave-2 slices import it from here.
+selora-workflow.workspace = true
+# The native folder picker behind pick_folder (Z4's Open Folder flow).
+rfd = "0.15"
+# External links (the About dialog's repository and release pages): hand a
+# validated http(s) URL to the OS default browser. The plugin's free
+# `open_url` is the spawn path; `main.rs` registers the plugin.
+tauri-plugin-opener = "2"
+# `OpenExternal` parses with the `url` crate the workspace already pins,
+# instead of hand-rolling scheme/host splitting.
+url.workspace = true
+
+# Phase 8 gap 1: `world.run` must kill grandchildren, not just the direct
+# PowerShell child, so `workflows_process.rs` owns a Job Object with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. Only the Win32 modules that gate the job
+# calls and their struct types are enabled (JobObjects needs Security for
+# SECURITY_ATTRIBUTES and Threading for IO_COUNTERS).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# Z2 state tests drive `dispatch`'s emit path with `tauri::test::mock_app`
+# (MockRuntime); the feature is an empty gate on the tauri crate itself.
+# Z3 adds wiremock (the selora-ai test pattern): a loopback mock gateway so
+# the streaming/approval seams are proven end-to-end without a network.
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+wiremock.workspace = true
+# Z4 workspace tests build throwaway trees (the LayoutStore precedent) and
+# real temporary repositories for the staged/unstaged diff selection.
+tempfile = "3"
+git2.workspace = true
+
+[[bin]]
+name = "selora-desktop"
+path = "src/main.rs"

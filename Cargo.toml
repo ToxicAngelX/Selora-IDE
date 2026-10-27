@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/selora-core",
+    "crates/selora-fs",
+    "crates/selora-editor",
+    "crates/selora-lsp",
+    "crates/selora-git",
+    "crates/selora-ai",
+    "crates/selora-settings",
+    "crates/selora-tokens",
+    "crates/selora-ui",
+    "crates/selora-app",
+    "crates/selora-protocol",
+    "crates/selora-workflow",
+    "apps/selora-desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ToxicAngelX/Selora-IDE"
+homepage = "https://github.com/ToxicAngelX/Selora-IDE"
+
+[workspace.dependencies]
+egui = "0.36"
+eframe = "0.36"
+# Buffer rope + shared types (selora-core).
+ropey = "1.6"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+selora-protocol = { path = "crates/selora-protocol" }
+# Networking (selora-ai): reqwest with rustls only — no OpenSSL on Windows (PLAN.md §4.7).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+# LSP client types (selora-lsp): PLAN.md §4.5 — thin client, no tower-lsp.
+lsp-types = "0.97"
+# Git bindings (selora-git): PLAN.md §4.6 — vendored libgit2 so Windows
+# builds don't need a system libgit2.
+git2 = { version = "0.21", features = ["vendored-libgit2"] }
+# OS keyring (selora-settings): the API key's only home (PLAN.md §4.8 —
+# never a file). Windows Credential Manager behind the platform-agnostic API.
+keyring = "3"
+# Dev-only: mock gateway for selora-ai tests (ROADMAP.md Phase 1b).
+wiremock = "0.6"
+
+selora-core = { path = "crates/selora-core" }
+selora-fs = { path = "crates/selora-fs" }
+selora-editor = { path = "crates/selora-editor" }
+selora-lsp = { path = "crates/selora-lsp" }
+selora-git = { path = "crates/selora-git" }
+selora-ai = { path = "crates/selora-ai" }
+selora-settings = { path = "crates/selora-settings" }
+selora-tokens = { path = "crates/selora-tokens" }
+selora-ui = { path = "crates/selora-ui" }
+selora-app = { path = "crates/selora-app" }
+selora-workflow = { path = "crates/selora-workflow" }
+
+# Release profile per ARCHITECTURE.md §14.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"

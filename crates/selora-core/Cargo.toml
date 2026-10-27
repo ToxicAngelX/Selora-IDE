@@ -1,0 +1,12 @@
+[package]
+name = "selora-core"
+description = "Buffer, workspace model, path and position types (see PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ropey.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

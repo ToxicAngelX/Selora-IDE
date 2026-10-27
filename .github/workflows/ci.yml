@@ -1,0 +1,103 @@
+# Selora IDE - continuous integration (RELEASE.md section 4.1).
+#
+# apps/selora-desktop/frontend/dist is gitignored and tauri-build embeds it
+# at compile time, so the frontend is installed, checked, and built before
+# any cargo step that compiles selora-desktop.
+#
+# Tags are covered too: a release tag is a commit anyone can push, so the
+# same lane runs on v*.*.* tags. release.yml repeats these checks as its own
+# gate (it does not trust that this workflow ran) - keep the two in sync.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/selora-desktop/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/selora-desktop/frontend
+        run: npm ci
+
+      - name: Typecheck frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm run typecheck
+
+      - name: Test frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm test
+
+      - name: Build frontend
+        working-directory: apps/selora-desktop/frontend
+        run: npm run build
+
+      - name: Verify frontend bundle
+        shell: pwsh
+        run: |
+          $index = 'apps\selora-desktop\frontend\dist\index.html'
+          if (-not (Test-Path -LiteralPath $index)) {
+            throw "Frontend build did not produce $index; tauri-build embeds this directory."
+          }
+
+      # This action has no semver tags; "stable" is its documented ref. The
+      # toolchain that is actually compiled with comes from
+      # rust-toolchain.toml (channel = "stable").
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2.7.5
+        with:
+          shared-key: ci-windows
+          cache-on-failure: true
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # cargo-deny-action is a container action, which GitHub cannot run on
+      # windows-latest. Install the same pinned tool natively instead, so the
+      # merge gate and release.yml agree on the cargo-deny version.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: cargo-deny (licenses + advisories)
+        run: cargo deny check

@@ -1,0 +1,8 @@
+[toolchain]
+channel = "stable"
+profile = "default"
+# Both merge gates run `cargo fmt --all -- --check` and
+# `cargo clippy --workspace --all-targets -- -D warnings`, so rustfmt and
+# clippy must be installed with the toolchain rather than failing the first
+# gate run on a fresh machine or runner.
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,252 @@
+/* ==========================================================================
+   Selora IDE — Phase Z5c keyboard cheat sheet
+   --------------------------------------------------------------------------
+   Modal dialog on the sanctioned --ink-mid surface with the same backdrop
+   pattern as the command palette (--scrim + --blur-surface). Tokens only
+   (DESIGN_TOKENS.md §12; PHASE_Z2_DESIGN §13): no hex literals, no raw px
+   outside layout arithmetic on --space-*, no shadows, no gradients. One-shot
+   fade/bloom only; base.css disables both under either reduced-motion path.
+   ========================================================================== */
+
+.cheatsheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+  background: var(--scrim);
+  backdrop-filter: blur(var(--blur-surface));
+  -webkit-backdrop-filter: blur(var(--blur-surface));
+  animation: cheatsheet-fade-in var(--dur-quick) var(--ease-fade);
+}
+
+.cheatsheet {
+  display: flex;
+  flex-direction: column;
+  width: min(calc(var(--space-6) * 22), 92vw);
+  max-height: min(calc(var(--space-6) * 19), 84vh);
+  overflow: hidden;
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-2);
+  animation: cheatsheet-bloom var(--dur-base) var(--ease-precise);
+}
+
+/* --- Header --------------------------------------------------------------- */
+.cheatsheet-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5) var(--space-3);
+  border-bottom: var(--border-hairline);
+}
+
+.cheatsheet-heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.cheatsheet-title {
+  font-size: var(--type-lg);
+  line-height: var(--type-lg-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-default);
+}
+
+.cheatsheet-subtitle {
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-muted);
+}
+
+.cheatsheet-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-6) - var(--space-1));
+  height: calc(var(--space-6) - var(--space-1));
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  background: transparent;
+  border: var(--hairline) solid transparent;
+  border-radius: var(--radius-1);
+  transition:
+    color var(--dur-instant) var(--ease-calm),
+    background-color var(--dur-instant) var(--ease-calm),
+    border-color var(--dur-instant) var(--ease-calm);
+}
+
+.cheatsheet-close:hover {
+  color: var(--fg-default);
+  background: var(--ink-faint);
+  border-color: var(--ink-hi);
+}
+
+/* --- Search --------------------------------------------------------------- */
+.cheatsheet-search-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  color: var(--fg-muted);
+  background: var(--ink-low);
+  border-bottom: var(--border-hairline);
+}
+
+.cheatsheet-search {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-default);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+}
+
+.cheatsheet-search::placeholder {
+  color: var(--fg-faint);
+  opacity: 1;
+}
+
+.cheatsheet-esc {
+  flex-shrink: 0;
+  padding: 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+  border: var(--border-hairline);
+  border-radius: var(--radius-1);
+}
+
+/* --- Grouped command list -------------------------------------------------- */
+.cheatsheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-3);
+}
+
+.cheatsheet-group {
+  padding: var(--space-2) 0;
+}
+
+.cheatsheet-group + .cheatsheet-group {
+  border-top: var(--border-hairline);
+}
+
+.cheatsheet-group-title {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+.cheatsheet-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--hairline) * 2);
+}
+
+.cheatsheet-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: var(--space-6);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-1);
+}
+
+.cheatsheet-row:hover {
+  background: var(--ink-faint);
+}
+
+.cheatsheet-command {
+  min-width: 0;
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-default);
+}
+
+.cheatsheet-keys {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+.cheatsheet-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: calc(var(--space-5) - var(--space-1));
+  height: calc(var(--space-5) - var(--space-1));
+  padding: 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-default);
+  background: var(--ink-low);
+  border: var(--border-hairline);
+  border-radius: var(--radius-1);
+}
+
+.cheatsheet-unbound {
+  flex-shrink: 0;
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+}
+
+.cheatsheet-empty {
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-muted);
+}
+
+/* --- Footer ---------------------------------------------------------------- */
+.cheatsheet-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+  background: var(--ink-low);
+  border-top: var(--border-hairline);
+}
+
+/* --- One-shot entrance (the only motion in the sheet) --------------------- */
+@keyframes cheatsheet-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes cheatsheet-bloom {
+  from {
+    transform: scale(0.98);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "selora-tokens"
+description = "Selora IDE design tokens — the typed DESIGN_TOKENS.md contract, as a leaf every UI-facing crate can import (see ARCHITECTURE.md §10.10)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
