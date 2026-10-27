@@ -42,6 +42,13 @@ type Harness = {
   toastStore: { getSnapshot: () => { toasts: Array<{ id: number; message: string }> } };
   agentStore: { getSnapshot: () => { unreadSubagentCount: number } };
   layoutStore: { getSnapshot: () => { layout: unknown; hydrated: boolean } };
+  terminalStore: {
+    getSnapshot: () => {
+      sessions: Array<{ terminal_id: string; status: string; exit_code: number | null }>;
+      active_id: string | null;
+    };
+    subscribeOutput: (terminalId: string, listener: (data: string) => void) => () => void;
+  };
   emit: (event: EventEnvelope) => void;
 };
 
@@ -59,6 +66,7 @@ async function freshHarness(): Promise<Harness> {
   const { toastStore } = await import('../features/toasts/toast-store');
   const { agentStore } = await import('../features/agent/agent-store');
   const { layoutStore } = await import('../features/layout/layout-store');
+  const { terminalStore } = await import('../features/dock/terminal-store');
   return {
     startApp,
     subscribeApp,
@@ -68,6 +76,7 @@ async function freshHarness(): Promise<Harness> {
     toastStore,
     agentStore,
     layoutStore,
+    terminalStore,
     emit: (event: EventEnvelope) => handler?.(event),
   };
 }
@@ -469,6 +478,33 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
     expect(h.toastStore.getSnapshot().toasts).toHaveLength(1);
     expect(h.toastStore.getSnapshot().toasts[0]?.message).toContain('review complete');
     expect(h.agentStore.getSnapshot().unreadSubagentCount).toBe(1);
+  });
+});
+
+describe('terminal protocol routing', () => {
+  it('routes TerminalCreated, TerminalOutput and TerminalExited into the terminal store', async () => {
+    const h = await freshHarness();
+    await h.startApp();
+    const output: string[] = [];
+    h.terminalStore.subscribeOutput('term-1', (data) => output.push(data));
+
+    h.emit(
+      makeEvent(1, {
+        type: 'terminal_created',
+        payload: { terminal_id: 'term-1', shell: '/bin/bash', cwd: '/workspace' },
+      }),
+    );
+    h.emit(makeEvent(2, { type: 'terminal_output', payload: { terminal_id: 'term-1', data: 'hi\r\n' } }));
+    h.emit(makeEvent(3, { type: 'terminal_exited', payload: { terminal_id: 'term-1', code: 130 } }));
+
+    const terminal = h.terminalStore.getSnapshot();
+    expect(terminal.active_id).toBe('term-1');
+    expect(terminal.sessions[0]).toMatchObject({
+      terminal_id: 'term-1',
+      status: 'exited',
+      exit_code: 130,
+    });
+    expect(output).toEqual(['hi\r\n']);
   });
 });
 

@@ -29,6 +29,7 @@ import {
   toWorkflowStoreEvent,
 } from '../features/workflows/workflows-bridge';
 import { applyAppearance } from '../features/theme/theme';
+import { terminalStore } from '../features/dock/terminal-store';
 
 export type AppPhase = 'connecting' | 'ready' | 'error';
 
@@ -313,6 +314,7 @@ function reduceEvent(event: EventEnvelope): void {
       applyAppearance(payload.payload.settings);
       layoutStore.hydrate(payload.payload);
       agentStore.hydrate(payload.payload);
+      if (previousWorkspaceId !== nextWorkspaceId) terminalStore.reset();
       notify();
       return;
     }
@@ -501,6 +503,15 @@ case 'plan_state_changed':
       state = { ...state, definitionResult: payload.payload };
       notify();
       return;
+    case 'terminal_created':
+      terminalStore.handleCreated(payload.payload);
+      return;
+    case 'terminal_output':
+      terminalStore.handleOutput(payload.payload);
+      return;
+    case 'terminal_exited':
+      terminalStore.handleExited(payload.payload);
+      return;
     default: {
       // Phase 8 workflow progress: one pure mapper decides which protocol
       // events the Workflows panel consumes. Everything else stays explicitly
@@ -553,6 +564,7 @@ function discardHeldState(): void {
   layoutStore.reset();
   agentStore.reset();
   workflowsStore.reset();
+  terminalStore.reset();
   state = emptyState();
   notify();
 }

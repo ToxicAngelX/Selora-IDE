@@ -25,6 +25,10 @@ import {
   sendChat,
   stopChat,
   switchSession,
+  terminalClose,
+  terminalInput,
+  terminalResize,
+  createTerminal,
   toggleSurface,
   validateEvent,
   type BootstrapState,
@@ -413,6 +417,47 @@ describe('event validation gate (ARCHITECTURE §3.4)', () => {
     const snapshot = makeBootstrap({ snapshot_sequence: 3 });
     const bootToast = makeEvent(1, BOOT_TOAST_PAYLOAD);
     expect(validateEvent(bootToast, snapshot, snapshot.snapshot_sequence)).toBe('stale');
+  });
+});
+
+describe('terminal wire shapes', () => {
+  const envelopePayload = (call: number): { type: string; payload: Record<string, unknown> } => {
+    const args = invokeMock.mock.calls[call][1] as {
+      envelope: { payload: { type: string; payload: Record<string, unknown> } };
+    };
+    return args.envelope.payload;
+  };
+
+  it('TerminalCreate serializes exactly { request_id, cols, rows }', async () => {
+    const { requestId, promise } = createTerminal(100, 30, CONTEXT);
+    await promise;
+    const payload = envelopePayload(0);
+    expect(payload.type).toBe('terminal_create');
+    expect(payload.payload).toEqual({ request_id: requestId, cols: 100, rows: 30 });
+  });
+
+  it('TerminalInput serializes exactly { terminal_id, data }', async () => {
+    await terminalInput('term-1', 'ls\r', CONTEXT);
+    expect(envelopePayload(0)).toEqual({
+      type: 'terminal_input',
+      payload: { terminal_id: 'term-1', data: 'ls\r' },
+    });
+  });
+
+  it('TerminalResize serializes exactly { terminal_id, cols, rows }', async () => {
+    await terminalResize('term-1', 120, 40, CONTEXT);
+    expect(envelopePayload(0)).toEqual({
+      type: 'terminal_resize',
+      payload: { terminal_id: 'term-1', cols: 120, rows: 40 },
+    });
+  });
+
+  it('TerminalClose serializes exactly { terminal_id }', async () => {
+    await terminalClose('term-1', CONTEXT);
+    expect(envelopePayload(0)).toEqual({
+      type: 'terminal_close',
+      payload: { terminal_id: 'term-1' },
+    });
   });
 });
 
