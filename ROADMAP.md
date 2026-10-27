@@ -586,7 +586,9 @@ ACCEPTANCE:
 
 ## Phase 8 — Workflows (dynamic multi-agent orchestration)
 
-**Status (2026-10-27): automated implementation complete; owner acceptance pending.** The root workspace includes the workflow engine, desktop Host, run/stop/resume dispatch, live event adapter, mounted confirmation card, tool-capable subagent turns, explicit approval routing, durable journal/replay, and receipt/token accounting. `STATUS.md` records the remaining hardening limits (no grandchild kill, partial effects on redispatching an unfinished ask, no completed-history view). Manual acceptance steps remain unrun.
+**Status (2026-10-27, post-merge skeleton): automated implementation complete; post-merge gate and owner acceptance pending.** The root workspace includes the workflow engine, desktop Host, run/stop/resume dispatch, live event adapter, mounted confirmation card, tool-capable subagent turns, explicit approval routing, durable journal/replay, and receipt/token accounting. Follow-ups on the `integration` branch add completed-run history with explicit phases/reports/artifacts, budget preflight on direct resume, dirty-buffer conflict handling, and LSP reload sync; merge state is `TODO-VERIFY`.
+
+Grandchild containment now creates the `world.run` child suspended and assigns it to the Job Object before it executes. Remaining limits: an unfinished ask may already have applied tool effects when the owner chooses **Resume anyway**, and owner process-tree behavior after Stop/timeout is still unverified. Manual acceptance steps remain **UNRUN**; see `docs/PHASE8_ACCEPTANCE.md`.
 
 **Goal:** The ZCode-style dynamic workflow, inside Selora IDE: the chat agent (or the user, pasting one in) authors a small script that orchestrates *subagents* — parallel fan-outs, per-item pipelines, loops with round caps, deterministic command gates — and the IDE runs it with a live phase graph, journaled crash recovery, per-run cost accounting, and approval cards exactly like Agent Mode's.
 
@@ -647,6 +649,21 @@ ACCEPTANCE:
 ---
 
 ## Phase 9 — Agent Workbench (the full ZCode/DSH-class agent experience)
+
+**Status (2026-10-27, post-merge skeleton): NOT ACCEPTED; partial implementation.** Only the 9a frontend contract exists, on branch `selora-p3-window`; it is not merged into this documentation worktree. The backend session/todo/retry slice exists on `selora-wt-session`, but durable session persistence, resume, compaction, and the session auto-approve flag are not implemented.
+
+| Wave | State |
+|---|---|
+| 9a Agent window (frontend) | Implemented on branch; merge `TODO-VERIFY` |
+| 9b Plan mode + todos | **NOT STARTED** - no plan execution gate, no `todo_read`/`todo_write` |
+| 9b **effects wave** (approved writes) | **NOT STARTED** - writes are not structurally rejected during planning, and plan approval does not flip execution |
+| 9c Subagent runtime + escalations | **NOT STARTED** - no shared runtime, `spawn_subagent`, `ask_user_question`, or question card |
+| 9d Sessions + compaction | **PARTIAL** - in-memory authoritative sessions/todos/retry on a branch; JSONL persistence, resume picker, compaction not started |
+| 9e Background runs + notifications | **NOT STARTED** |
+
+Owner acceptance is **UNRUN**. The ROADMAP acceptance block below is the
+required checklist, mirrored in `docs/PHASE9_ACCEPTANCE.md`. Do not mark a wave
+passed from headless tests alone.
 
 **Goal:** Upgrade Agent Mode from "chat with tool cards" to a real agent workbench: a dedicated agent session window with **plan mode** (nothing writes until you approve the plan), a **live todo list** as the session's spine, **structured escalation questions**, **subagents** (spawn, steer, run in background, get notified), **resumable sessions with context compaction**, and session-scoped permission modes. This plus Phase 8 is what "agent mode like ZCode / VS Code's agent window / Claude Code ultracode-class runs" actually means.
 

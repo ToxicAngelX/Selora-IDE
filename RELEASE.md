@@ -499,6 +499,11 @@ gh repo edit --enable-discussions
 
 ## 8. The release checklist (per release)
 
+> **Current tree (2026-10-27): NOT FINALIZED.** The checklist below has not been
+> run against the merged tree. Artifacts are unsigned, no clean-VM install was
+> performed, and owner acceptance is unrun. Record the actual release in §11
+> after the final gate; do not check boxes from pre-merge evidence.
+
 ```markdown
 ## Pre-release
 
@@ -572,3 +577,87 @@ When the Lite Edition is on a public GitHub Release, the project is at a fork in
 3. **Extend.** Add a v1.x feature (built-in terminal, debugger, more languages, custom themes, Linux/macOS installers, an extension model).
 
 The plan does not choose. The owner chooses after living with the Lite Edition for a few weeks.
+
+---
+
+## 11. Post-merge release record (skeleton)
+
+> **STATUS: SKELETON (2026-10-27).** Do not publish from this section until
+> every `TODO-VERIFY` is replaced from the final commit. This section records
+> one release; the checklist in §8 is the procedure.
+
+### 11.1 Release identity
+
+| Field | Value |
+|---|---|
+| Version | `TODO-VERIFY` (all three manifests must agree) |
+| Tag | `TODO-VERIFY` (`vX.Y.Z`) |
+| Commit | `TODO-VERIFY` (full hash) |
+| Branch | `TODO-VERIFY` (must be `main` for a release tag) |
+| Date | `TODO-VERIFY` |
+| Built by | `TODO-VERIFY` |
+| Tree clean before build | `TODO-VERIFY` (`git status --short` empty) |
+
+### 11.2 Gate on the release commit
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | `TODO-VERIFY` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | `TODO-VERIFY` |
+| `cargo test --workspace --no-fail-fast` | `TODO-VERIFY` |
+| `cargo deny check` | `TODO-VERIFY` |
+| `npm run typecheck` | `TODO-VERIFY` |
+| `npm test` | `TODO-VERIFY` |
+| `npm run build` | `TODO-VERIFY` |
+| `scripts/phase8-acceptance.ps1` | `TODO-VERIFY` |
+| Phase 8 owner acceptance | **UNRUN** |
+| Phase 9 owner acceptance | **UNRUN** (partial waves) |
+
+Do not fill this table from an earlier commit. Re-run the gate on the tagged
+commit.
+
+### 11.3 Artifacts
+
+| Artifact | Path | Size | SHA-256 | Authenticode |
+|---|---|---|---|---|
+| Release app | `target\release\selora-desktop.exe` | `TODO-VERIFY` | `TODO-VERIFY` | `TODO-VERIFY` |
+| Installer | `TODO-VERIFY` | `TODO-VERIFY` | `TODO-VERIFY` | `TODO-VERIFY` |
+| Checksum file | `TODO-VERIFY` | - | - | - |
+
+Current state: **UNSIGNED**. `SIGNING_CERT_BASE64` and
+`SIGNING_CERT_PASSWORD` are not configured. Both artifacts are expected to
+report `NotSigned`; SmartScreen will warn.
+
+### 11.4 Clean-VM install
+
+| Test | Result |
+|---|---|
+| Windows 11 clean VM, installer, launch | **NOT RUN** |
+| Windows 10 without WebView2 | **NOT RUN** |
+| Per-user install (no admin prompt) | **NOT RUN** |
+| WebView2 bootstrapper skipped when runtime present | **NOT RUN** |
+| `.txt` Open-with entry | **NOT RUN** |
+| Uninstall | **NOT RUN** |
+| Launch after install | **NOT RUN** |
+
+### 11.5 Owner-only release steps
+
+- [ ] Confirm the version and tag
+- [ ] Provide signing certificate secrets, or accept unsigned artifacts
+- [ ] Run Phase 8 owner steps 1-9 (real key, real workspace, visible window)
+- [ ] Run the Phase 9 steps supported by merged waves; mark the rest blocked
+- [ ] Install on a clean Windows 11 VM
+- [ ] Optionally test Windows 10 without WebView2
+- [ ] Publish the GitHub repository/release, or change the update-check slug
+- [ ] Edit release notes from `CHANGELOG.md`
+- [ ] Publish the draft release
+
+### 11.6 Known release limits
+
+- Artifacts are unsigned and will trigger SmartScreen.
+- No clean-VM install has been performed.
+- The update check returns 404 until the public repository/release exists.
+- Phase 8 owner acceptance is unrun.
+- Phase 9 is partial: 9a branch-only, 9b-9e not implemented, 9d partial.
+- No test counts or hashes are valid until the final gate writes them here.
+- Full auto-apply remains the default composer mode pending owner confirmation.
