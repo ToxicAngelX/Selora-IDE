@@ -10,6 +10,7 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   agentDecision,
   connectApiKey,
+  deleteSession,
   disconnectApiKey,
   dispatchCommand,
   fetchModels,
@@ -310,6 +311,17 @@ describe('Z3 command wire shapes (ARCHITECTURE §2.1 & selora-protocol)', () => 
         decision: 'deny',
         resolution: { kind: 'plan', decision: 'request_changes', feedback: 'Split the step' },
       },
+    });
+  });
+});
+
+describe('Z3 session delete wire shape', () => {
+  it('delete_session serializes to the exact contract JSON', async () => {
+    await deleteSession('sess-disk', CONTEXT);
+    const args = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    expect(args.envelope.payload).toEqual({
+      type: 'delete_session',
+      payload: { session_id: 'sess-disk' },
     });
   });
 });

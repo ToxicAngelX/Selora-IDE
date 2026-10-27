@@ -436,6 +436,16 @@ impl AgentSessionStore {
         Ok(state)
     }
 
+    /// Remove a session directory and its transcript. Missing directories are
+    /// a no-op so a stale tab can still close.
+    pub fn delete(&self, session_id: &str) -> Result<(), SeloraError> {
+        let dir = self.session_dir(session_id)?;
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
     pub fn load_state(&self, session_id: &str) -> Result<Option<AgentSessionState>, SeloraError> {
         let dir = self.session_dir(session_id)?;
         let path = dir.join(STATE_FILE);

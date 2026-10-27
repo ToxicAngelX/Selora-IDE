@@ -16,6 +16,8 @@ export type AgentSessionRailProps = {
   /** Phase 9d: durable sessions from Rust not yet open in this process. */
   resumableSessions?: ResumableAgentSession[];
   onClose?: () => void;
+  /** Backend delete. Durable sessions also lose their on-disk transcript. */
+  onDelete?: (sessionId: string) => void;
 };
 
 export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
@@ -23,10 +25,26 @@ export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
   activeSessionId,
   resumableSessions = [],
   onClose,
+  onDelete,
 }) => {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.getSnapshot);
   const closedIds = new Set(sessions.map((session) => session.id));
   const resumable = resumableSessions.filter((session) => !closedIds.has(session.id));
+
+  // Delete is destructive and removes the transcript, so it always asks
+  // first. The backend still refuses while that session's turn is running.
+  const confirmDelete = (sessionId: string, title: string) => {
+    if (!onDelete) return;
+    const label = title || sessionId;
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.confirm === 'function' &&
+      !window.confirm(`Delete "${label}"? This removes the session and its transcript.`)
+    ) {
+      return;
+    }
+    onDelete(sessionId);
+  };
   return (
     <aside className="agent-session-rail" aria-label="Agent Session History">
       <div className="session-rail-header">
@@ -65,36 +83,53 @@ void agentStore.requestNewSession().then((ok) => {
             });
           };
           return (
-            <button
-              key={session.id}
-              type="button"
-              className={`session-item ${isActive ? 'is-active' : ''}`}
-              onClick={activateSession}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault();
-                  activateSession();
-                }
-              }}
-              aria-current={isActive ? 'true' : undefined}
-              style={{ textAlign: 'left' }}
-            >
-              <div className="session-item-row">
-                <span className="session-indicator" />
-                <span className="session-title" title={session.title}>
-                  {session.title}
-                </span>
-              </div>
-              <div className="session-item-meta">
-                {session.branchName && (
-                  <span className="session-branch-tag">
-                    {session.branchName}
+            <div className="session-item-wrap" key={session.id}>
+              <button
+                type="button"
+                className={`session-item ${isActive ? 'is-active' : ''}`}
+                onClick={activateSession}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    activateSession();
+                  }
+                }}
+                aria-current={isActive ? 'true' : undefined}
+                style={{ textAlign: 'left' }}
+              >
+                <div className="session-item-row">
+                  <span className="session-indicator" />
+                  <span className="session-title" title={session.title}>
+                    {session.title}
                   </span>
-                )}
-                <span className="session-id">{session.id}</span>
-                {session.isRunning && <span className="session-running-tag">Running</span>}
-              </div>
-            </button>
+                </div>
+                <div className="session-item-meta">
+                  {session.branchName && (
+                    <span className="session-branch-tag">
+                      {session.branchName}
+                    </span>
+                  )}
+                  <span className="session-id">{session.id}</span>
+                  {session.isRunning && <span className="session-running-tag">Running</span>}
+                </div>
+              </button>
+              {onDelete && (
+                <button
+                  type="button"
+                  className="session-delete"
+                  onClick={() => confirmDelete(session.id, session.title)}
+                  disabled={state.sessionBusy || session.isRunning}
+                  title={
+                    session.isRunning
+                      ? 'Stop the running turn before deleting this session.'
+                      : 'Delete session'
+                  }
+                  aria-label={`Delete session ${session.title}`}
+                >
+                  Delete
+                </button>
+              )}
+            </div>
           );
         })}
       </div>
@@ -108,8 +143,8 @@ void agentStore.requestNewSession().then((ok) => {
               onClose?.();
             };
             return (
+              <div className="session-item-wrap" key={session.id}>
               <button
-                key={session.id}
                 type="button"
                 className="session-item session-item-resumable"
                 onClick={resume}
@@ -137,6 +172,19 @@ void agentStore.requestNewSession().then((ok) => {
                   )}
                 </div>
               </button>
+              {onDelete && (
+                <button
+                  type="button"
+                  className="session-delete"
+                  onClick={() => confirmDelete(session.id, session.title)}
+                  disabled={state.sessionBusy}
+                  title="Delete session"
+                  aria-label={`Delete session ${session.title}`}
+                >
+                  Delete
+                </button>
+              )}
+              </div>
             );
           })}
         </div>

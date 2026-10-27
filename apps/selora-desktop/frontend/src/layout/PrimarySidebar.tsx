@@ -60,6 +60,7 @@ function AgentSidebarView() {
         sessions={agentState.sessions}
         activeSessionId={agentState.activeSessionId}
         resumableSessions={agentState.resumableSessions}
+        onDelete={(sessionId) => void agentStore.requestDeleteSession(sessionId)}
       />
     </div>
   );
