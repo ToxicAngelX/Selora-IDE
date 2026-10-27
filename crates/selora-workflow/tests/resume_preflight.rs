@@ -420,3 +420,60 @@ fn torn_tail_is_still_recovered_by_the_preflight() {
     );
     assert!(run_dir(workspace.path(), &id).join("spec.json").is_file());
 }
+
+#[test]
+fn budget_exhausted_run_is_refused_before_any_effect() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = prepare(
+        "budget",
+        r#"agent("a").ask("one"); agent("a").ask("two"); agent("a").ask("three");"#,
+        1.5,
+    )
+    .unwrap()
+    .spec();
+    let first_host = Arc::new(TestHost::default());
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&first_host),
+        false,
+        false,
+    );
+    assert!(matches!(result, Err(WorkflowError::BudgetExceeded { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(WorkflowEvent::Finished { report })
+            if report.status == selora_workflow::RunStatus::BudgetExceeded
+    ));
+    assert_eq!(first_host.asks.load(Ordering::SeqCst), 2);
+
+    let path = workspace.journal(&id);
+    let before = fs::read(&path).unwrap();
+    let resume_host = Arc::new(TestHost::default());
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&resume_host),
+        true,
+        false,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowError::BudgetExceeded {
+                limit: 1.5,
+                spent: 2.0
+            })
+        ),
+        "a spent grant is never resumed or raised"
+    );
+    assert!(
+        events.is_empty(),
+        "the refusal happens before the Run event"
+    );
+    assert_eq!(resume_host.asks.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&path).unwrap(), before, "journal was not touched");
+}

@@ -108,13 +108,17 @@ pub fn incomplete_asks(root: &Path, run_id: &RunId) -> Result<Vec<IncompleteAsk>
 
 /// Execute a confirmed workflow with durable, deterministic replay. Blocking.
 ///
-/// Completed runs cannot be resumed. Failed or stopped runs can resume, except
-/// when an interrupted command has an ambiguous side effect. Unfinished asks
-/// are new host dispatches and require fresh approval slots; their tools may
-/// already have partially applied effects before interruption. A resume that
-/// would dispatch one again is refused with [`WorkflowError::IncompleteAsks`]
-/// unless [`RunOptions::allow_incomplete_asks`] is true, and the refusal
-/// happens before any host call or journal append.
+/// Completed runs cannot be resumed. A run whose confirmed cost cap already
+/// fired ([`RunStatus::BudgetExceeded`]) cannot resume either: the grant is
+/// spent, resume never raises it silently, and the refusal happens before any
+/// host call or journal append. Continuing needs a new confirmed run and
+/// budget. Failed or stopped runs can resume, except when an interrupted
+/// command has an ambiguous side effect. Unfinished asks are new host dispatches
+/// and require fresh approval slots; their tools may already have partially
+/// applied effects before interruption. A resume that would dispatch one again
+/// is refused with [`WorkflowError::IncompleteAsks`] unless
+/// [`RunOptions::allow_incomplete_asks`] is true, and the refusal happens before
+/// any host call or journal append.
 ///
 /// # Errors
 /// Returns workflow errors or persistence errors before any unjournaled effect.
@@ -396,6 +400,14 @@ impl Durable {
         let scan = scan_journal(&loaded.entries, spec)?;
         if scan.finished == Some(RunStatus::Completed) {
             return Err(persistence_error("completed run cannot resume"));
+        }
+        if scan.finished == Some(RunStatus::BudgetExceeded) {
+            // The confirmed cap already fired. Resume never raises the grant:
+            // a budget that is exhausted needs a new confirmed run and budget.
+            return Err(WorkflowError::BudgetExceeded {
+                limit: spec.max_cost_usd,
+                spent: scan.spent_usd,
+            });
         }
         let calls = scan.calls;
         if calls.values().any(|call| {

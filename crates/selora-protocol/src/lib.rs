@@ -510,6 +510,10 @@ pub enum FrontendCommand {
         /// pre-flag payload resumes fail-closed.
         #[serde(default)]
         allow_incomplete_asks: bool,
+        // No `max_cost_usd` here on purpose: resume replays the confirmed
+        // grant and never raises it. A run that exhausted its cap is refused
+        // with `workflow_budget_exhausted`; continuing needs a new run and a
+        // newly confirmed budget.
     },
     WorkflowStop {
         request_id: RequestId,
@@ -2577,12 +2581,26 @@ mod tests {
         .unwrap();
         let FrontendCommand::WorkflowResume {
             allow_incomplete_asks,
-            ..
+            request_id,
+            run_id,
         } = legacy
         else {
             panic!("expected a resume command");
         };
         assert!(!allow_incomplete_asks);
+
+        // Resume carries no budget field: the confirmed grant is replayed, and
+        // a budget-exhausted run needs a new run, never a silent raise.
+        let encoded = serde_json::to_value(FrontendCommand::WorkflowResume {
+            request_id,
+            run_id,
+            allow_incomplete_asks,
+        })
+        .unwrap();
+        assert!(
+            encoded["payload"].get("max_cost_usd").is_none(),
+            "resume must not accept a replacement budget: {encoded}"
+        );
 
         // A pre-history persisted run still loads: every additive field falls
         // to its empty/default value rather than failing the bootstrap.
