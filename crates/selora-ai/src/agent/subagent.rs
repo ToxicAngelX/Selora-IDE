@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
+use super::{ApprovalCard, ApprovalId, TurnDecision};
 use crate::chat_types::ToolResult;
 
 /// A subagent is identified by an opaque id minted by the host. Script
@@ -63,11 +64,66 @@ pub enum SubagentPolicy {
 }
 
 impl SubagentPolicy {
+    /// The tools a read-only child may ever see or route.
+    pub const READ_ONLY_TOOLS: [&'static str; 6] = [
+        "read_file",
+        "list_dir",
+        "fuzzy_find",
+        "search_files",
+        "web_search",
+        "web_fetch",
+    ];
+
+    /// The full child surface: §17.1 only. Orchestration tools
+    /// (`spawn_subagent`, `ask_user_question`, `wait`, `send_message`) are
+    /// intentionally absent, so a subagent cannot fan out nested children.
+    pub const FULL_TOOLS: [&'static str; 10] = [
+        "read_file",
+        "list_dir",
+        "fuzzy_find",
+        "search_files",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "bash",
+        "web_search",
+        "web_fetch",
+    ];
+
     /// The stable wire spelling (`read_only` / `full`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
             Self::Full => "full",
+        }
+    }
+
+    /// Whether this policy permits `tool` on either router path.
+    #[must_use]
+    pub fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::ReadOnly => Self::READ_ONLY_TOOLS.contains(&tool),
+            Self::Full => Self::FULL_TOOLS.contains(&tool),
+        }
+    }
+
+    /// The manifest this policy arms. Filtering the canonical manifest keeps
+    /// names/descriptions in one place while making the absent tools a fact.
+    #[must_use]
+    pub fn manifest(self) -> Vec<crate::chat_types::ToolSpec> {
+        super::router::tool_manifest()
+            .into_iter()
+            .filter(|spec| self.allows(&spec.name))
+            .collect()
+    }
+
+    /// Parse the model-facing spelling. Unknown spellings are rejected (never
+    /// widened to `full`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read-only" | "read_only" | "readonly" => Some(Self::ReadOnly),
+            "full" => Some(Self::Full),
+            _ => None,
         }
     }
 }
@@ -171,10 +227,37 @@ impl SubagentCompletion {
 
 /// The typed event stream. Exactly one `Completed` is emitted per accepted
 /// child; cancelled children emit nothing (there is no completion to claim).
+/// `ApprovalNeeded` is the §19.3 child-card rail: a child's write/bash or
+/// question parks here and is answered through [`SubagentRuntime::decide`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SubagentEvent {
     Completed(SubagentCompletion),
+    ApprovalNeeded(SubagentCard),
+}
+
+/// A child card waiting on the parent session's normal decision rail. The id
+/// is the single-use key; `decide` consumes it before forwarding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCard {
+    pub child_id: ChildId,
+    pub parent_session: String,
+    pub approval_id: ApprovalId,
+    pub card: ApprovalCard,
+}
+
+/// Why steering or answering a child card was refused. Every message is safe
+/// to show the parent model.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SubagentControlError {
+    #[error("subagent `{0}` is unknown")]
+    Unknown(ChildId),
+    #[error("subagent `{0}` is not running")]
+    NotRunning(ChildId),
+    #[error("no matching live subagent approval (stale or already used)")]
+    StaleApproval,
+    #[error("the subagent turn is no longer live")]
+    Closed,
 }
 
 /// One spawn request. `parent_turn` is diagnostic only (the session is the
@@ -189,6 +272,17 @@ pub struct SpawnRequest {
     pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_turn: Option<String>,
+    /// Optional stable name for the transcript; the driver mints one when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional persona/system supplement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Optional seed conversation (Phase 8 passes its per-agent history).
+    /// The mission is appended as a user message regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Vec<crate::types::ChatMessage>>,
 }
 
 impl SpawnRequest {
@@ -205,6 +299,9 @@ impl SpawnRequest {
             mission: mission.into(),
             background: true,
             parent_turn: None,
+            name: None,
+            persona: None,
+            conversation: None,
         }
     }
 
@@ -215,6 +312,24 @@ impl SpawnRequest {
 
     pub fn parent_turn(mut self, turn: impl Into<String>) -> Self {
         self.parent_turn = Some(turn.into());
+        self
+    }
+
+    /// Builder-style name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Builder-style persona.
+    pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
+        self.persona = Some(persona.into());
+        self
+    }
+
+    /// Builder-style seed conversation.
+    pub fn with_conversation(mut self, conversation: Vec<crate::types::ChatMessage>) -> Self {
+        self.conversation = Some(conversation);
         self
     }
 }
@@ -374,6 +489,19 @@ struct RuntimeInner {
     /// Every accepted completion or cancellation bumps this watch. `wait`
     /// subscribes before reading the state, so no wakeup can be lost.
     changed: watch::Sender<u64>,
+    /// §19.3: the desktop relay's event sink. Broadcast alone can drop an
+    /// event emitted before its receiver subscribes, so the session installs
+    /// one sink at construction time.
+    sink: Mutex<Option<mpsc::UnboundedSender<SubagentEvent>>>,
+    /// Pending child cards: the single-use decision route. `decide` removes
+    /// the entry before forwarding, so a duplicate is inert.
+    decisions: Mutex<BTreeMap<ApprovalId, mpsc::UnboundedSender<TurnDecision>>>,
+    /// Every card id registered by a child, so the driver can forget its
+    /// stale entries when the turn ends.
+    child_cards: Mutex<BTreeMap<ChildId, BTreeSet<ApprovalId>>>,
+    /// FIFO steering channel per running child. A child drains it between
+    /// turns; a finished child has no channel and refuses steering.
+    steering: Mutex<BTreeMap<ChildId, mpsc::UnboundedSender<String>>>,
 }
 
 /// The session-owned background subagent runtime. Cloning is cheap and
@@ -420,8 +548,128 @@ impl SubagentRuntime {
                 state: Mutex::new(RuntimeState::default()),
                 events,
                 changed,
+                sink: Mutex::new(None),
+                decisions: Mutex::new(BTreeMap::new()),
+                child_cards: Mutex::new(BTreeMap::new()),
+                steering: Mutex::new(BTreeMap::new()),
             }),
         }
+    }
+
+    /// Install the session relay's event sink. Every event is also broadcast;
+    /// the sink guarantees delivery even when no broadcast receiver exists
+    /// yet.
+    pub fn set_event_sink(&self, sink: mpsc::UnboundedSender<SubagentEvent>) {
+        *self.inner.sink.lock().expect("subagent sink lock") = Some(sink);
+    }
+
+    fn emit(&self, event: SubagentEvent) {
+        if let Some(sink) = self.inner.sink.lock().expect("subagent sink lock").as_ref() {
+            let _ = sink.send(event.clone());
+        }
+        let _ = self.inner.events.send(event);
+    }
+
+    /// Register a child's steer queue. The driver owns the receiver and
+    /// clears the entry when the run ends.
+    pub fn register_steering(&self, child_id: &str, tx: mpsc::UnboundedSender<String>) {
+        self.inner
+            .steering
+            .lock()
+            .expect("subagent steering lock")
+            .insert(child_id.to_owned(), tx);
+    }
+
+    /// Queue one steering message for a running child (FIFO).
+    pub fn send_message(
+        &self,
+        child_id: &str,
+        text: impl Into<String>,
+    ) -> Result<(), SubagentControlError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(SubagentControlError::NotRunning(child_id.to_owned()));
+        }
+        if self.child_state(child_id).is_none() {
+            return Err(SubagentControlError::Unknown(child_id.to_owned()));
+        }
+        let steering = self.inner.steering.lock().expect("subagent steering lock");
+        let Some(sender) = steering.get(child_id) else {
+            return Err(SubagentControlError::NotRunning(child_id.to_owned()));
+        };
+        sender
+            .send(text)
+            .map_err(|_| SubagentControlError::NotRunning(child_id.to_owned()))
+    }
+
+    /// Register one parked child card. Called by the driver before the event
+    /// is emitted, so the card cannot be answered before it exists.
+    pub fn register_decision(
+        &self,
+        child_id: &str,
+        approval_id: ApprovalId,
+        tx: mpsc::UnboundedSender<TurnDecision>,
+    ) {
+        self.inner
+            .decisions
+            .lock()
+            .expect("subagent decision lock")
+            .insert(approval_id, tx);
+        self.inner
+            .child_cards
+            .lock()
+            .expect("subagent card lock")
+            .entry(child_id.to_owned())
+            .or_default()
+            .insert(approval_id);
+    }
+
+    /// Answer one parked child card exactly once. The entry is consumed
+    /// before forwarding, so a stale or duplicate id can never apply.
+    pub fn decide(
+        &self,
+        approval_id: ApprovalId,
+        decision: TurnDecision,
+    ) -> Result<(), SubagentControlError> {
+        let sender = self
+            .inner
+            .decisions
+            .lock()
+            .expect("subagent decision lock")
+            .remove(&approval_id)
+            .ok_or(SubagentControlError::StaleApproval)?;
+        sender
+            .send(decision)
+            .map_err(|_| SubagentControlError::Closed)
+    }
+
+    /// Drop a child's stale card entries once its turn is no longer live.
+    pub fn forget_child_cards(&self, child_id: &str) {
+        let cards = self
+            .inner
+            .child_cards
+            .lock()
+            .expect("subagent card lock")
+            .remove(child_id)
+            .unwrap_or_default();
+        let mut decisions = self.inner.decisions.lock().expect("subagent decision lock");
+        for approval_id in cards {
+            decisions.remove(&approval_id);
+        }
+    }
+
+    /// Drop a child's steer queue when its run ends.
+    pub fn forget_steering(&self, child_id: &str) {
+        self.inner
+            .steering
+            .lock()
+            .expect("subagent steering lock")
+            .remove(child_id);
+    }
+
+    /// Emit the one `ApprovalNeeded` event for a child card.
+    pub fn emit_child_card(&self, card: SubagentCard) {
+        self.emit(SubagentEvent::ApprovalNeeded(card));
     }
 
     /// Subscribe to the one-event-per-child stream. Late subscribers do not
@@ -562,7 +810,9 @@ impl SubagentRuntime {
         record.task = None;
         self.bump(&state);
         drop(state);
-        let _ = self.inner.events.send(SubagentEvent::Completed(completion));
+        self.forget_child_cards(child_id);
+        self.forget_steering(child_id);
+        self.emit(SubagentEvent::Completed(completion));
         CompletionDisposition::Emitted
     }
 
@@ -587,6 +837,9 @@ impl SubagentRuntime {
             task.abort();
         }
         self.bump(&state);
+        drop(state);
+        self.forget_child_cards(child_id);
+        self.forget_steering(child_id);
         true
     }
 
@@ -596,6 +849,7 @@ impl SubagentRuntime {
         state.cancelled_parents.insert(parent_session.to_owned());
         let generation = *state.generations.get(parent_session).unwrap_or(&0);
         let mut cancelled = 0;
+        let mut cancelled_ids = Vec::new();
         for record in state.children.values_mut() {
             if record.request.parent_session == parent_session
                 && record.generation == generation
@@ -603,6 +857,7 @@ impl SubagentRuntime {
             {
                 record.state = ChildState::Cancelled;
                 record.result = None;
+                cancelled_ids.push(record.request.child_id.clone());
                 if let Some(task) = record.task.take() {
                     task.abort();
                 }
@@ -610,6 +865,11 @@ impl SubagentRuntime {
             }
         }
         self.bump(&state);
+        drop(state);
+        for child_id in cancelled_ids {
+            self.forget_child_cards(&child_id);
+            self.forget_steering(&child_id);
+        }
         cancelled
     }
 
@@ -981,6 +1241,7 @@ fn parse_timeout(args: &serde_json::Value) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentDecision;
 
     fn request(parent: &str, child: &str) -> SpawnRequest {
         SpawnRequest::new(parent, child, SubagentPolicy::ReadOnly, "review")
@@ -1059,7 +1320,10 @@ mod tests {
             .await
             .expect("completion arrives")
             .expect("event");
-        let SubagentEvent::Completed(completion) = event;
+        let completion = match event {
+            SubagentEvent::Completed(completion) => completion,
+            other => panic!("expected a completion, got {other:?}"),
+        };
         assert_eq!(completion.child_id, "child-1");
         assert_eq!(completion.parent_session, "parent-1");
         assert_eq!(completion.policy, SubagentPolicy::ReadOnly);
@@ -1082,7 +1346,10 @@ mod tests {
         );
 
         let event = events.recv().await.expect("one event");
-        let SubagentEvent::Completed(completion) = event;
+        let completion = match event {
+            SubagentEvent::Completed(completion) => completion,
+            other => panic!("expected a completion, got {other:?}"),
+        };
         assert_eq!(completion.final_message, "done");
         assert!(
             tokio::time::timeout(Duration::from_millis(30), events.recv())
@@ -1098,7 +1365,10 @@ mod tests {
         runtime.register(request("parent-1", "child-1")).unwrap();
         assert!(runtime.fail("child-1", "gateway said no"));
 
-        let SubagentEvent::Completed(completion) = events.recv().await.unwrap();
+        let completion = match events.recv().await.unwrap() {
+            SubagentEvent::Completed(completion) => completion,
+            other => panic!("expected a completion, got {other:?}"),
+        };
         assert!(!completion.ok);
         assert_eq!(completion.error.as_deref(), Some("gateway said no"));
         assert_eq!(completion.final_message, "");
@@ -1247,7 +1517,10 @@ mod tests {
         );
         assert!(runtime.complete("child-2", ChildOutcome::success("sibling won")));
 
-        let SubagentEvent::Completed(completion) = events.recv().await.unwrap();
+        let completion = match events.recv().await.unwrap() {
+            SubagentEvent::Completed(completion) => completion,
+            other => panic!("expected a completion, got {other:?}"),
+        };
         assert_eq!(completion.child_id, "child-2");
         assert!(completion.ok);
     }
@@ -1280,5 +1553,73 @@ mod tests {
             wait_tool_result(&runtime, "parent-1", "call-3", r#"{"child_ids":["ghost"]}"#).await;
         assert!(!unknown.ok);
         assert!(unknown.content.contains("unknown subagent id"));
+    }
+
+    #[test]
+    fn child_card_is_answered_exactly_once() {
+        let runtime = SubagentRuntime::new();
+        runtime.register(request("session", "child-1")).unwrap();
+        let approval_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnDecision>();
+        runtime.register_decision("child-1", approval_id, tx);
+        runtime.emit_child_card(SubagentCard {
+            child_id: "child-1".into(),
+            parent_session: "session".into(),
+            approval_id,
+            card: ApprovalCard::Command {
+                command: "cargo test".into(),
+            },
+        });
+        assert!(runtime
+            .decide(approval_id, (approval_id, AgentDecision::Approve))
+            .is_ok());
+        let (id, decision) = rx.try_recv().expect("decision forwarded");
+        assert_eq!(id, approval_id);
+        assert_eq!(decision, AgentDecision::Approve);
+        // A stale or duplicate answer can never reach the child twice.
+        assert_eq!(
+            runtime.decide(approval_id, (approval_id, AgentDecision::Approve)),
+            Err(SubagentControlError::StaleApproval)
+        );
+        runtime.forget_child_cards("child-1");
+    }
+
+    #[test]
+    fn steering_requires_a_registered_running_child() {
+        let runtime = SubagentRuntime::new();
+        runtime.register(request("session", "child-1")).unwrap();
+        assert_eq!(
+            runtime.send_message("child-1", "look closer"),
+            Err(SubagentControlError::NotRunning("child-1".into()))
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        runtime.register_steering("child-1", tx);
+        runtime.send_message("child-1", "look closer").unwrap();
+        assert_eq!(rx.try_recv().unwrap(), "look closer");
+        runtime.forget_steering("child-1");
+        assert_eq!(
+            runtime.send_message("ghost", "hi"),
+            Err(SubagentControlError::Unknown("ghost".into()))
+        );
+    }
+
+    #[test]
+    fn event_sink_receives_cards_without_a_broadcast_subscriber() {
+        let runtime = SubagentRuntime::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        runtime.set_event_sink(tx);
+        runtime.emit_child_card(SubagentCard {
+            child_id: "child-1".into(),
+            parent_session: "session".into(),
+            approval_id: uuid::Uuid::new_v4(),
+            card: ApprovalCard::Plan {
+                summary: None,
+                steps: vec!["Inspect".into()],
+            },
+        });
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SubagentEvent::ApprovalNeeded(card) if card.child_id == "child-1"
+        ));
     }
 }

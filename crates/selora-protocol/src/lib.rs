@@ -267,6 +267,44 @@ pub enum AgentDecisionResolutionDto {
         feedback: Option<String>,
     },
 }
+
+/// One option on a structured question (Phase 9a/§19.4).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionPromptOptionDto {
+    /// Stable option id; the UI echoes it in `AgentDecisionResolution`.
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The prompt that rides an `approval_needed` card when the model asked a
+/// structured question. It mirrors the frontend's `AgentQuestionPrompt`
+/// verbatim, so the question card is one route: the normal approval park, the
+/// normal `AgentDecision` answer. The plan prompt is carried by
+/// `ApprovalNeededDto::plan` and built by the UI, so only questions need this
+/// payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionPromptDto {
+    Question {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header: Option<String>,
+        question: String,
+        #[serde(default)]
+        options: Vec<QuestionPromptOptionDto>,
+        /// Free text is offered unless the model explicitly disabled it; a
+        /// question with no options is always answerable in text.
+        #[serde(default = "default_true")]
+        allow_free_text: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        free_text_placeholder: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchQueryDto {
     pub query: String,
@@ -757,6 +795,10 @@ pub struct ApprovalDto {
     /// reload can rebuild the same plan card. Absent on every other card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanApprovalDto>,
+    /// Phase 9a/§19.4: the parked question's prompt, so a reload rebuilds the
+    /// same question card. Absent on every non-question card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_prompt: Option<DecisionPromptDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelDto {
@@ -1368,6 +1410,14 @@ pub struct ApprovalNeededDto {
     /// summary. Additive/defaulted like `workflow`; absent elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanApprovalDto>,
+    /// Phase 9a/§19.4: the structured question prompt. Additive and
+    /// defaulted like `workflow`; absent on every non-question card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<DecisionPromptDto>,
+    /// §19.3: the background child that raised this card, when it is a
+    /// subagent's write/bash/question rather than the parent turn's own call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
 }
 /// The agent status line's phase (drives the dock's ThinkingOrb state).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2610,6 +2660,8 @@ mod tests {
                 diff_or_input: Some("+fn main() {}".into()),
                 workflow: None,
                 plan: None,
+                prompt: None,
+                subagent_id: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"src/main.rs","diff_or_input":"+fn main() {}"}}"#
@@ -2626,6 +2678,8 @@ mod tests {
                 diff_or_input: None,
                 workflow: None,
                 plan: None,
+                prompt: None,
+                subagent_id: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
@@ -2648,6 +2702,8 @@ mod tests {
                 max_cost_usd: 5.0,
             }),
             plan: None,
+            prompt: None,
+            subagent_id: None,
         };
         let workflow_json =
             serde_json::to_string(&FrontendEvent::ApprovalNeeded(workflow_card.clone())).unwrap();
@@ -2932,6 +2988,7 @@ mod tests {
             summary: "write".into(),
             can_approve_all_this_turn: false,
             plan: None,
+            decision_prompt: None,
         });
         assert_eq!(
             validate_and_consume_approval(
@@ -3247,6 +3304,8 @@ mod tests {
                 summary: Some("Make the change".into()),
                 steps: vec!["Inspect".into(), "Write".into()],
             }),
+            prompt: None,
+            subagent_id: None,
         };
         let json = serde_json::to_string(&FrontendEvent::ApprovalNeeded(card.clone())).unwrap();
         assert!(json.contains("\"plan\""));
@@ -3254,6 +3313,40 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<FrontendEvent>(&json).unwrap(),
             FrontendEvent::ApprovalNeeded(card)
+        );
+
+        // A question prompt is additive too: it rides the same card and the
+        // same single-use decision route, and its answer is a resolution.
+        let question_card = ApprovalNeededDto {
+            request_id: rid("request-1"),
+            session_id: sid("session-1"),
+            turn_id: tid("turn-1"),
+            approval_id: ApprovalId::new("approval-1").unwrap(),
+            tool_name: "ask_user_question".into(),
+            path_or_command: "Which file?".into(),
+            diff_or_input: None,
+            workflow: None,
+            plan: None,
+            prompt: Some(DecisionPromptDto::Question {
+                header: None,
+                question: "Which file?".into(),
+                options: vec![QuestionPromptOptionDto {
+                    id: "src/a.rs".into(),
+                    label: "src/a.rs".into(),
+                    description: Some("left".into()),
+                }],
+                allow_free_text: true,
+                free_text_placeholder: None,
+            }),
+            subagent_id: None,
+        };
+        let question_json =
+            serde_json::to_string(&FrontendEvent::ApprovalNeeded(question_card.clone())).unwrap();
+        assert!(question_json.contains("\"prompt\""));
+        assert!(!question_json.contains("\"workflow\""));
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&question_json).unwrap(),
+            FrontendEvent::ApprovalNeeded(question_card)
         );
 
         // Pre-9b approval_needed JSON still loads with no plan.

@@ -240,6 +240,10 @@ pub struct ChatSession {
 
 /// One persisted timeline entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// The approval card family (workflow + question payloads) is intentionally
+// inline: sessions persist this enum, and boxing would churn the wire shape
+// for one card size. Phase 9c added the question payload to the same card.
+#[allow(clippy::large_enum_variant)]
 pub enum SessionEntry {
     Bubble {
         role: Role,
