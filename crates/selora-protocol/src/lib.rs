@@ -370,10 +370,30 @@ pub fn clamp_region_size(region: RegionId, size_px: f32) -> Result<f32, Protocol
     };
     Ok(size_px.clamp(min, max))
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsPatchDto {
+    #[serde(default)]
     pub reduced_motion: Option<bool>,
+    #[serde(default)]
     pub theme: Option<String>,
+    /// Editor preferences (P1 settings slice). Every field is optional and
+    /// serde-defaulted, so a pre-P1 patch (`{"theme": "light"}`) still parses.
+    #[serde(default)]
+    pub editor_font_size: Option<u32>,
+    #[serde(default)]
+    pub editor_tab_size: Option<u32>,
+    #[serde(default)]
+    pub editor_word_wrap: Option<bool>,
+    /// Rebindable keybinds (the same grammar as `Keybind::parse`). The
+    /// desktop validates and canonicalizes each one before persisting.
+    #[serde(default)]
+    pub keybind_command_palette: Option<String>,
+    #[serde(default)]
+    pub keybind_fuzzy_find: Option<String>,
+    #[serde(default)]
+    pub keybind_toggle_chat: Option<String>,
+    #[serde(default)]
+    pub keybind_save: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -394,6 +414,12 @@ pub enum FrontendCommand {
         path: WorkspacePath,
     },
     CloseBuffer {
+        buffer_id: BufferId,
+    },
+    /// P1 active-buffer fix: the web shell's tab switch. Bootstrap then
+    /// reports the buffer the user actually selected, not the first one in
+    /// path order.
+    SetActiveBuffer {
         buffer_id: BufferId,
     },
     SaveBuffer {
@@ -614,19 +640,45 @@ fn default_keybind_command_palette() -> String {
 fn default_keybind_toggle_chat() -> String {
     "Ctrl+L".into()
 }
+fn default_keybind_fuzzy_find() -> String {
+    "Ctrl+P".into()
+}
+fn default_keybind_save() -> String {
+    "Ctrl+S".into()
+}
+fn default_editor_font_size() -> u32 {
+    14
+}
+fn default_editor_tab_size() -> u32 {
+    4
+}
+fn default_editor_word_wrap() -> bool {
+    false
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsViewDto {
     pub reduced_motion: bool,
     pub theme: String,
     /// §7.1's rebindable pair, populated from `settings.keybinds` (§5.1) so a
-    /// user's egui-side rebind carries into the web shell. The other two
-    /// settings keybinds (`fuzzy_find`, `save`) are not exposed until their
-    /// slices use them.
+    /// user's egui-side rebind carries into the web shell.
     #[serde(default = "default_keybind_command_palette")]
     pub keybind_command_palette: String,
     #[serde(default = "default_keybind_toggle_chat")]
     pub keybind_toggle_chat: String,
+    /// The other two settings keybinds (`fuzzy_find`, `save`), now resolved by
+    /// the web shell's command keymap.
+    #[serde(default = "default_keybind_fuzzy_find")]
+    pub keybind_fuzzy_find: String,
+    #[serde(default = "default_keybind_save")]
+    pub keybind_save: String,
+    /// Editor preferences applied to CodeMirror at runtime.
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u32,
+    #[serde(default = "default_editor_tab_size")]
+    pub editor_tab_size: u32,
+    #[serde(default = "default_editor_word_wrap")]
+    pub editor_word_wrap: bool,
 }
 /// Phase Z2 serde defaults (§5.1 / §4.2): every field is defaulted so a
 /// partial or pre-Z2 `LayoutDto` JSON deserializes — the values are §1.1's
@@ -1612,6 +1664,11 @@ mod tests {
                 theme: "selora-dark".into(),
                 keybind_command_palette: "Ctrl+Shift+P".into(),
                 keybind_toggle_chat: "Ctrl+L".into(),
+                keybind_fuzzy_find: "Ctrl+P".into(),
+                keybind_save: "Ctrl+S".into(),
+                editor_font_size: 14,
+                editor_tab_size: 4,
+                editor_word_wrap: false,
             },
             // §1.1: the Z1 stub values (280/220, agent dock open) were
             // diagnostic placeholders — Z2's fixture carries the table's
@@ -1653,6 +1710,42 @@ mod tests {
             serde_json::from_str::<BootstrapState>(&json).unwrap(),
             state
         );
+    }
+
+    /// P1 settings slice: a pre-P1 wire view (only the original four fields)
+    /// deserializes with the documented editor/keybind defaults.
+    #[test]
+    fn settings_view_old_wire_uses_editor_and_keybind_defaults() {
+        let view: SettingsViewDto = serde_json::from_str(
+            r#"{"reduced_motion":true,"theme":"light","keybind_command_palette":"F2","keybind_toggle_chat":"Alt+L"}"#,
+        )
+        .expect("pre-P1 view must load");
+        assert!(view.reduced_motion);
+        assert_eq!(view.theme, "light");
+        assert_eq!(view.keybind_command_palette, "F2");
+        assert_eq!(view.keybind_toggle_chat, "Alt+L");
+        assert_eq!(view.editor_font_size, 14);
+        assert_eq!(view.editor_tab_size, 4);
+        assert!(!view.editor_word_wrap);
+        assert_eq!(view.keybind_fuzzy_find, "Ctrl+P");
+        assert_eq!(view.keybind_save, "Ctrl+S");
+    }
+
+    /// The patch is additive: missing fields are `None`, so an old frontend
+    /// sending only a theme still parses.
+    #[test]
+    fn settings_patch_old_wire_is_additive() {
+        let patch: SettingsPatchDto =
+            serde_json::from_str(r#"{"theme":"light"}"#).expect("old patch parses");
+        assert_eq!(patch.theme.as_deref(), Some("light"));
+        assert!(patch.reduced_motion.is_none());
+        assert!(patch.editor_font_size.is_none());
+        assert!(patch.editor_tab_size.is_none());
+        assert!(patch.editor_word_wrap.is_none());
+        assert!(patch.keybind_command_palette.is_none());
+        assert!(patch.keybind_fuzzy_find.is_none());
+        assert!(patch.keybind_toggle_chat.is_none());
+        assert!(patch.keybind_save.is_none());
     }
     #[test]
     fn serde_rejects_invalid_ids_paths() {

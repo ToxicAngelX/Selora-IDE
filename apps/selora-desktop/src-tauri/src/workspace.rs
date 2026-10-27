@@ -129,6 +129,11 @@ struct RefreshCandidate {
 pub struct Workspace {
     root: PathBuf,
     buffers: Mutex<BTreeMap<String, BufferState>>,
+    /// The buffer the user most recently opened or selected. Bootstrap
+    /// reports this instead of the first path-sorted buffer, so a tab switch
+    /// or a close never jumps to an unrelated tab. Lock order is always
+    /// `buffers` then `active`; no path takes them in the other order.
+    active: Mutex<Option<BufferId>>,
     git: Mutex<Option<selora_git::GitRepo>>,
 }
 
@@ -168,6 +173,7 @@ impl Workspace {
         Ok(Self {
             root,
             buffers: Mutex::new(BTreeMap::new()),
+            active: Mutex::new(None),
             git: Mutex::new(git),
         })
     }
@@ -204,6 +210,9 @@ impl Workspace {
             let buffers = self.buffers_lock();
             buffers.get(&rel).map(BufferState::snapshot)
         } {
+            // Re-selecting an already-open file made it active in the old
+            // single-buffer day; keep that behavior for bootstrap.
+            self.set_active_buffer(&snapshot.buffer_id)?;
             return Ok(snapshot);
         }
 
@@ -213,7 +222,7 @@ impl Workspace {
         let id = Self::buffer_id_for(&rel)?;
         let path = WorkspacePath::new(&rel).map_err(invalid_path_error)?;
         let state = BufferState {
-            id,
+            id: id.clone(),
             path,
             abs_path,
             language: language_for(Path::new(&rel)).to_owned(),
@@ -225,9 +234,17 @@ impl Workspace {
         let snapshot = state.snapshot();
         let mut buffers = self.buffers_lock();
         if let Some(existing) = buffers.get(&rel) {
-            return Ok(existing.snapshot());
+            let snapshot = existing.snapshot();
+            drop(buffers);
+            self.set_active_buffer(&snapshot.buffer_id)?;
+            return Ok(snapshot);
         }
         buffers.insert(rel, state);
+        drop(buffers);
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(id);
         Ok(snapshot)
     }
 
@@ -237,6 +254,37 @@ impl Workspace {
             .values()
             .map(BufferState::snapshot)
             .collect()
+    }
+
+    /// The buffer bootstrap should report as active. `None` only when no
+    /// buffer is open (or the recorded id somehow is not in the table).
+    pub fn active_buffer_id(&self) -> Option<selora_protocol::BufferId> {
+        let buffers = self.buffers_lock();
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        active
+            .as_ref()
+            .filter(|id| buffers.values().any(|state| &state.id == *id))
+            .cloned()
+            .or_else(|| buffers.values().next().map(|state| state.id.clone()))
+    }
+
+    /// Record the user's tab selection. Unknown ids are rejected, so a stale
+    /// frontend cannot make bootstrap point at a closed buffer.
+    pub fn set_active_buffer(&self, id: &selora_protocol::BufferId) -> WsResult<()> {
+        {
+            let buffers = self.buffers_lock();
+            if !buffers.values().any(|state| &state.id == id) {
+                return Err(unknown_buffer_error(id));
+            }
+        }
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(id.clone());
+        Ok(())
     }
 
     /// Return one open buffer by id.
@@ -250,6 +298,10 @@ impl Workspace {
     }
 
     /// Close an open buffer without saving it.
+    ///
+    /// When the closed buffer was active, selection moves to its nearest
+    /// remaining neighbor (the previous path, else the next), never to the
+    /// alphabetically first tab.
     pub fn close_buffer(&self, id: &selora_protocol::BufferId) -> WsResult<()> {
         let mut buffers = self.buffers_lock();
         let key = buffers
@@ -257,7 +309,28 @@ impl Workspace {
             .find(|(_, state)| &state.id == id)
             .map(|(key, _)| key.clone())
             .ok_or_else(|| unknown_buffer_error(id))?;
+
+        let was_active = {
+            let active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            active.as_ref() == Some(id)
+        };
         buffers.remove(&key);
+
+        if was_active {
+            let next = buffers
+                .range(..key.clone())
+                .next_back()
+                .or_else(|| buffers.range(key..).next())
+                .map(|(_, state)| state.id.clone());
+            drop(buffers);
+            *self
+                .active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = next;
+        }
         Ok(())
     }
 
@@ -1413,6 +1486,52 @@ mod tests {
         );
         assert_eq!(workspace.buffers().len(), 1);
         assert_eq!(workspace.buffers()[0].buffer_id, readme.buffer_id);
+    }
+
+    #[test]
+    fn active_buffer_tracks_switches_and_nearest_neighbor_on_close() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let readme = workspace.open_file("README.md").expect("readme");
+        let main = workspace.open_file("src/main.rs").expect("main");
+        let note = workspace.open_file("src/nested/note.txt").expect("note");
+
+        // The last open is active, not the first path.
+        assert_eq!(workspace.active_buffer_id(), Some(note.buffer_id.clone()));
+
+        // Switching tabs records the choice for the next bootstrap.
+        workspace
+            .set_active_buffer(&main.buffer_id)
+            .expect("select main");
+        assert_eq!(workspace.active_buffer_id(), Some(main.buffer_id.clone()));
+
+        // Closing the active last tab moves to its previous neighbor, not to
+        // the alphabetically first README buffer.
+        workspace
+            .set_active_buffer(&note.buffer_id)
+            .expect("select note");
+        workspace.close_buffer(&note.buffer_id).expect("close note");
+        assert_eq!(workspace.active_buffer_id(), Some(main.buffer_id.clone()));
+        assert_ne!(workspace.active_buffer_id(), Some(readme.buffer_id.clone()));
+
+        // Closing a non-active tab leaves the active one alone.
+        workspace
+            .set_active_buffer(&main.buffer_id)
+            .expect("select main");
+        workspace
+            .close_buffer(&readme.buffer_id)
+            .expect("close readme");
+        assert_eq!(workspace.active_buffer_id(), Some(main.buffer_id.clone()));
+
+        // A stale id is rejected and never becomes the active buffer.
+        assert_eq!(
+            workspace
+                .set_active_buffer(&readme.buffer_id)
+                .unwrap_err()
+                .code,
+            "unknown_buffer"
+        );
+        assert_eq!(workspace.active_buffer_id(), Some(main.buffer_id));
     }
 
     #[test]

@@ -43,6 +43,11 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
         theme: 'selora-dark',
         keybind_command_palette: 'Ctrl+Shift+P',
         keybind_toggle_chat: 'Ctrl+L',
+        keybind_fuzzy_find: 'Ctrl+P',
+        keybind_save: 'Ctrl+S',
+        editor_font_size: 14,
+        editor_tab_size: 4,
+        editor_word_wrap: false,
       });
       const onRunCommand = vi.fn();
       const bootstrap = makeBootstrap({
@@ -85,6 +90,11 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
         theme: 'selora-dark',
         keybind_command_palette: 'Ctrl+Shift+P',
         keybind_toggle_chat: 'Ctrl+L',
+        keybind_fuzzy_find: 'Ctrl+P',
+        keybind_save: 'Ctrl+S',
+        editor_font_size: 14,
+        editor_tab_size: 4,
+        editor_word_wrap: false,
       });
       const onRunCommand = vi.fn();
       const { getByRole } = render(
@@ -141,6 +151,11 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
       theme: 'selora-dark',
       keybind_command_palette: 'Ctrl+Shift+P',
       keybind_toggle_chat: 'Ctrl+L',
+      keybind_fuzzy_find: 'Ctrl+P',
+      keybind_save: 'Ctrl+S',
+      editor_font_size: 14,
+      editor_tab_size: 4,
+      editor_word_wrap: false,
     });
     const onRunCommand = vi.fn();
     const { getByRole, queryByText } = render(
@@ -155,7 +170,7 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
     expect(onRunCommand).toHaveBeenCalledWith('selora.fileOpenFolder');
 
     fireEvent.click(getByRole('button', { name: 'Edit' }));
-    fireEvent.click(getByRole('menuitem', { name: 'Find in Files' }));
+    fireEvent.click(getByRole('menuitem', { name: /Find in Files/ }));
     expect(onRunCommand).toHaveBeenCalledWith('selora.editFindInFiles');
 
     fireEvent.click(getByRole('button', { name: 'Help' }));

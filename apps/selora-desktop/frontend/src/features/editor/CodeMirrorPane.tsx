@@ -55,6 +55,7 @@ import {
   type TextChange,
 } from '../../bridge/bridge';
 import { getAppSnapshot, subscribeApp } from '../../app/app-store';
+import { keybindMatches, parseKeybind } from '../keymap/keybind';
 import { createSeloraTheme } from './cm-theme';
 import {
   currentEditorContext,
@@ -84,7 +85,57 @@ export type CodeMirrorPaneProps = {
   buffer: BufferSnapshot;
   onScroll?: (geometry: ScrollGeometry) => void;
   revealTarget?: RevealTarget | null;
+  /** Persisted editor preferences. Omitted in isolated tests = defaults. */
+  settings?: EditorPreferences;
 };
+
+/** The settings fields the pane applies to a live EditorView. */
+export type EditorPreferences = {
+  editor_font_size: number;
+  editor_tab_size: number;
+  editor_word_wrap: boolean;
+  keybind_save: string;
+};
+
+export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
+  editor_font_size: 14,
+  editor_tab_size: 4,
+  editor_word_wrap: false,
+  keybind_save: 'Ctrl+S',
+};
+
+/** Font size, tab width, word wrap, and the rebindable save chord. */
+export function editorPreferencesExtension(preferences: EditorPreferences): Extension {
+  return [
+    EditorView.theme({
+      '.cm-scroller': { fontSize: `${preferences.editor_font_size}px` },
+      '.cm-content': { tabSize: String(preferences.editor_tab_size) },
+    }),
+    // Inline content attributes make the applied values observable (and keep
+    // the editor correct even before the theme stylesheet resolves).
+    EditorView.contentAttributes.of({
+      'data-editor-font-size': String(preferences.editor_font_size),
+      'data-editor-tab-size': String(preferences.editor_tab_size),
+      'data-editor-word-wrap': String(preferences.editor_word_wrap),
+      style: `font-size: ${preferences.editor_font_size}px; tab-size: ${preferences.editor_tab_size};`,
+    }),
+    preferences.editor_word_wrap ? EditorView.lineWrapping : [],
+  ];
+}
+
+/** The save chord resolved from settings, not a hard-coded Mod-s. */
+export function saveKeymapExtension(preferences: EditorPreferences): Extension {
+  const binding =
+    parseKeybind(preferences.keybind_save) ?? parseKeybind(DEFAULT_EDITOR_PREFERENCES.keybind_save)!;
+  return EditorView.domEventHandlers({
+    keydown(event) {
+      if (!keybindMatches(binding, event)) return false;
+      event.preventDefault();
+      editorStore.saveActive();
+      return true;
+    },
+  });
+}
 
 type LocalBufferState = {
   text: string;
@@ -209,10 +260,17 @@ export function computeTextChanges(docBefore: Text, changes: ChangeSet): TextCha
   return result;
 }
 
-export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMirrorPaneProps) {
+export function CodeMirrorPane({
+  buffer,
+  onScroll,
+  revealTarget = null,
+  settings = DEFAULT_EDITOR_PREFERENCES,
+}: CodeMirrorPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const bufferRef = useRef(buffer);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   // Local document state per buffer: the text the user is looking at and the
   // version the next `apply_editor_change` must use. The local doc stays
   // authoritative until the backend echo arrives, so switching away from a
@@ -227,6 +285,8 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
   const onScrollRef = useRef(onScroll);
   const languageCompartment = useRef(new Compartment());
   const diagnosticsCompartment = useRef(new Compartment());
+  const editorPreferencesCompartment = useRef(new Compartment());
+  const saveKeymapCompartment = useRef(new Compartment());
   const diagnosticsRef = useRef<readonly Diagnostic[]>(EMPTY_DIAGNOSTICS);
   const cmTheme = useMemo(() => createSeloraTheme(), []);
 
@@ -452,15 +512,6 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
       },
     });
 
-    const saveBinding = {
-      key: 'Mod-s',
-      preventDefault: true,
-      run: (): boolean => {
-        editorStore.saveActive();
-        return true;
-      },
-    };
-
     const baseExtensions = [
       lineNumbers(),
       highlightActiveLineGutter(),
@@ -483,7 +534,6 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
       definitionClick,
       search({ top: true }),
       keymap.of([
-        saveBinding,
         definitionBinding,
         { key: 'Ctrl-Space', preventDefault: true, run: startCompletion },
         ...searchKeymap,
@@ -493,6 +543,10 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
         indentWithTab,
       ]),
       cmTheme,
+      editorPreferencesCompartment.current.of(
+        editorPreferencesExtension(settingsRef.current),
+      ),
+      saveKeymapCompartment.current.of(saveKeymapExtension(settingsRef.current)),
       EditorView.updateListener.of(handleUpdate),
     ];
 
@@ -575,6 +629,24 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
       });
     });
   }, []);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: [
+        editorPreferencesCompartment.current.reconfigure(
+          editorPreferencesExtension(settings),
+        ),
+        saveKeymapCompartment.current.reconfigure(saveKeymapExtension(settings)),
+      ],
+    });
+  }, [
+    settings.editor_font_size,
+    settings.editor_tab_size,
+    settings.editor_word_wrap,
+    settings.keybind_save,
+  ]);
 
   useEffect(() => {
     const view = viewRef.current;

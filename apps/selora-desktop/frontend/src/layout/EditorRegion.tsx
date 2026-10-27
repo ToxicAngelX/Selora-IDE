@@ -26,6 +26,7 @@ const CodeMirrorPane = lazy(async () => {
 });
 import { currentEditorContext, editorStore } from '../features/editor/editor-store';
 import { toastStore } from '../features/toasts/toast-store';
+import { getAppSnapshot, subscribeApp } from '../app/app-store';
 import { openFolderAt, pickFolder, type FileTreeNode } from '../bridge/bridge';
 
 const MINIMAP_MAX_LINES = 2000;
@@ -92,6 +93,8 @@ function minimapLines(text: string): CodeLineData[] {
 
 export function EditorRegion() {
   const editor = useSyncExternalStore(editorStore.subscribe, editorStore.getSnapshot);
+  const app = useSyncExternalStore(subscribeApp, getAppSnapshot);
+  const editorSettings = app.bootstrap?.settings;
   const [scrollGeometry, setScrollGeometry] = useState<ScrollGeometry>({
     scrollTop: 0,
     scrollHeight: 100,
@@ -221,6 +224,7 @@ export function EditorRegion() {
             buffer={active}
             onScroll={handleScroll}
             revealTarget={editor.revealTarget}
+            settings={editorSettings}
           />
         </Suspense>
         <EditorMinimap

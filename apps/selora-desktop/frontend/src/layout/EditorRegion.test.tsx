@@ -33,6 +33,7 @@ const harness = vi.hoisted(() => {
       openFile: vi.fn(() => Promise.resolve(undefined)),
       closeBuffer: vi.fn(() => Promise.resolve(undefined)),
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
+      setActiveBuffer: vi.fn(() => Promise.resolve(undefined)),
       applyEditorChange: vi.fn(() => Promise.resolve(undefined)),
       setSelection: vi.fn(() => Promise.resolve(undefined)),
     },
@@ -51,6 +52,7 @@ vi.mock('../bridge/bridge', () => ({
   openFile: harness.bridge.openFile,
   closeBuffer: harness.bridge.closeBuffer,
   saveBuffer: harness.bridge.saveBuffer,
+  setActiveBuffer: harness.bridge.setActiveBuffer,
   applyEditorChange: harness.bridge.applyEditorChange,
   setSelection: harness.bridge.setSelection,
 }));

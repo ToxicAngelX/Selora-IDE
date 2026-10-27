@@ -83,6 +83,13 @@ fn default_save() -> String {
     "Ctrl+S".into()
 }
 
+/// Inclusive ranges the desktop validates a settings patch against. Kept here
+/// so the schema's documented range and the shell's check share one source.
+pub const EDITOR_FONT_SIZE_MIN: u32 = 8;
+pub const EDITOR_FONT_SIZE_MAX: u32 = 32;
+pub const EDITOR_TAB_SIZE_MIN: u32 = 1;
+pub const EDITOR_TAB_SIZE_MAX: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // The schema.
 // ---------------------------------------------------------------------------
@@ -714,6 +721,55 @@ pub(crate) mod tests {
         assert_eq!(loaded, settings);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P1 settings slice: the editor preferences and all four keybinds
+    /// round-trip through the real file, preserving every other section.
+    #[test]
+    fn editor_preferences_and_keybinds_round_trip() {
+        let dir = temp_settings_dir("editor-keybinds");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        let mut settings = Settings::default();
+        settings.editor.font_size = 20;
+        settings.editor.tab_size = 2;
+        settings.editor.word_wrap = true;
+        settings.keybinds.save = "Ctrl+Alt+S".into();
+        settings.keybinds.fuzzy_find = "Ctrl+Shift+F".into();
+        settings.keybinds.command_palette = "F2".into();
+        settings.keybinds.toggle_chat = "Alt+L".into();
+        settings.ui.reduce_motion = true;
+        settings.ui.theme = "light".into();
+
+        settings.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.editor.font_size, 20);
+        assert_eq!(loaded.editor.tab_size, 2);
+        assert!(loaded.editor.word_wrap);
+        assert_eq!(loaded.keybinds.save, "Ctrl+Alt+S");
+        assert_eq!(loaded.keybinds.fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(loaded.keybinds.command_palette, "F2");
+        assert_eq!(loaded.keybinds.toggle_chat, "Alt+L");
+        // Unrelated sections survive the whole-file rewrite.
+        assert_eq!(loaded.agent.max_iterations, 25);
+        assert_eq!(loaded.layout, LayoutSettings::default());
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains(r#""font_size": 20"#));
+        assert!(text.contains(r#""word_wrap": true"#));
+        assert!(text.contains(r#""save": "Ctrl+Alt+S""#));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The published validation ranges are the documented ones and do not
+    /// overlap inverted (the desktop uses them for every patch).
+    #[test]
+    fn editor_range_constants_are_sane() {
+        assert_eq!((EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX), (8, 32));
+        assert_eq!((EDITOR_TAB_SIZE_MIN, EDITOR_TAB_SIZE_MAX), (1, 8));
+        assert!((EDITOR_FONT_SIZE_MIN..=EDITOR_FONT_SIZE_MAX).contains(&14));
+        assert!((EDITOR_TAB_SIZE_MIN..=EDITOR_TAB_SIZE_MAX).contains(&4));
     }
 
     #[test]

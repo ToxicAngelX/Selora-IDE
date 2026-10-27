@@ -111,4 +111,24 @@ describe('useShortcuts (ARCHITECTURE §7.1)', () => {
     });
     expect(onCommand).toHaveBeenCalledWith('selora.toggleAgentDock');
   });
+
+  it('a Save rebind resolves to the Save command and the old chord stops matching', () => {
+    const onCommand = vi.fn();
+    const rebound = { ...settings, keybind_save: 'Ctrl+Alt+S' };
+    function ReboundHarness() {
+      useShortcuts({ settings: rebound, enabled: true, paletteOpen: false, onCommand, onClosePalette: vi.fn() });
+      return <div />;
+    }
+    render(<ReboundHarness />);
+
+    act(() => {
+      press('S', { ctrlKey: true });
+    });
+    expect(onCommand).not.toHaveBeenCalled();
+
+    act(() => {
+      press('S', { ctrlKey: true, altKey: true });
+    });
+    expect(onCommand).toHaveBeenCalledWith('selora.fileSave');
+  });
 });

@@ -128,7 +128,7 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
     // "Ask anything" heads the welcome; the inert composer carries its own
     // placeholder whose copy is gated by workspace/model readiness.
     // Lazy chunk (Z6 bundle split) — resolve before asserting its chrome.
-    expect((await findByText('Ask anything')).classList.contains('empty-heading')).toBe(true);
+    expect((await findByText('Ask anything', {}, { timeout: 5000 })).classList.contains('empty-heading')).toBe(true);
     expect(
       container.querySelector('.agent-composer-placeholder')?.textContent?.trim(),
     ).toBeTruthy();
@@ -190,7 +190,11 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
       layoutStore.applyLayoutEvent(makeLayout({ activity_view: 'settings' }));
     });
     expect((await findByText('Settings')).classList.contains('sidebar-header')).toBe(true);
-    expect(await findByText('The other controls are read-only in this build.')).toBeTruthy();
+    expect(
+      await findByText(
+        'Theme, reduced motion, editor preferences, and the four keybinds save automatically through Rust.',
+      ),
+    ).toBeTruthy();
     // The settings echo carries keybinds
     expect(getAllByText('Ctrl+Shift+P').length).toBeGreaterThan(0);
     expect(getAllByText('Ctrl+L').length).toBeGreaterThan(0);

@@ -64,6 +64,8 @@ export const SURFACE_IDS: SurfaceId[] = [
 
 const DEFAULT_COMMAND_PALETTE = 'Ctrl+Shift+P';
 const DEFAULT_TOGGLE_CHAT = 'Ctrl+L';
+const DEFAULT_FUZZY_FIND = 'Ctrl+P';
+const DEFAULT_SAVE = 'Ctrl+S';
 
 type CommandEntry = {
   id: CommandId;
@@ -71,7 +73,7 @@ type CommandEntry = {
   action: CommandAction;
   /** null = no shortcut (the palette-only commands). */
   fixedBinding: string | null;
-  rebindable: 'command_palette' | 'toggle_chat' | null;
+  rebindable: 'command_palette' | 'toggle_chat' | 'fuzzy_find' | 'save' | null;
 };
 
 const COMMANDS: CommandEntry[] = [
@@ -90,10 +92,10 @@ const COMMANDS: CommandEntry[] = [
   { id: 'selora.about', title: 'About Selora', action: { kind: 'about' }, fixedBinding: null, rebindable: null },
   { id: 'selora.saveLayout', title: 'Save Layout', action: { kind: 'save-layout' }, fixedBinding: null, rebindable: null },
   { id: 'selora.fileOpenFolder', title: 'Open Folder…', action: { kind: 'open-folder' }, fixedBinding: null, rebindable: null },
-  { id: 'selora.fileSave', title: 'Save', action: { kind: 'save-active' }, fixedBinding: null, rebindable: null },
+  { id: 'selora.fileSave', title: 'Save', action: { kind: 'save-active' }, fixedBinding: null, rebindable: 'save' },
   { id: 'selora.fileCloseEditor', title: 'Close Editor', action: { kind: 'close-active' }, fixedBinding: null, rebindable: null },
   { id: 'selora.fileCloseWindow', title: 'Exit Selora IDE', action: { kind: 'close-window' }, fixedBinding: null, rebindable: null },
-  { id: 'selora.editFindInFiles', title: 'Find in Files', action: { kind: 'toggle-surface', surface: 'search' }, fixedBinding: null, rebindable: null },
+  { id: 'selora.editFindInFiles', title: 'Find in Files', action: { kind: 'toggle-surface', surface: 'search' }, fixedBinding: null, rebindable: 'fuzzy_find' },
   { id: 'selora.editCommandPalette', title: 'Command Palette', action: { kind: 'open-palette' }, fixedBinding: null, rebindable: null },
   { id: 'selora.helpDocumentation', title: 'Documentation', action: { kind: 'open-documentation' }, fixedBinding: null, rebindable: null },
 ];
@@ -192,12 +194,26 @@ export function resolveKeymap(settings: SettingsView | null): Map<CommandId, Key
     DEFAULT_TOGGLE_CHAT,
     'toggle_chat',
   );
+  const fuzzyFind = rebindableKeybind(
+    settings?.keybind_fuzzy_find ?? DEFAULT_FUZZY_FIND,
+    DEFAULT_FUZZY_FIND,
+    'fuzzy_find',
+  );
+  const save = rebindableKeybind(
+    settings?.keybind_save ?? DEFAULT_SAVE,
+    DEFAULT_SAVE,
+    'save',
+  );
   for (const entry of COMMANDS) {
     let keybind: Keybind | null = null;
     if (entry.rebindable === 'command_palette') {
       keybind = palette;
     } else if (entry.rebindable === 'toggle_chat') {
       keybind = toggleChat;
+    } else if (entry.rebindable === 'fuzzy_find') {
+      keybind = fuzzyFind;
+    } else if (entry.rebindable === 'save') {
+      keybind = save;
     } else if (entry.fixedBinding) {
       keybind = parseKeybind(entry.fixedBinding);
     }

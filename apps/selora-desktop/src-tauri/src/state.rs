@@ -1,11 +1,12 @@
 use selora_protocol::{
-    clamp_region_size, ApprovalId, BootstrapState, CoreInstanceId, DecisionDto, EventEnvelope,
-    FileTreeDto, FrontendCommand, FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto,
-    RegionId, RequestEnvelope, RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId,
-    ToastDto, ToastSeverity, WorkflowApprovalNeededDto, WorkflowArtifactDto,
-    WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto, WorkflowPhaseEventDto,
-    WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus,
-    WorkflowStepDto, WorkflowStepEventDto, WorkspaceId, PROTOCOL_VERSION,
+    clamp_region_size, ApprovalId, BootstrapState, BufferSnapshotDto, CoreInstanceId, DecisionDto,
+    EventEnvelope, FileTreeDto, FrontendCommand, FrontendEvent, LayoutConstraintsDto, LayoutDto,
+    ProtocolErrorDto, RegionId, RequestEnvelope, RequestId, SessionId, SettingsPatchDto,
+    SettingsViewDto, SurfaceId, ToastDto, ToastSeverity, WorkflowApprovalNeededDto,
+    WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto,
+    WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto,
+    WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto, WorkspaceId,
+    PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
@@ -308,12 +309,41 @@ fn settings_view(settings: &selora_settings::Settings) -> SettingsViewDto {
     SettingsViewDto {
         reduced_motion: settings.ui.reduce_motion,
         theme: settings.ui.theme.clone(),
-        // §5.1: the rebindable pair, populated from settings.keybinds so a
+        // §5.1: the rebindable set, populated from settings.keybinds so a
         // user's egui-side rebind carries into the web shell.
         keybind_command_palette: settings.keybinds.command_palette.clone(),
         keybind_toggle_chat: settings.keybinds.toggle_chat.clone(),
+        keybind_fuzzy_find: settings.keybinds.fuzzy_find.clone(),
+        keybind_save: settings.keybinds.save.clone(),
+        editor_font_size: settings.editor.font_size,
+        editor_tab_size: settings.editor.tab_size,
+        editor_word_wrap: settings.editor.word_wrap,
     }
 }
+
+/// Validate one keybind patch value and return its canonical spelling.
+/// `None` means the patch did not carry the field. Garbage is rejected with a
+/// typed error before anything touches disk.
+fn validate_keybind_patch(
+    raw: Option<&str>,
+    label: &str,
+) -> Result<Option<String>, ProtocolErrorDto> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    match selora_settings::Keybind::parse(trimmed) {
+        Some(keybind) => Ok(Some(keybind.canonical())),
+        None => Err(ProtocolErrorDto {
+            code: "invalid_settings_keybind".into(),
+            message: format!(
+                "The {label} keybind must be one chord such as Ctrl+S (got \"{trimmed}\")."
+            ),
+            retryable: false,
+        }),
+    }
+}
+
 /// §3.4 (docs/ui/PHASE_Z2_ARCHITECTURE.md): keep the most recent 1024
 /// events; a replay request older than the oldest retained event simply
 /// yields a gap at the gate and the frontend re-bootstraps — the failure
@@ -1082,6 +1112,28 @@ fn build_workflow_spec(
     })
 }
 
+/// What the user chose in the native close prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// The result of the testable close seam. `Close` means the window may close;
+/// every other variant must call `api.prevent_close()`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    /// All unsaved edits were saved (or there were none), or the user chose
+    /// discard. `saved` counts the buffers written by this close.
+    Close { saved: usize },
+    /// The user cancelled; nothing was written and the window stays open.
+    Stay,
+    /// A save failed; the window stays open and the message is shown to the
+    /// user. Earlier buffers in `saved` may already be on disk.
+    SaveFailed { saved: usize, message: String },
+}
+
 #[derive(Clone)]
 pub struct DesktopState {
     log: Arc<EventLog>,
@@ -1381,13 +1433,25 @@ impl DesktopState {
     /// `BootstrapState` event so every consumer re-reads.
     ///
     /// Invalid input is rejected before either disk or memory is touched.
+    /// Editor values are range-checked against the selora-settings
+    /// constants, and each keybind must parse with the same grammar the
+    /// frontend's keymap uses; accepted keybinds are stored canonically.
     pub fn apply_settings_update<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         patch: SettingsPatchDto,
         request_id: Option<selora_protocol::RequestId>,
     ) -> Result<BootstrapState, ProtocolErrorDto> {
-        if patch.reduced_motion.is_none() && patch.theme.is_none() {
+        if patch.reduced_motion.is_none()
+            && patch.theme.is_none()
+            && patch.editor_font_size.is_none()
+            && patch.editor_tab_size.is_none()
+            && patch.editor_word_wrap.is_none()
+            && patch.keybind_command_palette.is_none()
+            && patch.keybind_fuzzy_find.is_none()
+            && patch.keybind_toggle_chat.is_none()
+            && patch.keybind_save.is_none()
+        {
             return Err(ProtocolErrorDto {
                 code: "invalid_settings_patch".into(),
                 message: "Settings update must change at least one field.".into(),
@@ -1413,6 +1477,44 @@ impl DesktopState {
             None => None,
         };
 
+        if let Some(font_size) = patch.editor_font_size {
+            if !(selora_settings::EDITOR_FONT_SIZE_MIN..=selora_settings::EDITOR_FONT_SIZE_MAX)
+                .contains(&font_size)
+            {
+                return Err(ProtocolErrorDto {
+                    code: "invalid_settings_editor".into(),
+                    message: format!(
+                        "Editor font size must be between {} and {} px.",
+                        selora_settings::EDITOR_FONT_SIZE_MIN,
+                        selora_settings::EDITOR_FONT_SIZE_MAX
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+        if let Some(tab_size) = patch.editor_tab_size {
+            if !(selora_settings::EDITOR_TAB_SIZE_MIN..=selora_settings::EDITOR_TAB_SIZE_MAX)
+                .contains(&tab_size)
+            {
+                return Err(ProtocolErrorDto {
+                    code: "invalid_settings_editor".into(),
+                    message: format!(
+                        "Editor tab size must be between {} and {}.",
+                        selora_settings::EDITOR_TAB_SIZE_MIN,
+                        selora_settings::EDITOR_TAB_SIZE_MAX
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+
+        let command_palette =
+            validate_keybind_patch(patch.keybind_command_palette.as_deref(), "command palette")?;
+        let fuzzy_find = validate_keybind_patch(patch.keybind_fuzzy_find.as_deref(), "fuzzy find")?;
+        let toggle_chat =
+            validate_keybind_patch(patch.keybind_toggle_chat.as_deref(), "toggle chat")?;
+        let save = validate_keybind_patch(patch.keybind_save.as_deref(), "save")?;
+
         let mut settings = self
             .layout_store
             .load_settings()
@@ -1426,6 +1528,27 @@ impl DesktopState {
         }
         if let Some(theme) = theme {
             settings.ui.theme = theme;
+        }
+        if let Some(font_size) = patch.editor_font_size {
+            settings.editor.font_size = font_size;
+        }
+        if let Some(tab_size) = patch.editor_tab_size {
+            settings.editor.tab_size = tab_size;
+        }
+        if let Some(word_wrap) = patch.editor_word_wrap {
+            settings.editor.word_wrap = word_wrap;
+        }
+        if let Some(binding) = command_palette {
+            settings.keybinds.command_palette = binding;
+        }
+        if let Some(binding) = fuzzy_find {
+            settings.keybinds.fuzzy_find = binding;
+        }
+        if let Some(binding) = toggle_chat {
+            settings.keybinds.toggle_chat = binding;
+        }
+        if let Some(binding) = save {
+            settings.keybinds.save = binding;
         }
         self.layout_store
             .save_settings(&settings)
@@ -1457,7 +1580,7 @@ impl DesktopState {
         let (workspace_dto, buffers, active_buffer_id, file_tree, git) = match workspace.as_ref() {
             Some(open) => {
                 let buffers = open.buffers();
-                let active = buffers.first().map(|buffer| buffer.buffer_id.clone());
+                let active = open.active_buffer_id();
                 let tree = open.tree().unwrap_or(FileTreeDto { root: None });
                 let git = open.git_status().unwrap_or(selora_protocol::GitStatusDto {
                     branch: None,
@@ -1783,6 +1906,11 @@ impl DesktopState {
                     Some(request_id),
                 );
                 Ok(snapshot)
+            }
+            FrontendCommand::SetActiveBuffer { buffer_id } => {
+                self.with_workspace(|workspace| workspace.set_active_buffer(&buffer_id))?;
+                // The next bootstrap/event reports the true active buffer.
+                Ok(self.bootstrap())
             }
             FrontendCommand::SaveBuffer { buffer_id } => {
                 let buffer = self.with_workspace(|workspace| workspace.save_buffer(&buffer_id))?;
@@ -2327,6 +2455,58 @@ impl DesktopState {
         self.layout_store.persist_layout(&mut settings, &layout)
     }
 
+    /// Every open buffer with unsaved edits, path-sorted. The close prompt
+    /// uses this snapshot and then drops the workspace lock before showing a
+    /// native dialog.
+    pub fn dirty_buffers(&self) -> Vec<BufferSnapshotDto> {
+        self.with_workspace(|workspace| {
+            Ok(workspace
+                .buffers()
+                .into_iter()
+                .filter(|buffer| buffer.dirty)
+                .collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// The testable close seam: prompt, then save/discard/cancel. No lock is
+    /// held across `prompt`; each save re-locks the workspace. `main.rs`
+    /// supplies the real rfd dialog, tests supply a closure that returns the
+    /// choice without touching a window.
+    pub fn handle_close_request<F>(&self, prompt: F) -> CloseOutcome
+    where
+        F: FnOnce(&[BufferSnapshotDto]) -> CloseChoice,
+    {
+        let dirty = self.dirty_buffers();
+        if dirty.is_empty() {
+            return CloseOutcome::Close { saved: 0 };
+        }
+
+        match prompt(&dirty) {
+            CloseChoice::Cancel => CloseOutcome::Stay,
+            CloseChoice::Discard => CloseOutcome::Close { saved: 0 },
+            CloseChoice::Save => {
+                let mut saved = 0;
+                for buffer in &dirty {
+                    if let Err(error) =
+                        self.with_workspace(|workspace| workspace.save_buffer(&buffer.buffer_id))
+                    {
+                        return CloseOutcome::SaveFailed {
+                            saved,
+                            message: format!(
+                                "Could not save '{}': {}",
+                                buffer.path.as_str(),
+                                error.message
+                            ),
+                        };
+                    }
+                    saved += 1;
+                }
+                CloseOutcome::Close { saved }
+            }
+        }
+    }
+
     /// The §2.4 emitter, now a delegation to the shared [`EventLog`] (Z3:
     /// the session relays record through the same seam). Runtime-generic
     /// so hermetic tests can drive it with `tauri::test`'s mock runtime
@@ -2782,6 +2962,7 @@ mod tests {
                         patch: SettingsPatchDto {
                             reduced_motion: Some(true),
                             theme: Some("light".into()),
+                            ..Default::default()
                         },
                     },
                 ),
@@ -2828,6 +3009,7 @@ mod tests {
                         patch: SettingsPatchDto {
                             reduced_motion: Some(true),
                             theme: Some("not-a-theme".into()),
+                            ..Default::default()
                         },
                     },
                 ),
@@ -2836,6 +3018,144 @@ mod tests {
 
         assert_eq!(error.code, "invalid_settings_theme");
         assert!(!error.retryable);
+        assert_eq!(state.bootstrap().settings, before, "memory is unchanged");
+        assert!(state.events_after(0).is_empty(), "no event is published");
+        assert!(!path.exists(), "invalid input never writes settings.json");
+    }
+
+    #[test]
+    fn settings_update_persists_editor_preferences_and_all_four_keybinds() {
+        let app = mock_app_handle();
+        let path = temp_settings_path("settings-editor-keybinds");
+        let _ = std::fs::remove_file(&path);
+        let state = DesktopState::from_settings_path(path.clone());
+
+        let returned = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SettingsUpdate {
+                        patch: SettingsPatchDto {
+                            editor_font_size: Some(18),
+                            editor_tab_size: Some(2),
+                            editor_word_wrap: Some(true),
+                            keybind_command_palette: Some("f2".into()),
+                            keybind_fuzzy_find: Some("ctrl + shift + f".into()),
+                            keybind_toggle_chat: Some("Alt+L".into()),
+                            keybind_save: Some("Ctrl+Alt+S".into()),
+                            ..Default::default()
+                        },
+                    },
+                ),
+            )
+            .expect("editor settings update succeeds");
+
+        // The view carries the persisted values and canonical keybinds.
+        assert_eq!(returned.settings.editor_font_size, 18);
+        assert_eq!(returned.settings.editor_tab_size, 2);
+        assert!(returned.settings.editor_word_wrap);
+        assert_eq!(returned.settings.keybind_command_palette, "F2");
+        assert_eq!(returned.settings.keybind_fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(returned.settings.keybind_toggle_chat, "Alt+L");
+        assert_eq!(returned.settings.keybind_save, "Ctrl+Alt+S");
+
+        let persisted = selora_settings::Settings::load_from(&path).expect("reload settings");
+        assert_eq!(persisted.editor.font_size, 18);
+        assert_eq!(persisted.editor.tab_size, 2);
+        assert!(persisted.editor.word_wrap);
+        assert_eq!(persisted.keybinds.command_palette, "F2");
+        assert_eq!(persisted.keybinds.fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(persisted.keybinds.toggle_chat, "Alt+L");
+        assert_eq!(persisted.keybinds.save, "Ctrl+Alt+S");
+        // A save preserves the unrelated sections.
+        assert_eq!(persisted.ui.theme, "selora-dark");
+        assert_eq!(persisted.agent.max_iterations, 25);
+
+        // A fresh state over the same file boots with the saved values.
+        let reopened = DesktopState::from_settings_path(path.clone());
+        assert_eq!(reopened.bootstrap().settings, returned.settings);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_update_rejects_editor_ranges_and_bad_keybinds_without_mutation() {
+        let app = mock_app_handle();
+        let path = temp_settings_path("settings-editor-ranges");
+        let _ = std::fs::remove_file(&path);
+        let state = DesktopState::from_settings_path(path.clone());
+        let before = state.bootstrap().settings;
+
+        let patches = [
+            (
+                SettingsPatchDto {
+                    editor_font_size: Some(selora_settings::EDITOR_FONT_SIZE_MIN - 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_font_size: Some(selora_settings::EDITOR_FONT_SIZE_MAX + 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_tab_size: Some(0),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_tab_size: Some(selora_settings::EDITOR_TAB_SIZE_MAX + 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    keybind_save: Some("Ctrl+Shift+P+L".into()),
+                    ..Default::default()
+                },
+                "invalid_settings_keybind",
+            ),
+            (
+                SettingsPatchDto {
+                    keybind_fuzzy_find: Some("   ".into()),
+                    ..Default::default()
+                },
+                "invalid_settings_keybind",
+            ),
+        ];
+
+        for (patch, code) in patches {
+            let error = state
+                .dispatch(
+                    &app,
+                    envelope(&state, FrontendCommand::SettingsUpdate { patch }),
+                )
+                .expect_err("invalid patch is rejected");
+            assert_eq!(error.code, code);
+            assert!(!error.retryable);
+        }
+
+        let empty = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SettingsUpdate {
+                        patch: SettingsPatchDto::default(),
+                    },
+                ),
+            )
+            .expect_err("an empty patch is rejected");
+        assert_eq!(empty.code, "invalid_settings_patch");
+
         assert_eq!(state.bootstrap().settings, before, "memory is unchanged");
         assert!(state.events_after(0).is_empty(), "no event is published");
         assert!(!path.exists(), "invalid input never writes settings.json");
@@ -3248,6 +3568,239 @@ mod tests {
             )
             .expect("open folder");
         dir
+    }
+
+    /// Open `path`, insert `insert` at the start, and return the dirty buffer id.
+    fn open_and_dirty(
+        state: &DesktopState,
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        path: &str,
+        insert: &str,
+    ) -> selora_protocol::BufferId {
+        let opened = state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::OpenFile {
+                        path: selora_protocol::WorkspacePath::new(path).expect("path"),
+                    },
+                ),
+            )
+            .expect("open file");
+        let buffer = opened
+            .buffers
+            .iter()
+            .find(|candidate| candidate.path.as_str() == path)
+            .expect("buffer present")
+            .clone();
+        state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: buffer.buffer_id.clone(),
+                        version: buffer.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            replacement: insert.into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("apply edit");
+        buffer.buffer_id
+    }
+
+    #[test]
+    fn z4_close_prompt_cancel_keeps_edits_and_stays_open() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let id = open_and_dirty(&state, &app, "hello.rs", "// cancel\n");
+        let prompted = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = prompted.clone();
+
+        let outcome = state.handle_close_request(|dirty| {
+            seen.store(true, Ordering::SeqCst);
+            assert_eq!(dirty.len(), 1);
+            assert_eq!(dirty[0].path.as_str(), "hello.rs");
+            CloseChoice::Cancel
+        });
+
+        assert_eq!(outcome, CloseOutcome::Stay);
+        assert!(prompted.load(Ordering::SeqCst), "the prompt ran");
+        assert!(state
+            .bootstrap()
+            .buffers
+            .iter()
+            .any(|buffer| buffer.buffer_id == id && buffer.dirty));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).expect("read"),
+            "fn main() {}\n",
+            "cancel never writes"
+        );
+    }
+
+    #[test]
+    fn z4_close_prompt_discard_closes_without_saving() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        open_and_dirty(&state, &app, "hello.rs", "// discard\n");
+
+        let outcome = state.handle_close_request(|_| CloseChoice::Discard);
+
+        assert_eq!(outcome, CloseOutcome::Close { saved: 0 });
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).expect("read"),
+            "fn main() {}\n",
+            "discard never writes"
+        );
+    }
+
+    #[test]
+    fn z4_close_prompt_save_writes_every_dirty_buffer_then_closes() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        open_and_dirty(&state, &app, "hello.rs", "// save hello\n");
+        open_and_dirty(&state, &app, "src/lib.rs", "// save lib\n");
+        assert_eq!(state.dirty_buffers().len(), 2);
+
+        let outcome = state.handle_close_request(|dirty| {
+            assert_eq!(dirty.len(), 2);
+            CloseChoice::Save
+        });
+
+        assert_eq!(outcome, CloseOutcome::Close { saved: 2 });
+        assert!(state.dirty_buffers().is_empty(), "every save cleared dirty");
+        assert!(std::fs::read_to_string(dir.path().join("hello.rs"))
+            .expect("read")
+            .starts_with("// save hello\n"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("src").join("lib.rs"))
+                .expect("read")
+                .starts_with("// save lib\n")
+        );
+    }
+
+    #[test]
+    fn z4_close_with_no_dirty_buffers_skips_the_prompt() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: selora_protocol::WorkspacePath::new("hello.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open clean file");
+
+        let outcome = state.handle_close_request(|_| panic!("no prompt for clean buffers"));
+        assert_eq!(outcome, CloseOutcome::Close { saved: 0 });
+    }
+
+    #[test]
+    fn z4_bootstrap_reports_switched_and_neighbor_active_buffer() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        std::fs::write(dir.path().join("aaa.txt"), "a\n").expect("seed aaa");
+        std::fs::write(dir.path().join("zzz.txt"), "z\n").expect("seed zzz");
+
+        let open = |path: &str| {
+            state
+                .dispatch(
+                    &app,
+                    envelope(
+                        &state,
+                        FrontendCommand::OpenFile {
+                            path: selora_protocol::WorkspacePath::new(path).expect("path"),
+                        },
+                    ),
+                )
+                .expect("open file")
+        };
+
+        let aaa = open("aaa.txt");
+        let aaa_id = aaa
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "aaa.txt")
+            .expect("aaa")
+            .buffer_id
+            .clone();
+        let zzz = open("zzz.txt");
+        let zzz_id = zzz
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "zzz.txt")
+            .expect("zzz")
+            .buffer_id
+            .clone();
+        // The last opened buffer is active.
+        assert_eq!(zzz.active_buffer_id, Some(zzz_id.clone()));
+
+        // A tab switch is recorded and the next bootstrap reports it.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: aaa_id.clone(),
+                    },
+                ),
+            )
+            .expect("switch tab");
+        assert_eq!(state.bootstrap().active_buffer_id, Some(aaa_id.clone()));
+
+        // Close the non-active zzz; active stays aaa.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: zzz_id.clone(),
+                    },
+                ),
+            )
+            .expect("close zzz");
+        assert_eq!(state.bootstrap().active_buffer_id, Some(aaa_id.clone()));
+
+        // Closing the active tab reports a real neighbor, never a stale id.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: aaa_id.clone(),
+                    },
+                ),
+            )
+            .expect("close aaa");
+        let after = state.bootstrap();
+        assert_ne!(after.active_buffer_id, Some(aaa_id));
+        assert!(after
+            .active_buffer_id
+            .as_ref()
+            .is_none_or(|id| after.buffers.iter().any(|buffer| &buffer.buffer_id == id)));
     }
 
     #[test]

@@ -202,6 +202,91 @@ describe('CodeMirrorPane mount', () => {
     saveSpy.mockRestore();
   });
 
+  it('resolves the save chord from settings, so a rebind changes behavior', async () => {
+    const saveSpy = vi.spyOn(editorStore, 'saveActive').mockImplementation(() => undefined);
+    const { container } = render(
+      <CodeMirrorPane
+        buffer={buffer}
+        settings={{
+          editor_font_size: 14,
+          editor_tab_size: 4,
+          editor_word_wrap: false,
+          keybind_save: 'Ctrl+Alt+S',
+        }}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('.cm-editor')).not.toBeNull();
+    });
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>('.cm-editor')!);
+
+    const oldChord = new KeyboardEvent('keydown', {
+      key: 's',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    view!.contentDOM.dispatchEvent(oldChord);
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    const rebound = new KeyboardEvent('keydown', {
+      key: 's',
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    view!.contentDOM.dispatchEvent(rebound);
+    expect(rebound.defaultPrevented).toBe(true);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    saveSpy.mockRestore();
+  });
+
+  it('applies font size, tab size, and word wrap at runtime', async () => {
+    const { container, rerender } = render(
+      <CodeMirrorPane
+        buffer={buffer}
+        settings={{
+          editor_font_size: 18,
+          editor_tab_size: 2,
+          editor_word_wrap: true,
+          keybind_save: 'Ctrl+S',
+        }}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('.cm-editor')).not.toBeNull();
+    });
+    const scroller = container.querySelector<HTMLElement>('.cm-scroller')!;
+    const content = container.querySelector<HTMLElement>('.cm-content')!;
+    expect(scroller).not.toBeNull();
+    expect(content.style.fontSize).toBe('18px');
+    expect(content.style.tabSize).toBe('2');
+    expect(content.dataset.editorFontSize).toBe('18');
+    expect(content.dataset.editorTabSize).toBe('2');
+    expect(content.dataset.editorWordWrap).toBe('true');
+    expect(content.classList.contains('cm-lineWrapping')).toBe(true);
+
+    rerender(
+      <CodeMirrorPane
+        buffer={buffer}
+        settings={{
+          editor_font_size: 22,
+          editor_tab_size: 8,
+          editor_word_wrap: false,
+          keybind_save: 'Ctrl+S',
+        }}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector<HTMLElement>('.cm-content')!.style.fontSize).toBe('22px');
+    });
+    const next = container.querySelector<HTMLElement>('.cm-content')!;
+    expect(next.style.tabSize).toBe('8');
+    expect(next.dataset.editorWordWrap).toBe('false');
+    expect(next.classList.contains('cm-lineWrapping')).toBe(false);
+  });
+
   it('reports the debounced selection with the current version', async () => {
     vi.mocked(setSelection).mockClear();
     const { container } = render(<CodeMirrorPane buffer={buffer} />);
