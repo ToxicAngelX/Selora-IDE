@@ -113,6 +113,11 @@ export type AgentState = {
 const STORED_SETTINGS_KEY = 'selora:model_settings';
 
 const INITIAL_SESSIONS: AgentSession[] = [];
+/**
+ * Session-scoped permission default (Phase 9): auto-approve is never a
+ * persisted trust grant. A restart, a reset, or a new session starts here.
+ */
+const DEFAULT_PERMISSION_MODE: PermissionMode = 'ask_before_change';
 
 function loadStoredSettings(): ModelSettings {
   try {
@@ -207,7 +212,7 @@ let state: AgentState = {
   artifacts: INITIAL_ARTIFACTS,
   inFlight: false,
   thinkingState: 'breathing',
-  permissionMode: 'full',
+  permissionMode: DEFAULT_PERMISSION_MODE,
   reasoningEffort: 'max',
   selectedModel: '',
   availableModels: [],
@@ -983,6 +988,7 @@ const activeSessionId =
       revealedSubagentId: null,
       inFlight: false,
       thinkingState: 'breathing',
+      permissionMode: DEFAULT_PERMISSION_MODE,
       streamingActivityLevel: 0,
       promptQueue: [],
       availableModels: [],
@@ -1072,6 +1078,8 @@ const activeSessionId =
       plan: null,
       inFlight: false,
       thinkingState: 'breathing',
+      // The flag dies with the session that enabled it.
+      permissionMode: DEFAULT_PERMISSION_MODE,
       promptQueue: [],
     };
     notify();

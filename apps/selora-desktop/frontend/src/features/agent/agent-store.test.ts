@@ -1409,4 +1409,22 @@ describe('Phase 9e background subagent completions', () => {
     expect(child?.unread).toBe(false);
     expect(snapshot.unreadSubagentCount).toBe(0);
   });
+
+  it('never carries auto-approve across a restart or into a new session', async () => {
+    // Auto-approve is session-scoped (Phase 9): enabling it must not become a
+    // persisted trust grant. A restart, a reset, and a new session all start
+    // at the ask-before-change default.
+    agentStore.setPermissionMode('full');
+    agentStore.reset();
+    expect(agentStore.getSnapshot().permissionMode).toBe('ask_before_change');
+
+    agentStore.setPermissionMode('full');
+    agentStore.createSession('fresh session');
+    expect(agentStore.getSnapshot().permissionMode).toBe('ask_before_change');
+
+    // A real restart re-evaluates the module's initial state.
+    vi.resetModules();
+    const restarted = await import('./agent-store');
+    expect(restarted.agentStore.getSnapshot().permissionMode).toBe('ask_before_change');
+  });
 });
