@@ -1,6 +1,6 @@
 // Selora IDE — AgentSessionRail accessibility tests
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import React from 'react';
 import { AgentSessionRail } from './AgentSessionRail';
 import { agentStore } from '../agent-store';
@@ -12,18 +12,16 @@ const sessions: AgentSession[] = [
     title: 'Current session',
     createdAt: 1,
     updatedAt: 2,
-    tokenCount: 1200,
-    costUsd: 0.01,
-    branchName: 'main',
+    tokenCount: 0,
+    costUsd: 0,
   },
   {
     id: 'sess-older',
     title: 'Older session',
     createdAt: 3,
     updatedAt: 4,
-    tokenCount: 2400,
-    costUsd: 0.02,
-    branchName: 'feature/a11y',
+    tokenCount: 0,
+    costUsd: 0,
   },
 ];
 
@@ -48,8 +46,8 @@ describe('AgentSessionRail', () => {
     expect(otherRow?.hasAttribute('aria-current')).toBe(false);
   });
 
-  it('switches sessions with both Enter and Space', () => {
-    const switchSpy = vi.spyOn(agentStore, 'switchSession').mockImplementation(() => {});
+  it('calls the backend switch command with both Enter and Space', async () => {
+    const switchSpy = vi.spyOn(agentStore, 'switchSession').mockResolvedValue(true);
     const onClose = vi.fn();
     const { getByText } = render(
       <AgentSessionRail
@@ -62,11 +60,12 @@ describe('AgentSessionRail', () => {
     expect(otherRow).toBeTruthy();
 
     fireEvent.keyDown(otherRow!, { key: 'Enter' });
-    expect(switchSpy).toHaveBeenLastCalledWith('sess-older');
+    await waitFor(() => expect(switchSpy).toHaveBeenLastCalledWith('sess-older'));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
 
     expect(fireEvent.keyDown(otherRow!, { key: ' ' })).toBe(false);
-    expect(switchSpy).toHaveBeenCalledTimes(2);
-    expect(onClose).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(switchSpy).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(2));
 
     switchSpy.mockRestore();
   });

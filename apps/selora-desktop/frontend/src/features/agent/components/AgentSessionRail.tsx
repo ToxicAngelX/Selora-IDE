@@ -26,10 +26,13 @@ export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
           type="button"
           className="btn-new-session"
           onClick={() => {
-            agentStore.createSession();
-            onClose?.();
+            // Rust creates and selects the session, then emits the snapshot
+            // this rail hydrates from. No local placeholder row.
+            void agentStore.createSession().then((ok) => {
+              if (ok) onClose?.();
+            });
           }}
-          title="New agent session (Ctrl+N)"
+          title="New agent session"
           style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}
         >
           <Plus size={12} />
@@ -41,8 +44,9 @@ export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
         {sessions.map((session) => {
           const isActive = session.id === activeSessionId;
           const activateSession = () => {
-            agentStore.switchSession(session.id);
-            onClose?.();
+            void agentStore.switchSession(session.id).then((ok) => {
+              if (ok) onClose?.();
+            });
           };
 
           return (
@@ -64,16 +68,6 @@ export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
                 <span className="session-indicator" />
                 <span className="session-title" title={session.title}>
                   {session.title}
-                </span>
-              </div>
-              <div className="session-item-meta">
-                {session.branchName && (
-                  <span className="session-branch-tag">
-                    {session.branchName}
-                  </span>
-                )}
-                <span className="session-tokens">
-                  {(session.tokenCount / 1000).toFixed(1)}k tokens
                 </span>
               </div>
             </button>

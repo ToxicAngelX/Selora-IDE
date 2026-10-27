@@ -3,7 +3,11 @@
 // status bar contents — and region open/close state follows the live layout
 // store (event-driven, not optimistic).
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, configure, fireEvent, render, waitFor, within } from '@testing-library/react';
+
+// The shell's route modules are lazy chunks; under the full parallel suite a
+// cold transform can exceed the 1s default. Give the lazy mount room.
+configure({ asyncUtilTimeout: 5000 });
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));

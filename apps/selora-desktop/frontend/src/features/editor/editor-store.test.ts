@@ -33,6 +33,7 @@ const harness = vi.hoisted(() => {
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
       reloadBufferFromDisk: vi.fn(() => Promise.resolve(undefined)),
       keepBufferEdits: vi.fn(() => Promise.resolve(undefined)),
+      setActiveBuffer: vi.fn(() => Promise.resolve(undefined)),
     },
   };
 });
@@ -49,6 +50,7 @@ vi.mock('../../bridge/bridge', () => ({
   saveBuffer: harness.bridge.saveBuffer,
   reloadBufferFromDisk: harness.bridge.reloadBufferFromDisk,
   keepBufferEdits: harness.bridge.keepBufferEdits,
+  setActiveBuffer: harness.bridge.setActiveBuffer,
 }));
 
 import { activeEditorContext, editorStore, recordEditorSelection } from './editor-store';

@@ -4,7 +4,7 @@
 // - Reasoning Accordion with live elapsed stopwatch & checkpoint breakdown
 // - Tool Execution Cards with glowing status borders & overhauled diffs
 // - Markdown Code Blocks with language badges, copy feedback, & "Apply to Editor"
-// - User message bubble actions: Copy, Rewind, Edit, Fork with sleek tooltips
+// - User message bubble actions: Copy, Rewind, Edit, Retry with sleek tooltips
 import React, { useRef, useEffect, useState } from 'react';
 import {
   BrainCircuit,
@@ -13,7 +13,6 @@ import {
   Check,
   Edit,
   RotateLeft,
-  GitBranch,
   DirectSend,
   X,
 } from '../../../components/icons';
@@ -291,18 +290,18 @@ export const AgentExecutionFeed: React.FC<AgentExecutionFeedProps> = ({
                         <span className="btn-tooltip-label">Edit</span>
                       </button>
 
-                      {/* Fork Session Button */}
+                      {/* Retry Button: backend truncates the tail and re-dispatches */}
                       <button
                         type="button"
                         className="user-action-btn"
                         onClick={() => {
-                          agentStore.forkSessionFromPrompt(msg.id);
+                          void agentStore.retryMessage(msg.id);
                         }}
-                        title="Fork new branch session from this checkpoint"
-                        aria-label="Fork session"
+                        title="Retry this prompt (removes the failed tail and re-sends once)"
+                        aria-label="Retry from this prompt"
                       >
-                        <GitBranch size={12} />
-                        <span className="btn-tooltip-label">Fork</span>
+                        <RotateLeft size={12} />
+                        <span className="btn-tooltip-label">Retry</span>
                       </button>
                     </div>
                   )}

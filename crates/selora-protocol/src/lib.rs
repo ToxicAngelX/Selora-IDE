@@ -471,6 +471,13 @@ pub enum FrontendCommand {
         session_id: SessionId,
     },
     NewSession,
+    /// Phase 9 session slice: record the buffer the user is actually looking
+    /// at, so the next bootstrap reports it instead of the first buffer in
+    /// path order. Additive to protocol_version 1: older clients simply never
+    /// send it and keep the path-order fallback.
+    SetActiveBuffer {
+        buffer_id: BufferId,
+    },
     Search {
         query: SearchQueryDto,
     },
@@ -597,6 +604,28 @@ pub struct SessionDto {
     pub title: String,
     pub message_ids: Vec<MessageId>,
     pub active: bool,
+    /// Phase 9 session slice: this session's authoritative todo list, written
+    /// only by the `manage_todo` tool. Additive: a pre-Phase-9 snapshot
+    /// deserializes as an empty list.
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
+}
+/// One authoritative session todo (`manage_todo`), in the order the tool
+/// stored it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodoDto {
+    /// The tool-supplied stable id, unique within the session.
+    pub id: String,
+    /// The task text, already validated and length-bounded by the tool.
+    pub text: String,
+    pub status: TodoStatusDto,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatusDto {
+    Pending,
+    InProgress,
+    Completed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageDto {
@@ -636,6 +665,11 @@ pub struct ChatStateDto {
     pub active_request_id: Option<RequestId>,
     pub active_turn_id: Option<TurnId>,
     pub pending_approval: Option<ApprovalDto>,
+    /// Phase 9 session slice: the active session's authoritative todo list.
+    /// Additive and serde-defaulted, so a pre-Phase-9 bootstrap loads with no
+    /// todos rather than failing. Per-session copies ride [`SessionDto`].
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -959,6 +993,40 @@ pub struct BootstrapState {
     /// arrive as `workflow_*` events instead.
     #[serde(default)]
     pub workflows: Vec<WorkflowPersistedRunDto>,
+}
+
+/// The reply shape of `dispatch_command` (P1 state slice).
+///
+/// Additive strategy: the union is untagged, so every reply is still one JSON
+/// object. `GetBootstrapState` (and the two folder-open commands) keep the
+/// exact pre-existing `BootstrapState` shape, so a protocol client that reads
+/// those replies is unaffected. Commands that previously answered
+/// `unsupported_phase_slice`, plus event-backed mutations, may answer the
+/// small [`CommandAckDto`] instead: a client that only used the event stream
+/// (the shipped frontend) sees no difference, and a client that reads the
+/// reply can distinguish the two by `acknowledged`. `protocol_version` stays
+/// 1 because the variants are additive.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CommandResultDto {
+    Snapshot(Box<BootstrapState>),
+    Ack(CommandAckDto),
+}
+
+/// A mutation acknowledgement: the core identity, the log position after the
+/// mutation, and the session the engine now considers active (if any). It is
+/// intentionally much smaller than a `BootstrapState` (no tree walk, no
+/// libgit2 status, no transcript).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandAckDto {
+    pub protocol_version: u32,
+    pub core_instance_id: CoreInstanceId,
+    pub snapshot_sequence: u64,
+    /// Always true: the command was accepted and the mutation applied (or was
+    /// an idempotent no-op). Failures come back as `ProtocolErrorDto`.
+    pub acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 /// One durable run discovered under `.selora/workflow-runs/` at bootstrap.
@@ -1481,7 +1549,19 @@ pub enum FrontendEvent {
     WorkflowArtifact(WorkflowArtifactEventDto),
     WorkflowApprovalNeeded(WorkflowApprovalNeededDto),
     WorkflowFinished(WorkflowFinishedDto),
+    // Phase 9 session slice: the `manage_todo` tool wrote a session's list.
+    // The full list is authoritative; the active session's copy is also in
+    // the next `ChatStateDto`. Additive (protocol_version stays 1).
+    SessionTodosChanged(SessionTodosDto),
     Error(ProtocolErrorDto),
+}
+
+/// The `manage_todo` write announcement. Carries the whole stored list so a
+/// concurrent switch cannot make the frontend apply another session's todos.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionTodosDto {
+    pub session_id: SessionId,
+    pub todos: Vec<TodoDto>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1686,12 +1766,14 @@ mod tests {
                     title: "Welcome".into(),
                     message_ids: vec![],
                     active: true,
+                    todos: vec![],
                 }],
                 messages: vec![],
                 active_session_id: None,
                 active_request_id: None,
                 active_turn_id: None,
                 pending_approval: None,
+                todos: vec![],
             },
             settings: SettingsViewDto {
                 reduced_motion: false,
@@ -2307,6 +2389,68 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
+    #[test]
+    fn p9_todos_and_command_results_are_additive() {
+        // A pre-Phase-9 chat snapshot (no todos) still loads: the additive
+        // fields default to empty lists.
+        let chat = serde_json::from_str::<ChatStateDto>(
+            r#"{"sessions":[{"session_id":"s","title":"t","message_ids":[],"active":true}],
+                "messages":[],"active_session_id":null,"active_request_id":null,
+                "active_turn_id":null,"pending_approval":null}"#,
+        )
+        .unwrap();
+        assert!(chat.todos.is_empty());
+        assert!(chat.sessions[0].todos.is_empty());
+
+        // The full list round-trips, including the status spelling.
+        let with_todos = ChatStateDto {
+            todos: vec![TodoDto {
+                id: "t1".into(),
+                text: "build".into(),
+                status: TodoStatusDto::InProgress,
+            }],
+            ..chat.clone()
+        };
+        let json = serde_json::to_string(&with_todos).unwrap();
+        assert!(json.contains(r#""status":"in_progress""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ChatStateDto>(&json).unwrap(),
+            with_todos
+        );
+
+        // A full snapshot still parses as the snapshot arm; an ack parses as
+        // the small arm. The reply is always one JSON object.
+        let snapshot = sample();
+        let reply = CommandResultDto::Snapshot(Box::new(snapshot.clone()));
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandResultDto>(&json).unwrap(),
+            reply
+        );
+        let ack = CommandResultDto::Ack(CommandAckDto {
+            protocol_version: PROTOCOL_VERSION,
+            core_instance_id: cid("core-1"),
+            snapshot_sequence: 42,
+            acknowledged: true,
+            session_id: Some(sid("session-1")),
+        });
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.len() < serde_json::to_string(&snapshot).unwrap().len());
+        assert_eq!(
+            serde_json::from_str::<CommandResultDto>(&json).unwrap(),
+            ack
+        );
+
+        // The todo event rides the additive enum spelling.
+        let event = FrontendEvent::SessionTodosChanged(SessionTodosDto {
+            session_id: sid("session-1"),
+            todos: with_todos.todos.clone(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"session_todos_changed""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
+    }
+
     #[test]
     fn pre_z3_chat_completed_and_agent_request_load_with_defaults() {
         // A pre-Z3 ChatCompletedDto (no metering) deserializes with zeros.

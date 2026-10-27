@@ -1,40 +1,24 @@
-// Selora IDE — AgentPlanSpine Component Tests
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+// Selora IDE — AgentPlanSpine Component Tests (Phase 9: backend-authoritative)
+import { describe, it, expect, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import React from 'react';
 import { AgentPlanSpine } from './AgentPlanSpine';
 import { agentStore } from '../agent-store';
-import type { AgentTodo, SubagentInfo, ArtifactItem } from '../types';
+import type { AgentTodo } from '../types';
 
 beforeEach(() => {
   agentStore.reset();
 });
 
 const sampleTodos: AgentTodo[] = [
-  { id: 't-1', title: '1. Audit frontend architecture', status: 'completed' },
-  { id: 't-2', title: '2. Implement responsive composer (Phase Z)', status: 'in_progress', assignedSubagent: 'frontend-developer' },
-  { id: 't-3', title: '3. Run test verification', status: 'pending' },
-];
-
-const sampleSubagents: SubagentInfo[] = [
-  { id: 'sub-1', name: 'frontend-developer', model: 'GLM-5.3 CodeFast', status: 'working', activeStep: 'Elevating AgentComposer' },
-  { id: 'sub-2', name: 'rust-developer', model: 'Claude 3.7 Sonnet', status: 'idle' },
-  { id: 'sub-3', name: 'qa-tester', model: 'GPT-4o', status: 'done', activeStep: 'All test assertions passed' },
-];
-
-const sampleArtifacts: ArtifactItem[] = [
-  { id: 'art-1', title: 'COMPOSER_REVAMP.md', kind: 'doc', path: 'docs/composer.md', summary: 'UI revamp specs', createdAt: Date.now() },
+  { id: 't-1', text: '1. Audit frontend architecture', status: 'completed' },
+  { id: 't-2', text: '2. Implement responsive composer (Phase Z)', status: 'in_progress' },
+  { id: 't-3', text: '3. Run test verification', status: 'pending' },
 ];
 
 describe('AgentPlanSpine Component', () => {
-  it('renders live progress percentage bar and step counters in full view', () => {
-    const { getByText, getAllByText } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
-    );
+  it('renders live progress and step counters in full view', () => {
+    const { getByText, getAllByText } = render(<AgentPlanSpine todos={sampleTodos} />);
 
     // 1 completed out of 3 = 33%
     expect(getAllByText('33%').length).toBeGreaterThan(0);
@@ -42,115 +26,67 @@ describe('AgentPlanSpine Component', () => {
     expect(getByText('In Progress')).toBeTruthy();
   });
 
-  it('renders subagents swarm roster with live status badges (Running, Idle, Completed)', () => {
-    const { getByText, getAllByText } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
-    );
+  it('renders only stored todos — no invented subagent roster or artifacts', () => {
+    const { queryByText } = render(<AgentPlanSpine todos={sampleTodos} />);
 
-    expect(getByText('Subagents Swarm')).toBeTruthy();
-    expect(getAllByText('frontend-developer').length).toBeGreaterThan(0);
-    expect(getByText('Running')).toBeTruthy();
-    expect(getByText('Idle')).toBeTruthy();
-    expect(getByText('Completed')).toBeTruthy();
+    expect(queryByText('Subagents Swarm')).toBeNull();
+    expect(queryByText('frontend-developer')).toBeNull();
+    expect(queryByText('Artifacts')).toBeNull();
+    // The old template actions would have fabricated local todos.
+    expect(queryByText('+ Add step')).toBeNull();
+    expect(queryByText(/Load Full Development Plan/)).toBeNull();
   });
 
-  it('renders active task objective with animated indicator and subagent tag', () => {
-    const { getByText, getAllByText } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
-    );
+  it('renders the active objective from the stored text', () => {
+    const { getByText, getAllByText } = render(<AgentPlanSpine todos={sampleTodos} />);
 
     expect(getByText('CURRENT OBJECTIVE')).toBeTruthy();
     expect(getAllByText('2. Implement responsive composer').length).toBeGreaterThan(0);
     expect(getAllByText('(Phase Z)').length).toBeGreaterThan(0);
   });
 
-  it('renders compact infeed view with progress bar and git tools', () => {
-    const { getByText } = render(
+  it('uses the real git branch and never a fabricated main/commit action', () => {
+    const { getByText, queryByText } = render(
       <AgentPlanSpine
         todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
+        gitStatus={{ branch: 'feature/phase-9', changed_paths: ['src/a.ts'] }}
         isCompactInfeed={true}
-      />
+      />,
     );
 
-    expect(getByText('Git tools')).toBeTruthy();
-    expect(getByText('Progress')).toBeTruthy();
-    expect(getByText('1/3')).toBeTruthy();
-    expect(getByText('33%')).toBeTruthy();
+    expect(getByText('feature/phase-9')).toBeTruthy();
+    expect(queryByText('main')).toBeNull();
+    expect(queryByText('Commit or push')).toBeNull();
   });
 
-  it('activates plan rows through a real primary button and exposes their pressed state', () => {
-    const updateSpy = vi.spyOn(agentStore, 'updateTodoStatus').mockImplementation(() => {});
-    const { getByRole } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
+  it('says No branch when the backend reports none', () => {
+    const { getByText } = render(
+      <AgentPlanSpine todos={sampleTodos} isCompactInfeed={true} />,
     );
-
-    const pendingRow = getByRole('button', { name: 'Start 3. Run test verification' });
-    expect(pendingRow.tagName).toBe('BUTTON');
-    expect(pendingRow.getAttribute('type')).toBe('button');
-    expect(pendingRow.getAttribute('aria-pressed')).toBe('false');
-
-    fireEvent.click(pendingRow);
-    expect(updateSpy).toHaveBeenLastCalledWith('t-3', 'in_progress');
-
-    updateSpy.mockRestore();
+    expect(getByText('No branch')).toBeTruthy();
   });
 
-  it('renders rows as sibling buttons instead of a button nested in role=button', () => {
-    const updateSpy = vi.spyOn(agentStore, 'updateTodoStatus').mockImplementation(() => {});
-    const removeSpy = vi.spyOn(agentStore, 'removeTodo').mockImplementation(() => {});
-    const { container, getByRole } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
-    );
+  it('renders todos as read-only rows (no local status mutation controls)', () => {
+    const { container, queryByRole } = render(<AgentPlanSpine todos={sampleTodos} />);
 
-    // Reveal the completed section so every full-view row shape is covered.
-    fireEvent.click(getByRole('button', { name: /1 completed/ }));
+    expect(queryByRole('button', { name: /Start 3\. Run test verification/ })).toBeNull();
+    expect(queryByRole('button', { name: /Remove/ })).toBeNull();
 
-    expect(container.querySelectorAll('[role="button"]')).toHaveLength(0);
-    expect(container.querySelectorAll('.zcode-todo-row button button')).toHaveLength(0);
+    // Reveal the completed section: still no row buttons.
+    const toggle = queryByRole('button', { name: /1 completed/ });
+    expect(toggle).toBeTruthy();
+    fireEvent.click(toggle!);
 
     const rows = Array.from(container.querySelectorAll('.zcode-todo-row'));
     expect(rows.length).toBe(3);
     for (const row of rows) {
       expect(row.tagName).not.toBe('BUTTON');
-      expect(row.getAttribute('role')).not.toBe('button');
-      const directButtons = Array.from(row.children).filter((child) => child.tagName === 'BUTTON');
-      expect(directButtons.length).toBe(2);
+      expect(row.querySelectorAll('button')).toHaveLength(0);
     }
-
-    fireEvent.click(getByRole('button', { name: 'Remove 2. Implement responsive composer' }));
-    expect(removeSpy).toHaveBeenCalledWith('t-2');
-    expect(updateSpy).not.toHaveBeenCalled();
-
-    removeSpy.mockRestore();
-    updateSpy.mockRestore();
   });
 
   it('exposes plan progress as an ARIA progressbar with min, max, and now values', () => {
-    const { getAllByRole } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-      />
-    );
+    const { getAllByRole } = render(<AgentPlanSpine todos={sampleTodos} />);
 
     const bars = getAllByRole('progressbar');
     expect(bars).toHaveLength(1);
@@ -161,12 +97,7 @@ describe('AgentPlanSpine Component', () => {
 
   it('exposes compact progress as an ARIA progressbar', () => {
     const { getByRole } = render(
-      <AgentPlanSpine
-        todos={sampleTodos}
-        subagents={sampleSubagents}
-        artifacts={sampleArtifacts}
-        isCompactInfeed={true}
-      />
+      <AgentPlanSpine todos={sampleTodos} isCompactInfeed={true} />,
     );
 
     const bar = getByRole('progressbar', { name: 'Progress: 33%' });

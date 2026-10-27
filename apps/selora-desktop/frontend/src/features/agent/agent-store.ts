@@ -1,31 +1,31 @@
 // Selora IDE — Phase Z3 Agent Store
 //
 // Manages agent sessions, messages, tool executions, approval gates,
-// live todos, subagents, and hero composer interactions.
+// backend-authoritative todos, and hero composer interactions.
 // Implemented via React 18 external store subscription pattern.
 import type {
   AgentSession,
   AgentToolCall,
   AgentTodo,
   AgentWorkspace,
-  ArtifactItem,
   ChatMessage,
   ComposerGate,
   PermissionMode,
   QueuedPrompt,
   ReasoningEffort,
-  SubagentInfo,
   ThinkingState,
-  TodoStatus,
   AgentMetrics,
 } from './types';
 import {
   agentDecision,
   fetchModels,
+  newSession,
+  retryMessage as retryMessageCommand,
   runWorkflow,
   sendAgent,
   sendChat,
   stopChat,
+  switchSession as switchSessionCommand,
   type AgentMode,
   type AgentStateChangedPayload,
   type AgentTurnDonePayload,
@@ -37,8 +37,10 @@ import {
   type Model,
   type ToolCallStartedPayload,
   type ToolResultPayload,
+  type TodoDto,
   type WorkflowApproval,
 } from '../../bridge/bridge';
+import { toastStore } from '../toasts/toast-store';
 
 export type ModelSettings = {
   temperature: number;
@@ -50,9 +52,8 @@ export type AgentState = {
   sessions: AgentSession[];
   activeSessionId: string;
   messages: ChatMessage[];
+  /** Authoritative `manage_todo` list for the active session (backend-owned). */
   todos: AgentTodo[];
-  subagents: SubagentInfo[];
-  artifacts: ArtifactItem[];
   inFlight: boolean;
   thinkingState: ThinkingState;
   permissionMode: PermissionMode;
@@ -160,32 +161,11 @@ const INITIAL_SESSIONS: AgentSession[] = [
 
 const INITIAL_TODOS: AgentTodo[] = [];
 
-const INITIAL_SUBAGENTS: SubagentInfo[] = [
-  {
-    id: 'sub-1',
-    name: 'frontend-developer',
-    model: 'Auto',
-    status: 'idle',
-    activeStep: 'Ready for instructions',
-  },
-  {
-    id: 'sub-2',
-    name: 'rust-developer',
-    model: 'Auto',
-    status: 'idle',
-    activeStep: 'Ready for instructions',
-  },
-];
-
-const INITIAL_ARTIFACTS: ArtifactItem[] = [];
-
 let state: AgentState = {
   sessions: INITIAL_SESSIONS,
   activeSessionId: DEFAULT_SESSION_ID,
   messages: [],
   todos: INITIAL_TODOS,
-  subagents: INITIAL_SUBAGENTS,
-  artifacts: INITIAL_ARTIFACTS,
   inFlight: false,
   thinkingState: 'breathing',
   permissionMode: 'full',
@@ -211,84 +191,20 @@ let state: AgentState = {
   promptQueue: [],
 };
 
-export function extractMarkdownChecklist(text: string): AgentTodo[] | null {
-  const lines = text.split('\n');
-  const todos: AgentTodo[] = [];
-  let idx = 0;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const match =
-      trimmed.match(/^[-*]\s*\[([ xX/\\-])\]\s*(.+)$/) ||
-      trimmed.match(/^\d+\.\s*\[([ xX/\\-])\]\s*(.+)$/);
-    if (match) {
-      const mark = match[1].toLowerCase();
-      const title = match[2].trim();
-      if (!title) continue;
-      const status: TodoStatus =
-        mark === 'x' ? 'completed' : mark === '/' ? 'in_progress' : 'pending';
-      todos.push({
-        id: `todo_md_${idx++}`,
-        title,
-        status,
-      });
-    }
-  }
-  return todos.length > 0 ? todos : null;
+/** Protocol/command errors keep their message (never invented), shortened to one line. */
+function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unknown): string {
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? String((error as { message: unknown }).message)
+      : typeof error === 'string'
+        ? error
+        : 'the backend refused the command';
+  return `Could not ${action} the session: ${message}`;
 }
 
-export function parseModelTodos(input: unknown): AgentTodo[] | null {
-  if (!input) return null;
-
-  if (Array.isArray(input)) {
-    const todos: AgentTodo[] = [];
-    input.forEach((item, idx) => {
-      if (typeof item === 'string') {
-        const trimmed = item.trim();
-        if (trimmed) {
-          todos.push({
-            id: `todo_${Date.now()}_${idx}`,
-            title: trimmed,
-            status: 'pending',
-          });
-        }
-      } else if (item && typeof item === 'object') {
-        const itemObj = item as Record<string, unknown>;
-        const title = String(itemObj.title || itemObj.task || itemObj.text || itemObj.name || '').trim();
-        if (!title) return;
-        const rawStatus = String(itemObj.status || '').toLowerCase();
-        const status: TodoStatus =
-          rawStatus === 'completed' || rawStatus === 'done' || itemObj.completed === true
-            ? 'completed'
-            : rawStatus === 'in_progress' || rawStatus === 'active' || rawStatus === 'working'
-            ? 'in_progress'
-            : 'pending';
-        todos.push({
-          id: String(itemObj.id || `todo_${Date.now()}_${idx}`),
-          title,
-          status,
-          assignedSubagent: itemObj.assignedSubagent ? String(itemObj.assignedSubagent) : undefined,
-        });
-      }
-    });
-    return todos.length > 0 ? todos : null;
-  }
-
-  if (typeof input === 'string') {
-    try {
-      const parsed = JSON.parse(input);
-      if (Array.isArray(parsed)) return parseModelTodos(parsed);
-      if (parsed && typeof parsed === 'object') {
-        const parsedObj = parsed as Record<string, unknown>;
-        const list = parsedObj.todos || parsedObj.tasks || parsedObj.steps || parsedObj.items;
-        if (Array.isArray(list)) return parseModelTodos(list);
-      }
-    } catch {
-      // Not JSON, try checklist
-    }
-    return extractMarkdownChecklist(input);
-  }
-
-  return null;
+/** Protocol todo → the plan-spine row shape. Text is the task; no invented fields. */
+function todoFromDto(todo: TodoDto): AgentTodo {
+  return { id: todo.id, text: todo.text, status: todo.status };
 }
 
 type Listener = () => void;
@@ -558,8 +474,18 @@ export const agentStore = {
       costUsd: 0,
     }));
 
+    const activeSessionId =
+      bootstrap.chat.active_session_id ??
+      bootstrap.chat.sessions.find((session) => session.active)?.session_id ??
+      sessions[0]?.id ??
+      state.activeSessionId;
+
+    // The engine flattens every session's transcript into `chat.messages`;
+    // the pane shows only the active one. Without this filter a NewSession
+    // would still display the previous session's transcript.
     const messages: ChatMessage[] = [];
     for (const message of bootstrap.chat.messages) {
+      if (message.session_id !== activeSessionId) continue;
       if (message.role !== 'user' && message.role !== 'assistant') continue;
       messages.push({
         id: message.message_id,
@@ -570,11 +496,8 @@ export const agentStore = {
       });
     }
 
-    const activeSessionId =
-      bootstrap.chat.active_session_id ??
-      bootstrap.chat.sessions.find((session) => session.active)?.session_id ??
-      sessions[0]?.id ??
-      state.activeSessionId;
+    // Authoritative todos: the active session's list, hydrated server-side.
+    const todos = (bootstrap.chat.todos ?? []).map(todoFromDto);
 
     // Keep request routing aligned with the turn Rust says is live.
     activeRequestId = bootstrap.chat.active_request_id ?? null;
@@ -650,6 +573,7 @@ export const agentStore = {
       workspace,
       sessions,
       messages,
+      todos,
       activeSessionId,
       inFlight: Boolean(bootstrap.chat.active_request_id),
     };
@@ -696,48 +620,64 @@ export const agentStore = {
     notify();
   },
 
-  createSession(title = 'New Agent Session'): string {
-    const newId = `sess_${Date.now().toString(36)}`;
-    const newSession: AgentSession = {
-      id: newId,
-      title,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      tokenCount: 0,
-      costUsd: 0,
-    };
-    state = {
-      ...state,
-      sessions: [newSession, ...state.sessions],
-      activeSessionId: newId,
-      messages: [],
-      todos: [],
-      inFlight: false,
-      thinkingState: 'breathing',
-      promptQueue: [],
-    };
-    notify();
-    return newId;
+  /**
+   * Ask the backend for a real session. Rust creates it, selects it, and
+   * emits the bootstrap snapshot this store hydrates from — no local
+   * placeholder row is ever fabricated.
+   */
+  async createSession(): Promise<boolean> {
+    if (!context) {
+      toastStore.pushLocal('warning', 'Open a folder and connect before starting a session.');
+      return false;
+    }
+    try {
+      await newSession({ ...context, session_id: null });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('create', error));
+      return false;
+    }
   },
 
-  switchSession(sessionId: string) {
-    if (state.activeSessionId === sessionId) return;
-    state = {
-      ...state,
-      activeSessionId: sessionId,
-      messages: sessionId === DEFAULT_SESSION_ID ? state.messages : [],
-    };
-    notify();
+  /** Select an existing backend session (unknown ids are refused by Rust). */
+  async switchSession(sessionId: string): Promise<boolean> {
+    if (!state.sessions.some((session) => session.id === sessionId)) return false;
+    if (!context) return false;
+    if (sessionId === state.activeSessionId) return true;
+    try {
+      await switchSessionCommand(sessionId, { ...context, session_id: null });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('switch', error));
+      return false;
+    }
   },
 
-  deleteSession(sessionId: string) {
-    const remaining = state.sessions.filter((s) => s.id !== sessionId);
-    const nextActive = remaining[0]?.id || '';
-    state = {
-      ...state,
-      sessions: remaining,
-      activeSessionId: nextActive,
-    };
+  /** Retry a user turn: Rust truncates the failed tail and dispatches once. */
+  async retryMessage(messageId: string): Promise<boolean> {
+    const target = state.messages.find((message) => message.id === messageId);
+    if (!target || target.role !== 'user') return false;
+    if (!context || !state.activeSessionId) return false;
+    try {
+      await retryMessageCommand(state.activeSessionId, messageId, {
+        ...context,
+        session_id: state.activeSessionId,
+      });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('retry', error));
+      return false;
+    }
+  },
+
+  /**
+   * Apply a `session_todos_changed` event. The list is authoritative and
+   * session-scoped: a late event from another session is ignored (the next
+   * bootstrap restores that session's own list on switch).
+   */
+  applySessionTodos(payload: { session_id: string; todos: TodoDto[] }): void {
+    if (payload.session_id !== state.activeSessionId) return;
+    state = { ...state, todos: payload.todos.map(todoFromDto) };
     notify();
   },
 
@@ -828,35 +768,11 @@ export const agentStore = {
       toolCalls: [],
     };
 
-    // If existing todos are all completed or empty, initialize a new plan starting with this user task
-    const hasPending = state.todos.some((t) => t.status !== 'completed');
-    const initialTodo: AgentTodo = {
-      id: `todo_${Date.now()}`,
-      title: isSteer ? `Steer: ${trimmed.slice(0, 45)}` : trimmed,
-      status: 'in_progress',
-      assignedSubagent: 'coding-agent',
-    };
-    const updatedTodos = hasPending
-      ? [...state.todos, initialTodo]
-      : [initialTodo];
-
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            status: 'working' as const,
-            activeStep: isSteer
-              ? `Steering: ${trimmed.slice(0, 40)}`
-              : `Planning: ${trimmed.slice(0, 45)}`,
-          }
-        : sub
-    );
-
+    // The backend owns the transcript; these are the live render rows only.
+    // Todos are NOT seeded from the prompt — `manage_todo` is the only writer.
     state = {
       ...state,
       messages: [...state.messages, userMsg, assistantMsg],
-      todos: updatedTodos,
-      subagents: updatedSubagents,
       inFlight: true,
       thinkingState: 'working',
       streamingActivityLevel: isSteer ? 0.9 : 0.7,
@@ -1004,21 +920,6 @@ export const agentStore = {
     this.sendUserMessage(trimmed);
   },
 
-  forkSessionFromPrompt(messageId: string): string {
-    const idx = state.messages.findIndex((m) => m.id === messageId);
-    if (idx === -1) return '';
-    const targetMsg = state.messages[idx];
-    const sliced = state.messages.slice(0, idx + 1);
-    const titleSnippet = targetMsg.content.slice(0, 24).trim();
-    const newSessionId = this.createSession(`Fork: ${titleSnippet || 'Checkpoint'}`);
-    state = {
-      ...state,
-      messages: sliced.map((m) => ({ ...m })),
-    };
-    notify();
-    return newSessionId;
-  },
-
   queuePrompt(text: string, mode?: PermissionMode): string {
     const trimmed = text.trim();
     if (!trimmed) return '';
@@ -1118,16 +1019,9 @@ export const agentStore = {
     const newMessages = [...state.messages];
     newMessages[lastMsgIndex] = updated;
 
-    let updatedTodos = state.todos;
-    const mdTodos = extractMarkdownChecklist(newContent);
-    if (mdTodos && mdTodos.length > 0) {
-      updatedTodos = mdTodos;
-    }
-
     state = {
       ...state,
       messages: newMessages,
-      todos: updatedTodos,
       thinkingState: 'connecting',
       streamingActivityLevel: Math.min(1.0, state.streamingActivityLevel + 0.1),
     };
@@ -1331,38 +1225,8 @@ export const agentStore = {
         ? workflowApprovalFromArgs(parsedArgs)
         : undefined;
 
-    // 1. If tool is manage_todo or update_plan, extract and update todos
-    let updatedTodos = state.todos;
-    if (payload.tool_name === 'manage_todo' || payload.tool_name === 'update_plan') {
-      const raw = parsedArgs ? (parsedArgs.todos ?? parsedArgs.tasks ?? parsedArgs.steps ?? parsedArgs) : payload.args_json;
-      const modelTodos = parseModelTodos(raw);
-      if (modelTodos && modelTodos.length > 0) {
-        updatedTodos = modelTodos;
-      }
-    } else {
-      // If there are pending todos and one is in_progress, keep it; if none in_progress, make first pending in_progress
-      const hasInProgress = updatedTodos.some((t) => t.status === 'in_progress');
-      if (!hasInProgress && updatedTodos.length > 0) {
-        const firstPending = updatedTodos.find((t) => t.status === 'pending');
-        if (firstPending) {
-          updatedTodos = updatedTodos.map((t) =>
-            t.id === firstPending.id ? { ...t, status: 'in_progress' as const } : t
-          );
-        }
-      }
-    }
-
-    // 2. Update subagents active step
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            status: 'working' as const,
-            activeStep: `${payload.tool_name}: ${argsSummary.slice(0, 45)}`,
-          }
-        : sub
-    );
-
+    // No local todo derivation: `manage_todo` writes through the backend and
+    // the authoritative list arrives as `session_todos_changed`.
     const toolCall: WorkflowToolCall = {
       id: payload.call_id,
       toolName: payload.tool_name,
@@ -1386,16 +1250,13 @@ export const agentStore = {
       state = {
         ...state,
         messages: newMessages,
-        todos: updatedTodos,
-        subagents: updatedSubagents,
         thinkingState: payload.tool_name === 'read_file' ? 'searching' : 'solving',
       };
       notify();
     } else {
       state = {
         ...state,
-        todos: updatedTodos,
-        subagents: updatedSubagents,
+        thinkingState: payload.tool_name === 'read_file' ? 'searching' : 'solving',
       };
       notify();
     }
@@ -1404,18 +1265,6 @@ export const agentStore = {
   handleToolResult(payload: ToolResultPayload) {
     if (!isActiveEvent(payload)) return;
     this.updateToolResult(payload.call_id, payload.result_summary, payload.is_err);
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            activeStep: payload.is_err
-              ? `Error: ${payload.result_summary.slice(0, 40)}`
-              : `Completed: ${payload.result_summary.slice(0, 40)}`,
-          }
-        : sub
-    );
-    state = { ...state, subagents: updatedSubagents };
-    notify();
   },
 
   handleApprovalNeeded(payload: ApprovalNeededPayload) {
@@ -1568,21 +1417,10 @@ export const agentStore = {
       state = { ...state, messages: newMessages };
     }
 
-    // Mark in-progress todos as completed on successful turn completion
-    const finishedTodos = state.todos.map((t) =>
-      t.status === 'in_progress' ? { ...t, status: 'completed' as const } : t
-    );
-
-    const idleSubagents = state.subagents.map((s) => ({
-      ...s,
-      status: 'idle' as const,
-      activeStep: 'Ready',
-    }));
-
+    // Todos are not rewritten here: the plan stays exactly what the backend
+    // last stored. A turn ending is not a todo status change.
     state = {
       ...state,
-      todos: finishedTodos,
-      subagents: idleSubagents,
       inFlight: false,
       thinkingState: 'breathing',
       streamingActivityLevel: 0,
@@ -1615,42 +1453,5 @@ export const agentStore = {
     if (payload.message) {
       this.appendAssistantDelta(payload.message);
     }
-  },
-
-  updateTodoStatus(todoId: string, status: TodoStatus) {
-    const updated = state.todos.map((todo) => {
-      if (todo.id === todoId) {
-        return { ...todo, status };
-      }
-      return todo;
-    });
-    state = { ...state, todos: updated };
-    notify();
-  },
-
-  addTodo(title: string, assignedSubagent?: string) {
-    const newTodo: AgentTodo = {
-      id: `todo-${Date.now().toString(36)}`,
-      title,
-      status: 'pending',
-      assignedSubagent,
-    };
-    state = { ...state, todos: [...state.todos, newTodo] };
-    notify();
-  },
-
-  removeTodo(todoId: string) {
-    state = { ...state, todos: state.todos.filter((t) => t.id !== todoId) };
-    notify();
-  },
-
-  addArtifact(artifact: Omit<ArtifactItem, 'id' | 'createdAt'>) {
-    const newArt: ArtifactItem = {
-      ...artifact,
-      id: `art-${Date.now().toString(36)}`,
-      createdAt: Date.now(),
-    };
-    state = { ...state, artifacts: [newArt, ...state.artifacts] };
-    notify();
   },
 };

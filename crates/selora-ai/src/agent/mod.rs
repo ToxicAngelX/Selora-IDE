@@ -19,6 +19,7 @@
 //! implementations build on these seams.
 
 pub mod router;
+pub mod todo;
 pub mod tools;
 pub mod turn;
 
@@ -28,6 +29,10 @@ pub mod turn;
 pub use router::{
     denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
     ToolOutcome,
+};
+pub use todo::{
+    parse_todos, stored_result, TodoItem, TodoSink, TodoStatus, MAX_TODOS, MAX_TODO_ID_CHARS,
+    MAX_TODO_TEXT_CHARS,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{

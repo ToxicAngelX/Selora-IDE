@@ -103,33 +103,11 @@ export type QueuedPrompt = {
 
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
+/** A backend-authored todo (`manage_todo`); never created locally. */
 export type AgentTodo = {
   id: string;
-  title: string;
+  text: string;
   status: TodoStatus;
-  assignedSubagent?: string;
-};
-
-export type SubagentStatus = 'working' | 'idle' | 'done';
-
-export type SubagentInfo = {
-  id: string;
-  name: string;
-  model: string;
-  status: SubagentStatus;
-  activeStep?: string;
-};
-
-export type ArtifactKind = 'doc' | 'code' | 'diff' | 'diagram';
-
-export type ArtifactItem = {
-  id: string;
-  title: string;
-  kind: ArtifactKind;
-  path: string;
-  sizeBytes?: number;
-  summary: string;
-  createdAt: number;
 };
 
 export type AgentSession = {

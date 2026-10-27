@@ -157,7 +157,7 @@ describe('AgentExecutionFeed Component', () => {
     expect(getByLabelText('Copy prompt')).toBeTruthy();
     expect(getByLabelText('Rewind here')).toBeTruthy();
     expect(getByLabelText('Edit prompt')).toBeTruthy();
-    expect(getByLabelText('Fork session')).toBeTruthy();
+    expect(getByLabelText('Retry from this prompt')).toBeTruthy();
   });
 
   it('triggers copyPrompt on copy button click', async () => {
@@ -241,11 +241,11 @@ describe('AgentExecutionFeed Component', () => {
     resubmitSpy.mockRestore();
   });
 
-  it('triggers forkSessionFromPrompt on fork button click', () => {
-    const forkSpy = vi.spyOn(agentStore, 'forkSessionFromPrompt').mockReturnValue('session-forked');
+  it('triggers retryMessage on retry button click', () => {
+    const retrySpy = vi.spyOn(agentStore, 'retryMessage').mockResolvedValue(true);
 
     const messages: ChatMessage[] = [
-      createTestUserMessage('msg-u1', 'Branch from here'),
+      createTestUserMessage('msg-u1', 'Retry from here'),
     ];
 
     const { getByLabelText } = render(
@@ -257,11 +257,11 @@ describe('AgentExecutionFeed Component', () => {
       />
     );
 
-    const forkBtn = getByLabelText('Fork session');
-    fireEvent.click(forkBtn);
+    const retryBtn = getByLabelText('Retry from this prompt');
+    fireEvent.click(retryBtn);
 
-    expect(forkSpy).toHaveBeenCalledWith('msg-u1');
-    forkSpy.mockRestore();
+    expect(retrySpy).toHaveBeenCalledWith('msg-u1');
+    retrySpy.mockRestore();
   });
 
   it('displays steer directive badge for steered prompts', () => {

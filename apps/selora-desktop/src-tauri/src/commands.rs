@@ -1,8 +1,8 @@
 use crate::state::DesktopState;
 use selora_protocol::{
-    ApiKeyStatusDto, BootstrapState, ConnectResultDto, ConnectionStatus, EventEnvelope,
-    FrontendCommand, FrontendEvent, ModelDto, ModelsDto, ProtocolErrorDto, RequestEnvelope,
-    SeloraStatusDto, SettingsPatchDto, PROTOCOL_VERSION,
+    ApiKeyStatusDto, BootstrapState, CommandResultDto, ConnectResultDto, ConnectionStatus,
+    EventEnvelope, FrontendCommand, FrontendEvent, ModelDto, ModelsDto, ProtocolErrorDto,
+    RequestEnvelope, SeloraStatusDto, SettingsPatchDto, PROTOCOL_VERSION,
 };
 
 /// P1 hardening: a synchronous Tauri command runs on the main/IPC thread, so
@@ -83,13 +83,15 @@ pub async fn dispatch_command(
     envelope: RequestEnvelope<FrontendCommand>,
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
-) -> Result<BootstrapState, ProtocolErrorDto> {
+) -> Result<CommandResultDto, ProtocolErrorDto> {
     // §2.4: the app handle rides the command so accepted commands can emit
     // `WorkspaceLayoutChanged` through the existing `record_event` path.
-    // `dispatch` is synchronous and does the command's whole body (tree walks,
-    // libgit2, file I/O, the `rg` subprocess), so it runs on the blocking pool.
+    // `dispatch_result` is synchronous and does the command's whole body
+    // (tree walks, libgit2, file I/O, the `rg` subprocess), so it runs on the
+    // blocking pool. The reply is a snapshot only when the command is a read
+    // (bootstrap/folder open); event-backed mutations answer a small ack.
     let state = state.inner().clone();
-    offload(move || state.dispatch(&app, envelope)).await
+    offload(move || state.dispatch_result(&app, envelope)).await
 }
 
 /// Persist a settings patch through the same validated path as the protocol
