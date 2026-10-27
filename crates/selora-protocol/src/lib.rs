@@ -452,6 +452,16 @@ pub enum FrontendCommand {
         session_id: SessionId,
     },
     NewSession,
+    /// Phase 9d: refresh the resume picker. The answer is a full bootstrap
+    /// whose `agent_sessions` is freshly scanned from disk.
+    ListAgentSessions,
+    /// Phase 9d: arm/disarm session full access. The flag lives only in the
+    /// engine's session memory: it is never written to disk and resets on
+    /// switch/new/restart.
+    SetAgentAutoApprove {
+        session_id: SessionId,
+        enabled: bool,
+    },
     Search {
         query: SearchQueryDto,
     },
@@ -600,6 +610,57 @@ pub struct ChatStateDto {
     pub active_request_id: Option<RequestId>,
     pub active_turn_id: Option<TurnId>,
     pub pending_approval: Option<ApprovalDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9d — durable agent sessions (ARCHITECTURE §19.1).
+//
+// The resume picker's data comes from `.selora/agent-sessions/{id}/`. It is a
+// read-only projection: a switch/resume restores the transcript, todos, plan,
+// model, mode and parked cards; the session auto-approve flag has no wire
+// field because it must never survive a process or a switch.
+// ---------------------------------------------------------------------------
+
+/// One durable session in the resume picker (newest first).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionSummaryDto {
+    pub session_id: SessionId,
+    pub title: String,
+    /// Wall-clock milliseconds since the Unix epoch (the store's unit).
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `execute` / `explore` / `plan`; `auto` is never persisted.
+    #[serde(default)]
+    pub mode: String,
+    /// The restored park, if any. It is shown once and never auto-executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<AgentParkSummaryDto>,
+    /// True once a compaction cursor was recorded (full transcript preserved).
+    #[serde(default)]
+    pub compacted: bool,
+    #[serde(default)]
+    pub message_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentParkSummaryDto {
+    /// `approval` or `question`.
+    pub kind: String,
+    pub summary: String,
+}
+
+/// The typed compaction failure. `partial_summary` is the text streamed before
+/// the summarize round failed — surfaced, never silently dropped.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentCompactionFailedDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_summary: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -894,6 +955,10 @@ pub struct BootstrapState {
     /// arrive as `workflow_*` events instead.
     #[serde(default)]
     pub workflows: Vec<WorkflowPersistedRunDto>,
+    /// Phase 9d: durable agent sessions found in the open workspace (the
+    /// resume picker). Read-only projection — switching loads the session.
+    #[serde(default)]
+    pub agent_sessions: Vec<AgentSessionSummaryDto>,
 }
 
 /// One durable run discovered under `.selora/workflow-runs/` at bootstrap.
@@ -1374,6 +1439,9 @@ pub enum FrontendEvent {
     ApprovalNeeded(ApprovalNeededDto),
     AgentStateChanged(AgentStateDto),
     AgentTurnDone(AgentTurnDoneDto),
+    /// Phase 9d: the summarize round failed. The turn ends with a typed
+    /// `CompactionFailed` end too; this event carries the partial summary.
+    AgentCompactionFailed(AgentCompactionFailedDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     // Phase Z4b — the LSP request answers (each echoes the buffer so the
     // editor can drop a result for a tab that closed mid-flight).
@@ -1647,6 +1715,7 @@ mod tests {
                 later_slices: vec!["agent".into(), "lsp".into()],
             },
             workflows: vec![],
+            agent_sessions: vec![],
         }
     }
     #[test]
@@ -1657,6 +1726,60 @@ mod tests {
             serde_json::from_str::<BootstrapState>(&json).unwrap(),
             state
         );
+    }
+    #[test]
+    fn phase9d_resume_picker_and_compaction_failure_round_trip() {
+        let summary = AgentSessionSummaryDto {
+            session_id: sid("sess-disk"),
+            title: "Yesterday".into(),
+            updated_at: 42,
+            model: Some("test-model".into()),
+            mode: "execute".into(),
+            pending: Some(AgentParkSummaryDto {
+                kind: "approval".into(),
+                summary: "bash cargo test".into(),
+            }),
+            compacted: true,
+            message_count: 12,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentSessionSummaryDto>(&json).unwrap(),
+            summary
+        );
+
+        // A pre-9d bootstrap (no agent_sessions key) still loads the picker as
+        // empty; the command/event spellings are stable.
+        let mut state = sample();
+        state.agent_sessions = vec![summary];
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("agent_sessions");
+        let back: BootstrapState = serde_json::from_value(value).unwrap();
+        assert!(back.agent_sessions.is_empty());
+
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::ListAgentSessions).unwrap(),
+            r#"{"type":"list_agent_sessions"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::SetAgentAutoApprove {
+                session_id: sid("sess-disk"),
+                enabled: true,
+            })
+            .unwrap(),
+            r#"{"type":"set_agent_auto_approve","payload":{"session_id":"sess-disk","enabled":true}}"#
+        );
+        let failure = AgentCompactionFailedDto {
+            request_id: rid("req-1"),
+            session_id: sid("sess-disk"),
+            turn_id: tid("turn-1"),
+            message: "gateway down".into(),
+            partial_summary: Some("half".into()),
+        };
+        let event = FrontendEvent::AgentCompactionFailed(failure.clone());
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "agent_compaction_failed");
+        assert_eq!(json["payload"]["partial_summary"], "half");
     }
     #[test]
     fn serde_rejects_invalid_ids_paths() {

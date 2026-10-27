@@ -96,6 +96,42 @@ impl TurnCaps {
     }
 }
 
+/// When and how the turn compacts its conversation (ARCHITECTURE §19.5).
+///
+/// Opt-in: `TurnInput::new` leaves compaction off so a turn's request count
+/// stays caller-controlled. The desktop enables it with the §19.5 threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    /// Fraction of the context budget that triggers the summarize round.
+    pub threshold: f64,
+    /// Messages carried after the summary.
+    pub keep_last: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            threshold: super::session::COMPACTION_THRESHOLD,
+            keep_last: super::session::COMPACTION_KEEP_LAST,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// True when `estimated_tokens` has reached this config's threshold.
+    pub fn should_compact(&self, estimated_tokens: u64, budget_tokens: u64) -> bool {
+        if budget_tokens == 0 {
+            return false;
+        }
+        let threshold = if self.threshold.is_finite() {
+            self.threshold.clamp(0.0, 1.0)
+        } else {
+            super::session::COMPACTION_THRESHOLD
+        };
+        (estimated_tokens as f64) >= (budget_tokens as f64 * threshold)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // End states and events
 // ---------------------------------------------------------------------------
@@ -122,6 +158,14 @@ pub enum TurnEnd {
     /// The user pressed Stop (§17.4): any running bash child was killed,
     /// the stream cancelled.
     StoppedByUser,
+    /// The ~80% summarize round failed. The typed error is also emitted as
+    /// [`AgentEvent::CompactionFailed`]; the partial summary is retained so
+    /// the caller surfaces it instead of silently truncating history.
+    CompactionFailed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_summary: Option<String>,
+    },
     /// The stream or a tool failed; the message is the surfaced error.
     Failed(String),
 }
@@ -148,6 +192,9 @@ impl TurnEnd {
                 "agent turn stopped: conversation (~{estimated_tokens} tokens) exceeds the context budget ({budget_tokens} tokens)"
             ),
             TurnEnd::StoppedByUser => "agent turn stopped by user".to_owned(),
+            TurnEnd::CompactionFailed { message, .. } => {
+                format!("agent turn stopped: context compaction failed ({message})")
+            }
             TurnEnd::Failed(message) => format!("agent turn failed: {message}"),
         }
     }
@@ -182,6 +229,12 @@ pub enum AgentEvent {
         approval_id: ApprovalId,
         card: ApprovalCard,
     },
+    /// The context-compaction summarize round failed. Typed for the shell:
+    /// `SummaryFailed` carries the partial summary (never silently dropped).
+    CompactionFailed(super::session::CompactionError),
+    /// One summarize round completed; the caller records the cursor (the
+    /// full transcript on disk is untouched).
+    Compacted(super::session::CompactionCursor),
     /// The turn ended: the summary, the reason, the (partial) answer, and
     /// the grown conversation.
     TurnDone(AgentTurnReport),
@@ -411,6 +464,11 @@ pub struct TurnInput {
     /// This is a property of the caller's session mode, never persisted by
     /// the engine.
     pub auto_approve_writes: bool,
+    /// Opt-in context compaction (§19.5). `None` keeps the request sequence
+    /// caller-controlled (tests, short turns).
+    pub compaction: Option<CompactionConfig>,
+    /// Open todos carried into the compacted summary.
+    pub open_todos: Vec<super::session::TodoItem>,
 }
 
 impl TurnInput {
@@ -426,6 +484,8 @@ impl TurnInput {
             temperature: None,
             reasoning_effort: None,
             auto_approve_writes: false,
+            compaction: None,
+            open_todos: Vec::new(),
         }
     }
 
@@ -446,6 +506,18 @@ impl TurnInput {
     /// Bash and workflows keep their approval gates.
     pub fn with_auto_approve_writes(mut self, on: bool) -> Self {
         self.auto_approve_writes = on;
+        self
+    }
+
+    /// Opt in to §19.5 context compaction at the configured threshold.
+    pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = Some(config);
+        self
+    }
+
+    /// The session's open todos, carried into the compacted summary.
+    pub fn with_open_todos(mut self, todos: Vec<super::session::TodoItem>) -> Self {
+        self.open_todos = todos;
         self
     }
 
@@ -474,7 +546,7 @@ impl TurnInput {
 /// Chars/4 token estimate over the conversation (the same fallback the
 /// client's receipts use, RISKS.md §3) — coarse, but it keeps the
 /// context cap honest without shipping a tokenizer.
-fn estimate_conversation_tokens(conversation: &[ChatMessage]) -> u64 {
+pub(crate) fn estimate_conversation_tokens(conversation: &[ChatMessage]) -> u64 {
     conversation
         .iter()
         .map(|message| {
@@ -738,6 +810,9 @@ where
     let caps = input.caps.clone();
     let model = input.model.clone();
     let auto_approve_writes = input.auto_approve_writes;
+    let compaction = input.compaction.clone();
+    let open_todos = input.open_todos.clone();
+    let mut compaction_attempted = false;
     let deadline = if caps.max_turn_secs == 0 {
         None
     } else {
@@ -753,7 +828,47 @@ where
     'turn: loop {
         // --- the caps, checked before every round ------------------------
         if let Some(budget) = caps.context_budget_tokens() {
-            let estimated = estimate_conversation_tokens(&conversation);
+            let mut estimated = estimate_conversation_tokens(&conversation);
+            // §19.5: at ~80% of the budget, run one summarize round
+            // through this same chat backend and continue with the
+            // summary + open todos + last N messages. One attempt per
+            // turn; a failure is typed and preserves the partial summary.
+            if let Some(config) = compaction.as_ref() {
+                if !compaction_attempted && config.should_compact(estimated, budget) {
+                    compaction_attempted = true;
+                    match super::session::compact_conversation(
+                        &mut chat,
+                        &model.id,
+                        &conversation,
+                        &open_todos,
+                        config.keep_last,
+                        0,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            conversation = outcome.conversation;
+                            estimated = estimate_conversation_tokens(&conversation);
+                            let _ = emit(&events, AgentEvent::Compacted(outcome.cursor));
+                        }
+                        Err(error) => {
+                            let _ = emit(&events, AgentEvent::CompactionFailed(error.clone()));
+                            let partial_summary = match &error {
+                                super::session::CompactionError::SummaryFailed {
+                                    partial_summary,
+                                    ..
+                                } => partial_summary.clone(),
+                                _ => None,
+                            };
+                            end = Some(TurnEnd::CompactionFailed {
+                                message: error.to_string(),
+                                partial_summary,
+                            });
+                            break 'turn;
+                        }
+                    }
+                }
+            }
             if estimated > budget {
                 end = Some(TurnEnd::ContextOverflow {
                     estimated_tokens: estimated,
@@ -1168,6 +1283,7 @@ mod tests {
             events,
             receipt: round_receipt,
             delay: None,
+            error: None,
         }
     }
 
@@ -1178,6 +1294,7 @@ mod tests {
             events: vec![text_delta(text), ChatEvent::Done(round_receipt.clone())],
             receipt: round_receipt,
             delay: None,
+            error: None,
         }
     }
 
@@ -1185,10 +1302,25 @@ mod tests {
     // The mock gateway (ChatStream)
     // -----------------------------------------------------------------------
 
+    /// A round that streams `text` then fails (the compaction summarize
+    /// failure path).
+    fn error_round(text: &str) -> ScriptedRound {
+        let round_receipt = receipt(0.0, 10, 5);
+        ScriptedRound {
+            events: vec![text_delta(text)],
+            receipt: round_receipt,
+            delay: None,
+            error: Some(SeloraError::Net("gateway down".into())),
+        }
+    }
+
     struct ScriptedRound {
         events: Vec<ChatEvent>,
         receipt: ChatReceipt,
         delay: Option<Duration>,
+        /// When set, the round streams `events` then fails (the compaction
+        /// failure path: a partial summary must not be dropped).
+        error: Option<SeloraError>,
     }
 
     /// The mock gateway: one [`ScriptedRound`] per request, every request
@@ -1230,7 +1362,10 @@ mod tests {
                 for event in round.events {
                     let _ = events.send(event);
                 }
-                Ok(round.receipt)
+                match round.error {
+                    Some(error) => Err(error),
+                    None => Ok(round.receipt),
+                }
             })
         }
     }
@@ -1634,6 +1769,7 @@ mod tests {
                 ],
                 receipt: receipt(0.01, 100, 50),
                 delay: None,
+                error: None,
             });
         }
         let (chat, requests) = ScriptedChat::new(rounds);
@@ -1851,6 +1987,56 @@ mod tests {
         assert_eq!(
             count(&events, |event| matches!(event, AgentEvent::ToolResult(_))),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_approve_writes_never_pre_approves_bash() {
+        // Session full access pre-approves the file side effects only. A
+        // non-allowlisted command still parks; denying it never runs it.
+        let rounds = vec![
+            tool_round(
+                &[("call_bash", "bash", r#"{"command":"cargo test"}"#)],
+                "",
+                0.01,
+            ),
+            answer_round("The command was denied.", 0.01),
+        ];
+        let (chat, _requests) = ScriptedChat::new(rounds);
+        let (runner, state) = MockRunner::new(vec![(
+            "call_bash".to_owned(),
+            MockTool::Card {
+                card: ApprovalCard::Command {
+                    command: "cargo test".into(),
+                },
+                approved: ToolResult {
+                    id: "call_bash".to_owned(),
+                    ok: true,
+                    content: "ran".into(),
+                },
+            },
+        )]);
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
+        let input = TurnInput::new(model(), conversation())
+            .with_manifest(manifest())
+            .with_auto_approve_writes(true);
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
+
+        let approval_id = recorder.wait_for_approval().await;
+        decision_tx
+            .send((approval_id, AgentDecision::Deny))
+            .expect("deny the command");
+        let report = task.await.expect("turn task joins");
+
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert_eq!(report.summary.denied, 1);
+        assert_eq!(report.summary.approved, 0);
+        assert!(
+            state.lock().expect("runner").approved_runs.is_empty(),
+            "the denied command never ran"
         );
     }
 
@@ -2242,6 +2428,7 @@ mod tests {
             events: vec![text_delta("partial "), text_delta("answer")],
             receipt: receipt(0.10, 100, 50),
             delay: Some(Duration::from_secs(5)),
+            error: None,
         };
         let (chat, requests) = ScriptedChat::new(vec![round]);
         let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
@@ -2307,6 +2494,104 @@ mod tests {
             requests.lock().expect("requests lock").len(),
             0,
             "no request was made"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_compaction_runs_one_summary_round_and_carries_state_forward() {
+        let mut conversation = vec![ChatMessage::user("x".repeat(3000))];
+        conversation.push(ChatMessage::assistant("older answer"));
+        conversation.push(ChatMessage::user("recent question"));
+        conversation.push(ChatMessage::assistant("recent answer"));
+        let (chat, requests) = ScriptedChat::new(vec![
+            answer_round("summary of the work so far", 0.0),
+            answer_round("all done", 0.01),
+        ]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
+        let caps = TurnCaps {
+            context_window: 1_000,
+            ..caps()
+        };
+        let input = TurnInput::new(model(), conversation)
+            .with_caps(caps)
+            .with_manifest(manifest())
+            .with_compaction(CompactionConfig {
+                threshold: 0.8,
+                keep_last: 2,
+            })
+            .with_open_todos(vec![crate::agent::session::TodoItem {
+                id: "t1".into(),
+                title: "keep this todo".into(),
+                status: crate::agent::session::TodoStatus::InProgress,
+            }]);
+        let (report, mut rx) = run_turn(chat, runner, input).await;
+
+        assert_eq!(report.end, TurnEnd::Completed);
+        let events = drain_remaining(&mut rx);
+        assert_eq!(
+            count(&events, |event| matches!(event, AgentEvent::Compacted(_))),
+            1,
+            "the cursor event is emitted once"
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2, "one summarize round, then the answer");
+        assert!(requests[0].tools.is_none(), "the summary is tool-free");
+        let carried = &requests[1].messages;
+        assert!(carried[0].content.contains("summary of the work so far"));
+        assert!(carried[0].content.contains("keep this todo"));
+        assert_eq!(carried.len(), 3, "summary + keep_last 2");
+        assert_eq!(carried[1].content, "recent question");
+        assert_eq!(carried[2].content, "recent answer");
+    }
+
+    #[tokio::test]
+    async fn context_compaction_failure_is_typed_and_keeps_the_partial_summary() {
+        let mut conversation = vec![ChatMessage::user("x".repeat(3000))];
+        conversation.push(ChatMessage::user("recent question"));
+        conversation.push(ChatMessage::assistant("recent answer"));
+        let (chat, requests) = ScriptedChat::new(vec![error_round("partial summary")]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
+        let caps = TurnCaps {
+            context_window: 1_000,
+            ..caps()
+        };
+        let input = TurnInput::new(model(), conversation)
+            .with_caps(caps)
+            .with_manifest(manifest())
+            .with_compaction(CompactionConfig {
+                threshold: 0.8,
+                keep_last: 2,
+            });
+        let (report, mut rx) = run_turn(chat, runner, input).await;
+
+        match &report.end {
+            TurnEnd::CompactionFailed {
+                message,
+                partial_summary,
+            } => {
+                assert!(message.contains("gateway down"));
+                assert_eq!(partial_summary.as_deref(), Some("partial summary"));
+            }
+            other => panic!("expected a typed compaction failure, got {other:?}"),
+        }
+        assert!(!report.summary.completed);
+        let events = drain_remaining(&mut rx);
+        assert_eq!(
+            count(&events, |event| matches!(
+                event,
+                AgentEvent::CompactionFailed(
+                    crate::agent::session::CompactionError::SummaryFailed {
+                        partial_summary: Some(_),
+                        ..
+                    }
+                )
+            )),
+            1
+        );
+        assert_eq!(
+            requests.lock().expect("requests").len(),
+            1,
+            "the failed summary is not retried silently"
         );
     }
 

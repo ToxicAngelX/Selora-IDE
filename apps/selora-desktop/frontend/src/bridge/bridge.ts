@@ -129,6 +129,21 @@ export type BootstrapState = {
   diagnostics: Diagnostic[];
   feature_flags: { agent: boolean; git: boolean; search: boolean; editor: boolean; later_slices: string[] };
   workflows?: WorkflowPersistedRun[];
+  /** Phase 9d: durable sessions for the resume picker (newest first). */
+  agent_sessions?: AgentSessionSummary[];
+};
+
+/** One durable agent session in the resume picker (`.selora/agent-sessions`). */
+export type AgentSessionSummary = {
+  session_id: Id;
+  title: string;
+  updated_at: number;
+  model?: string;
+  /** `execute` | `explore` | `plan`; `auto` is never persisted. */
+  mode: string;
+  pending?: { kind: string; summary: string };
+  compacted: boolean;
+  message_count: number;
 };
 
 export type WorkflowPersistedRun = {
@@ -220,6 +235,16 @@ export type AgentTurnDonePayload = {
   denied: number;
   completed: boolean;
   end_message: string;
+};
+
+/** Phase 9d: the summarize round failed; the turn also ends with a typed
+ *  `CompactionFailed`. `partial_summary` is the text streamed before failure. */
+export type AgentCompactionFailedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  message: string;
+  partial_summary?: string;
 };
 
 export type ChatCompletedPayload = {
@@ -337,6 +362,8 @@ export type FrontendCommand =
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
+  | { type: 'list_agent_sessions' }
+  | { type: 'set_agent_auto_approve'; payload: { session_id: Id; enabled: boolean } }
   | { type: 'open_folder_at'; payload: { root: string } }
   | { type: 'refresh_tree' }
   | { type: 'reveal_in_explorer'; payload: { path: string } }
@@ -380,6 +407,7 @@ export type FrontendEvent =
   | { type: 'approval_needed'; payload: ApprovalNeededPayload }
   | { type: 'agent_state_changed'; payload: AgentStateChangedPayload }
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
+  | { type: 'agent_compaction_failed'; payload: AgentCompactionFailedPayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'hover_result'; payload: HoverResult }
@@ -717,6 +745,32 @@ export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unkn
 
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);
+
+/** Phase 9d: refresh the resume picker (the bootstrap carries the list). */
+export const listAgentSessions = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'list_agent_sessions' }, ctx);
+
+/** Phase 9d: session full access. Never persisted; resets on switch/new. */
+export const setAgentAutoApprove = (
+  sessionId: Id,
+  enabled: boolean,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'set_agent_auto_approve', payload: { session_id: sessionId, enabled } },
+    ctx,
+  );
+
+/** Phase 9d: rewind a session before `messageId` and send that message again. */
+export const retryMessage = (
+  sessionId: Id,
+  messageId: Id,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'retry_message', payload: { session_id: sessionId, message_id: messageId } },
+    ctx,
+  );
 
 // --- Phase 8 workflow commands (ARCHITECTURE §18.4) -------------------------
 

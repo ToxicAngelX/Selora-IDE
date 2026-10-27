@@ -143,6 +143,21 @@ export type AgentSession = {
   isCompacted?: boolean;
 };
 
+/**
+ * Phase 9d — a durable session found under `.selora/agent-sessions/{id}/`.
+ * Only ever populated from the Rust bootstrap; the UI never invents one.
+ */
+export type ResumableAgentSession = {
+  id: string;
+  title: string;
+  updatedAt: number;
+  model?: string;
+  mode: string;
+  pending?: { kind: string; summary: string };
+  compacted: boolean;
+  messageCount: number;
+};
+
 export type AgentMetrics = {
   totalTokens: number;
   costUsd: number;

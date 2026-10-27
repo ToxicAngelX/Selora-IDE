@@ -22,11 +22,20 @@ mod types;
 mod updates;
 
 pub use agent::{
+    bound_summary, compact_conversation, compacted_conversation, now_millis, should_compact,
+    summary_request, transcript_conversation, SESSION_SCHEMA, STATE_FILE, TODOS_FILE,
+    TRANSCRIPT_FILE,
+};
+pub use agent::{
     denied_result, execute_approved, execute_tool, run_agent_turn, spawn_agent_turn, tool_manifest,
-    AgentDecision, AgentEvent, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport,
+    AgentDecision, AgentEvent, AgentSessionMode, AgentSessionState, AgentSessionStore,
+    AgentSessionSummary, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport,
     AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle, ChatStream, ClientChatStream,
-    RouterToolRunner, ToolContext, ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd,
-    TurnInput, DENIED_MESSAGE,
+    CompactionConfig, CompactionCursor, CompactionError, CompactionOutcome, LoadedAgentSession,
+    ParkSummary, ParkedCard, PlanState, PlanStatus, RouterToolRunner, TodoItem, TodoStatus,
+    ToolContext, ToolOutcome, ToolRunner, TranscriptEntry, TranscriptLoad, TurnCaps, TurnDecision,
+    TurnEnd, TurnInput, AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD,
+    DENIED_MESSAGE, MAX_SUMMARY_CHARS,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

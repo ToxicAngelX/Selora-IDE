@@ -13,6 +13,11 @@ const bridgeMocks = vi.hoisted(() => {
     sendChat: vi.fn((..._args: unknown[]) => ({ requestId: nextRequestId('req-chat'), promise: Promise.resolve() })),
     stopChat: vi.fn((..._args: unknown[]) => Promise.resolve()),
     agentDecision: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    switchSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    newSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    retryMessage: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    listAgentSessions: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    setAgentAutoApprove: vi.fn((..._args: unknown[]) => Promise.resolve()),
     runWorkflow: vi.fn((..._args: unknown[]) => ({
       requestId: nextRequestId('req-workflow'),
       promise: Promise.resolve(),

@@ -802,6 +802,8 @@ pub fn spawn_agent(
                     AppMessage::ApprovalNeeded(turn_id, approval_id, card)
                 }
                 selora_ai::AgentEvent::State(_) => continue,
+                selora_ai::AgentEvent::Compacted(_) => continue,
+                selora_ai::AgentEvent::CompactionFailed(_) => continue,
                 selora_ai::AgentEvent::TurnDone(report) => {
                     done_seen = true;
                     AppMessage::AgentTurnDone(
