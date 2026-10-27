@@ -288,8 +288,12 @@ The §10 table was written before the wave-2 agents landed. Current state:
 
 - `world.run` now owns a Windows Job Object (`workflows_process.rs`) with
   `KILL_ON_JOB_CLOSE`; timeout, cancel and normal exit terminate the tree. The
-  child is assigned immediately after `CreateProcess`, so descendants created in
-  that sub-startup window can still escape.
+  child is created with `CREATE_SUSPENDED`, assigned to the job, and only then
+  resumed, so a grandchild it spawns in its first instruction is already
+  contained. A failed create/assign/resume terminates the child instead of
+  running it uncontained. The remaining escape is a broker-started process
+  (`ShellExecuteEx` via the shell service), which is not a `CreateProcess`
+  descendant.
 - Resume preflights unfinished asks. Default resume returns
   `workflow_incomplete_asks` without starting a worker; the panel shows
   “Resume anyway”, and only that explicit click sets `allow_incomplete_asks`.

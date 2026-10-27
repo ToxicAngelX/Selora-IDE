@@ -56,13 +56,16 @@
 //!   restored through the `Host` snapshot hooks during replay.
 //! * **Exit codes and process trees.** `world.run` reports the PowerShell
 //!   process's exit code; Windows PowerShell 5.1 collapses a failing native
-//!   command to `1` (`pwsh` preserves it). The child is contained in a Windows
-//!   Job Object (`workflows_process`), so a timeout or cancellation kills the
-//!   whole tree, including `Start-Process`/`Start-Job` descendants, and a
-//!   descendant holding the inherited capture pipes can no longer delay the
-//!   reader joins. Two limits remain: a descendant spawned before the job
-//!   assignment completes escapes (see that module), and a run whose
-//!   job-containment call fails is stopped rather than run uncontained.
+//!   command to `1` (`pwsh` preserves it). The child is created suspended and
+//!   assigned to a Windows Job Object *before* it executes
+//!   (`workflows_process`), so a timeout or cancellation kills the whole tree,
+//!   including `Start-Process`/`Start-Job` descendants, and a descendant
+//!   holding the inherited capture pipes can no longer delay the reader joins.
+//!   A spawn whose job creation, assignment or resume fails is terminated
+//!   without ever being resumed. The residual escape is a process another
+//!   broker creates on the child's behalf (for example a `ShellExecuteEx`
+//!   launch started by the shell service), which is not a `CreateProcess`
+//!   descendant; see that module.
 //! * The legacy `with_chat` synchronous fake is cooperative only around the
 //!   closure. Real turns cancel HTTP, parked approvals and running tools promptly.
 //! * `git.log` and any `git.*` call with a `base` use the `git` CLI, because
@@ -81,6 +84,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fmt,
     io::Read,
     path::{Path, PathBuf},
@@ -104,7 +108,7 @@ use selora_workflow::{
 };
 use serde_json::Value;
 
-use crate::workflows_process::ProcessJob;
+use crate::workflows_process::WorldProcess;
 
 #[path = "workflows_agent.rs"]
 mod workflows_agent;
@@ -905,53 +909,36 @@ impl WorkflowHost {
         }
 
         let program = powershell_program();
-        let mut command = Command::new(program);
-        command
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // The child gets exactly the allowlist, never the ambient
-            // environment (and therefore never the gateway key).
-            .env_clear();
-        for name in ALLOWED_ENV_VARS {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
         // PowerShell reparses arguments after `-Command` as code. Keep the
         // confirmed command as code, but encode runtime arguments as data.
         let script = crate::workflow_command::invocation(cmd, args).map_err(HostError::new)?;
-        command
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(script);
-
-        let mut child = command.spawn().map_err(|err| {
-            HostError::new(format!(
-                "cannot start PowerShell (`{program}`) for `world.run`: {err}"
-            ))
-        })?;
-        // Contain the whole tree before anything else touches the child. The
-        // job is authoritative; the direct-child kill below is only the
-        // belt-and-braces fallback for the assignment window.
-        let job = match ProcessJob::assign(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                // The child is live and uncontained: stop it before reporting,
-                // so a failed assignment never leaves a running PowerShell.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
+        let arguments = [
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ];
+        // The child gets exactly the allowlist, never the ambient environment
+        // (and therefore never the gateway key).
+        let environment: Vec<(&str, OsString)> = ALLOWED_ENV_VARS
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+            .collect();
+        // `WorldProcess::spawn` creates the job first and starts the child
+        // suspended. It returns only after the child is assigned to the job and
+        // resumed, so every descendant of this child is contained.
+        let mut child = WorldProcess::spawn(program, &arguments, &self.root, &environment)
+            .map_err(|err| {
+                HostError::new(format!(
+                    "cannot start PowerShell (`{program}`) for `world.run`: {}",
+                    err.message
+                ))
+            })?;
         let budget = Arc::new(Mutex::new(self.config.max_output_bytes));
         let stdout_reader = child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|pipe| spawn_capture(pipe, Arc::clone(&budget)));
-        let stderr_reader = child.stderr.take().map(|pipe| spawn_capture(pipe, budget));
+        let stderr_reader = child.take_stderr().map(|pipe| spawn_capture(pipe, budget));
 
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(self.config.default_timeout_ms));
         let started = Instant::now();
@@ -962,23 +949,23 @@ impl WorkflowHost {
                 Err(err) => {
                     // The wait itself failed, so the child's state is unknown:
                     // terminate the job, then fall back to the direct kill.
-                    let containment = stop_process_tree(&job, &mut child);
+                    let containment = stop_process_tree(&mut child);
                     join_capture(stdout_reader);
                     join_capture(stderr_reader);
                     return Err(with_containment(
-                        format!("cannot wait for `{cmd}`: {err}"),
+                        format!("cannot wait for `{cmd}`: {}", err.message),
                         containment,
                     ));
                 }
             }
             if self.is_cancelled() {
-                let containment = stop_process_tree(&job, &mut child);
+                let containment = stop_process_tree(&mut child);
                 join_capture(stdout_reader);
                 join_capture(stderr_reader);
                 return Err(with_containment(cancelled_error().message, containment));
             }
             if started.elapsed() >= timeout {
-                let containment = stop_process_tree(&job, &mut child);
+                let containment = stop_process_tree(&mut child);
                 join_capture(stdout_reader);
                 join_capture(stderr_reader);
                 return Err(with_containment(
@@ -995,7 +982,7 @@ impl WorkflowHost {
         // The direct child is gone; kill anything it left behind *before* the
         // capture joins, so a grandchild holding the inherited pipes cannot
         // block the run. The job handle stays open until both readers are done.
-        let containment = job.terminate().err();
+        let containment = child.terminate_job().err();
         let stdout = join_capture(stdout_reader).unwrap_or_default();
         let stderr = join_capture(stderr_reader).unwrap_or_default();
         if let Some(error) = containment {
@@ -1004,7 +991,7 @@ impl WorkflowHost {
             return Err(error);
         }
         Ok(CommandOutput {
-            exit_code: status.code().unwrap_or(-1),
+            exit_code: status as i32,
             stdout: decode_process_text(&stdout),
             stderr: decode_process_text(&stderr),
         })
@@ -1341,10 +1328,9 @@ fn cancelled_error() -> HostError {
 ///
 /// Returns the job's failure, if any, so the caller can still report a typed
 /// containment error next to the timeout/cancel/wait failure it already has.
-fn stop_process_tree(job: &ProcessJob, child: &mut std::process::Child) -> Option<HostError> {
-    let containment = job.terminate().err();
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop_process_tree(child: &mut WorldProcess) -> Option<HostError> {
+    let containment = child.terminate_job().err();
+    child.kill_and_reap();
     containment
 }
 
@@ -2046,26 +2032,91 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn world_run_keeps_stdout_stderr_and_the_exit_code() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = WorkflowHost::new(workspace.path().to_path_buf(), config());
+        let output = host
+            .world_run(
+                "Write-Output 'hello'; [Console]::Error.WriteLine('bad'); exit 7",
+                &[],
+                Some(30_000),
+            )
+            .expect("powershell runs");
+        assert_eq!(output.exit_code, 7, "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("hello"), "stdout: {}", output.stdout);
+        assert!(output.stderr.contains("bad"), "stderr: {}", output.stderr);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn world_run_stdin_is_the_null_device() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = WorkflowHost::new(workspace.path().to_path_buf(), config());
+        let output = host
+            .world_run(
+                "if ($null -eq [Console]::In.ReadLine()) { 'eof' } else { 'data' }",
+                &[],
+                Some(30_000),
+            )
+            .expect("powershell runs");
+        assert!(
+            output.stdout.contains("eof"),
+            "stdin was not the NUL device: stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn world_run_caps_stdout_and_stderr_together() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = WorkflowHost::new(
+            workspace.path().to_path_buf(),
+            config().with_max_output_bytes(16),
+        );
+        let output = host
+            .world_run(
+                "Write-Output ('x' * 4096); [Console]::Error.WriteLine('y' * 4096)",
+                &[],
+                Some(30_000),
+            )
+            .expect("powershell runs");
+        assert!(
+            output.stdout.len() + output.stderr.len() <= 16,
+            "the combined cap was exceeded: {} + {} bytes",
+            output.stdout.len(),
+            output.stderr.len()
+        );
+    }
+
     /// A PowerShell single-quoted literal for `value` (`'` is doubled).
     #[cfg(windows)]
     fn ps_literal(value: &Path) -> String {
         format!("'{}'", value.display().to_string().replace('\'', "''"))
     }
 
-    /// A script that starts a `Start-Process` grandchild sleeping for a minute,
-    /// records its PID in `pid_file`, then runs `tail`.
+    /// A script whose **first** statement starts a grandchild (a second
+    /// PowerShell sleeping for two minutes) and records its PID; only then does
+    /// it run `tail`.
     ///
     /// `-NoNewWindow` keeps `Start-Process` on `CreateProcess`, so the grandchild
-    /// inherits the job like any other descendant. The minute-long sleep bounds
-    /// a failed containment test instead of letting the capture join hang.
+    /// inherits the job like any other descendant (and inherits the capture
+    /// pipes, so a failed job kill would block the reader joins). Spawning it
+    /// before any other work is what catches a post-spawn job assignment: the
+    /// child cannot have created it unless it was resumed first. The long sleep
+    /// bounds a failed containment test instead of letting the capture join
+    /// hang.
     #[cfg(windows)]
     fn grandchild_script(pid_file: &Path, tail: &str) -> String {
         format!(
-            "$self = (Get-Process -Id $PID).Path; \
-             $grand = Start-Process -FilePath $self -ArgumentList '-NoProfile',\
-             '-NonInteractive','-Command','Start-Sleep -Seconds 60' -NoNewWindow -PassThru; \
+            "$grand = Start-Process -FilePath {} -ArgumentList '-NoProfile',\
+             '-NonInteractive','-Command','Start-Sleep -Seconds 120' -NoNewWindow -PassThru; \
              Set-Content -LiteralPath {} -Value $grand.Id; \
              {tail}",
+            ps_literal(Path::new(powershell_program())),
             ps_literal(pid_file)
         )
     }

@@ -313,8 +313,10 @@ window. Every owner row is **UNRUN** as of this record.
    2026-10-27 06:19:16. Another session was editing this repository during the
    session; with no VCS there is no diff to bound those edits.
 8. **Grandchild kill is test-covered, not owner-verified.** `workflows_process.rs`
-   now has Job Object tests, but live process-tree behavior after Stop or timeout
-   remains an owner check (step 6).
+   creates the child suspended, assigns it to the job, and resumes it only after
+   the assignment; its tests make the child spawn a grandchild as its first
+   statement and check job membership plus death on success/timeout/cancel. Live
+   process-tree behavior after Stop or timeout remains an owner check (step 6).
 9. **Completed-run history** is not part of this record; STATUS.md's Phase 8 gap
    list remains authoritative and was not edited here.
 

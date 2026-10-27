@@ -1,132 +1,473 @@
-//! Windows Job Object containment for one `world.run` process tree.
+//! Windows containment for one `world.run` process tree.
 //!
-//! `workflows_host::WorkflowHost::world_run_inner` starts a PowerShell child
-//! from an environment allowlist and captures its streams.
-//! `std::process::Child::kill` stops only that one process: a grandchild
-//! started with `Start-Process`/`Start-Job` keeps running, and a grandchild that
-//! inherited the capture pipes also keeps the run's reader joins from
-//! finishing. This module owns the containment half of that gate.
+//! `workflows_host::WorkflowHost::world_run_inner` needs the whole descendant
+//! tree of its PowerShell child to die with the run. `std::process::Command`
+//! cannot guarantee that: it returns only after `CreateProcessW` has already
+//! resumed the child, so a grandchild started in the interval before
+//! `AssignProcessToJobObject` escapes the job. This module owns the spawn path
+//! instead and closes that window:
 //!
-//! [`ProcessJob::assign`] creates an unnamed Job Object, switches on
-//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and adds the already-spawned PowerShell
-//! child to it. Windows puts every later descendant into the same job, and the
-//! job does not grant `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so the tree cannot leave
-//! it. The caller keeps the returned [`ProcessJob`] alive for the whole
-//! wait/capture path and calls [`ProcessJob::terminate`] before the direct-child
-//! kill and before the capture joins.
+//! 1. create the unnamed Job Object and set `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
+//! 2. create the stdin NUL device, the stdout/stderr pipes and the
+//!    handle-inheritance list;
+//! 3. `CreateProcessW` with `CREATE_SUSPENDED | CREATE_NO_WINDOW`: the child
+//!    exists, owns its pipes, but has not executed one instruction;
+//! 4. `AssignProcessToJobObject` while the child is still suspended;
+//! 5. `ResumeThread`, and only after the assignment succeeded.
 //!
-//! Handle lifetime is RAII: `Drop` calls `TerminateJobObject` and then
+//! Any failure in steps 1-5 terminates the child and closes the job; a child is
+//! never resumed uncontained. Windows puts every later descendant into the same
+//! job, and the job does not grant `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so the tree
+//! cannot leave it. The caller keeps the returned [`WorldProcess`] alive for the
+//! whole wait/capture path and calls [`WorldProcess::terminate_job`] before the
+//! direct-child kill and before the capture joins.
+//!
+//! Handle lifetime is RAII: job, process, thread, pipe and NUL handles all
+//! close on every path. `JobHandle`'s `Drop` calls `TerminateJobObject` and then
 //! `CloseHandle`, so an early return cannot leak a job handle or leave a
-//! descendant behind. The explicit `TerminateJobObject` is the documented tree
-//! kill; the close is the `KILL_ON_JOB_CLOSE` backstop if termination itself
-//! failed or was never reached.
+//! descendant behind.
+//!
+//! The environment block is built only from the caller's allowlist (never the
+//! ambient environment), stdin is the NUL device, stdout and stderr are separate
+//! pipes, and the command line uses the same quoting rules as
+//! `std::process::Command`, so `workflow_command::invocation`'s argument
+//! encoding crosses the boundary unchanged.
 //!
 //! # Failure policy
 //!
-//! A job that cannot be created, configured, or assigned is a typed
+//! A job that cannot be created, configured, assigned, or resumed is a typed
 //! [`HostError`] and `world_run` fails: running the command without containment
 //! would silently leave grandchildren behind, which this gate does not allow.
 //! `AssignProcessToJobObject` can fail with `ERROR_ACCESS_DENIED` when the
 //! Selora process already sits in a restrictive Job Object that rejects nested
 //! jobs; that case gets its own message instead of a generic one.
 //!
-//! # Residual race
+//! # Remaining limits
 //!
-//! The child is created by `std::process::Command` and assigned a moment later,
-//! so a descendant spawned between `CreateProcessW` returning inside the child
-//! and `AssignProcessToJobObject` completing is outside the job. `std::process`
-//! exposes no Windows spawn hook (no `CREATE_SUSPENDED` handshake as on Unix's
-//! `pre_exec`), so that gap cannot be closed from here. In practice PowerShell
-//! has not finished loading in that window. Every process created after the
-//! assignment is contained.
+//! * A process that another broker creates on the child's behalf is not a
+//!   `CreateProcess` descendant of the child at all: a `ShellExecuteEx` launch
+//!   can be started by the shell service, which is outside this job, so it can
+//!   escape. Ordinary `CreateProcess`/`Start-Process -NoNewWindow` descendants
+//!   are contained because job membership is inherited.
+//! * A job that cannot be created or assigned stops the command instead of
+//!   running it uncontained.
 
 use selora_workflow::HostError;
 
-/// A Job Object that contains one `world.run` process tree.
-///
-/// The handle stays open while this value is alive. `world_run_inner` drops it
-/// only after the direct child was reaped and both capture readers joined.
-pub struct ProcessJob {
-    #[cfg(windows)]
-    handle: windows::JobHandle,
-}
+#[cfg(windows)]
+pub use windows::WorldProcess;
 
-impl ProcessJob {
-    /// Create a kill-on-close job and add the spawned PowerShell `child` to it.
-    ///
-    /// `child` must still be running (the caller has not seen it exit), so the
-    /// process handle is valid. On failure the caller still owns a live child
-    /// and must kill it; nothing was assigned to a job that outlives this call.
-    pub fn assign(child: &std::process::Child) -> Result<Self, HostError> {
-        #[cfg(windows)]
-        {
-            let handle = windows::JobHandle::create()?;
-            handle.assign(child)?;
-            Ok(Self { handle })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = child;
+#[cfg(not(windows))]
+pub use fallback::WorldProcess;
+
+/// A non-Windows host cannot provide a Job Object, so `world.run` is refused.
+#[cfg(not(windows))]
+mod fallback {
+    use super::HostError;
+    use std::{ffi::OsString, fs::File, path::Path};
+
+    /// Placeholder that keeps `world.run` fail-closed on every other host.
+    #[allow(dead_code)] // constructed only by the Windows path
+    pub struct WorldProcess(());
+
+    impl WorldProcess {
+        /// Always fails: this host cannot contain a descendant process tree.
+        pub fn spawn(
+            _program: &str,
+            _args: &[String],
+            _cwd: &Path,
+            _environment: &[(&str, OsString)],
+        ) -> Result<Self, HostError> {
             Err(HostError::new(
                 "`world.run` process containment needs a Windows Job Object; this host cannot \
                  guarantee that descendant processes are killed, so the command was stopped",
             ))
         }
-    }
 
-    /// Terminate every process still in the job.
-    ///
-    /// Call this on every exit path — normal exit, timeout, cancellation and a
-    /// failed wait — before the direct-child `kill` and before the capture
-    /// joins. Calling it on an empty job succeeds.
-    pub fn terminate(&self) -> Result<(), HostError> {
-        #[cfg(windows)]
-        {
-            self.handle.terminate()
+        pub fn take_stdout(&mut self) -> Option<File> {
+            None
         }
-        #[cfg(not(windows))]
-        {
+
+        pub fn take_stderr(&mut self) -> Option<File> {
+            None
+        }
+
+        pub fn try_wait(&mut self) -> Result<Option<u32>, HostError> {
+            Err(HostError::new(
+                "`world.run` process containment needs a Windows Job Object",
+            ))
+        }
+
+        pub fn terminate_job(&self) -> Result<(), HostError> {
             Ok(())
         }
+
+        pub fn kill_and_reap(&mut self) {}
     }
 }
 
 #[cfg(windows)]
 mod windows {
-    //! The raw Win32 calls. Every `unsafe` block here is a single documented
-    //! FFI call whose handle and pointer preconditions are established by the
-    //! owning struct.
+    //! The raw Win32 calls. Every `unsafe` block here is a documented FFI call
+    //! whose handle and pointer preconditions are established by the owning
+    //! struct or by the enclosing spawn step.
 
     use super::HostError;
-    use std::{io, os::windows::io::AsRawHandle, ptr};
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    use std::{
+        ffi::{OsStr, OsString},
+        fs::File,
+        io,
+        os::windows::{
+            ffi::OsStrExt,
+            io::{FromRawHandle, RawHandle},
         },
+        path::{Path, PathBuf},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, SetHandleInformation, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
+            INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Pipes::CreatePipe,
+            Threading::{
+                CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+                InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+                UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+                CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+                LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            },
+        },
+    };
+
+    // Only the containment assertions in tests query another process's job.
+    #[cfg(test)]
+    use windows_sys::Win32::{
+        System::JobObjects::IsProcessInJob,
+        System::Threading::{GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
 
     /// `ERROR_ACCESS_DENIED`: the child is already in a job that rejects nesting.
     const ERROR_ACCESS_DENIED: i32 = 5;
 
-    /// Exit code the OS reports for processes this job terminates. They are
+    /// Exit code the OS reports for processes this module terminates. They are
     /// discarded: the caller either already read the direct child's own status
     /// or returns a timeout/cancel error.
     const JOB_EXIT_CODE: u32 = 1;
 
+    /// The spawn-time assignment hook. Production passes
+    /// [`JobHandle::assign_raw`]; tests pass a failing call to prove the child
+    /// is terminated without ever being resumed.
+    type AssignFn<'a> = dyn Fn(HANDLE, HANDLE) -> Result<(), HostError> + 'a;
+
+    /// One contained `world.run` child plus the job that owns its tree.
+    ///
+    /// `spawn` creates the job first, starts the child suspended, assigns it to
+    /// the job, and resumes it only after the assignment. The job handle stays
+    /// open while this value is alive, so descendants cannot outlive it.
+    pub struct WorldProcess {
+        job: JobHandle,
+        process: ProcessHandle,
+        stdout: Option<File>,
+        stderr: Option<File>,
+    }
+
+    impl WorldProcess {
+        /// Spawn `program` suspended, contain it in a kill-on-close job, then
+        /// resume it. `args` are passed as separate argv entries; `cwd` and
+        /// `environment` replace the child's inherited values completely.
+        pub fn spawn(
+            program: &str,
+            args: &[String],
+            cwd: &Path,
+            environment: &[(&str, OsString)],
+        ) -> Result<Self, HostError> {
+            spawn_with_assign(program, args, cwd, environment, &JobHandle::assign_raw)
+        }
+
+        /// The child's stdout read end, if the spawn created it.
+        pub fn take_stdout(&mut self) -> Option<File> {
+            self.stdout.take()
+        }
+
+        /// The child's stderr read end, if the spawn created it.
+        pub fn take_stderr(&mut self) -> Option<File> {
+            self.stderr.take()
+        }
+
+        /// Poll for exit without blocking. `Ok(Some(code))` is the child's own
+        /// exit code; it is never the job's synthetic code.
+        pub fn try_wait(&mut self) -> Result<Option<u32>, HostError> {
+            // SAFETY: `self.process` is a live process handle owned by this
+            // value; a zero timeout polls without blocking.
+            match unsafe { WaitForSingleObject(self.process.raw(), 0) } {
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    // SAFETY: the process handle is valid and `code` is a live
+                    // `u32` out-parameter.
+                    if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
+                        return Err(HostError::new(format!(
+                            "cannot read the `world.run` child's exit code: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                    Ok(Some(code))
+                }
+                _ => Err(HostError::new(format!(
+                    "cannot wait for the `world.run` child: {}",
+                    io::Error::last_os_error()
+                ))),
+            }
+        }
+
+        /// Terminate every process still in the job.
+        ///
+        /// Call this on every exit path — normal exit, timeout, cancellation and
+        /// a failed wait — before [`Self::kill_and_reap`] and before the capture
+        /// joins. Calling it on an empty job succeeds.
+        pub fn terminate_job(&self) -> Result<(), HostError> {
+            self.job.terminate()
+        }
+
+        /// Kill and reap the direct child as the belt-and-braces fallback.
+        ///
+        /// The job kill above is authoritative; this only guarantees the direct
+        /// handle is reaped even when the job termination call failed.
+        pub fn kill_and_reap(&mut self) {
+            // SAFETY: both calls use the live process handle owned by this
+            // value. A process that already exited makes them fail harmlessly,
+            // which is why the results are ignored exactly as the previous
+            // `Child::kill`/`Child::wait` fallback ignored them.
+            unsafe {
+                TerminateProcess(self.process.raw(), JOB_EXIT_CODE);
+                WaitForSingleObject(self.process.raw(), INFINITE);
+            }
+        }
+
+        /// The Windows process id of the contained child.
+        #[cfg(test)]
+        pub(super) fn pid(&self) -> u32 {
+            self.process.id()
+        }
+
+        /// Whether `pid` is currently a member of this child's job.
+        ///
+        /// Test-only proof that a grandchild spawned by the child itself was
+        /// contained at creation time rather than killed after the fact.
+        #[cfg(test)]
+        pub(super) fn job_contains(&self, pid: u32) -> bool {
+            // SAFETY: `OpenProcess` takes a plain access mask and process id;
+            // the returned handle is checked before use. The job handle is the
+            // live handle owned by this value.
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if !valid(process) {
+                return false;
+            }
+            let process = ProcessHandle(process);
+            let mut member = 0i32;
+            // SAFETY: both handles are valid for the call and `member` is a
+            // live `BOOL` out-parameter.
+            let ok = unsafe { IsProcessInJob(process.raw(), self.job.raw(), &mut member) };
+            ok != 0 && member != 0
+        }
+    }
+
+    /// The real spawn path; `assign` exists so a test can force the assignment
+    /// step to fail without weakening the production call.
+    pub(super) fn spawn_with_assign(
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        environment: &[(&str, OsString)],
+        assign: &AssignFn<'_>,
+    ) -> Result<WorldProcess, HostError> {
+        let application = resolve_program(program)?;
+        // The job exists before the process does, so there is no instant at
+        // which a live child has no job to be assigned to.
+        let job = JobHandle::create()?;
+        let stdio = StdioHandles::create()?;
+
+        let mut command_line = command_line(application.as_os_str(), args);
+        let environment_block = environment_block(environment);
+        let current_directory = current_directory(cwd);
+        let application: Vec<u16> = application
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // The handle values must outlive both `UpdateProcThreadAttribute` and
+        // `CreateProcessW`, so keep the array in this frame.
+        let child_handles = stdio.child_handles();
+        let attributes = AttributeList::new(&child_handles)?;
+
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdio.nul.raw();
+        startup.StartupInfo.hStdOutput = stdio.out_write.raw();
+        startup.StartupInfo.hStdError = stdio.err_write.raw();
+        startup.lpAttributeList = attributes.raw();
+
+        let mut process_info = PROCESS_INFORMATION::default();
+        // SAFETY: every pointer is valid for the duration of the call and lives
+        // in this frame: the mutable command-line, NUL-terminated application,
+        // environment and current-directory buffers, the extended startup info
+        // with its initialized attribute list, and the writable process-info
+        // out-parameter. The attribute list restricts inheritance to the three
+        // standard handles above, so no other inheritable handle leaks in.
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                CREATE_SUSPENDED
+                    | CREATE_NO_WINDOW
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT,
+                environment_block.as_ptr().cast(),
+                current_directory.as_ptr(),
+                &startup.StartupInfo,
+                &mut process_info,
+            )
+        };
+        if created == 0 {
+            return Err(HostError::new(format!(
+                "cannot create the suspended `world.run` PowerShell child (`{program}`): {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: on success `CreateProcessW` returned two distinct owned
+        // handles. Each wrapper below takes one and closes it exactly once.
+        let process = ProcessHandle(process_info.hProcess);
+        let thread = OwnedHandle(process_info.hThread);
+
+        // The child is suspended, so no descendant can exist yet. Assignment is
+        // therefore atomic with respect to "before the child executes".
+        if let Err(error) = assign(job.raw(), process.raw()) {
+            // Never resume an uncontained child: terminate and reap it, then
+            // let the job and pipe handles close on the way out.
+            terminate_and_wait(process.raw());
+            return Err(error);
+        }
+
+        // SAFETY: `thread` is the live primary thread handle returned by
+        // CreateProcessW for the suspended child.
+        if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
+            let error = io::Error::last_os_error();
+            terminate_and_wait(process.raw());
+            return Err(HostError::new(format!(
+                "cannot resume the contained `world.run` child: {error}; the child was \
+                 terminated without running"
+            )));
+        }
+        drop(thread);
+
+        let stdout = stdio.out_read.into_file();
+        let stderr = stdio.err_read.into_file();
+        // `stdio` now drops its write and NUL ends, so the capture readers see
+        // EOF when the last descendant holding an inherited pipe exits.
+        Ok(WorldProcess {
+            job,
+            process,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        })
+    }
+
+    /// Resolve a bare program name against `PATH` before `CreateProcessW`.
+    ///
+    /// Passing the resolved path as `lpApplicationName` keeps the search order
+    /// identical to `std::process::Command` (which does not search the current
+    /// directory); leaving it null would add the parent's working directory to
+    /// the search and let a planted `pwsh.exe` win.
+    fn resolve_program(program: &str) -> Result<PathBuf, HostError> {
+        let path = Path::new(program);
+        if path.is_absolute() || program.contains(['\\', '/']) {
+            return Ok(path.to_path_buf());
+        }
+        let mut searched = false;
+        if let Some(directories) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&directories) {
+                let candidate = directory.join(program);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+                let candidate = directory.join(format!("{program}.exe"));
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+                searched = true;
+            }
+        }
+        Err(HostError::new(if searched {
+            format!("cannot find `{program}` on PATH")
+        } else {
+            format!("cannot find `{program}` because PATH is not set")
+        }))
+    }
+
+    /// The child's NUL-terminated working directory.
+    ///
+    /// `Path::canonicalize` (and therefore the host's workspace root) returns
+    /// the `\\?\` verbatim form on Windows. Passing that form to
+    /// `CreateProcessW` makes PowerShell report `Microsoft.PowerShell.Core\
+    /// FileSystem::\\?\…` from `(Get-Location).Path`, whereas
+    /// `std::process::Command` passes the plain form. Strip the prefix (and map
+    /// `\\?\UNC\` back to `\\`) so `world.run` keeps the previous behaviour.
+    pub(super) fn current_directory(cwd: &Path) -> Vec<u16> {
+        const BACKSLASH: u16 = b'\\' as u16;
+        let mut units: Vec<u16> = cwd.as_os_str().encode_wide().collect();
+        let verbatim = [BACKSLASH, BACKSLASH, u16::from(b'?'), BACKSLASH];
+        if units.starts_with(&verbatim) {
+            let unc = [u16::from(b'U'), u16::from(b'N'), u16::from(b'C'), BACKSLASH];
+            if units[verbatim.len()..].starts_with(&unc) {
+                let mut normalized = vec![BACKSLASH; 2];
+                normalized.extend_from_slice(&units[verbatim.len() + unc.len()..]);
+                units = normalized;
+            } else {
+                units.drain(..verbatim.len());
+            }
+        }
+        units.push(0);
+        units
+    }
+
+    /// Terminate a suspended (or just-failed) child and wait for it to be gone.
+    fn terminate_and_wait(process: HANDLE) {
+        // SAFETY: `process` is a live process handle owned by the caller for
+        // this call. Failures are possible when the process already exited and
+        // are intentionally ignored; the caller reports its own error.
+        unsafe {
+            TerminateProcess(process, JOB_EXIT_CODE);
+            WaitForSingleObject(process, INFINITE);
+        }
+    }
+
     /// Sole owner of one unnamed Job Object handle. Closing it is a tree kill
     /// because the job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-    pub(super) struct JobHandle(HANDLE);
+    struct JobHandle(HANDLE);
 
     impl JobHandle {
-        pub(super) fn create() -> Result<Self, HostError> {
+        fn create() -> Result<Self, HostError> {
             // SAFETY: a null security-attribute pointer and a null name ask the
             // OS for a fresh, unnamed job with default security; the returned
             // handle is the only reference and this struct takes ownership.
             let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-            if handle.is_null() {
+            if !valid(handle) {
                 return Err(job_error(
                     "cannot create the `world.run` Job Object",
                     io::Error::last_os_error(),
@@ -135,6 +476,10 @@ mod windows {
             let job = Self(handle);
             job.enable_kill_on_close()?;
             Ok(job)
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
         }
 
         fn enable_kill_on_close(&self) -> Result<(), HostError> {
@@ -163,11 +508,13 @@ mod windows {
             Ok(())
         }
 
-        pub(super) fn assign(&self, child: &std::process::Child) -> Result<(), HostError> {
+        /// Add one process to `job`. The process may be suspended: the kernel
+        /// job link is what `ResumeThread` is gated on.
+        fn assign_raw(job: HANDLE, process: HANDLE) -> Result<(), HostError> {
             // SAFETY: both handles are live and borrowed for the call — the job
-            // handle is owned by `self`, and `child` is a running process the
-            // caller keeps alive. Neither is closed here.
-            let ok = unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
+            // handle is owned by the caller, and the process handle belongs to
+            // the just-created suspended child. Neither is closed here.
+            let ok = unsafe { AssignProcessToJobObject(job, process) };
             if ok == 0 {
                 let error = io::Error::last_os_error();
                 return Err(if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
@@ -175,21 +522,20 @@ mod windows {
                         "`world.run` cannot contain its PowerShell child: Windows refused the \
                          Job Object assignment ({error}). Selora is itself running inside a \
                          restrictive Job Object that does not allow nested jobs, so descendant \
-                         processes would survive the run. The command was stopped instead of \
-                         run without containment"
+                         processes would survive the run. The child was terminated before it ran"
                     ))
                 } else {
                     HostError::new(format!(
-                        "`world.run` cannot add its PowerShell child to the Job Object \
-                         ({error}); descendant processes could not be contained, so the command \
-                         was stopped"
+                        "`world.run` cannot add its suspended PowerShell child to the Job Object \
+                         ({error}); descendant processes could not be contained, so the child \
+                         was terminated before it ran"
                     ))
                 });
             }
             Ok(())
         }
 
-        pub(super) fn terminate(&self) -> Result<(), HostError> {
+        fn terminate(&self) -> Result<(), HostError> {
             // SAFETY: `self.0` is the live job handle owned by this struct and
             // the exit code is passed by value.
             if unsafe { TerminateJobObject(self.0, JOB_EXIT_CODE) } == 0 {
@@ -204,7 +550,7 @@ mod windows {
 
     impl Drop for JobHandle {
         fn drop(&mut self) {
-            if self.0.is_null() {
+            if !valid(self.0) {
                 return;
             }
             // SAFETY: `self.0` is the handle this struct owns and has not yet
@@ -220,7 +566,537 @@ mod windows {
         }
     }
 
+    /// Owned process handle; `Drop` closes it once.
+    struct ProcessHandle(HANDLE);
+
+    impl ProcessHandle {
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        #[cfg(test)]
+        fn id(&self) -> u32 {
+            // SAFETY: the handle is a live process handle owned by this struct.
+            unsafe { GetProcessId(self.0) }
+        }
+    }
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            if valid(self.0) {
+                // SAFETY: this struct owns the handle and closes it once.
+                unsafe { CloseHandle(self.0) };
+                self.0 = ptr::null_mut();
+            }
+        }
+    }
+
+    /// Owned non-process kernel handle (thread, pipe end, NUL device).
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn new(handle: HANDLE) -> Option<Self> {
+            valid(handle).then_some(Self(handle))
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        /// Hand the handle to [`File`] so the capture readers can use it.
+        fn into_file(mut self) -> File {
+            let handle = self.0;
+            self.0 = ptr::null_mut();
+            // SAFETY: `handle` was owned by this value and is forgotten here, so
+            // the returned `File` is its only owner. It is a pipe read end,
+            // which `File::read` accepts.
+            unsafe { File::from_raw_handle(handle as RawHandle) }
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if valid(self.0) {
+                // SAFETY: this struct owns the handle and closes it once.
+                unsafe { CloseHandle(self.0) };
+                self.0 = ptr::null_mut();
+            }
+        }
+    }
+
+    /// The three inheritable standard handles and the two parent read ends.
+    struct StdioHandles {
+        nul: OwnedHandle,
+        out_write: OwnedHandle,
+        err_write: OwnedHandle,
+        out_read: OwnedHandle,
+        err_read: OwnedHandle,
+    }
+
+    impl StdioHandles {
+        fn create() -> Result<Self, HostError> {
+            let attributes = inheritable_security_attributes();
+            let nul = create_nul(&attributes)?;
+            let (out_read, out_write) = create_pipe(&attributes)?;
+            let (err_read, err_write) = create_pipe(&attributes)?;
+            // The parent keeps the read ends across later spawns; they must not
+            // become inherited by an unrelated child.
+            for handle in [out_read.raw(), err_read.raw()] {
+                // SAFETY: both handles are live and owned by the locals above.
+                if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                    return Err(HostError::new(format!(
+                        "cannot make the `world.run` capture pipe private: {}",
+                        io::Error::last_os_error()
+                    )));
+                }
+            }
+            Ok(Self {
+                nul,
+                out_write,
+                err_write,
+                out_read,
+                err_read,
+            })
+        }
+
+        /// The handles the child inherits, in stdin/stdout/stderr order.
+        fn child_handles(&self) -> [HANDLE; 3] {
+            [self.nul.raw(), self.out_write.raw(), self.err_write.raw()]
+        }
+    }
+
+    /// A `SECURITY_ATTRIBUTES` that makes a created handle inheritable.
+    fn inheritable_security_attributes() -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        }
+    }
+
+    fn create_nul(attributes: &SECURITY_ATTRIBUTES) -> Result<OwnedHandle, HostError> {
+        let name: Vec<u16> = "NUL\0".encode_utf16().collect();
+        // SAFETY: `name` is a NUL-terminated UTF-16 path that outlives the
+        // call, and `attributes` is a valid struct for the call. `NUL` opens
+        // the null device, so the child's stdin is always at EOF.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                attributes,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        OwnedHandle::new(handle).ok_or_else(|| {
+            HostError::new(format!(
+                "cannot open the `world.run` child's stdin NUL device: {}",
+                io::Error::last_os_error()
+            ))
+        })
+    }
+
+    fn create_pipe(
+        attributes: &SECURITY_ATTRIBUTES,
+    ) -> Result<(OwnedHandle, OwnedHandle), HostError> {
+        let mut read = ptr::null_mut();
+        let mut write = ptr::null_mut();
+        // SAFETY: both out-parameters are live `HANDLE` slots, and `attributes`
+        // marks the new handles inheritable. A zero size asks for the default
+        // buffer size.
+        if unsafe { CreatePipe(&mut read, &mut write, attributes, 0) } == 0 {
+            return Err(HostError::new(format!(
+                "cannot create a `world.run` capture pipe: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let read = OwnedHandle::new(read);
+        let write = OwnedHandle::new(write);
+        match (read, write) {
+            (Some(read), Some(write)) => Ok((read, write)),
+            _ => Err(HostError::new(
+                "Windows returned an invalid `world.run` capture pipe handle",
+            )),
+        }
+    }
+
+    /// `InitializeProcThreadAttributeList` output kept alive for the spawn.
+    ///
+    /// The list records a pointer to the caller's handle array, so the caller
+    /// keeps that array (`child_handles`) alive until `CreateProcessW` returns.
+    struct AttributeList {
+        // Backing storage for the opaque list; it must stay pointer-aligned and
+        // must outlive `ptr`.
+        _storage: Vec<usize>,
+        ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+    }
+
+    impl AttributeList {
+        fn new(handles: &[HANDLE]) -> Result<Self, HostError> {
+            let mut size = 0usize;
+            // SAFETY: a null list with a valid size out-parameter is the
+            // documented sizing probe; it fails with ERROR_INSUFFICIENT_BUFFER.
+            unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+            if size == 0 {
+                return Err(attribute_error(io::Error::last_os_error()));
+            }
+            let words = size.div_ceil(std::mem::size_of::<usize>());
+            let mut storage = vec![0usize; words];
+            let ptr: LPPROC_THREAD_ATTRIBUTE_LIST = storage.as_mut_ptr().cast();
+            // SAFETY: `ptr` points at `storage`, which is at least `size` bytes
+            // and pointer-aligned (Vec<usize>), and one attribute slot was
+            // requested in the probe above. A failure here leaves the list
+            // uninitialized, so it is not wrapped in `AttributeList` and no
+            // delete runs.
+            if unsafe { InitializeProcThreadAttributeList(ptr, 1, 0, &mut size) } == 0 {
+                return Err(attribute_error(io::Error::last_os_error()));
+            }
+            let list = Self {
+                _storage: storage,
+                ptr,
+            };
+            // SAFETY: the list is initialized with one slot reserved. The value
+            // points at `handles`, which the caller keeps alive through
+            // `CreateProcessW`, and its byte length is exact. No previous value
+            // or return size is needed.
+            let ok = unsafe {
+                UpdateProcThreadAttribute(
+                    list.ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handles.as_ptr().cast(),
+                    std::mem::size_of_val(handles),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(attribute_error(io::Error::last_os_error()));
+            }
+            Ok(list)
+        }
+
+        fn raw(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.ptr
+        }
+    }
+
+    impl Drop for AttributeList {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                // SAFETY: `ptr` was initialized by `Self::new` and has not been
+                // deleted yet; `_storage` still backs it and is dropped after
+                // this call.
+                unsafe { DeleteProcThreadAttributeList(self.ptr) };
+                self.ptr = ptr::null_mut();
+            }
+        }
+    }
+
+    fn attribute_error(error: io::Error) -> HostError {
+        HostError::new(format!(
+            "cannot restrict `world.run` handle inheritance: {error}"
+        ))
+    }
+
+    /// A Windows command line that round-trips through `CommandLineToArgvW`,
+    /// using the same quoting rules as `std::process::Command`.
+    fn command_line(program: &OsStr, args: &[String]) -> Vec<u16> {
+        let mut line = Vec::new();
+        push_quoted(&mut line, program);
+        for argument in args {
+            line.push(u16::from(b' '));
+            push_quoted(&mut line, OsStr::new(argument));
+        }
+        line.push(0);
+        line
+    }
+
+    fn push_quoted(line: &mut Vec<u16>, argument: &OsStr) {
+        const SPACE: u16 = b' ' as u16;
+        const TAB: u16 = b'\t' as u16;
+        const QUOTE: u16 = b'"' as u16;
+        const BACKSLASH: u16 = b'\\' as u16;
+
+        let units: Vec<u16> = argument.encode_wide().collect();
+        let needs_quotes = units.is_empty()
+            || units
+                .iter()
+                .any(|unit| matches!(*unit, SPACE | TAB | QUOTE | 10 | 11 | 13));
+        if !needs_quotes {
+            line.extend_from_slice(&units);
+            return;
+        }
+        line.push(QUOTE);
+        let mut backslashes = 0usize;
+        for unit in units {
+            if unit == BACKSLASH {
+                backslashes += 1;
+                continue;
+            }
+            if unit == QUOTE {
+                // 2n+1 backslashes: n literal ones plus one escaping the quote.
+                line.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+            } else {
+                line.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+            }
+            line.push(unit);
+            backslashes = 0;
+        }
+        // Trailing backslashes precede the closing quote and must be doubled.
+        line.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+        line.push(QUOTE);
+    }
+
+    /// A UTF-16, NUL-terminated, case-insensitively sorted environment block.
+    ///
+    /// Only `environment` entries are present: the child never inherits the
+    /// parent's ambient environment (and therefore never the gateway key).
+    fn environment_block(environment: &[(&str, OsString)]) -> Vec<u16> {
+        let mut entries: Vec<(&str, &OsString)> =
+            environment.iter().map(|(n, v)| (*n, v)).collect();
+        entries.sort_by_key(|(name, _value)| name.to_ascii_uppercase());
+        let mut block = Vec::new();
+        for (name, value) in entries {
+            block.extend(name.encode_utf16());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn valid(handle: HANDLE) -> bool {
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
+    }
+
     fn job_error(message: &str, error: io::Error) -> HostError {
         HostError::new(format!("{message}: {error}"))
+    }
+
+    /// Test-only: `AssignProcessToJobObject` against a deliberately invalid job
+    /// handle, so the failure test drives the real Win32 error path.
+    #[cfg(test)]
+    pub(super) fn assign_against_invalid_job(process: HANDLE) -> Result<(), HostError> {
+        JobHandle::assign_raw(ptr::null_mut(), process)
+    }
+
+    /// Test-only: the pid behind a raw process handle.
+    #[cfg(test)]
+    pub(super) fn raw_process_id(process: HANDLE) -> u32 {
+        // SAFETY: the caller passes the live handle of a process it just
+        // spawned; `GetProcessId` does not take ownership.
+        unsafe { GetProcessId(process) }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    //! These tests make the child spawn its grandchild as its very first
+    //! statement, so they fail if assignment ever happens after the child can
+    //! execute.
+
+    use super::{
+        windows::{assign_against_invalid_job, raw_process_id, spawn_with_assign},
+        WorldProcess,
+    };
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+
+    fn powershell() -> &'static str {
+        if Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            "pwsh"
+        } else {
+            "powershell"
+        }
+    }
+
+    fn environment() -> Vec<(&'static str, OsString)> {
+        [
+            "PATH",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+        .collect()
+    }
+
+    fn args(script: &str) -> Vec<String> {
+        vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script.to_owned(),
+        ]
+    }
+
+    /// A PowerShell single-quoted literal for `value` (`'` is doubled).
+    fn ps_literal(value: &Path) -> String {
+        format!("'{}'", value.display().to_string().replace('\'', "''"))
+    }
+
+    fn wait_for_pid_file(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild never wrote its PID to {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    fn wait_until_gone(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if !process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        !process_alive(pid)
+    }
+
+    /// The script's first statement starts a second PowerShell (a grandchild
+    /// the direct-child kill cannot reach) and records its PID. Only then does
+    /// it do anything else.
+    fn grandchild_first_script(pid_file: &Path, tail: &str) -> String {
+        format!(
+            "$grand = Start-Process -FilePath {} -ArgumentList '-NoProfile',\
+             '-NonInteractive','-Command','Start-Sleep -Seconds 120' -NoNewWindow -PassThru; \
+             Set-Content -LiteralPath {} -Value $grand.Id; {tail}",
+            ps_literal(Path::new(powershell())),
+            ps_literal(pid_file)
+        )
+    }
+
+    #[test]
+    fn current_directory_drops_the_verbatim_prefix() {
+        let units = super::windows::current_directory(Path::new(r"\\?\C:\work\repo"));
+        let text = String::from_utf16(&units[..units.len() - 1]).expect("utf-16");
+        assert_eq!(text, r"C:\work\repo");
+
+        let units = super::windows::current_directory(Path::new(r"\\?\UNC\server\share\repo"));
+        let text = String::from_utf16(&units[..units.len() - 1]).expect("utf-16");
+        assert_eq!(text, r"\\server\share\repo");
+
+        let units = super::windows::current_directory(Path::new(r"C:\plain\repo"));
+        let text = String::from_utf16(&units[..units.len() - 1]).expect("utf-16");
+        assert_eq!(text, r"C:\plain\repo");
+    }
+
+    #[test]
+    fn child_spawned_grandchild_is_in_the_job_and_dies_with_it() {
+        for attempt in 0..3 {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let pid_file: PathBuf = workspace.path().join(format!("grandchild-{attempt}.pid"));
+            let script = grandchild_first_script(&pid_file, "Start-Sleep -Seconds 120");
+            let mut child = WorldProcess::spawn(
+                powershell(),
+                &args(&script),
+                workspace.path(),
+                &environment(),
+            )
+            .expect("suspended spawn and assignment succeed");
+            let grandchild = wait_for_pid_file(&pid_file);
+            assert!(
+                child.job_contains(child.pid()),
+                "attempt {attempt}: the child itself is not in its job"
+            );
+            assert!(
+                child.job_contains(grandchild),
+                "attempt {attempt}: grandchild {grandchild} spawned before assignment was in the \
+                 job; the suspend window is open"
+            );
+            child.terminate_job().expect("job terminates");
+            child.kill_and_reap();
+            assert!(
+                wait_until_gone(grandchild),
+                "attempt {attempt}: grandchild {grandchild} survived the job termination"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_assignment_never_resumes_the_child() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sentinel = workspace.path().join("child-ran.txt");
+        let script = format!(
+            "Set-Content -LiteralPath {} -Value 'ran'",
+            ps_literal(&sentinel)
+        );
+        let observed = Mutex::new(None);
+        // Run the real `AssignProcessToJobObject` against an invalid job handle
+        // so the failure is the Win32 failure, not a simulated one.
+        let result = spawn_with_assign(
+            powershell(),
+            &args(&script),
+            workspace.path(),
+            &environment(),
+            &|_job, process| {
+                *observed.lock().expect("pid slot") = Some(raw_process_id(process));
+                assign_against_invalid_job(process)
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("assignment failure must abort the spawn"),
+            Err(error) => error,
+        };
+        assert!(
+            error.message.contains("Job Object"),
+            "unexpected error: {error}"
+        );
+        let pid = observed
+            .into_inner()
+            .expect("pid slot")
+            .expect("pid recorded before assignment");
+        assert!(
+            !sentinel.exists(),
+            "the child executed even though assignment failed"
+        );
+        assert!(
+            wait_until_gone(pid),
+            "child {pid} was left running after a failed assignment"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !sentinel.exists(),
+            "the child ran after the failed assignment returned"
+        );
     }
 }
