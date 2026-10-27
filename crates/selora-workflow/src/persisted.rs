@@ -4,10 +4,21 @@
 //! ambiguous and cannot resume: its effects may already have happened.
 //! A per-run tool-effect ledger (`.selora/workflow-runs/{run_id}/tool-effects.jsonl`)
 //! records `started`/`finished` pairs around side-effecting ask tools. A
-//! `started` without `finished`, or an effect owned by an unfinished ask, makes
-//! the run non-resumable until [`RunOptions::acknowledge_partial_effects`]
-//! accepts that effects may already exist. A corrupt ledger is a typed error,
-//! never empty evidence. [`partial_effects`] is the shell's preflight.
+//! `started` attempt without `finished`, a failed attempt, or an effect owned by
+//! an unfinished ask makes the run non-resumable until
+//! [`RunOptions::acknowledge_partial_effects`] accepts that effects may already
+//! exist. That option first appends durable `acknowledged` evidence per effect
+//! (step/ask, actor, reason) through [`acknowledge_partial_effects`], then the
+//! preflight reads it back. A corrupt ledger is a typed error, never empty
+//! evidence. [`partial_effects`] is the shell's preflight.
+//!
+//! Effect ids are stable (run, step/ask, model call id, tool). When a resumed
+//! ask re-issues a call id the ledger proves completed, the host replays it
+//! (one `replayed` record, no second execution) instead of running the tool
+//! again. A retry of an unfinished or failed attempt needs that attempt's
+//! acknowledgement. This narrows the duplicate-effect window; it is not
+//! exactly-once across a process crash, OS crash or power loss (see
+//! [`crate::effects`]).
 //! Unfinished asks are dispatched again through the host with fresh approval
 //! slots. When any ask would be dispatched again and neither
 //! [`RunOptions::allow_incomplete_asks`] nor the partial-effect acknowledgement
@@ -27,7 +38,7 @@
 //! run-wide ordinal), `engine_artifact` (full markdown/file content),
 //! `engine_run_finished`, and `phase_started`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,7 +47,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::effects::{ToolEffectPhase, ToolEffectRecord};
+use crate::effects::{effect_states, EffectOutcome, ToolEffectLedger, ToolEffectRecord};
 use crate::journal::{check_file, checked_run_dir, load_verified, Journal, JournalWriter};
 use crate::{
     EventSink, Host, RunId, RunStatus, StepKind, WorkflowError, WorkflowOutcome, WorkflowReport,
@@ -61,14 +72,16 @@ pub struct RunOptions {
     /// journal append, because a re-dispatched ask is not exactly-once.
     pub allow_incomplete_asks: bool,
     /// Accept that resume may replay tool effects the ledger proves may already
-    /// have applied: a `started` record without `finished`, or a side effect
-    /// owned by an ask the resume would dispatch again.
+    /// have applied: an unfinished or failed attempt, or a side effect owned by
+    /// an ask the resume would dispatch again.
     ///
     /// Only consulted when `resume` is true. Default (`false`) refuses with
     /// [`WorkflowError::PartialEffects`] before any host call or journal
     /// append. Set this only from a separate, explicit user action that names
     /// the existing-effect risk; it also accepts the unfinished-ask
-    /// re-dispatch, because that ask is the owner of those effects.
+    /// re-dispatch, because that ask is the owner of those effects. When set,
+    /// durable `acknowledged` records are appended first, so the acceptance is
+    /// auditable and permits one retry of each accepted attempt.
     pub acknowledge_partial_effects: bool,
 }
 
@@ -132,30 +145,39 @@ pub fn incomplete_asks(root: &Path, run_id: &RunId) -> Result<Vec<IncompleteAsk>
 ///
 /// Non-empty when the run's tool-effect ledger proves at least one of:
 ///
-/// * a `started` side effect has no matching `finished` record (the crash
-///   window between the effect landing and its completion append);
+/// * a `started` attempt has no matching `finished` record (the crash window
+///   between the effect landing and its completion append);
+/// * an attempt finished with a tool error (a partial effect is possible);
 /// * a side effect is owned by an ask the resume would dispatch again (that
 ///   ask's tools may run a second time);
 /// * a side effect cannot be attributed to any known step (fail closed, never
 ///   guess it is safe).
 ///
-/// Effects owned by completed asks are not reported, and a read-only unfinished
-/// ask produces no ledger records at all.
+/// Attempts the owner already acknowledged in durable ledger evidence are
+/// counted in `acknowledged_effects` and do not block. A successful effect
+/// owned by a completed ask is not reported; a failed attempt is, because it
+/// may have applied part of its effect. A read-only unfinished ask produces no
+/// ledger records at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PartialEffects {
-    /// `started` records with no matching `finished`.
+    /// `started` attempts with no matching `finished`.
     pub unfinished_effects: usize,
+    /// Attempts that finished with a tool error.
+    pub failed_effects: usize,
     /// Side effects owned by an ask the resume would dispatch again.
     pub unfinished_ask_effects: usize,
     /// Side effects whose step identity is unknown to the journal.
     pub unattributed_effects: usize,
+    /// Risks the owner already accepted in durable ledger evidence.
+    pub acknowledged_effects: usize,
 }
 
 impl PartialEffects {
-    /// No durable partial-effect evidence.
+    /// No unacknowledged durable partial-effect evidence.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.unfinished_effects == 0
+            && self.failed_effects == 0
             && self.unfinished_ask_effects == 0
             && self.unattributed_effects == 0
     }
@@ -163,8 +185,63 @@ impl PartialEffects {
     /// Distinct side effects that make a silent resume unsafe.
     #[must_use]
     pub fn risk_count(&self) -> usize {
-        self.unfinished_effects + self.unfinished_ask_effects + self.unattributed_effects
+        self.unfinished_effects
+            + self.failed_effects
+            + self.unfinished_ask_effects
+            + self.unattributed_effects
     }
+}
+
+/// Ledger effect ids grouped by why a resume would be unsafe.
+#[derive(Debug, Default)]
+struct EffectEvidence {
+    unfinished: BTreeSet<String>,
+    failed: BTreeSet<String>,
+    unfinished_ask: BTreeSet<String>,
+    unattributed: BTreeSet<String>,
+    acknowledged: BTreeSet<String>,
+}
+
+impl EffectEvidence {
+    /// Every effect id whose risk still needs an acknowledgement.
+    fn risky_ids(&self) -> BTreeSet<String> {
+        self.unfinished
+            .iter()
+            .chain(self.failed.iter())
+            .chain(self.unfinished_ask.iter())
+            .chain(self.unattributed.iter())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Append durable `acknowledged` evidence for every risky attempt of this run.
+///
+/// Called only from an explicit owner action: the `acknowledge_partial_effects`
+/// resume option. One record per effect names its durable step/ask, the actor
+/// and the reason, so a later reader can audit who accepted which risk. The
+/// call is idempotent; already acknowledged attempts are skipped. It writes no
+/// record when nothing is risky.
+///
+/// # Errors
+/// Invalid run id, untrusted path, missing or malformed spec, damaged journal,
+/// a corrupt/foreign ledger, or an append failure. In every error case no
+/// host call happens and the run does not start.
+pub fn acknowledge_partial_effects(
+    root: &Path,
+    run_id: &RunId,
+    acknowledged_by: &str,
+    reason: &str,
+) -> Result<usize, WorkflowError> {
+    let spec = load_workflow_spec(root, run_id)?;
+    let verified = load_verified(root, run_id).map_err(persistence_error)?;
+    let scan = scan_journal(&verified.loaded.entries, &spec)?;
+    let records = crate::effects::load_tool_effects(root, run_id)?;
+    let ids = scan.effect_evidence(&records).risky_ids();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    ToolEffectLedger::open_for_run(root, run_id)?.acknowledge_effects(&ids, acknowledged_by, reason)
 }
 
 /// Read the run's tool-effect ledger against its journal: the shell's
@@ -204,9 +281,10 @@ pub fn partial_effects(root: &Path, run_id: &RunId) -> Result<PartialEffects, Wo
 /// host call or journal append. Continuing needs a new confirmed run and
 /// budget. Failed or stopped runs can resume, except when an interrupted
 /// command has an ambiguous side effect. The tool-effect ledger is consulted
-/// first: an unfinished `started` record, or an effect owned by an unfinished
+/// first: an unfinished or failed attempt, or an effect owned by an unfinished
 /// ask, is refused with [`WorkflowError::PartialEffects`] unless
-/// [`RunOptions::acknowledge_partial_effects`] is true. A corrupt ledger is
+/// [`RunOptions::acknowledge_partial_effects`] is true (which appends durable
+/// per-effect acknowledgement evidence first). A corrupt ledger is
 /// [`WorkflowError::ToolEffectLedger`]. Unfinished asks are new host dispatches
 /// and require fresh approval slots; their tools may already have partially
 /// applied effects before interruption. A resume that would dispatch one again
@@ -484,9 +562,7 @@ impl JournalScan {
     }
 
     /// Classify the ledger against this journal's proven step identities.
-    fn partial_effects(&self, records: &[ToolEffectRecord]) -> PartialEffects {
-        use std::collections::BTreeSet;
-
+    fn effect_evidence(&self, records: &[ToolEffectRecord]) -> EffectEvidence {
         let unfinished_asks: BTreeSet<u64> = self
             .calls
             .values()
@@ -499,43 +575,51 @@ impl JournalScan {
             })
             .map(|saved| saved.start.step.index)
             .collect();
-        let mut finished: BTreeSet<&str> = BTreeSet::new();
-        for record in records {
-            if record.phase == ToolEffectPhase::Finished {
-                finished.insert(record.effect_id.as_str());
-            }
-        }
-        let mut unfinished_effects = BTreeSet::new();
-        let mut unfinished_ask_effects = BTreeSet::new();
-        let mut unattributed_effects = BTreeSet::new();
-        for record in records {
-            if record.phase != ToolEffectPhase::Started {
+        let mut evidence = EffectEvidence::default();
+        for state in effect_states(records) {
+            if state.acknowledged {
+                // The owner accepted this attempt's risk in durable evidence.
+                evidence.acknowledged.insert(state.effect_id);
                 continue;
             }
-            if !finished.contains(record.effect_id.as_str()) {
-                unfinished_effects.insert(record.effect_id.as_str());
-                continue;
-            }
-            let known = record.step.as_ref().and_then(|step| {
-                step.step_id
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|index| self.calls.contains_key(index))
-            });
-            match known {
-                Some(index) if unfinished_asks.contains(&index) => {
-                    unfinished_ask_effects.insert(record.effect_id.as_str());
+            match state.outcome {
+                EffectOutcome::Open => {
+                    evidence.unfinished.insert(state.effect_id);
                 }
-                Some(_) => {}
-                None => {
-                    unattributed_effects.insert(record.effect_id.as_str());
+                EffectOutcome::Finished { ok: false } => {
+                    evidence.failed.insert(state.effect_id);
+                }
+                EffectOutcome::Finished { ok: true } => {
+                    let known = state.step.as_ref().and_then(|step| {
+                        step.step_id
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|index| self.calls.contains_key(index))
+                    });
+                    match known {
+                        Some(index) if unfinished_asks.contains(&index) => {
+                            evidence.unfinished_ask.insert(state.effect_id);
+                        }
+                        Some(_) => {}
+                        None => {
+                            evidence.unattributed.insert(state.effect_id);
+                        }
+                    }
                 }
             }
         }
+        evidence
+    }
+
+    /// Count the risks that still need an acknowledgement.
+    fn partial_effects(&self, records: &[ToolEffectRecord]) -> PartialEffects {
+        let evidence = self.effect_evidence(records);
         PartialEffects {
-            unfinished_effects: unfinished_effects.len(),
-            unfinished_ask_effects: unfinished_ask_effects.len(),
-            unattributed_effects: unattributed_effects.len(),
+            unfinished_effects: evidence.unfinished.len(),
+            failed_effects: evidence.failed.len(),
+            unfinished_ask_effects: evidence.unfinished_ask.len(),
+            unattributed_effects: evidence.unattributed.len(),
+            acknowledged_effects: evidence.acknowledged.len(),
         }
     }
 }
@@ -569,6 +653,18 @@ impl Durable {
             .open(lock_path)
             .map_err(persistence_error)?;
         lock.try_lock().map_err(persistence_error)?;
+        // The explicit acknowledgement is written as durable per-effect
+        // evidence before the preflight reads it back. One record names each
+        // risky attempt's step/ask, actor and reason. A failed append starts
+        // nothing.
+        if options.resume && options.acknowledge_partial_effects {
+            acknowledge_partial_effects(
+                &options.workspace_root,
+                &options.run_id,
+                "workflow resume",
+                "owner accepted that earlier tool effects may already exist",
+            )?;
+        }
         // Fail closed before any host call: a resume may replay tools whose
         // earlier effects already landed. The ledger is the durable evidence.
         if options.resume {
