@@ -51,7 +51,8 @@ use selora_protocol::{
     ApprovalDto, ApprovalId, ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto,
     ChatRequestDto, ChatStateDto, ConnectionStatus, DecisionDto, FrontendEvent, MessageDto,
     MessageId, MessageRole, ModelDto, ModelsDto, ProtocolErrorDto, RequestId, SeloraStatusDto,
-    SessionDto, SessionId, ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
+    SessionDto, SessionId, SubagentArtifactDto, SubagentCompletedDto, SubagentPolicyDto,
+    ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -60,7 +61,7 @@ use crate::state::EventLog;
 
 /// The read-only half of the §17.1 manifest — `explore` mode arms exactly
 /// these (the model cannot request a side effect).
-const EXPLORE_TOOLS: [&str; 7] = [
+const EXPLORE_TOOLS: [&str; 8] = [
     "read_file",
     "list_dir",
     "fuzzy_find",
@@ -68,6 +69,7 @@ const EXPLORE_TOOLS: [&str; 7] = [
     "web_search",
     "web_fetch",
     "manage_todo",
+    "wait",
 ];
 
 /// Transcript bound (the egui panel's 100-entry cap, R3) on the web shell's
@@ -205,6 +207,11 @@ struct EngineInner {
 pub(crate) struct SessionEngine {
     inner: Mutex<EngineInner>,
     config: EngineConfig,
+    /// Phase 9e: the session-scoped background subagent runtime. It
+    /// outlives individual turns, so a child started by one turn can finish
+    /// while the user edits in another. The `wait` tool reads it through
+    /// `ToolContext`.
+    subagents: selora_ai::SubagentRuntime,
     /// The agent tools' root. The Z3 shell has no folder picker (that lands
     /// in Z4 with the workbench), so `SELORA_WORKSPACE_ROOT` is the one way
     /// to point the tools at a real tree today; without it `SendAgent`
@@ -248,6 +255,7 @@ impl SessionEngine {
             }),
             config,
             workspace_root: Mutex::new(None),
+            subagents: selora_ai::SubagentRuntime::new(),
         }
     }
 
@@ -471,7 +479,10 @@ impl SessionEngine {
             input = input.with_reasoning_effort(effort.clone());
         }
         let tool_settings = agent_tool_settings(&self.config.agent, self.brave_key());
-        let tools = RouterToolRunner::new(ToolContext::new(root, tool_settings));
+        let tools = RouterToolRunner::new(
+            ToolContext::new(root, tool_settings)
+                .with_subagents(self.subagents.clone(), payload.session_id.as_str()),
+        );
         let chat = selora_ai::ClientChatStream::new(selora_ai::SeloraClient::new(
             &self.base_url(),
             &api_key,
@@ -508,6 +519,47 @@ impl SessionEngine {
         Ok(())
     }
 
+    /// Phase 9e: start one background child and emit its single typed
+    /// completion event. The runtime outlives the parent turn; the relay
+    /// only maps the one accepted result onto `selora://event`. A cancelled
+    /// child emits nothing, and a late result is discarded by the runtime.
+    ///
+    /// The host-facing spawn tool (Phase 9c) calls this seam; keeping the
+    /// relay here means every consumer gets the same event contract.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_background_subagent<R: tauri::Runtime, F>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        request: selora_ai::SpawnRequest,
+        work: F,
+    ) -> Result<selora_ai::SubagentHandle, selora_ai::SpawnError>
+    where
+        F: std::future::Future<Output = selora_ai::ChildOutcome> + Send + 'static,
+    {
+        let mut events = self.subagents.subscribe();
+        let child_id = request.child_id.clone();
+        let handle = self.subagents.spawn_background(request, work)?;
+        tauri::async_runtime::spawn(async move {
+            while let Ok(selora_ai::SubagentEvent::Completed(completion)) = events.recv().await {
+                if completion.child_id != child_id {
+                    continue;
+                }
+                let Ok(parent) = SessionId::new(completion.parent_session.clone()) else {
+                    return;
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::SubagentCompleted(subagent_completed_dto(completion)),
+                    None,
+                    parent,
+                );
+                return;
+            }
+        });
+        Ok(handle)
+    }
+
     // -----------------------------------------------------------------
     // StopChat / AgentDecision
     // -----------------------------------------------------------------
@@ -532,7 +584,10 @@ impl SessionEngine {
                     let _ = cancel.send(true);
                 }
                 ActiveRequest::Agent { decisions, .. } => {
+                    // Phase 9e: stopping the parent stops its children. The
+                    // runtime drops any result that arrives afterwards.
                     let _ = decisions.send((Uuid::nil(), selora_ai::AgentDecision::Stop));
+                    self.subagents.cancel_parent(active.session_id().as_str());
                 }
             }
         }
@@ -1532,6 +1587,31 @@ fn fallback_tool_name(card: &ApprovalCard) -> String {
         ApprovalCard::Delete { .. } => "delete_file".into(),
         ApprovalCard::Command { .. } => "bash".into(),
         ApprovalCard::Workflow { .. } => "run_workflow".into(),
+    }
+}
+
+/// Map the runtime's completion onto the wire DTO (one shape for every
+/// consumer; the frontend dedupes by `child_id`).
+fn subagent_completed_dto(completion: selora_ai::SubagentCompletion) -> SubagentCompletedDto {
+    SubagentCompletedDto {
+        child_id: completion.child_id,
+        parent_session_id: SessionId::new(completion.parent_session)
+            .expect("runtime parent sessions originate from a SessionId"),
+        policy: match completion.policy {
+            selora_ai::SubagentPolicy::ReadOnly => SubagentPolicyDto::ReadOnly,
+            selora_ai::SubagentPolicy::Full => SubagentPolicyDto::Full,
+        },
+        ok: completion.ok,
+        error: completion.error,
+        final_message: completion.final_message,
+        artifacts: completion
+            .artifacts
+            .into_iter()
+            .map(|artifact| SubagentArtifactDto {
+                kind: artifact.kind,
+                path: artifact.path,
+            })
+            .collect(),
     }
 }
 
@@ -2836,5 +2916,68 @@ mod tests {
             prompt.contains("Active file (workspace-relative): apps/selora-desktop/src/main.rs")
         );
         assert!(prompt.contains("do not claim to have read a file you have not read in this turn"));
+    }
+
+    #[test]
+    fn phase_9e_background_completion_emits_one_typed_event() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let app = mock_app_handle();
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            active_model: None,
+            agent: selora_settings::AgentSettings::default(),
+            key_source: ApiKeySource::Fixed(None),
+        }));
+
+        let spawn = tauri::async_runtime::block_on(async {
+            engine.spawn_background_subagent(
+                Arc::clone(&log),
+                app,
+                selora_ai::SpawnRequest::new(
+                    "session-1",
+                    "child-desktop-1",
+                    selora_ai::SubagentPolicy::ReadOnly,
+                    "review",
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    selora_ai::ChildOutcome::success("review complete")
+                },
+            )
+        });
+        spawn.expect("spawn");
+
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let events = loop {
+            let events = log.events_after(0);
+            if events
+                .iter()
+                .any(|event| matches!(event.payload, FrontendEvent::SubagentCompleted(_)))
+                || Instant::now() >= deadline
+            {
+                break events;
+            }
+            tauri::async_runtime::block_on(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            });
+        };
+
+        let completions: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                FrontendEvent::SubagentCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 1, "one event, never a duplicate");
+        let completion = &completions[0];
+        assert_eq!(completion.child_id, "child-desktop-1");
+        assert_eq!(
+            completion.parent_session_id,
+            SessionId::new("session-1").unwrap()
+        );
+        assert!(completion.ok);
+        assert_eq!(completion.final_message, "review complete");
     }
 }

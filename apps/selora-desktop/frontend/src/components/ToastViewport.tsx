@@ -7,6 +7,7 @@
 // and auto-dismiss progress timer bar on the bottom edge.
 import { useSyncExternalStore } from 'react';
 import { toastDuration, toastStore } from '../features/toasts/toast-store';
+import { agentStore } from '../features/agent/agent-store';
 import { Icon, type IconName } from './Icon';
 
 const SEVERITY_ICON: Record<string, IconName> = {
@@ -49,6 +50,20 @@ export function ToastViewport() {
                 </span>
                 <p className="toast-message">{toast.message}</p>
               </div>
+              {toast.action ? (
+                <button
+                  type="button"
+                  className="toast-open"
+                  onClick={() => {
+                    if (toast.action?.kind === 'subagent') {
+                      agentStore.revealSubagent(toast.action.sessionId, toast.action.childId);
+                    }
+                    toastStore.dismissTransient(toast.id);
+                  }}
+                >
+                  Open
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="toast-dismiss"

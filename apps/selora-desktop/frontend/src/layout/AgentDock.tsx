@@ -95,6 +95,13 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
   const hasMessages = state.messages.length > 0;
   const gate = getComposerGate(state);
   const autoApplyArmed = state.permissionMode === 'full';
+  const revealedSubagent = state.revealedSubagentId
+    ? state.subagents.find((subagent) => subagent.id === state.revealedSubagentId)
+    : undefined;
+
+  useEffect(() => {
+    if (state.revealedSubagentId) setActiveTab('plan');
+  }, [state.revealedSubagentId]);
 
   const suggestions = SUGGESTIONS.filter((suggestion) => {
     if (suggestion === 'Explain this file') return editor.activeBuffer !== null;
@@ -220,6 +227,41 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
           )}
         </div>
       </header>
+
+      {/* Phase 9e: notification click reveals the child result here, under
+          the selected parent session. */}
+      {revealedSubagent ? (
+        <section className="agent-subagent-result" data-testid="subagent-result" aria-label="Subagent result">
+          <div className="agent-subagent-result-head">
+            <span className="agent-subagent-result-title">
+              {revealedSubagent.name}
+              <span className="agent-subagent-policy">{revealedSubagent.policy ?? 'read_only'}</span>
+            </span>
+            <button
+              type="button"
+              className="agent-subagent-result-close"
+              aria-label="Dismiss subagent result"
+              onClick={() => agentStore.clearSubagentReveal()}
+            >
+              Close
+            </button>
+          </div>
+          <p className="agent-subagent-result-body">
+            {revealedSubagent.status === 'failed'
+              ? revealedSubagent.error ?? 'Subagent failed without a message.'
+              : revealedSubagent.result || 'Subagent finished without a final message.'}
+          </p>
+          {revealedSubagent.artifacts && revealedSubagent.artifacts.length > 0 ? (
+            <ul className="agent-subagent-artifacts">
+              {revealedSubagent.artifacts.map((artifact) => (
+                <li key={`${artifact.kind}:${artifact.path}`}>
+                  <span>{artifact.kind}</span> {artifact.path}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
 
       {/* 2. Main Workbench Body */}
       <div className="agent-workbench-body">

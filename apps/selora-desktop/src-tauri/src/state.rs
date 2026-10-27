@@ -58,7 +58,9 @@ fn reveal_in_file_explorer(path: &std::path::Path) -> Result<(), ProtocolErrorDt
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let target = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
         std::process::Command::new("xdg-open")
             .arg(target.unwrap_or(path))
             .spawn()

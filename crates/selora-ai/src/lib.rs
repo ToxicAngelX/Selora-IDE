@@ -23,10 +23,13 @@ mod updates;
 
 pub use agent::{
     denied_result, execute_approved, execute_tool, run_agent_turn, spawn_agent_turn, tool_manifest,
-    AgentDecision, AgentEvent, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport,
-    AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle, ChatStream, ClientChatStream,
-    RouterToolRunner, ToolContext, ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd,
-    TurnInput, DENIED_MESSAGE,
+    wait_tool_result, wait_tool_spec, AgentDecision, AgentEvent, AgentSummary, AgentToolSettings,
+    AgentTurn, AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId, ArtifactRef,
+    BashAbortHandle, CancelToken, ChatStream, ChildId, ChildOutcome, ChildState, ClientChatStream,
+    CompletionDisposition, RouterToolRunner, SpawnError, SpawnRequest, SubagentCompletion,
+    SubagentEvent, SubagentHandle, SubagentPolicy, SubagentRuntime, ToolContext, ToolOutcome,
+    ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput, WaitError, WaitOutcome,
+    DEFAULT_WAIT_TIMEOUT, DENIED_MESSAGE, MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

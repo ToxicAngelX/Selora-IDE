@@ -1457,7 +1457,13 @@ mod tests {
         touch(&root, "src/b.rs", "nothing here\n");
         let result = search_files(&root, "call_1", "NEEDLE");
         assert!(result.ok, "{}", result.content);
-        eprintln!("DIRECT: {:?}", selora_fs::search::search_in_files(&root, &selora_fs::search::SearchQuery::new("NEEDLE")));
+        eprintln!(
+            "DIRECT: {:?}",
+            selora_fs::search::search_in_files(
+                &root,
+                &selora_fs::search::SearchQuery::new("NEEDLE")
+            )
+        );
         assert!(result.content.contains("src/a.rs:1"), "{}", result.content);
         assert!(result.content.contains("fn needle"));
         assert!(!result.content.contains("b.rs"));

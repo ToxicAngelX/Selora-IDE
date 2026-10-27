@@ -147,6 +147,13 @@ pub struct ToolContext {
     pub settings: AgentToolSettings,
     /// The Stop button's kill switch for bash children (§17.3).
     pub abort: bash::BashAbortHandle,
+    /// Phase 9e: the session-owned background subagent runtime, when the
+    /// host has one. `wait` is a model-visible error without it (never a
+    /// silent no-op).
+    pub subagents: Option<crate::agent::subagent::SubagentRuntime>,
+    /// Phase 9e: the parent session `wait` scopes to. Required with
+    /// `subagents`.
+    pub parent_session: Option<String>,
 }
 
 impl ToolContext {
@@ -159,7 +166,21 @@ impl ToolContext {
             root,
             settings,
             abort: bash::BashAbortHandle::default(),
+            subagents: None,
+            parent_session: None,
         }
+    }
+
+    /// Attach the session's background subagent runtime for the `wait`
+    /// tool. The runtime must outlive this turn (the session owns it).
+    pub fn with_subagents(
+        mut self,
+        runtime: crate::agent::subagent::SubagentRuntime,
+        parent_session: impl Into<String>,
+    ) -> Self {
+        self.subagents = Some(runtime);
+        self.parent_session = Some(parent_session.into());
+        self
     }
 }
 
@@ -331,6 +352,8 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
                 "required": ["name", "script", "commands"],
             }),
         ),
+        // -- Phase 9e: background subagent completion wait ------------------
+        crate::agent::subagent::wait_tool_spec(),
     ]
 }
 
@@ -513,6 +536,23 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
         }
 
         // -- §17.1: the manifest is closed --------------------------------
+        // -- Phase 9e: wait for background subagents (never spins) ----------
+        "wait" => match (&ctx.subagents, &ctx.parent_session) {
+            (Some(runtime), Some(parent)) => Ok(ToolOutcome::Ready(
+                crate::agent::subagent::wait_tool_result(
+                    runtime,
+                    parent,
+                    &call.id,
+                    &call.arguments,
+                )
+                .await,
+            )),
+            _ => Ok(ToolOutcome::Ready(ToolResult::error(
+                &call.id,
+                "wait: no subagent runtime is attached to this turn",
+            ))),
+        },
+
         unknown => Err(format!(
             "unknown tool `{unknown}` — the tool manifest (§17.1) is fixed"
         )),
@@ -821,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_section_17_1s_ten_tools_plus_manifest_v2s_run_workflow() {
+    fn manifest_is_section_17_1s_ten_tools_plus_manifest_v2_and_9e_wait() {
         let manifest = tool_manifest();
         let names: Vec<&str> = manifest.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -840,6 +880,7 @@ mod tests {
                 // §18.4: manifest v2 is additive — the ten §17.1 tools and
                 // exactly one new entry.
                 "run_workflow",
+                "wait",
             ],
             "§17.1's closed set plus §18.4's additive run_workflow"
         );
@@ -1326,6 +1367,48 @@ mod tests {
         match bad {
             ToolOutcome::Ready(result) => assert!(!result.ok, "{}", result.content),
             other => panic!("invalid web_search arguments must error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_tool_requires_a_runtime_and_returns_the_child_result() {
+        let root = temp_root("route-wait");
+        let missing = execute_tool(&ctx(&root), call("wait", "{}")).await;
+        match missing {
+            ToolOutcome::Ready(result) => {
+                assert!(!result.ok);
+                assert!(
+                    result.content.contains("no subagent runtime"),
+                    "{}",
+                    result.content
+                );
+            }
+            other => panic!("wait without a runtime must be a model-visible error, got {other:?}"),
+        }
+
+        let runtime = crate::agent::subagent::SubagentRuntime::new();
+        runtime
+            .register(crate::agent::subagent::SpawnRequest::new(
+                "session-1",
+                "child-1",
+                crate::agent::subagent::SubagentPolicy::ReadOnly,
+                "review",
+            ))
+            .expect("register");
+        runtime.complete(
+            "child-1",
+            crate::agent::subagent::ChildOutcome::success("finished"),
+        );
+        let parent = ToolContext::new(&root, AgentToolSettings::default())
+            .with_subagents(runtime, "session-1");
+        match execute_tool(&parent, call("wait", r#"{"child_ids":["child-1"]}"#)).await {
+            ToolOutcome::Ready(result) => {
+                assert!(result.ok, "{}", result.content);
+                let body: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                assert_eq!(body["status"], "completed");
+                assert_eq!(body["children"][0]["final_message"], "finished");
+            }
+            other => panic!("wait must resolve through the runtime, got {other:?}"),
         }
     }
 

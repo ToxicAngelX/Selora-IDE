@@ -19,6 +19,7 @@
 //! implementations build on these seams.
 
 pub mod router;
+pub mod subagent;
 pub mod tools;
 pub mod turn;
 
@@ -28,6 +29,13 @@ pub mod turn;
 pub use router::{
     denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
     ToolOutcome,
+};
+#[allow(unused_imports)]
+pub use subagent::{
+    wait_tool_result, wait_tool_spec, ArtifactRef, CancelToken, ChildId, ChildOutcome, ChildState,
+    CompletionDisposition, SpawnError, SpawnRequest, SubagentCompletion, SubagentEvent,
+    SubagentHandle, SubagentPolicy, SubagentRuntime, WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT,
+    MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{

@@ -9,6 +9,7 @@ import {
   formatNotificationAge,
 } from './NotificationCenter';
 import { toastStore } from '../features/toasts/toast-store';
+import { agentStore } from '../features/agent/agent-store';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -206,5 +207,28 @@ describe('NotificationCenter', () => {
     expect(formatNotificationAge(1_000, 1_000 + MINUTE)).toBe('1m');
     expect(formatNotificationAge(1_000, 1_000 + HOUR)).toBe('1h');
     expect(formatNotificationAge(1_000, 1_000 + DAY)).toBe('1d');
+  });
+
+  it('opens and selects the parent session when a subagent completion is clicked', () => {
+    const reveal = vi.spyOn(agentStore, 'revealSubagent').mockImplementation(() => {});
+    act(() => {
+      toastStore.pushSubagentCompletion(3001, {
+        childId: 'child-notification-1',
+        sessionId: 'sess-parent-1',
+        ok: true,
+        message: 'Subagent finished: review complete',
+      });
+    });
+
+    const { getByRole, queryByRole } = render(<NotificationCenter />);
+    fireEvent.click(getByRole('button', { name: 'Notifications' }));
+    const row = getByRole('button', { name: /review complete/ });
+    expect(row.getAttribute('aria-label')).toContain('open result');
+
+    fireEvent.click(row);
+
+    expect(reveal).toHaveBeenCalledWith('sess-parent-1', 'child-notification-1');
+    expect(queryByRole('dialog', { name: 'Notifications' })).toBeNull();
+    reveal.mockRestore();
   });
 });

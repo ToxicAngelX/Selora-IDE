@@ -35,6 +35,7 @@ type Harness = {
   currentEnvelopeContext: () => EnvelopeContext | null;
   currentSessionEnvelopeContext: (sessionId?: string | null) => EnvelopeContext | null;
   toastStore: { getSnapshot: () => { toasts: Array<{ id: number; message: string }> } };
+  agentStore: { getSnapshot: () => { unreadSubagentCount: number } };
   layoutStore: { getSnapshot: () => { layout: unknown; hydrated: boolean } };
   emit: (event: EventEnvelope) => void;
 };
@@ -51,6 +52,7 @@ async function freshHarness(): Promise<Harness> {
   const { startApp, subscribeApp, getAppSnapshot, currentEnvelopeContext, currentSessionEnvelopeContext } =
     await import('./app-store');
   const { toastStore } = await import('../features/toasts/toast-store');
+  const { agentStore } = await import('../features/agent/agent-store');
   const { layoutStore } = await import('../features/layout/layout-store');
   return {
     startApp,
@@ -59,6 +61,7 @@ async function freshHarness(): Promise<Harness> {
     currentEnvelopeContext,
     currentSessionEnvelopeContext,
     toastStore,
+    agentStore,
     layoutStore,
     emit: (event: EventEnvelope) => handler?.(event),
   };
@@ -372,6 +375,30 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
     });
     // An explicit override (the agent's live active session) wins.
     expect(h.currentSessionEnvelopeContext('sess-other')?.session_id).toBe('sess-other');
+  });
+
+  it('a background subagent completion toasts and badges exactly once', async () => {
+    const h = await freshHarness();
+    await h.startApp();
+    const completion = {
+      type: 'subagent_completed' as const,
+      payload: {
+        child_id: 'child-app-1',
+        parent_session_id: 'sess-live',
+        policy: 'read_only' as const,
+        ok: true,
+        final_message: 'review complete',
+        artifacts: [{ kind: 'diff', path: 'src/lib.rs' }],
+      },
+    };
+
+    h.emit(makeEvent(3, completion));
+    // The same child under a new sequence is still one notification.
+    h.emit(makeEvent(4, completion));
+
+    expect(h.toastStore.getSnapshot().toasts).toHaveLength(1);
+    expect(h.toastStore.getSnapshot().toasts[0]?.message).toContain('review complete');
+    expect(h.agentStore.getSnapshot().unreadSubagentCount).toBe(1);
   });
 });
 

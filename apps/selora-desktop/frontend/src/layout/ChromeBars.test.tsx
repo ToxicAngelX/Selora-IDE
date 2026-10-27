@@ -230,6 +230,23 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
       expect(toggle).toHaveBeenCalledWith('workflows');
       toggle.mockRestore();
     });
+    it('renders the Agent completion badge from unread background results', () => {
+      const bootstrap = makeBootstrap();
+      layoutStore.hydrate(bootstrap);
+      agentStore.handleSubagentCompleted({
+        child_id: 'child-badge-1',
+        parent_session_id: 'sess-badge',
+        policy: 'read_only',
+        ok: true,
+        final_message: 'done',
+      });
+
+      const { container } = render(<ActivityBar bootstrap={bootstrap} />);
+      const agentButton = container.querySelector('button[aria-label="Agent"]');
+      expect(agentButton?.querySelector('.activity-badge.is-success')?.textContent).toBe('1');
+      agentStore.clearSubagentReveal();
+      agentStore.markSubagentRead('child-badge-1');
+    });
   });
 
   describe('StatusBar', () => {

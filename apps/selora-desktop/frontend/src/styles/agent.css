@@ -4008,3 +4008,80 @@
     animation: none !important;
   }
 }
+
+/* --- Phase 9e: background subagent result (notification click) --------- */
+.agent-subagent-result {
+  margin: 0 12px 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline-active);
+  border-radius: 8px;
+  background: var(--ink-mid);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.agent-subagent-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agent-subagent-result-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-default);
+}
+
+.agent-subagent-policy {
+  padding: 1px 5px;
+  border: 1px solid var(--hairline-active);
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg-faint);
+}
+
+.agent-subagent-result-body {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--fg-muted);
+}
+
+.agent-subagent-result-close {
+  border: 0;
+  background: transparent;
+  color: var(--fg-faint);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.agent-subagent-result-close:hover,
+.agent-subagent-result-close:focus-visible {
+  color: var(--fg-default);
+  background: var(--ink-hi);
+}
+
+.agent-subagent-artifacts {
+  margin: 0;
+  padding-left: 16px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+
+.agent-subagent-artifacts span {
+  color: var(--fg-muted);
+  margin-right: 4px;
+}

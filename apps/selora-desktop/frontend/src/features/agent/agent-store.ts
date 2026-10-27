@@ -35,6 +35,7 @@ import {
   type EditorContextDto,
   type EnvelopeContext,
   type Model,
+  type SubagentCompletedPayload,
   type ToolCallStartedPayload,
   type ToolResultPayload,
   type WorkflowApproval,
@@ -52,6 +53,10 @@ export type AgentState = {
   messages: ChatMessage[];
   todos: AgentTodo[];
   subagents: SubagentInfo[];
+  /** Phase 9e: completion notifications not yet opened (activity badge). */
+  unreadSubagentCount: number;
+  /** Phase 9e: the child whose result the UI should reveal (click hook). */
+  revealedSubagentId: string | null;
   artifacts: ArtifactItem[];
   inFlight: boolean;
   thinkingState: ThinkingState;
@@ -185,6 +190,8 @@ let state: AgentState = {
   messages: [],
   todos: INITIAL_TODOS,
   subagents: INITIAL_SUBAGENTS,
+  unreadSubagentCount: 0,
+  revealedSubagentId: null,
   artifacts: INITIAL_ARTIFACTS,
   inFlight: false,
   thinkingState: 'breathing',
@@ -293,6 +300,17 @@ export function parseModelTodos(input: unknown): AgentTodo[] | null {
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
+
+/**
+ * Phase 9e: the dedupe ledger. A child id reaches this store once, ever;
+ * a replayed protocol event or a duplicate completion is ignored rather
+ * than producing a second toast/badge/result.
+ */
+const completedSubagentIds = new Set<string>();
+
+function countUnreadSubagents(subagents: SubagentInfo[]): number {
+  return subagents.reduce((count, subagent) => (subagent.unread ? count + 1 : count), 0);
+}
 
 /**
  * A `run_workflow` card also carries the §18.1 confirmation payload (script,
@@ -681,10 +699,14 @@ export const agentStore = {
     pendingApprovalRequests.clear();
     workflowConfirmations.clear();
     terminalRequests.clear();
+    completedSubagentIds.clear();
     state = {
       ...state,
       messages: [],
       todos: [],
+      subagents: INITIAL_SUBAGENTS,
+      unreadSubagentCount: 0,
+      revealedSubagentId: null,
       inFlight: false,
       thinkingState: 'breathing',
       streamingActivityLevel: 0,
@@ -727,6 +749,85 @@ export const agentStore = {
       activeSessionId: sessionId,
       messages: sessionId === DEFAULT_SESSION_ID ? state.messages : [],
     };
+    notify();
+  },
+
+  /**
+   * Phase 9e: one accepted background completion. Returns false when this
+   * child id was already handled (dedupe) or when the payload claims success
+   * without a result. A failed child stays failed: it is never painted as a
+   * completed result.
+   */
+  handleSubagentCompleted(payload: SubagentCompletedPayload): boolean {
+    if (completedSubagentIds.has(payload.child_id)) return false;
+    completedSubagentIds.add(payload.child_id);
+
+    const existing = state.subagents.find((subagent) => subagent.id === payload.child_id);
+    const ok = payload.ok === true;
+    const entry: SubagentInfo = {
+      id: payload.child_id,
+      name: existing?.name ?? `subagent-${payload.child_id}`,
+      model: existing?.model ?? 'Auto',
+      status: ok ? 'done' : 'failed',
+      parentSessionId: payload.parent_session_id,
+      policy: payload.policy,
+      result: ok ? payload.final_message : '',
+      error: ok ? undefined : payload.error ?? 'subagent failed without a message',
+      artifacts: payload.artifacts ?? [],
+      unread: true,
+      activeStep: ok
+        ? `Completed: ${payload.final_message || 'no output'}`
+        : `Failed: ${payload.error ?? 'unknown error'}`,
+    };
+    const subagents = existing
+      ? state.subagents.map((subagent) =>
+          subagent.id === payload.child_id ? { ...subagent, ...entry } : subagent,
+        )
+      : [...state.subagents, entry];
+    state = {
+      ...state,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+    };
+    notify();
+    return true;
+  },
+
+  /**
+   * A notification click: select the parent session and reveal the child's
+   * result under it. Marking read keeps the badge truthful.
+   */
+  revealSubagent(sessionId: string, childId: string) {
+    const subagents = state.subagents.map((subagent) =>
+      subagent.id === childId ? { ...subagent, unread: false } : subagent,
+    );
+    state = {
+      ...state,
+      activeSessionId: sessionId || state.activeSessionId,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+      revealedSubagentId: childId,
+      messages: sessionId && sessionId !== state.activeSessionId ? [] : state.messages,
+    };
+    notify();
+  },
+
+  /** Mark one child's result read without changing the selected session. */
+  markSubagentRead(childId: string) {
+    const subagents = state.subagents.map((subagent) =>
+      subagent.id === childId ? { ...subagent, unread: false } : subagent,
+    );
+    state = {
+      ...state,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+    };
+    notify();
+  },
+
+  clearSubagentReveal() {
+    if (state.revealedSubagentId === null) return;
+    state = { ...state, revealedSubagentId: null };
     notify();
   },
 
@@ -1573,11 +1674,15 @@ export const agentStore = {
       t.status === 'in_progress' ? { ...t, status: 'completed' as const } : t
     );
 
-    const idleSubagents = state.subagents.map((s) => ({
-      ...s,
-      status: 'idle' as const,
-      activeStep: 'Ready',
-    }));
+    const idleSubagents = state.subagents.map((s) =>
+      s.status === 'done' || s.status === 'failed'
+        ? s
+        : {
+            ...s,
+            status: 'idle' as const,
+            activeStep: 'Ready',
+          },
+    );
 
     state = {
       ...state,

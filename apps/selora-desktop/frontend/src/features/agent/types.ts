@@ -110,7 +110,12 @@ export type AgentTodo = {
   assignedSubagent?: string;
 };
 
-export type SubagentStatus = 'working' | 'idle' | 'done';
+export type SubagentStatus = 'working' | 'idle' | 'done' | 'failed';
+
+export type SubagentArtifact = {
+  kind: string;
+  path: string;
+};
 
 export type SubagentInfo = {
   id: string;
@@ -118,6 +123,16 @@ export type SubagentInfo = {
   model: string;
   status: SubagentStatus;
   activeStep?: string;
+  /** Phase 9e: the session whose transcript groups this child's result. */
+  parentSessionId?: string;
+  policy?: 'read_only' | 'full';
+  /** The child's final answer (empty for a failed child). */
+  result?: string;
+  /** The honest failure text; only set when status is `failed`. */
+  error?: string;
+  artifacts?: SubagentArtifact[];
+  /** True until the user opens the parent session/result. */
+  unread?: boolean;
 };
 
 export type ArtifactKind = 'doc' | 'code' | 'diff' | 'diagram';
