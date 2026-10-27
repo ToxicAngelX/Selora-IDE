@@ -48,6 +48,10 @@ git2 = { version = "0.21", features = ["vendored-libgit2"] }
 keyring = "3"
 # Dev-only: mock gateway for selora-ai tests (ROADMAP.md Phase 1b).
 wiremock = "0.6"
+# Embedded terminal (desktop shell): Windows ConPTY through the same crate
+# WezTerm uses, so the pty semantics (resize, EOF, exit code) are the
+# battle-tested ones rather than a hand-rolled CreatePseudoConsole wrapper.
+portable-pty = "0.9"
 
 selora-core = { path = "crates/selora-core" }
 selora-fs = { path = "crates/selora-fs" }

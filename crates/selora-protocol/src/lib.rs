@@ -603,6 +603,29 @@ pub enum FrontendCommand {
         approval_id: ApprovalId,
         decision: DecisionDto,
     },
+    // Phase 10 — the embedded terminal. `TerminalCreate` names the request so
+    // the invoke and its retry are correlated at the transport level; the
+    // `TerminalCreated` event carries the minted session id every later
+    // command names. There is no `cwd` or `shell` field on purpose: the
+    // backend roots every session at the open workspace and picks the shell
+    // itself, so a payload cannot point a process outside the workspace.
+    TerminalCreate {
+        request_id: RequestId,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalInput {
+        terminal_id: String,
+        data: String,
+    },
+    TerminalResize {
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalClose {
+        terminal_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1742,6 +1765,39 @@ pub struct ApiKeyStatusDto {
     pub key_hint: Option<String>,
     pub active_model_id: Option<String>,
 }
+// ---------------------------------------------------------------------------
+// Phase 10 — the embedded terminal's payloads.
+//
+// `terminal_id` is the backend-minted session id (a UUID, never a path or a
+// pid) carried by every command and event for one live ConPTY. `shell` is the
+// resolved executable's file name (`pwsh` when present, else `powershell`) and
+// `cwd` is the canonical workspace root the session was started in.
+// ---------------------------------------------------------------------------
+
+/// A live terminal was started. Emitted before the first `TerminalOutput`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalCreatedDto {
+    pub terminal_id: String,
+    pub shell: String,
+    pub cwd: String,
+}
+
+/// One batch of terminal output. `data` is complete UTF-8 text, at most the
+/// backend's batch cap; escape sequences pass through unchanged for xterm.js.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalOutputDto {
+    pub terminal_id: String,
+    pub data: String,
+}
+
+/// The session's shell exited (or was killed). `code` is the process's exit
+/// code, or `-1` when the backend could not read one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalExitedDto {
+    pub terminal_id: String,
+    pub code: i32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -1800,6 +1856,12 @@ pub enum FrontendEvent {
     // ignores the arms it does not know.
     PlanStateChanged(PlanStateDto),
     TodosChanged(TodosDto),
+    // Phase 10 — the embedded terminal's stream. `TerminalCreated` precedes
+    // every `TerminalOutput` for a session; `TerminalExited` is last and is
+    // emitted exactly once for each created session.
+    TerminalCreated(TerminalCreatedDto),
+    TerminalOutput(TerminalOutputDto),
+    TerminalExited(TerminalExitedDto),
     Error(ProtocolErrorDto),
 }
 
@@ -3366,5 +3428,85 @@ mod tests {
             assert_eq!(json["type"], name);
             assert_eq!(json["payload"]["buffer_id"], "buffer-1");
         }
+    }
+
+    #[test]
+    fn terminal_command_wire_shapes_are_stable() {
+        assert_command_wire(
+            FrontendCommand::TerminalCreate {
+                request_id: rid("request-1"),
+                cols: 120,
+                rows: 32,
+            },
+            r#"{"type":"terminal_create","payload":{"request_id":"request-1","cols":120,"rows":32}}"#,
+        );
+        assert_command_wire(
+            FrontendCommand::TerminalInput {
+                terminal_id: "terminal-1".into(),
+                data: "ls\r".into(),
+            },
+            r#"{"type":"terminal_input","payload":{"terminal_id":"terminal-1","data":"ls\r"}}"#,
+        );
+        assert_command_wire(
+            FrontendCommand::TerminalResize {
+                terminal_id: "terminal-1".into(),
+                cols: 80,
+                rows: 24,
+            },
+            r#"{"type":"terminal_resize","payload":{"terminal_id":"terminal-1","cols":80,"rows":24}}"#,
+        );
+        assert_command_wire(
+            FrontendCommand::TerminalClose {
+                terminal_id: "terminal-1".into(),
+            },
+            r#"{"type":"terminal_close","payload":{"terminal_id":"terminal-1"}}"#,
+        );
+    }
+
+    #[test]
+    fn terminal_event_wire_shapes_are_stable() {
+        assert_event_wire(
+            FrontendEvent::TerminalCreated(TerminalCreatedDto {
+                terminal_id: "terminal-1".into(),
+                shell: "pwsh".into(),
+                cwd: r"C:\work\repo".into(),
+            }),
+            r#"{"type":"terminal_created","payload":{"terminal_id":"terminal-1","shell":"pwsh","cwd":"C:\\work\\repo"}}"#,
+        );
+        assert_event_wire(
+            FrontendEvent::TerminalOutput(TerminalOutputDto {
+                terminal_id: "terminal-1".into(),
+                data: "hello\r\n".into(),
+            }),
+            r#"{"type":"terminal_output","payload":{"terminal_id":"terminal-1","data":"hello\r\n"}}"#,
+        );
+        assert_event_wire(
+            FrontendEvent::TerminalExited(TerminalExitedDto {
+                terminal_id: "terminal-1".into(),
+                code: 7,
+            }),
+            r#"{"type":"terminal_exited","payload":{"terminal_id":"terminal-1","code":7}}"#,
+        );
+    }
+
+    #[test]
+    fn terminal_create_ignores_a_smuggled_cwd_field() {
+        // There is no `cwd` on the wire. An extra field must not become one:
+        // serde ignores it, so the backend still roots the session at the
+        // workspace and a hostile payload cannot steer the shell elsewhere.
+        let parsed: FrontendCommand = serde_json::from_str(
+            r#"{"type":"terminal_create","payload":{"request_id":"request-1","cols":80,"rows":24,"cwd":"C:\\Windows","shell":"cmd.exe"}}"#,
+        )
+        .unwrap();
+        let FrontendCommand::TerminalCreate {
+            request_id,
+            cols,
+            rows,
+        } = parsed
+        else {
+            panic!("expected a terminal create command");
+        };
+        assert_eq!(request_id, rid("request-1"));
+        assert_eq!((cols, rows), (80, 24));
     }
 }
