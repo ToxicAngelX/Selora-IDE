@@ -633,6 +633,8 @@
   align-items: center;
   gap: 2px;
   height: 100%;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .terminal-tab {

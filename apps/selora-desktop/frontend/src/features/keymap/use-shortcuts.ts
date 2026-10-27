@@ -53,7 +53,17 @@ export function useShortcuts({ settings, enabled, paletteOpen, onCommand, onClos
         return;
       }
       // Everything else is inert while a modal is open or a text input has focus.
-      if (paletteOpen || isTextEntry(event.target)) return;
+      if (paletteOpen) return;
+      // Closing the editor stays live inside the CodeMirror surface: its
+      // contenteditable would otherwise swallow Ctrl+F4, and the tab-menu hint
+      // promises it works from the editor.
+      const closeBinding = keymap.get('selora.fileCloseEditor');
+      if (closeBinding && keybindMatches(closeBinding, event)) {
+        event.preventDefault();
+        onCommand('selora.fileCloseEditor');
+        return;
+      }
+      if (isTextEntry(event.target)) return;
       for (const [id, keybind] of ordered) {
         if (id === 'selora.openCommandPalette') continue; // handled above
         if (keybindMatches(keybind, event)) {

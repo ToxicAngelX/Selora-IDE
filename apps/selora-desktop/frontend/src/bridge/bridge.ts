@@ -339,6 +339,7 @@ export type FrontendCommand =
   | { type: 'new_session' }
   | { type: 'open_folder_at'; payload: { root: string } }
   | { type: 'refresh_tree' }
+  | { type: 'reveal_in_explorer'; payload: { path: string } }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
   | { type: 'save_buffer'; payload: { buffer_id: Id } }
   | { type: 'apply_editor_change'; payload: { buffer_id: Id; version: number; changes: TextChange[] } }
@@ -550,6 +551,10 @@ export const closeBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown
 
 export const saveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'save_buffer', payload: { buffer_id: bufferId } }, ctx);
+
+/** Select one workspace-relative file in the OS file manager. */
+export const revealInExplorer = (path: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'reveal_in_explorer', payload: { path } }, ctx);
 
 export const applyEditorChange = (
   bufferId: Id,

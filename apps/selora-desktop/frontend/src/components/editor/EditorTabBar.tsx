@@ -4,8 +4,9 @@
 // and the active tab's bottom hairline. Tabs mirror the protocol's open buffer
 // list; creation and splitting stay out of the chrome until the core supports
 // them.
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { X } from '../icons';
+import { TabContextMenu, type TabMenuAction } from './TabContextMenu';
 
 export type EditorTabView = {
   id: string;
@@ -13,6 +14,8 @@ export type EditorTabView = {
   path: string;
   language: string;
   isDirty: boolean;
+  /** Local "Keep Open" pin; bulk closes spare pinned tabs. */
+  isPinned?: boolean;
 };
 
 export type EditorTabBarProps = {
@@ -25,12 +28,20 @@ export type EditorTabBarProps = {
    * close until this resolves successfully.
    */
   onSaveTab: (id: string) => Promise<boolean | void> | boolean | void;
+  /** Tab context-menu action, except `close` which routes through the prompt. */
+  onTabMenuAction?: (action: TabMenuAction, tab: EditorTabView) => void;
 };
 
 type ClosePrompt = {
   id: string;
   top: number;
   left: number;
+};
+
+type TabMenuState = {
+  id: string;
+  x: number;
+  y: number;
 };
 
 function FileTypeIcon({ language, filename }: { language: string; filename: string }) {
@@ -73,13 +84,30 @@ export function EditorTabBar({
   onSelectTab,
   onCloseTab,
   onSaveTab,
+  onTabMenuAction,
 }: EditorTabBarProps) {
   const [closePrompt, setClosePrompt] = useState<ClosePrompt | null>(null);
+  const [menu, setMenu] = useState<TabMenuState | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveFailed, setSaveFailed] = useState(false);
   const promptRef = useRef<HTMLDivElement>(null);
   const saveButtonRef = useRef<HTMLButtonElement>(null);
   const promptTab = closePrompt ? tabs.find((tab) => tab.id === closePrompt.id) ?? null : null;
+  const menuTab = menu ? tabs.find((tab) => tab.id === menu.id) ?? null : null;
+
+  // A bootstrap can drop the menu's buffer (closed elsewhere) — dismiss then.
+  useEffect(() => {
+    if (menu && !tabs.some((tab) => tab.id === menu.id)) setMenu(null);
+  }, [menu, tabs]);
+
+  const openMenu = (event: ReactMouseEvent<HTMLElement>, tab: EditorTabView) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setClosePrompt(null);
+    setSaving(false);
+    setSaveFailed(false);
+    setMenu({ id: tab.id, x: event.clientX, y: event.clientY });
+  };
 
   const selectAndFocus = (id: string) => {
     onSelectTab(id);
@@ -119,6 +147,14 @@ export function EditorTabBar({
       top: anchor && anchor.height > 0 ? anchor.bottom + 4 : 40,
       left: anchor && anchor.width > 0 ? Math.max(8, Math.min(anchor.left, viewportWidth - 190)) : 8,
     });
+  };
+
+  const handleMenuAction = (action: TabMenuAction, tab: EditorTabView) => {
+    if (action === 'close') {
+      requestClose(tab.id);
+      return;
+    }
+    onTabMenuAction?.(action, tab);
   };
 
   const confirmDiscard = () => {
@@ -205,7 +241,8 @@ export function EditorTabBar({
           return (
             <div
               key={tab.id}
-              className={`editor-tab-shell${isActive ? ' is-active' : ''}`}
+              className={`editor-tab-shell${isActive ? ' is-active' : ''}${tab.isPinned ? ' is-pinned' : ''}`}
+              onContextMenu={(event) => openMenu(event, tab)}
             >
               <button
                 id={`editor-tab-${tab.id}`}
@@ -244,6 +281,16 @@ export function EditorTabBar({
           );
         })}
       </div>
+      {menu && menuTab ? (
+        <TabContextMenu
+          tab={menuTab}
+          x={menu.x}
+          y={menu.y}
+          isPinned={Boolean(menuTab.isPinned)}
+          onAction={(action) => handleMenuAction(action, menuTab)}
+          onClose={() => setMenu(null)}
+        />
+      ) : null}
       {closePrompt && promptTab ? (
         <div
           ref={promptRef}

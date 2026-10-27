@@ -39,6 +39,8 @@ export type EditorStoreState = {
   activeBuffer: BufferSnapshot | null;
   activeSelection: Selection | null;
   revealTarget: RevealTarget | null;
+  /** Buffers the user marked "Keep Open"; bulk closes spare them. */
+  pinnedIds: string[];
   workspaceRoot: string | null;
   workspaceName: string | null;
   fileTree: FileTreeNode | null;
@@ -59,6 +61,9 @@ let knownBufferIds = new Set(
 // Selections typed in the pane, keyed by buffer, recorded before the protocol
 // echo lands. Kept outside the snapshot so a keystroke does not rebuild the app.
 let liveSelections = new Map<string, Selection>();
+// "Keep Open" is a local tab affordance: the protocol has no pin concept, so
+// the pins survive snapshots and are pruned whenever a buffer disappears.
+let pinnedIds = new Set<string>();
 let state: EditorStoreState = deriveState(appSnapshot, localActiveId, revealTarget);
 let appUnsubscribe: (() => void) | null = null;
 
@@ -121,6 +126,7 @@ function deriveState(
     activeBuffer,
     activeSelection,
     revealTarget: reveal,
+    pinnedIds: tabs.filter((tab) => pinnedIds.has(tab.id)).map((tab) => tab.id),
     workspaceRoot: bootstrap?.workspace.root ?? null,
     workspaceName: bootstrap?.workspace.display_name ?? null,
     fileTree: bootstrap?.file_tree.root ?? null,
@@ -250,6 +256,7 @@ export const editorStore = {
     revealTarget = null;
     pendingOpenPath = null;
     liveSelections.clear();
+    pinnedIds = new Set();
     appSnapshot = getAppSnapshot();
     protocolActiveId = appSnapshot.bootstrap?.active_buffer_id ?? null;
     knownBufferIds = new Set(
@@ -319,6 +326,36 @@ export const editorStore = {
       return;
     }
     void closeBufferCommand(id, context).catch(() => undefined);
+  },
+
+  /**
+   * Close several buffers at once, skipping dirty and "kept open" tabs so no
+   * unsaved edit is ever discarded silently. Returns how many closes were
+   * dispatched and how many requested tabs were spared.
+   */
+  closeMany(ids: string[]): { closed: number; kept: number } {
+    syncFromApp();
+    const context = currentEditorContext();
+    if (!context) {
+      reportMissingContext();
+      return { closed: 0, kept: 0 };
+    }
+    const requested = new Set(ids);
+    const matches = state.tabs.filter((tab) => requested.has(tab.id));
+    const targets = matches.filter((tab) => !tab.isDirty && !pinnedIds.has(tab.id));
+    for (const tab of targets) {
+      void closeBufferCommand(tab.id, context).catch(() => undefined);
+    }
+    return { closed: targets.length, kept: matches.length - targets.length };
+  },
+
+  /** Toggle the local "Keep Open" pin for one tab. */
+  togglePinned(id: string): void {
+    syncFromApp();
+    if (!state.tabs.some((tab) => tab.id === id)) return;
+    if (pinnedIds.has(id)) pinnedIds.delete(id);
+    else pinnedIds.add(id);
+    rebuild();
   },
 
   /**

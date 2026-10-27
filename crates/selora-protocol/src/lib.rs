@@ -390,6 +390,10 @@ pub enum FrontendCommand {
     /// Phase Z4: rebuild the file tree from disk and emit
     /// FileTreeChanged (the explorer's refresh affordance).
     RefreshTree,
+    /// Phase Z4: select a workspace-relative file in the OS file manager.
+    RevealInExplorer {
+        path: WorkspacePath,
+    },
     OpenFile {
         path: WorkspacePath,
     },
@@ -1696,6 +1700,19 @@ mod tests {
             serde_json::to_string(&FrontendCommand::RefreshTree).unwrap(),
             r#"{"type":"refresh_tree"}"#
         );
+        let reveal = serde_json::to_string(&FrontendCommand::RevealInExplorer {
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            reveal,
+            r#"{"type":"reveal_in_explorer","payload":{"path":"src/main.rs"}}"#
+        );
+        let parsed: FrontendCommand = serde_json::from_str(&reveal).unwrap();
+        assert!(matches!(
+            parsed,
+            FrontendCommand::RevealInExplorer { path } if path.as_str() == "src/main.rs"
+        ));
         assert_eq!(
             serde_json::to_string(&FrontendCommand::OpenFile {
                 path: WorkspacePath::new("src/main.rs").unwrap()

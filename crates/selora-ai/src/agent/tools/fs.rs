@@ -571,6 +571,7 @@ pub(crate) fn plan_write(
             content.len()
         ));
     }
+    let rel = rel_display(root, &resolved);
     let old = match std::fs::metadata(&resolved) {
         Ok(meta) if meta.is_file() => {
             if meta.len() > MAX_READ_BYTES {
@@ -585,7 +586,15 @@ pub(crate) fn plan_write(
         }
         _ => String::new(), // create (or a dangling symlink, which the write replaces)
     };
-    let rel = rel_display(root, &resolved);
+    // An empty `content` is a full-file delete, not a write. Refuse it when
+    // the target holds bytes: the agent's own `delete_file` (and its card) is
+    // the explicit path for that, so a malformed/empty tool argument can
+    // never silently truncate a file the user is looking at.
+    if content.is_empty() && !old.is_empty() {
+        return Err(format!(
+            "refusing to replace non-empty `{rel}` with empty content — pass the file's full new content, or use `delete_file` to delete it"
+        ));
+    }
     let diff = unified_diff(&rel, &old, content);
     Ok((rel, diff))
 }
@@ -682,10 +691,17 @@ pub(crate) fn apply_write(root: &Path, id: &str, path: &str, content: &str) -> T
     };
     let rel = rel_display(root, &resolved);
     match write_atomic(&resolved, content) {
-        Ok(()) => ToolResult {
+        Ok(backup) => ToolResult {
             id: id.to_owned(),
             ok: true,
-            content: format!("wrote {} bytes to `{rel}`", content.len()),
+            content: match backup {
+                Some(backup) => format!(
+                    "wrote {} bytes to `{rel}` (previous content saved to `{}`)",
+                    content.len(),
+                    rel_display(root, &backup)
+                ),
+                None => format!("wrote {} bytes to `{rel}`", content.len()),
+            },
         },
         Err(e) => ToolResult::error(id, format!("write to `{rel}` failed: {e}")),
     }
@@ -742,10 +758,16 @@ pub(crate) fn apply_edit(
         old.replacen(old_str, new_str, 1)
     };
     match write_atomic(&resolved, &new_content) {
-        Ok(()) => ToolResult {
+        Ok(backup) => ToolResult {
             id: id.to_owned(),
             ok: true,
-            content: format!("edited `{rel}` ({occurrences} replacement(s))"),
+            content: match backup {
+                Some(backup) => format!(
+                    "edited `{rel}` ({occurrences} replacement(s); previous content saved to `{}`)",
+                    rel_display(root, &backup)
+                ),
+                None => format!("edited `{rel}` ({occurrences} replacement(s))"),
+            },
         },
         Err(e) => ToolResult::error(id, format!("edit of `{rel}` failed: {e}")),
     }
@@ -801,16 +823,62 @@ fn temp_sibling(target: &Path) -> PathBuf {
         .join(format!(".{name}.selora-tmp-{}-{seq}", std::process::id()))
 }
 
+/// The one-slot recovery sidecar for `target`: `.<name>.selora-bak`.
+/// Replaced (atomically) on every write, so the file the user was looking at
+/// is always available after an approved overwrite.
+fn backup_sibling(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.selora-bak"))
+}
+
+/// Copy the current bytes of `target` to [`backup_sibling`], atomically.
+/// Returns `None` when the target does not exist yet (a create has nothing
+/// to preserve) or is not a regular file. A backup failure aborts the write:
+/// losing the recovery copy is worse than failing the edit.
+fn backup_existing(target: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::metadata(target) {
+        Ok(meta) if meta.is_file() => {
+            let backup = backup_sibling(target);
+            let tmp = temp_sibling(&backup);
+            if let Err(e) = std::fs::copy(target, &tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            match std::fs::rename(&tmp, &backup) {
+                Ok(()) => Ok(Some(backup)),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Atomic-ish write: a unique temp file in the target directory, then
 /// rename over the target (std's rename replaces an existing file on
 /// Windows). Parent directories are created (write_file into a new folder is
 /// a create). The temp is created with `create_new` so even a cross-process
 /// name clash is an error rather than silently sharing a temp file, and it
 /// is removed if writing or renaming fails.
-fn write_atomic(target: &Path, content: &str) -> std::io::Result<()> {
+///
+/// Before replacing an existing regular file, its current bytes are copied
+/// to [`backup_sibling`] (also via temp + rename). Returns the backup path
+/// when one was written.
+fn write_atomic(target: &Path, content: &str) -> std::io::Result<Option<PathBuf>> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let backup = backup_existing(target)?;
     let tmp = temp_sibling(target);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -824,7 +892,7 @@ fn write_atomic(target: &Path, content: &str) -> std::io::Result<()> {
     // Windows cannot rename over the target while our temp handle is open.
     drop(file);
     match std::fs::rename(&tmp, target) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(backup),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -1389,7 +1457,8 @@ mod tests {
         touch(&root, "src/b.rs", "nothing here\n");
         let result = search_files(&root, "call_1", "NEEDLE");
         assert!(result.ok, "{}", result.content);
-        assert!(result.content.contains("src/a.rs:1"));
+        eprintln!("DIRECT: {:?}", selora_fs::search::search_in_files(&root, &selora_fs::search::SearchQuery::new("NEEDLE")));
+        assert!(result.content.contains("src/a.rs:1"), "{}", result.content);
         assert!(result.content.contains("fn needle"));
         assert!(!result.content.contains("b.rs"));
         let none = search_files(&root, "call_1", "absent-string");
@@ -1461,6 +1530,62 @@ mod tests {
     }
 
     #[test]
+    fn plan_write_refuses_empty_content_for_a_non_empty_target() {
+        let root = temp_root("write-empty");
+        touch(&root, "f.txt", "keep me\n");
+        let err = plan_write(&root, "f.txt", "").expect_err("empty overwrite");
+        assert!(err.contains("empty content"), "got: {err}");
+        assert!(err.contains("delete_file"), "got: {err}");
+        // Planning never writes: the bytes are still there.
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "keep me\n"
+        );
+        // An already-empty target and a brand-new file may be empty.
+        touch(&root, "empty.txt", "");
+        assert!(plan_write(&root, "empty.txt", "").is_ok());
+        assert!(plan_write(&root, "new-empty.txt", "").is_ok());
+    }
+
+    #[test]
+    fn apply_write_refuses_empty_content_without_touching_the_file() {
+        let root = temp_root("apply-write-empty");
+        touch(&root, "f.txt", "keep me\n");
+        let result = apply_write(&root, "call_1", "f.txt", "");
+        assert!(!result.ok, "{}", result.content);
+        assert!(result.content.contains("delete_file"), "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "keep me\n"
+        );
+        // No backup and no temp: nothing was replaced.
+        assert!(!root.join(".f.txt.selora-bak").exists());
+    }
+
+    #[test]
+    fn write_atomic_keeps_previous_content_in_a_sidecar() {
+        let root = temp_root("write-backup");
+        let target = root.join("f.txt");
+        std::fs::write(&target, "old\n").expect("seed");
+        let backup = write_atomic(&target, "new\n")
+            .expect("write")
+            .expect("existing target gets a backup");
+        assert_eq!(backup, root.join(".f.txt.selora-bak"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        // The next write replaces the backup with the next-most-recent bytes.
+        let backup = write_atomic(&target, "newer\n")
+            .expect("write")
+            .expect("backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "newer\n");
+        // A create has nothing to preserve.
+        assert!(write_atomic(&root.join("fresh.txt"), "x\n")
+            .expect("create")
+            .is_none());
+    }
+
+    #[test]
     fn plan_edit_validates_the_exact_match() {
         let root = temp_root("edit-plan");
         touch(&root, "f.txt", "fn main() {}\nfn other() {}\n");
@@ -1497,6 +1622,11 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("nested/new.rs")).unwrap(),
             "replaced\n"
+        );
+        // The approved overwrite preserved the bytes the user was viewing.
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/.new.rs.selora-bak")).unwrap(),
+            "content\n"
         );
     }
 
@@ -1538,7 +1668,7 @@ mod tests {
                 let content = format!("writer {writer}\n");
                 barrier.wait();
                 for _ in 0..20 {
-                    write_atomic(&target, &content)?;
+                    let _ = write_atomic(&target, &content)?;
                 }
                 Ok::<(), std::io::Error>(())
             }));

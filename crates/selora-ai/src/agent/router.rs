@@ -231,7 +231,9 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
             "write_file",
             "Create a file (or overwrite an existing one) with full content. \
              The user approves a diff before anything is written; creating a \
-             file is shown as all additions.",
+             file is shown as all additions. Empty content is refused for a \
+             non-empty file (use `delete_file` to delete); an overwrite keeps \
+             the previous bytes in a sibling `.<name>.selora-bak` file.",
             json_schema(
                 [("path", "string"), ("content", "string")],
                 ["path", "content"],

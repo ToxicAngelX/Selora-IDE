@@ -7,7 +7,7 @@
 import { lazy, Suspense, useCallback, useMemo, useState, useSyncExternalStore } from 'react';
 import { EmptyState, EmptyStateButton, KeyChip } from '../components/EmptyState';
 import { SeloraMark } from '../components/SeloraMark';
-import { EditorTabBar } from '../components/editor/EditorTabBar';
+import { EditorTabBar, type EditorTabView } from '../components/editor/EditorTabBar';
 import { EditorBreadcrumbs } from '../components/editor/EditorBreadcrumbs';
 import { EditorMinimap } from '../components/editor/EditorMinimap';
 import type {
@@ -25,8 +25,17 @@ const CodeMirrorPane = lazy(async () => {
   return { default: module.CodeMirrorPane };
 });
 import { currentEditorContext, editorStore } from '../features/editor/editor-store';
+import {
+  absolutePathFor,
+  breadcrumbsPathFor,
+  copyTextToClipboard,
+  relativePathFor,
+} from '../features/editor/tab-actions';
+import { layoutStore } from '../features/layout/layout-store';
+import { requestFileTreeReveal } from '../features/sidebar/file-tree-reveal';
 import { toastStore } from '../features/toasts/toast-store';
-import { openFolderAt, pickFolder, type FileTreeNode } from '../bridge/bridge';
+import { openFolderAt, pickFolder, revealInExplorer, type FileTreeNode } from '../bridge/bridge';
+import type { TabMenuAction } from '../components/editor/TabContextMenu';
 
 const MINIMAP_MAX_LINES = 2000;
 
@@ -119,6 +128,90 @@ export function EditorRegion() {
     }
   }, []);
 
+  const handleTabMenuAction = useCallback((action: TabMenuAction, tab: EditorTabView) => {
+    const current = editorStore.getSnapshot();
+    const index = current.tabs.findIndex((candidate) => candidate.id === tab.id);
+
+    const reportBulkClose = (result: { closed: number; kept: number }) => {
+      if (result.kept === 0) return;
+      const spared = `${result.kept} ${result.kept === 1 ? 'tab' : 'tabs'} stayed open (unsaved or kept open).`;
+      toastStore.pushLocal('info', result.closed > 0 ? `Closed ${result.closed}. ${spared}` : spared);
+    };
+
+    switch (action) {
+      case 'close-others':
+        reportBulkClose(
+          editorStore.closeMany(
+            current.tabs.filter((candidate) => candidate.id !== tab.id).map((candidate) => candidate.id),
+          ),
+        );
+        break;
+      case 'close-right':
+        reportBulkClose(
+          editorStore.closeMany(
+            (index >= 0 ? current.tabs.slice(index + 1) : []).map((candidate) => candidate.id),
+          ),
+        );
+        break;
+      case 'close-saved':
+        reportBulkClose(
+          editorStore.closeMany(
+            current.tabs.filter((candidate) => !candidate.isDirty).map((candidate) => candidate.id),
+          ),
+        );
+        break;
+      case 'close-all':
+        reportBulkClose(editorStore.closeMany(current.tabs.map((candidate) => candidate.id)));
+        break;
+      case 'copy-path':
+        void copyTextToClipboard(absolutePathFor(current.workspaceRoot, tab.path), 'path');
+        break;
+      case 'copy-relative-path':
+        void copyTextToClipboard(relativePathFor(tab.path), 'relative path');
+        break;
+      case 'copy-breadcrumbs-path':
+        void copyTextToClipboard(
+          breadcrumbsPathFor(current.workspaceName, current.workspaceRoot, tab.path),
+          'breadcrumbs path',
+        );
+        break;
+      case 'reveal-in-explorer': {
+        const context = currentEditorContext();
+        if (!context) {
+          toastStore.pushLocal('warning', 'Connect to a workspace before revealing a file.');
+          break;
+        }
+        // The bridge reports failures through the command-error toast path.
+        void revealInExplorer(tab.path, context).catch(() => undefined);
+        break;
+      }
+      case 'reveal-in-view': {
+        const layout = layoutStore.getSnapshot().layout;
+        if (!layout || !layout.primary_sidebar_open || layout.activity_view !== 'files') {
+          void layoutStore.toggle('files');
+        }
+        requestFileTreeReveal(tab.path);
+        break;
+      }
+      case 'toggle-pin':
+        editorStore.togglePinned(tab.id);
+        break;
+      case 'find-references':
+        void (async () => {
+          const layout = layoutStore.getSnapshot().layout;
+          if (!layout || !layout.primary_sidebar_open || layout.activity_view !== 'search') {
+            await layoutStore.toggle('search');
+          }
+          window.dispatchEvent(
+            new CustomEvent('selora:search-query', { detail: { query: tab.filename } }),
+          );
+        })();
+        break;
+      default:
+        break;
+    }
+  }, []);
+
   const active = editor.activeBuffer;
   const activeTab = editor.tabs.find((tab) => tab.id === editor.activeBufferId) ?? null;
   const recentFiles = useMemo(() => topLevelFiles(editor.fileTree), [editor.fileTree]);
@@ -127,6 +220,14 @@ export function EditorRegion() {
     [active, editor.workspaceName, editor.workspaceRoot],
   );
   const minimap = useMemo(() => (active ? minimapLines(active.text) : []), [active]);
+  const tabViews = useMemo(
+    () =>
+      editor.tabs.map((tab) => ({
+        ...tab,
+        isPinned: editor.pinnedIds.includes(tab.id),
+      })),
+    [editor.tabs, editor.pinnedIds],
+  );
 
   if (!active || !activeTab) {
     const hasWorkspace = Boolean(editor.workspaceRoot);
@@ -199,11 +300,12 @@ export function EditorRegion() {
   return (
     <div className="editor-region">
       <EditorTabBar
-        tabs={editor.tabs}
+        tabs={tabViews}
         activeTabId={editor.activeBufferId}
         onSelectTab={(id) => editorStore.setActive(id)}
         onCloseTab={(id) => editorStore.closeBuffer(id)}
         onSaveTab={(id) => editorStore.saveBuffer(id)}
+        onTabMenuAction={handleTabMenuAction}
       />
 
       <EditorBreadcrumbs segments={breadcrumbs} />

@@ -24,6 +24,50 @@ use crate::lsp_bridge::LspBridge;
 use crate::sessions::{ApiKeySource, EngineConfig, SessionEngine};
 use crate::workspace::{Workspace, WorkspaceError};
 
+/// The `reveal_failed` wire error for a file-manager launch that did not start.
+fn reveal_failed(cause: std::io::Error) -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "reveal_failed".into(),
+        message: format!("Could not open the file manager: {cause}"),
+        retryable: true,
+    }
+}
+
+/// Select `path` in the platform file manager. Windows uses explorer.exe
+/// `/select,`; macOS uses Finder's `open -R`; other Unix opens the parent
+/// folder.
+fn reveal_in_file_explorer(path: &std::path::Path) -> Result<(), ProtocolErrorDto> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        if path.is_dir() {
+            command.arg(path);
+        } else {
+            command.arg(format!("/select,{}", path.display()));
+        }
+        command.spawn().map(|_| ()).map_err(reveal_failed)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(reveal_failed)?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        std::process::Command::new("xdg-open")
+            .arg(target.unwrap_or(path))
+            .spawn()
+            .map(|_| ())
+            .map_err(reveal_failed)?;
+    }
+    Ok(())
+}
+
 /// The stable id for a workspace root: `ws_` + FNV-1a of the canonical path,
 /// so a restart re-attaches to the same identity (and the frontend's envelope
 /// context keeps matching).
@@ -1743,6 +1787,15 @@ impl DesktopState {
             FrontendCommand::RefreshTree => {
                 let tree = self.with_workspace(|workspace| workspace.tree())?;
                 self.record_event(app, FrontendEvent::FileTreeChanged(tree), Some(request_id));
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::RevealInExplorer { path } => {
+                let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
+                    code: "no_workspace".into(),
+                    message: "Open a folder first.".into(),
+                    retryable: false,
+                })?;
+                reveal_in_file_explorer(&root.join(path.as_str()))?;
                 Ok(self.bootstrap())
             }
             FrontendCommand::OpenFile { path } => {

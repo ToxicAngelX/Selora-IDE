@@ -1,7 +1,8 @@
 // useShortcuts tests (ARCHITECTURE §7.1): the palette chord opens the
 // palette even from a text input; matched commands are swallowed and run;
-// bindings are inert while a text input has focus; Esc dismisses the
-// topmost toast with no modal open and closes the palette when one is.
+// bindings are inert while a text input has focus, except closing the editor;
+// Esc dismisses the topmost toast with no modal open and closes the palette
+// when one is.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
 import { useShortcuts } from './use-shortcuts';
@@ -70,6 +71,15 @@ describe('useShortcuts (ARCHITECTURE §7.1)', () => {
     input.focus();
     fireEvent.keyDown(input, { key: 'B', ctrlKey: true });
     expect(onCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps Ctrl+F4 live while the editor surface has focus', () => {
+    const onCommand = vi.fn();
+    const { getByTestId } = render(<Harness paletteOpen={false} onCommand={onCommand} onClosePalette={vi.fn()} withInput />);
+    const input = getByTestId('surface-input');
+    input.focus();
+    fireEvent.keyDown(input, { key: 'F4', ctrlKey: true });
+    expect(onCommand).toHaveBeenCalledWith('selora.fileCloseEditor');
   });
 
   it('Esc with no modal dismisses the topmost toast', () => {

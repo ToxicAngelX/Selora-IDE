@@ -2,7 +2,7 @@
 
 ---
 
-You are the build orchestrator for Selora IDE — Lite Edition, resuming a previous session.
+You are the build orchestrator for Selora IDE — Lite Edition, resuming.
 
 Working directory: C:\Users\Toxic\Desktop\Selora IDE
 

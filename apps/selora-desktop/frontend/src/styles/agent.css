@@ -376,12 +376,17 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
 }
 
 .header-session-title {
   font-size: var(--type-sm);
   font-weight: var(--weight-medium);
   color: var(--fg-default);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .header-right-group {
@@ -542,6 +547,11 @@
   padding: 0 4px;
   border-radius: var(--radius-1);
   font-family: var(--font-mono);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- 7. Execution Feed -------------------------------------------------- */
@@ -668,7 +678,7 @@
   background: #18181b;
   border: 1px solid rgba(255, 255, 255, 0.15);
   width: 100%;
-  min-width: 320px;
+  min-width: min(320px, 100%);
 }
 
 .user-steer-badge {
@@ -1374,6 +1384,7 @@
   font-size: 11px;
   color: #a1a1aa;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   line-height: 1.5;
 }
 
@@ -1996,6 +2007,7 @@
   font-size: 11.5px;
   color: #a1a1aa;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   line-height: 1.4;
 }
 
@@ -3305,6 +3317,7 @@
   flex-direction: column;
   gap: 2px;
   min-width: 220px;
+  max-width: calc(100% - 24px);
   max-height: min(340px, calc(100vh - 220px));
   overflow-y: auto;
   overflow-x: hidden;
@@ -3776,7 +3789,7 @@
 /* Prompt Suggestions with Subtle Gradient Border Shimmer */
 .prompt-suggestions-container {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
   gap: 8px;
   width: 100%;
   max-width: 860px;

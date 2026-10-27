@@ -22,6 +22,11 @@ import {
 } from '../../bridge/bridge';
 import { ChevronDown, ChevronRight, FileText, RefreshCw } from '../../components/icons';
 import { editorStore } from '../editor/editor-store';
+import {
+  consumeFileTreeReveal,
+  subscribeFileTreeReveal,
+  type FileTreeRevealRequest,
+} from './file-tree-reveal';
 
 const pathKey = (path: string): string => path.replace(/\\/g, '/').replace(/\/+$/, '');
 const fileName = (path: string): string => path.split(/[\\/]/).pop() || path;
@@ -175,6 +180,53 @@ export function FileTreeView({ bootstrap }: FileTreeViewProps) {
   useEffect(() => {
     if (activePath) setSelectedPath(activePath);
   }, [activePath]);
+
+  // Reveal a path requested by another surface (tabs, palette, AI).
+  // Ancestor keys are added, never removed, so a reveal never collapses
+  // folders the user opened.
+  useEffect(() => {
+    if (!root) return;
+
+    let frame: number | null = null;
+
+    const reveal = (request: FileTreeRevealRequest) => {
+      const targetKey = pathKey(request.path);
+      const segments = targetKey.split('/').filter(Boolean);
+      const ancestorKeys: string[] = [];
+      for (let index = 1; index < segments.length; index += 1) {
+        ancestorKeys.push(segments.slice(0, index).join('/'));
+      }
+
+      setExpanded((previous) => {
+        if (ancestorKeys.length === 0) return previous;
+        const next = new Set(previous);
+        for (const key of ancestorKeys) next.add(key);
+        return next;
+      });
+      setSelectedPath(request.path);
+      setFocusPath(targetKey);
+
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = requestAnimationFrame(() => {
+          frame = null;
+          const element = rowRefs.current.get(targetKey);
+          if (!element) return;
+          element.scrollIntoView({ block: 'nearest' });
+          element.focus({ preventScroll: true });
+        });
+      });
+    };
+
+    const queued = consumeFileTreeReveal();
+    if (queued) reveal(queued);
+    const unsubscribe = subscribeFileTreeReveal(reveal);
+
+    return () => {
+      unsubscribe();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [root?.path]);
 
   const toggleDirectory = (path: string) => {
     const key = pathKey(path);

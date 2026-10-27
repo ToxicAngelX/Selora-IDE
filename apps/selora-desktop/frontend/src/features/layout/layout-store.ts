@@ -263,6 +263,41 @@ export const layoutStore = {
     workbench.activityBarWidth = box.activityBarWidth;
   },
 
+  /**
+   * Re-clamp every open region against the last measured workbench box — the
+   * window-resize path, purely local (no ResizeRegion/SaveLayout IPC): the
+   * persisted layout (and any pending preview) is clamped in place and notify
+   * only fires when a value actually changed, so the observer loop terminates.
+   */
+  reclampToWorkbench(): void {
+    const cur = state.layout;
+    const clampCtx = clampContextNow();
+    if (!cur || !clampCtx) return;
+    if (clampCtx.workbenchWidth <= 0 || clampCtx.workbenchHeight <= 0) return; // no measurement yet
+    let layout: Layout = cur;
+    let pending = state.pending;
+    let changed = false;
+    for (const region of Object.keys(REGION_SIZE_FIELD) as RegionId[]) {
+      if (!regionOpen(cur, region)) continue;
+      const field = REGION_SIZE_FIELD[region];
+      const clamped = snapToWholePx(clampRegionSize(region, layout[field] as number, clampCtx));
+      if (clamped !== (layout[field] as number)) {
+        layout = { ...layout, [field]: clamped } as Layout;
+        changed = true;
+      }
+      if (pending?.region === region) {
+        const clampedPending = snapToWholePx(clampRegionSize(region, pending.sizePx, clampCtx));
+        if (clampedPending !== pending.sizePx) {
+          pending = { region, sizePx: clampedPending };
+          changed = true;
+        }
+      }
+    }
+    if (!changed) return;
+    state = { ...state, layout, pending };
+    notify();
+  },
+
   // --- Pointer drag lifecycle (ARCHITECTURE §3.1) ---------------------------
 
   /** `pointerdown`: record start; no IPC. */

@@ -136,6 +136,24 @@
   display: inline-block;
 }
 
+/* "Keep Open": VS Code marks pinned tabs with a dotted title underline. */
+.editor-tab-shell.is-pinned .tab-title {
+  text-decoration: underline dotted var(--fg-muted);
+  text-underline-offset: 3px;
+}
+
+/* Right-click menu on a tab. Base chrome comes from .tree-context-menu;
+   this only widens it for labels plus shortcut hints and caps its height. */
+.tab-context-menu {
+  min-width: 232px;
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+}
+
+.tab-context-menu .context-menu-item {
+  width: 100%;
+}
+
 .tab-close-btn {
   position: absolute;
   right: 6px;

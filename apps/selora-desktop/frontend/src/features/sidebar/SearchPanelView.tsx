@@ -170,6 +170,17 @@ export const SearchPanelView: FC<SearchPanelViewProps> = ({ bootstrap, onNavigat
     if (currentResults) setIsSearching(false);
   }, [currentResults]);
 
+  // Another surface (palette, AI action) can prefill the query. The existing
+  // debounce effect runs the search once the state lands.
+  useEffect(() => {
+    const handleSearchQuery = (event: Event) => {
+      const detail = (event as CustomEvent<{ query?: unknown }>).detail;
+      if (detail && typeof detail.query === 'string') setQuery(detail.query);
+    };
+    window.addEventListener('selora:search-query', handleSearchQuery);
+    return () => window.removeEventListener('selora:search-query', handleSearchQuery);
+  }, []);
+
   useEffect(() => {
     setCollapsedFiles(new Set());
     setSelectedHit(null);

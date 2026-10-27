@@ -91,7 +91,7 @@ const COMMANDS: CommandEntry[] = [
   { id: 'selora.saveLayout', title: 'Save Layout', action: { kind: 'save-layout' }, fixedBinding: null, rebindable: null },
   { id: 'selora.fileOpenFolder', title: 'Open Folder…', action: { kind: 'open-folder' }, fixedBinding: null, rebindable: null },
   { id: 'selora.fileSave', title: 'Save', action: { kind: 'save-active' }, fixedBinding: null, rebindable: null },
-  { id: 'selora.fileCloseEditor', title: 'Close Editor', action: { kind: 'close-active' }, fixedBinding: null, rebindable: null },
+  { id: 'selora.fileCloseEditor', title: 'Close Editor', action: { kind: 'close-active' }, fixedBinding: 'Ctrl+F4', rebindable: null },
   { id: 'selora.fileCloseWindow', title: 'Exit Selora IDE', action: { kind: 'close-window' }, fixedBinding: null, rebindable: null },
   { id: 'selora.editFindInFiles', title: 'Find in Files', action: { kind: 'toggle-surface', surface: 'search' }, fixedBinding: null, rebindable: null },
   { id: 'selora.editCommandPalette', title: 'Command Palette', action: { kind: 'open-palette' }, fixedBinding: null, rebindable: null },

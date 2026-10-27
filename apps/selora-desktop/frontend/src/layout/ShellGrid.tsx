@@ -92,6 +92,9 @@ export function ShellGrid({ bootstrap, commands, onRunCommand, onOpenConnect }: 
         height: workbench.getBoundingClientRect().height,
         activityBarWidth: activityBar.getBoundingClientRect().width,
       });
+      // Re-clamp open regions after measuring so an OS window resize cannot
+      // crush the editor column or overflow the docks (no IPC, local only).
+      layoutStore.reclampToWorkbench();
     };
     measure();
     if (typeof ResizeObserver === 'undefined') return;

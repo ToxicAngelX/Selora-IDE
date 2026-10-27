@@ -332,4 +332,45 @@ describe('editor store', () => {
     const context = activeEditorContext();
     expect(context && 'selection' in context).toBe(false);
   });
+
+  it('bulk close skips dirty and kept-open tabs', () => {
+    harness.app.setSnapshot(
+      appWith(
+        [
+          buffer('b1', 'C:/workspace/src/main.rs'),
+          buffer('b2', 'C:/workspace/src/lib.rs', 1, 'fn lib() {}\n', null, true),
+          buffer('b3', 'C:/workspace/src/engine.rs'),
+        ],
+        'b1',
+      ),
+    );
+    editorStore.reset();
+    editorStore.togglePinned('b3');
+
+    const result = editorStore.closeMany(['b1', 'b2', 'b3']);
+
+    expect(result).toEqual({ closed: 1, kept: 2 });
+    expect(harness.bridge.closeBuffer).toHaveBeenCalledTimes(1);
+    expect(harness.bridge.closeBuffer).toHaveBeenCalledWith(
+      'b1',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
+  });
+
+  it('togglePinned exposes pinned ids and unpins on a second call', () => {
+    harness.app.setSnapshot(
+      appWith(
+        [buffer('b1', 'C:/workspace/src/main.rs'), buffer('b2', 'C:/workspace/src/lib.rs')],
+        'b1',
+      ),
+    );
+    editorStore.reset();
+    expect(editorStore.getSnapshot().pinnedIds).toEqual([]);
+
+    editorStore.togglePinned('b2');
+    expect(editorStore.getSnapshot().pinnedIds).toEqual(['b2']);
+
+    editorStore.togglePinned('b2');
+    expect(editorStore.getSnapshot().pinnedIds).toEqual([]);
+  });
 });
