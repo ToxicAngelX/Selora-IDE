@@ -1,5 +1,5 @@
-// AgentDock interaction parity: the session drawer is dismissible from the
-// keyboard and returns focus to its toggle (UI_SPEC §17).
+// AgentDock workbench parity: honest empty session state, the header Stop
+// switch, and the explicit way back to the editor/split view (UI_SPEC §17).
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
 import { AgentDock } from './AgentDock';
@@ -31,34 +31,21 @@ beforeEach(() => {
   editorHarness.set({ activeBuffer: null, activeSelection: null });
 });
 
-describe('AgentDock keyboard drawer', () => {
-  it('closes the session drawer on Escape and restores focus to its toggle', () => {
-    const { getByRole, queryByLabelText } = render(<AgentDock />);
-    const toggle = getByRole('button', { name: /Agent Session 1/ });
-    fireEvent.click(toggle);
-    expect(queryByLabelText('Agent Session History')).toBeTruthy();
-    const dialog = getByRole('dialog', { name: 'Agent sessions' });
-    expect(dialog.getAttribute('aria-modal')).toBe('true');
-    expect(dialog.contains(document.activeElement)).toBe(true);
+describe('AgentDock session truth', () => {
+  it('shows an empty session strip rather than inventing a session', () => {
+    const { getByText, queryAllByRole } = render(<AgentDock />);
+    expect(getByText('No sessions yet')).toBeTruthy();
+    expect(queryAllByRole('tab')).toHaveLength(0);
+    expect(agentStore.getSnapshot().sessions).toEqual([]);
+  });
 
-    const focusables = Array.from(
-      dialog.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ),
-    );
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    first.focus();
-    fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
-    expect(document.activeElement).toBe(last);
-    last.focus();
-    fireEvent.keyDown(last, { key: 'Tab' });
-    expect(document.activeElement).toBe(first);
+  it('offers editor and split exits that name the shell mode', () => {
+    const onExit = vi.fn();
+    const { getByRole } = render(<AgentDock onExit={onExit} />);
 
-    fireEvent.keyDown(window, { key: 'Escape' });
-
-    expect(queryByLabelText('Agent Session History')).toBeNull();
-    expect(document.activeElement).toBe(toggle);
+    fireEvent.click(getByRole('button', { name: 'Editor view' }));
+    fireEvent.click(getByRole('button', { name: 'Split view' }));
+    expect(onExit.mock.calls.map(([mode]) => mode)).toEqual(['editor', 'split']);
   });
 });
 

@@ -17,7 +17,6 @@ import {
   Code2,
   BarChart2,
   Sparkles,
-  Plus,
   CheckCircle,
   Check,
 } from '../../../components/icons';
@@ -147,8 +146,6 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
   onClosePopover,
 }) => {
   const [showCompleted, setShowCompleted] = useState(false);
-  const [isAdding, setIsAdding] = useState(false);
-  const [newStepText, setNewStepText] = useState('');
 
   const completedTodos = todos.filter((t) => t.status === 'completed');
   const activeAndPendingTodos = todos.filter((t) => t.status !== 'completed');
@@ -164,15 +161,6 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
   const workingSubagents = subagents.filter((s) => s.status === 'working');
   const idleSubagents = subagents.filter((s) => s.status === 'idle');
   const doneSubagents = subagents.filter((s) => s.status === 'done');
-
-  const handleAddStep = () => {
-    const trimmed = newStepText.trim();
-    if (trimmed) {
-      agentStore.addTodo(trimmed);
-      setNewStepText('');
-      setIsAdding(false);
-    }
-  };
 
   // --- Compact View (Used in In-feed progress bar and Floating popover) ---
   if (isFloatingPopover || isCompactInfeed) {
@@ -333,9 +321,9 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                   textAlign: 'center',
                 }}
               >
-                <div>No active tasks yet.</div>
+                <div>No todos yet</div>
                 <div style={{ fontSize: '11px', opacity: 0.75, marginTop: '4px' }}>
-                  Prompt the agent to begin work — tasks and progress will be created and updated here dynamically.
+                  The session's todo list appears here when the agent reports one.
                 </div>
               </div>
             ) : (
@@ -381,89 +369,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
               </div>
             )}
 
-            {/* Interactive Add Step */}
-            <div className="zcode-add-step-container" style={{ marginTop: '10px', paddingTop: '6px', borderTop: '1px solid rgba(255, 255, 255, 0.05)' }}>
-              {isAdding ? (
-                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                  <input
-                    type="text"
-                    autoFocus
-                    value={newStepText}
-                    onChange={(e) => setNewStepText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleAddStep();
-                      if (e.key === 'Escape') {
-                        setIsAdding(false);
-                        setNewStepText('');
-                      }
-                    }}
-                    placeholder="Add task step..."
-                    style={{
-                      flex: 1,
-                      background: 'rgba(255, 255, 255, 0.06)',
-                      border: '1px solid rgba(255, 255, 255, 0.12)',
-                      borderRadius: '4px',
-                      color: 'var(--fg-normal)',
-                      fontSize: '11px',
-                      padding: '4px 8px',
-                      outline: 'none',
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddStep}
-                    style={{
-                      background: 'var(--accent, #3b82f6)',
-                      border: 'none',
-                      borderRadius: '4px',
-                      color: '#fff',
-                      fontSize: '11px',
-                      padding: '4px 10px',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    Add
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsAdding(false);
-                      setNewStepText('');
-                    }}
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      color: 'var(--fg-faint)',
-                      fontSize: '11px',
-                      cursor: 'pointer',
-                      padding: '4px 6px',
-                    }}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="zcode-add-step-btn"
-                  onClick={() => setIsAdding(true)}
-                  style={{
-                    background: 'transparent',
-                    border: 'none',
-                    color: 'var(--fg-faint)',
-                    fontSize: '11px',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                    padding: '2px 0',
-                  }}
-                >
-                  <span>+ Add step</span>
-                </button>
-              )}
             </div>
-          </div>
         </div>
       </div>
     );
@@ -708,38 +614,11 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                 {/* Active and Pending Tasks */}
                 {todos.length === 0 ? (
                   <div className="zcode-todos-empty-full">
-                    <div style={{ fontSize: '13px', fontWeight: 500, color: '#e4e4e7' }}>
-                      No execution tasks currently planned
+                    <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--fg-default)' }}>
+                      No todos yet
                     </div>
-                    <div style={{ fontSize: '12px', color: '#71717a', marginTop: '4px', lineHeight: 1.5 }}>
-                      When the agent tackles a task, structured steps will appear here in real time.
-                      You can also initialize a plan using starter templates or add custom steps below.
-                    </div>
-                    <div className="zcode-starter-templates">
-                      <button
-                        type="button"
-                        className="zcode-starter-btn"
-                        onClick={() => {
-                          agentStore.addTodo('1. Audit architecture and component boundaries', 'frontend-developer');
-                          agentStore.addTodo('2. Implement features with full test coverage', 'frontend-developer');
-                          agentStore.addTodo('3. Verify edge cases and performance', 'rust-developer');
-                        }}
-                      >
-                        <span>+ Load Full Development Plan template</span>
-                        <span style={{ fontSize: '11px', color: '#71717a' }}>3 steps</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="zcode-starter-btn"
-                        onClick={() => {
-                          agentStore.addTodo('1. Reproduce issue and inspect logs', 'frontend-developer');
-                          agentStore.addTodo('2. Implement regression fix', 'frontend-developer');
-                          agentStore.addTodo('3. Run unit tests and verify fix', 'rust-developer');
-                        }}
-                      >
-                        <span>+ Load Bug Investigation &amp; Fix template</span>
-                        <span style={{ fontSize: '11px', color: '#71717a' }}>3 steps</span>
-                      </button>
+                    <div style={{ fontSize: '12px', color: 'var(--fg-faint)', marginTop: '4px', lineHeight: 1.5 }}>
+                      The session's real todo list appears here when the agent reports one.
                     </div>
                   </div>
                 ) : (
@@ -798,75 +677,6 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                     })}
                   </div>
                 )}
-
-                {/* Interactive Add Step */}
-                <div className="zcode-add-step-container" style={{ marginTop: '14px', paddingTop: '10px', borderTop: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                  {isAdding ? (
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                      <input
-                        type="text"
-                        autoFocus
-                        value={newStepText}
-                        onChange={(e) => setNewStepText(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') handleAddStep();
-                          if (e.key === 'Escape') {
-                            setIsAdding(false);
-                            setNewStepText('');
-                          }
-                        }}
-                        placeholder="Add task step (e.g. Verify test suite)..."
-                        style={{
-                          flex: 1,
-                          background: 'rgba(255, 255, 255, 0.06)',
-                          border: '1px solid rgba(255, 255, 255, 0.12)',
-                          borderRadius: '6px',
-                          color: 'var(--fg-normal)',
-                          fontSize: '12px',
-                          padding: '6px 10px',
-                          outline: 'none',
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={handleAddStep}
-                        className="zcode-btn-sm primary"
-                      >
-                        Add
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsAdding(false);
-                          setNewStepText('');
-                        }}
-                        className="zcode-btn-sm"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="zcode-add-step-btn"
-                      onClick={() => setIsAdding(true)}
-                      style={{
-                        background: 'transparent',
-                        border: 'none',
-                        color: 'var(--fg-faint)',
-                        fontSize: '12px',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '6px',
-                        padding: '2px 0',
-                      }}
-                    >
-                      <Plus size={14} />
-                      <span>Add step</span>
-                    </button>
-                  )}
-                </div>
               </div>
             </div>
           </div>
