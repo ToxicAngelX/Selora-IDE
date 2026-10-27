@@ -524,6 +524,7 @@ export type FrontendCommand =
   | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision; resolution?: AgentDecisionResolution } }
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
+  | { type: 'delete_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
   | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'list_agent_sessions' }
@@ -947,6 +948,10 @@ export const agentDecision = (
 
 export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'switch_session', payload: { session_id: sessionId } }, ctx);
+
+/** Delete a session (durable sessions also lose their on-disk store). */
+export const deleteSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'delete_session', payload: { session_id: sessionId } }, ctx);
 
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);

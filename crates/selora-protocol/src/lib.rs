@@ -515,6 +515,11 @@ pub enum FrontendCommand {
     SwitchSession {
         session_id: SessionId,
     },
+    /// Delete a session: remove it from the dock and, for a durable agent
+    /// session, remove its `.selora/agent-sessions/{id}` store.
+    DeleteSession {
+        session_id: SessionId,
+    },
     NewSession,
     /// Phase 9d: refresh the resume picker. The answer is a full bootstrap
     /// whose `agent_sessions` is freshly scanned from disk.
@@ -2140,6 +2145,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FrontendCommand::ListAgentSessions).unwrap(),
             r#"{"type":"list_agent_sessions"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::DeleteSession {
+                session_id: sid("sess-disk"),
+            })
+            .unwrap(),
+            r#"{"type":"delete_session","payload":{"session_id":"sess-disk"}}"#
         );
         assert_eq!(
             serde_json::to_string(&FrontendCommand::SetAgentAutoApprove {

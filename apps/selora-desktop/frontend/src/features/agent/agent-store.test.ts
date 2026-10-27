@@ -14,6 +14,7 @@ const bridgeMocks = vi.hoisted(() => {
     stopChat: vi.fn((..._args: unknown[]) => Promise.resolve()),
     agentDecision: vi.fn((..._args: unknown[]) => Promise.resolve()),
     switchSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    deleteSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
     newSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
     retryMessage: vi.fn((..._args: unknown[]) => Promise.resolve()),
     listAgentSessions: vi.fn((..._args: unknown[]) => Promise.resolve()),
@@ -398,6 +399,101 @@ describe('agentStore', () => {
     ]);
     expect(agentStore.getSnapshot().sessionError).toContain('Creating agent sessions is not supported');
     expect(agentStore.getSnapshot().sessionBusy).toBe(false);
+  });
+
+  it('deletes through the backend, keeps a non-active tab selected, and refreshes the dock', async () => {
+    agentStore.reset();
+    agentStore.hydrate(
+      makeAgentBootstrap('sess-b', {
+        chat: {
+          sessions: [
+            { session_id: 'sess-a', title: 'First', message_ids: [], active: false },
+            { session_id: 'sess-b', title: 'Second', message_ids: [], active: false },
+            { session_id: 'sess-c', title: 'Third', message_ids: [], active: false },
+          ],
+          messages: [],
+          active_session_id: 'sess-b',
+          active_request_id: null,
+          active_turn_id: null,
+          pending_approval: null,
+        },
+        agent_sessions: [
+          {
+            session_id: 'sess-disk',
+            title: 'On disk',
+            updated_at: 5,
+            mode: 'execute',
+            compacted: false,
+            message_count: 2,
+          },
+        ],
+      }),
+    );
+
+    // Deleting a background tab must not select another tab.
+    await expect(agentStore.requestDeleteSession('sess-a')).resolves.toBe(true);
+    expect(bridgeMocks.deleteSession).toHaveBeenCalledWith(
+      'sess-a',
+      expect.objectContaining({ session_id: null, core_instance_id: 'core-01' }),
+    );
+    let snapshot = agentStore.getSnapshot();
+    expect(snapshot.sessions.map((session) => session.id)).toEqual(['sess-b', 'sess-c']);
+    expect(snapshot.activeSessionId).toBe('sess-b');
+
+    // Deleting the active tab selects a real remaining session.
+    await expect(agentStore.requestDeleteSession('sess-b')).resolves.toBe(true);
+    snapshot = agentStore.getSnapshot();
+    expect(snapshot.sessions.map((session) => session.id)).toEqual(['sess-c']);
+    expect(snapshot.activeSessionId).toBe('sess-c');
+
+    // A disk-only durable session leaves the resume rail on success.
+    await expect(agentStore.requestDeleteSession('sess-disk')).resolves.toBe(true);
+    snapshot = agentStore.getSnapshot();
+    expect(snapshot.resumableSessions).toEqual([]);
+
+    await expect(agentStore.requestDeleteSession('sess-c')).resolves.toBe(true);
+    snapshot = agentStore.getSnapshot();
+    expect(snapshot.sessions).toEqual([]);
+    expect(snapshot.activeSessionId).toBe('');
+    expect(snapshot.messages).toEqual([]);
+  });
+
+  it('keeps a live session when the backend refuses the delete', async () => {
+    agentStore.reset();
+    agentStore.hydrate(
+      makeAgentBootstrap('sess-live', {
+        chat: {
+          sessions: [
+            { session_id: 'sess-live', title: 'Live', message_ids: [], active: true },
+          ],
+          messages: [],
+          active_session_id: 'sess-live',
+          active_request_id: 'req-live',
+          active_turn_id: 'turn-live',
+          pending_approval: null,
+        },
+      }),
+    );
+    bridgeMocks.deleteSession.mockRejectedValueOnce({
+      code: 'session_busy',
+      message: 'A request is already running for this session - stop it first.',
+    });
+
+    await expect(agentStore.requestDeleteSession('sess-live')).resolves.toBe(false);
+    const snapshot = agentStore.getSnapshot();
+    expect(snapshot.sessions.map((session) => session.id)).toEqual(['sess-live']);
+    expect(snapshot.activeSessionId).toBe('sess-live');
+    expect(snapshot.sessionBusy).toBe(false);
+    expect(snapshot.sessionError).toContain('Could not delete the agent session');
+    expect(snapshot.sessionError).toContain('stop it first');
+  });
+
+  it('does not fabricate a deletion for an unknown or stale session', async () => {
+    await expect(agentStore.requestDeleteSession('sess-unknown')).resolves.toBe(false);
+    expect(bridgeMocks.deleteSession).not.toHaveBeenCalled();
+    expect(agentStore.getSnapshot().sessionError).toBe(
+      'That session is not in the backend session list.',
+    );
   });
 
   it('manages conversation turns, deltas, and in-flight states', () => {
