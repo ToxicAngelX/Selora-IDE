@@ -30,14 +30,19 @@
 //! timeout, output cap) — each with its own test citing its §.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::chat_types::{ToolCall, ToolResult, ToolSpec};
 
+use super::subagent::{
+    SubagentCompletion, SubagentId, SubagentPolicy, SubagentRequest, SubagentRuntime,
+};
 use super::tools::{bash, fs, web};
-use super::ApprovalCard;
+use super::{AgentQuestion, ApprovalCard, QuestionAnswer, QuestionCard, QuestionOption};
 
 /// What the router produced for one tool call: a finished result, or a
 /// card the user must approve before execution proceeds.
@@ -147,6 +152,14 @@ pub struct ToolContext {
     pub settings: AgentToolSettings,
     /// The Stop button's kill switch for bash children (§17.3).
     pub abort: bash::BashAbortHandle,
+    /// Structural tool policy (§19.3). `None` is the ordinary parent Agent Mode
+    /// context (the full manifest, including manifest v3 orchestration tools);
+    /// `Some(policy)` is a child, whose calls are rejected on **both** router
+    /// entry points when the policy does not allow them.
+    pub policy: Option<SubagentPolicy>,
+    /// The background child runtime, when this turn is the parent Agent Mode
+    /// turn. Child tools and Phase 8 asks leave this `None`.
+    pub subagents: Option<Arc<SubagentRuntime>>,
 }
 
 impl ToolContext {
@@ -159,7 +172,24 @@ impl ToolContext {
             root,
             settings,
             abort: bash::BashAbortHandle::default(),
+            policy: None,
+            subagents: None,
         }
+    }
+
+    /// Scope this context to a subagent policy. A read-only context has no
+    /// write/bash route on either `execute_tool` or `execute_approved`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: SubagentPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Give this parent turn a background subagent runtime.
+    #[must_use]
+    pub fn with_subagents(mut self, subagents: Arc<SubagentRuntime>) -> Self {
+        self.subagents = Some(subagents);
+        self
     }
 }
 
@@ -331,6 +361,103 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
                 "required": ["name", "script", "commands"],
             }),
         ),
+        // -- §19 manifest v3, part 2: subagents and escalations -----------
+        ToolSpec::new(
+            "spawn_subagent",
+            "Spawn a child agent with its own conversation and §17.3 turn caps. \
+             `policy` is `read-only` (read tools only; no write/bash tool exists) \
+             or `full` (the §17.1 tools; writes and non-allowlisted bash still \
+             park on approval cards in this session). `background` defaults to \
+             false: the call waits for the child's result. A background child \
+             returns its id immediately and reports completion later; use \
+             `wait` to collect it. Children cannot spawn further children.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "policy": {
+                        "type": "string",
+                        "enum": ["read-only", "full"],
+                        "description": "Structural tool policy (`read-only` or `full`)."
+                    },
+                    "mission": {
+                        "type": "string",
+                        "description": "What the child must accomplish. Include the evidence it should return."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in the background and return immediately (default false)."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional stable child name for the transcript."
+                    }
+                },
+                "required": ["policy", "mission"]
+            }),
+        ),
+        ToolSpec::new(
+            "send_message",
+            "Steer or resume a spawned subagent. A running child receives the text \
+             as its next user turn in FIFO order; a finished child resumes with the \
+             message. The child keeps its own conversation and policy.",
+            json_schema(
+                [("subagent_id", "string"), ("message", "string")],
+                ["subagent_id", "message"],
+            ),
+        ),
+        ToolSpec::new(
+            "wait",
+            "Block until one subagent finishes, or until every current child \
+             finishes when `subagent_id` is omitted. Returns the child's final \
+             result (and token/cost summary). `timeout_secs` is optional.",
+            json_schema([("subagent_id", "string"), ("timeout_secs", "integer")], []),
+        ),
+        ToolSpec::new(
+            "ask_user_question",
+            "Ask the user one or more structured questions and wait for the answer. \
+             Each question carries 2-4 options with descriptions; free text is \
+             available unless `allow_free_text` is false. The turn parks on the \
+             normal approval channel and resumes with the user's answer as this \
+             tool's result. Prefer one focused question over a batch.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The question text."
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 0,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "allow_free_text": {
+                                    "type": "boolean",
+                                    "description": "Whether the user may type a free-text answer (default true)."
+                                }
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        ),
     ]
 }
 
@@ -373,6 +500,14 @@ pub async fn execute_tool(ctx: &ToolContext, call: ToolCall) -> ToolOutcome {
 }
 
 async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String> {
+    if let Some(policy) = ctx.policy {
+        if !policy.allows(&call.name) {
+            return Ok(ToolOutcome::Ready(ToolResult::error(
+                &call.id,
+                disabled_by_policy(&call.name, policy),
+            )));
+        }
+    }
     let args = parse_arguments(&call.name, &call.arguments)?;
 
     match call.name.as_str() {
@@ -512,6 +647,131 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
             )))
         }
 
+        // -- §19.3: spawn / steer / wait on the shared subagent runtime ----
+        "spawn_subagent" => {
+            let policy_raw = req_str(&args, &call.name, "policy")?;
+            let policy = SubagentPolicy::parse(&policy_raw).ok_or_else(|| {
+                format!(
+                    "`spawn_subagent` policy `{policy_raw}` is not one of `read-only` or `full`"
+                )
+            })?;
+            let mission = req_str(&args, &call.name, "mission")?;
+            if mission.trim().is_empty() {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "`spawn_subagent` needs a non-empty `mission`",
+                )));
+            }
+            let background = opt_bool(&args, &call.name, "background")?.unwrap_or(false);
+            let name = opt_str(&args, &call.name, "name")?;
+            let Some(runtime) = ctx.subagents.clone() else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "subagents are not available in this turn",
+                )));
+            };
+            let mut request = SubagentRequest::new(policy, mission, background);
+            if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+                request = request.with_name(name);
+            }
+            match runtime.spawn(request).await {
+                Ok(completion) if background => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    format!(
+                        "subagent `{}` started in the background (policy `{}`). Use `wait` to \
+                         collect its result.",
+                        completion.id,
+                        completion.policy.as_str()
+                    ),
+                ))),
+                Ok(completion) => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    format_subagent_completion(&completion),
+                ))),
+                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    error.to_string(),
+                ))),
+            }
+        }
+        "send_message" => {
+            let raw_id = req_str(&args, &call.name, "subagent_id")?;
+            let message = req_str(&args, &call.name, "message")?;
+            let Some(runtime) = ctx.subagents.as_ref() else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "subagents are not available in this turn",
+                )));
+            };
+            let Some(id) = SubagentId::parse(&raw_id) else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "`send_message` needs a non-empty `subagent_id`",
+                )));
+            };
+            match runtime.send_message(&id, message) {
+                Ok(()) => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    format!("message queued for subagent `{id}`"),
+                ))),
+                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    error.to_string(),
+                ))),
+            }
+        }
+        "wait" => {
+            let Some(runtime) = ctx.subagents.as_ref() else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "subagents are not available in this turn",
+                )));
+            };
+            let timeout_secs = opt_u64(&args, &call.name, "timeout_secs")?;
+            let timeout = timeout_secs.map(|secs| Duration::from_secs(secs.min(600)));
+            let raw_id = opt_str(&args, &call.name, "subagent_id")?;
+            if let Some(raw_id) = raw_id.filter(|id| !id.trim().is_empty()) {
+                let Some(id) = SubagentId::parse(&raw_id) else {
+                    return Ok(ToolOutcome::Ready(ToolResult::error(
+                        &call.id,
+                        "`wait` received an invalid `subagent_id`",
+                    )));
+                };
+                match runtime.wait(&id, timeout).await {
+                    Ok(completion) => Ok(ToolOutcome::Ready(ToolResult::success(
+                        &call.id,
+                        format_subagent_completion(&completion),
+                    ))),
+                    Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                        &call.id,
+                        error.to_string(),
+                    ))),
+                }
+            } else {
+                match runtime.wait_all(timeout).await {
+                    Ok(completions) if completions.is_empty() => Ok(ToolOutcome::Ready(
+                        ToolResult::error(&call.id, "there are no subagents to wait for"),
+                    )),
+                    Ok(completions) => Ok(ToolOutcome::Ready(ToolResult::success(
+                        &call.id,
+                        completions
+                            .iter()
+                            .map(format_subagent_completion)
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    ))),
+                    Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                        &call.id,
+                        error.to_string(),
+                    ))),
+                }
+            }
+        }
+        "ask_user_question" => {
+            let card = parse_question_card(&args, &call.name)?;
+            Ok(ToolOutcome::NeedsApproval(ApprovalCard::Question(card)))
+        }
+
         // -- §17.1: the manifest is closed --------------------------------
         unknown => Err(format!(
             "unknown tool `{unknown}` — the tool manifest (§17.1) is fixed"
@@ -539,6 +799,11 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
 /// else is an error result (read tools already ran, and a card was never
 /// built for them).
 pub async fn execute_approved(ctx: &ToolContext, call: ToolCall) -> ToolResult {
+    if let Some(policy) = ctx.policy {
+        if !policy.allows(&call.name) {
+            return ToolResult::error(&call.id, disabled_by_policy(&call.name, policy));
+        }
+    }
     let args = match parse_arguments(&call.name, &call.arguments) {
         Ok(args) => args,
         Err(message) => return ToolResult::error(&call.id, message),
@@ -797,6 +1062,151 @@ fn parse_workflow(args: &Map<String, Value>, tool: &str) -> Result<WorkflowPlan,
     })
 }
 
+/// A policy rejection the parent model can read and adapt to. It names the
+/// policy rather than pretending the tool does not exist.
+fn disabled_by_policy(tool: &str, policy: SubagentPolicy) -> String {
+    format!(
+        "tool `{tool}` is disabled by the `{}` subagent policy",
+        policy.as_str()
+    )
+}
+
+/// Validate one `ask_user_question` payload into the card the UI renders.
+/// Two to four options per question when options are supplied; free text is
+/// on by default. An unanswerable question (no options, free text off) is a
+/// model-visible error, never an empty card.
+fn parse_question_card(args: &Map<String, Value>, tool: &str) -> Result<QuestionCard, String> {
+    let Some(Value::Array(raw_questions)) = args.get("questions") else {
+        return Err(format!("`{tool}` requires an array parameter `questions`"));
+    };
+    if raw_questions.is_empty() {
+        return Err(format!("`{tool}` needs at least one question"));
+    }
+    if raw_questions.len() > 4 {
+        return Err(format!(
+            "`{tool}` accepts at most 4 questions per card (received {})",
+            raw_questions.len()
+        ));
+    }
+    let mut questions = Vec::with_capacity(raw_questions.len());
+    for (index, raw) in raw_questions.iter().enumerate() {
+        let object = raw
+            .as_object()
+            .ok_or_else(|| format!("`{tool}` parameter `questions[{index}]` must be an object"))?;
+        let question = object
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "`{tool}` parameter `questions[{index}].question` must be a non-empty string"
+                )
+            })?
+            .to_owned();
+        let allow_free_text = match object.get("allow_free_text") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(format!(
+                    "`{tool}` parameter `questions[{index}].allow_free_text` must be a boolean"
+                ))
+            }
+        };
+        let mut options = Vec::new();
+        if let Some(raw_options) = object.get("options") {
+            let array = raw_options.as_array().ok_or_else(|| {
+                format!("`{tool}` parameter `questions[{index}].options` must be an array")
+            })?;
+            if array.len() > 4 {
+                return Err(format!(
+                    "`{tool}` parameter `questions[{index}].options` accepts at most 4 options"
+                ));
+            }
+            for (option_index, raw_option) in array.iter().enumerate() {
+                let option = raw_option.as_object().ok_or_else(|| {
+                    format!(
+                        "`{tool}` parameter `questions[{index}].options[{option_index}]` must be an object"
+                    )
+                })?;
+                let label = option
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "`{tool}` parameter `questions[{index}].options[{option_index}].label` must be a non-empty string"
+                        )
+                    })?
+                    .to_owned();
+                let description = match option.get("description") {
+                    None | Some(Value::Null) => String::new(),
+                    Some(Value::String(text)) => text.clone(),
+                    Some(_) => {
+                        return Err(format!(
+                            "`{tool}` parameter `questions[{index}].options[{option_index}].description` must be a string"
+                        ))
+                    }
+                };
+                options.push(QuestionOption { label, description });
+            }
+        }
+        if !allow_free_text && options.len() < 2 {
+            return Err(format!(
+                "`{tool}` question {index} cannot be answered: provide 2-4 options or allow free text"
+            ));
+        }
+        questions.push(AgentQuestion {
+            question,
+            options,
+            allow_free_text,
+        });
+    }
+    Ok(QuestionCard { questions })
+}
+
+/// Render a child's completion as the parent model's tool result. Only facts
+/// the runtime actually observed appear; a background start is never reported
+/// as a completed mission.
+fn format_subagent_completion(completion: &SubagentCompletion) -> String {
+    let status = if completion.cancelled {
+        "cancelled"
+    } else if completion.end.is_completed() {
+        "completed"
+    } else {
+        "ended"
+    };
+    format!(
+        "subagent `{}` (policy `{}`) {status} — {} tool(s), {} tokens, ${:.4}{}.\n\n{}",
+        completion.id,
+        completion.policy.as_str(),
+        completion.summary.tools_used,
+        completion.summary.tokens,
+        completion.summary.cost_usd,
+        if completion.end.is_completed() {
+            String::new()
+        } else {
+            format!(" ({})", completion.end.toast())
+        },
+        completion.final_message
+    )
+}
+
+/// The tool result for a question card's answer. The model consumes this
+/// verbatim; the answer is never reinterpreted as an approval.
+pub fn question_answer_result(call: &ToolCall, answer: &QuestionAnswer) -> ToolResult {
+    let mut body = String::from("User answer:\n");
+    for response in &answer.answers {
+        body.push_str("Q: ");
+        body.push_str(&response.question);
+        body.push_str("\nA: ");
+        body.push_str(&response.answer);
+        body.push('\n');
+    }
+    ToolResult::success(&call.id, body.trim_end().to_owned())
+}
+
 // -----------------------------------------------------------------------------
 // Tests — routing and the approval split
 // -----------------------------------------------------------------------------
@@ -821,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_section_17_1s_ten_tools_plus_manifest_v2s_run_workflow() {
+    fn manifest_is_17_1_plus_manifest_v2_and_v3() {
         let manifest = tool_manifest();
         let names: Vec<&str> = manifest.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -837,11 +1247,15 @@ mod tests {
                 "bash",
                 "web_search",
                 "web_fetch",
-                // §18.4: manifest v2 is additive — the ten §17.1 tools and
-                // exactly one new entry.
+                // §18.4: manifest v2 is additive.
                 "run_workflow",
+                // §19.3/§19.4: manifest v3, part 2.
+                "spawn_subagent",
+                "send_message",
+                "wait",
+                "ask_user_question",
             ],
-            "§17.1's closed set plus §18.4's additive run_workflow"
+            "§17.1's closed set plus the additive v2/v3 entries"
         );
         for spec in &manifest {
             assert!(
@@ -925,6 +1339,66 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(required, ["name", "script", "commands"]);
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_builds_a_question_card_with_options_and_free_text() {
+        let root = temp_root("route-question");
+        let call = call(
+            "ask_user_question",
+            &serde_json::json!({
+                "questions": [{
+                    "question": "Which file?",
+                    "options": [
+                        {"label": "src/a.rs", "description": "left"},
+                        {"label": "src/b.rs", "description": "right"}
+                    ],
+                    "allow_free_text": false
+                }]
+            })
+            .to_string(),
+        );
+        match execute_tool(&ctx(&root), call).await {
+            ToolOutcome::NeedsApproval(ApprovalCard::Question(card)) => {
+                assert_eq!(card.questions.len(), 1);
+                assert_eq!(card.questions[0].options.len(), 2);
+                assert!(!card.questions[0].allow_free_text);
+            }
+            other => panic!("expected a question card, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unanswerable_question_is_a_model_visible_error_not_a_card() {
+        let root = temp_root("route-question-error");
+        let call = call(
+            "ask_user_question",
+            &serde_json::json!({
+                "questions": [{
+                    "question": "Pick",
+                    "options": [],
+                    "allow_free_text": false
+                }]
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            execute_tool(&ctx(&root), call).await,
+            ToolOutcome::Ready(result) if !result.ok && result.content.contains("cannot be answered")
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_without_a_runtime_is_a_visible_error() {
+        let root = temp_root("route-spawn");
+        let call = call(
+            "spawn_subagent",
+            &serde_json::json!({"policy": "read-only", "mission": "review"}).to_string(),
+        );
+        assert!(matches!(
+            execute_tool(&ctx(&root), call).await,
+            ToolOutcome::Ready(result) if !result.ok && result.content.contains("not available")
+        ));
     }
 
     #[tokio::test]

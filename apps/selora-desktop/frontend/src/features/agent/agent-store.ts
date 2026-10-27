@@ -35,6 +35,10 @@ import {
   type EditorContextDto,
   type EnvelopeContext,
   type Model,
+  type QuestionAnswer,
+  type QuestionApproval,
+  type SubagentCompletedPayload,
+  type SubagentStartedPayload,
   type ToolCallStartedPayload,
   type ToolResultPayload,
   type WorkflowApproval,
@@ -302,6 +306,8 @@ const listeners = new Set<Listener>();
  */
 export type WorkflowToolCall = AgentToolCall & {
   workflow?: WorkflowApproval;
+  /** §19.4 escalation payload (mutually exclusive with `workflow`). */
+  question?: QuestionApproval;
   approvalSubmitting?: boolean;
 };
 
@@ -1191,9 +1197,116 @@ export const agentStore = {
     notify();
   },
 
+  /**
+   * §19.4: answer a structured question. The answer rides the same
+   * single-use `agent_decision` route as an approval; the Rust side rejects a
+   * stale id or a second answer.
+   */
+  handleQuestionDecision(approvalId: string, answers: QuestionAnswer['answers']): void {
+    const target = state.messages.flatMap((message) => message.toolCalls ?? [])
+      .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
+    if (!target?.question || target.status !== 'needs_approval' || target.approvalSubmitting) return;
+    const requestId = pendingApprovalRequests.get(approvalId) ?? activeRequestId;
+    const sessionContext = requestId ? sessionEnvelopeContext() : null;
+    if (!requestId || !sessionContext) {
+      updateWorkflowConfirmationCard(approvalId, {
+        resultSummary: 'The session that asked this question is no longer live.',
+      });
+      return;
+    }
+    updateWorkflowConfirmationCard(approvalId, {
+      approvalSubmitting: true,
+      resultSummary: undefined,
+    });
+    void agentDecision(
+      requestId,
+      approvalId,
+      { answer: { answers } },
+      sessionContext,
+    )
+      .then(() => {
+        pendingApprovalRequests.delete(approvalId);
+        updateWorkflowConfirmationCard(approvalId, {
+          status: 'approved',
+          approvalSubmitting: false,
+        });
+      })
+      .catch((error: unknown) => {
+        const message =
+          error && typeof error === 'object' && 'message' in error
+            ? String((error as { message: unknown }).message)
+            : 'The answer was refused. The card is still waiting.';
+        updateWorkflowConfirmationCard(approvalId, {
+          approvalSubmitting: false,
+          resultSummary: `Question answer failed: ${message}`,
+        });
+      });
+  },
+
+  handleSubagentStarted(payload: SubagentStartedPayload) {
+    const existing = state.subagents.find((agent) => agent.id === payload.subagent_id);
+    const entry = {
+      id: payload.subagent_id,
+      name: payload.name,
+      model: payload.policy,
+      status: 'working' as const,
+      activeStep: payload.mission,
+    };
+    state = {
+      ...state,
+      subagents: existing
+        ? state.subagents.map((agent) => (agent.id === payload.subagent_id ? entry : agent))
+        : [...state.subagents, entry],
+    };
+    notify();
+  },
+
+  handleSubagentCompleted(payload: SubagentCompletedPayload) {
+    const existing = state.subagents.find((agent) => agent.id === payload.subagent_id);
+    const entry = {
+      id: payload.subagent_id,
+      name: payload.name,
+      model: payload.policy,
+      status: 'done' as const,
+      activeStep: payload.cancelled
+        ? 'Cancelled'
+        : payload.ok
+        ? `Completed: ${payload.result.slice(0, 80)}`
+        : `Failed: ${payload.result.slice(0, 80)}`,
+    };
+    const messages =
+      payload.session_id === state.activeSessionId && payload.result.trim()
+        ? [
+            ...state.messages,
+            {
+              id: `subagent_result_${payload.subagent_id}_${payload.tokens}`,
+              role: 'assistant' as const,
+              content: `Subagent \`${payload.name}\` (${payload.policy}) ${
+                payload.cancelled ? 'was cancelled' : payload.ok ? 'completed' : 'failed'
+              }:\n${payload.result}`,
+              status: 'complete' as const,
+              timestamp: Date.now(),
+            },
+          ]
+        : state.messages;
+    state = {
+      ...state,
+      messages,
+      subagents: existing
+        ? state.subagents.map((agent) => (agent.id === payload.subagent_id ? entry : agent))
+        : [...state.subagents, entry],
+    };
+    notify();
+  },
+
   handleApprovalDecision(approvalId: string, decision: 'approve' | 'deny' | 'approve_all'): void | Promise<void> {
     const target = state.messages.flatMap((message) => message.toolCalls ?? [])
       .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
+    if (target?.question) {
+      // A question is never approved or denied generically: it needs text or
+      // one of the offered options.
+      return;
+    }
     if (target?.toolName === 'run_workflow' || target?.workflow || workflowConfirmations.has(approvalId)) {
       return submitWorkflowConfirmation(approvalId, decision);
     }
@@ -1419,7 +1532,12 @@ export const agentStore = {
   },
 
   handleApprovalNeeded(payload: ApprovalNeededPayload) {
-    if (!isActiveEvent(payload)) return;
+    // A background child can ask after its parent turn ended. Its card is
+    // still bound to the same session and is safe to render there.
+    const backgroundChild =
+      Boolean(payload.subagent_id) &&
+      (!payload.session_id || payload.session_id === state.activeSessionId);
+    if (!isActiveEvent(payload) && !backgroundChild) return;
     if (payload.tool_name === 'run_workflow' && !state.inFlight && activeRequestId === payload.request_id) return;
     const existingConfirmation = workflowConfirmations.get(payload.approval_id);
     if (existingConfirmation && (
@@ -1450,8 +1568,9 @@ export const agentStore = {
     // A workflow card is a grant, not a diff: the payload rides `workflow`
     // and its script is never counted as a diff hunk.
     const workflow = payload.workflow;
+    const question = payload.question;
     const diffHunks =
-      !workflow && payload.diff_or_input ? [payload.diff_or_input] : undefined;
+      !workflow && !question && payload.diff_or_input ? [payload.diff_or_input] : undefined;
     const approvalCall: WorkflowToolCall = {
       id: `call_appr_${payload.approval_id}`,
       toolName: payload.tool_name,
@@ -1459,6 +1578,7 @@ export const agentStore = {
       status: 'needs_approval',
       approvalId: payload.approval_id,
       workflow,
+      question,
       resultSummary: undefined,
       diff: diffHunks
         ? {
@@ -1573,11 +1693,17 @@ export const agentStore = {
       t.status === 'in_progress' ? { ...t, status: 'completed' as const } : t
     );
 
-    const idleSubagents = state.subagents.map((s) => ({
-      ...s,
-      status: 'idle' as const,
-      activeStep: 'Ready',
-    }));
+    // A parent turn ending does not end its background children: leave a
+// working child's roster row alone; only settled/placeholder rows reset.
+    const idleSubagents = state.subagents.map((s) =>
+      s.status === 'working'
+        ? s
+        : {
+            ...s,
+            status: 'idle' as const,
+            activeStep: 'Ready',
+          },
+    );
 
     state = {
       ...state,

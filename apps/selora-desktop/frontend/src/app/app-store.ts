@@ -335,6 +335,22 @@ function reduceEvent(event: EventEnvelope): void {
     case 'agent_turn_done':
       agentStore.handleAgentTurnDone(payload.payload);
       return;
+    case 'subagent_started':
+      agentStore.handleSubagentStarted(payload.payload);
+      return;
+    case 'subagent_completed':
+      // A background child may finish while the user edits another file:
+      // the toast is the interruption, the session transcript keeps the result.
+      agentStore.handleSubagentCompleted(payload.payload);
+      toastStore.pushProtocol(event.sequence, {
+        severity: payload.payload.ok ? 'success' : 'warning',
+        message: payload.payload.cancelled
+          ? `Subagent ${payload.payload.name} was cancelled.`
+          : payload.payload.ok
+          ? `Subagent ${payload.payload.name} finished.`
+          : `Subagent ${payload.payload.name} failed.`,
+      });
+      return;
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;

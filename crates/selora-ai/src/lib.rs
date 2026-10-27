@@ -22,11 +22,14 @@ mod types;
 mod updates;
 
 pub use agent::{
-    denied_result, execute_approved, execute_tool, run_agent_turn, spawn_agent_turn, tool_manifest,
-    AgentDecision, AgentEvent, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport,
-    AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle, ChatStream, ClientChatStream,
-    RouterToolRunner, ToolContext, ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd,
-    TurnInput, DENIED_MESSAGE,
+    denied_result, execute_approved, execute_tool, run_agent_turn, run_subagent_turn,
+    run_subagent_turn_blocking, spawn_agent_turn, tool_manifest, AgentDecision, AgentEvent,
+    AgentQuestion, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport, AgentTurnState,
+    ApprovalCard, ApprovalId, BashAbortHandle, ChatStream, ClientChatStream, QuestionAnswer,
+    QuestionCard, QuestionOption, QuestionResponse, RouterToolRunner, SubagentBackend,
+    SubagentCompletion, SubagentError, SubagentEvent, SubagentId, SubagentInfo, SubagentPolicy,
+    SubagentRequest, SubagentRuntime, SubagentSession, SubagentStatus, ToolContext, ToolOutcome,
+    ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

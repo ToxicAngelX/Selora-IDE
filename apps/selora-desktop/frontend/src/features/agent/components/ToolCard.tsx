@@ -26,6 +26,7 @@ import {
 import type { AgentToolCall } from '../types';
 import { agentStore, type WorkflowToolCall } from '../agent-store';
 import { WorkflowCard } from './WorkflowCard';
+import { QuestionCard } from './QuestionCard';
 
 export type ToolCardProps = {
   /** A workflow card carries the §18.1 confirmation payload on the call. */
@@ -212,6 +213,17 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
     ? 'deny'
     : 'approve';
 
+  // §19.4: an escalation is its own card body. It stays after the answer so
+  // the transcript records the question and the chosen answer.
+  const question = tool.question;
+  const showQuestion =
+    Boolean(question) &&
+    (isApproval ||
+      tool.status === 'approved' ||
+      tool.status === 'denied' ||
+      tool.status === 'completed' ||
+      tool.status === 'error');
+
   // Live timer for running tools
   useEffect(() => {
     if (!isRunning) return;
@@ -233,7 +245,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   // never through a global listener: only keystrokes routed to this card — and
   // not owned by a form/button/contentEditable descendant — may decide.
   const handleCardKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!isApproval || !tool.approvalId) return;
+    if (!isApproval || !tool.approvalId || question) return;
 
     // Modified keystrokes belong to global shortcuts (Ctrl+Enter, Cmd+K, ...).
     if (e.ctrlKey || e.altKey || e.metaKey) return;
@@ -433,8 +445,29 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
             </div>
           )}
 
+          {showQuestion && question && (
+            <div className="tool-approval-gate" data-testid="tool-question-grant">
+              <QuestionCard
+                question={question}
+                approvalId={tool.approvalId}
+                answered={tool.status === 'approved' || tool.status === 'completed'}
+                submitting={Boolean(tool.approvalSubmitting)}
+                error={
+                  isApproval && tool.resultSummary?.startsWith('Question answer failed')
+                    ? tool.resultSummary
+                    : undefined
+                }
+                onAnswer={(answers, approvalId) => {
+                  if (approvalId) {
+                    agentStore.handleQuestionDecision(approvalId, answers);
+                  }
+                }}
+              />
+            </div>
+          )}
+
           {/* Interactive Approval Gate & Diff View */}
-          {isApproval && !showWorkflowGrant && (
+          {isApproval && !showWorkflowGrant && !showQuestion && (
             <div className="tool-approval-gate">
               <div className="approval-banner">
                 <div className="approval-banner-left">

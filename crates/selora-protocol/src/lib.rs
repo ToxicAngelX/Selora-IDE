@@ -242,13 +242,64 @@ pub enum AgentModeDto {
     /// apply without an approval card. Bash still cards. Never persisted.
     Auto,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionDto {
     Approve,
     Deny,
     ApproveAllThisTurn,
     Stop,
+    /// §19.4: the user's answer to a question card. It rides the same
+    /// single-use approval id route; a stale or duplicate answer is refused
+    /// by [`validate_and_consume_approval`] before it reaches the loop.
+    Answer(QuestionAnswerDto),
+}
+
+/// One option on an escalation question (UI_SPEC §4.2 / ARCHITECTURE §19.4).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOptionDto {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One structured question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionDto {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOptionDto>,
+    #[serde(default = "default_true")]
+    pub allow_free_text: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The question card payload carried by `approval_needed.question`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionApprovalDto {
+    #[serde(default)]
+    pub questions: Vec<QuestionDto>,
+}
+
+/// The user's verbatim answer to one question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionResponseDto {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub answer: String,
+}
+
+/// One question card's answers, in the order asked.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuestionAnswerDto {
+    #[serde(default)]
+    pub answers: Vec<QuestionResponseDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchQueryDto {
@@ -585,6 +636,10 @@ pub struct ApprovalDto {
     pub session_id: SessionId,
     pub summary: String,
     pub can_approve_all_this_turn: bool,
+    /// §19.4: this parked card is a question. Used to refuse an Approve/
+    /// Deny or a free-text answer aimed at the wrong card type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionApprovalDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelDto {
@@ -1031,6 +1086,14 @@ pub struct ApprovalNeededDto {
     /// field absent) and every non-workflow card omits the key entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowApprovalDto>,
+    /// §19.4: the question-card payload. Additive and defaulted; absent on
+    /// every approval card and on pre-9 payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionApprovalDto>,
+    /// §19.3: the child that raised this card, when it is a subagent's write/
+    /// bash/question rather than the parent turn's own tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
 }
 /// The agent status line's phase (drives the dock's ThinkingOrb state).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1078,6 +1141,40 @@ pub struct AgentEventDto {
     pub turn_id: TurnId,
     pub approval: Option<ApprovalDto>,
     pub message: String,
+}
+
+/// §19.3: a background subagent started. `parent_request_id` groups children
+/// spawned by one parent turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubagentStartedDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub subagent_id: String,
+    pub name: String,
+    /// `read-only` or `full`.
+    pub policy: String,
+    #[serde(default)]
+    pub mission: String,
+}
+
+/// §19.3: a subagent finished. The shell lands the result in the parent
+/// transcript and may surface a toast while the user is editing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCompletedDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub subagent_id: String,
+    pub name: String,
+    pub policy: String,
+    pub ok: bool,
+    pub cancelled: bool,
+    pub result: String,
+    #[serde(default = "default_tokens")]
+    pub tokens: u64,
+    #[serde(default = "default_cost_usd")]
+    pub cost_usd: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1471,10 @@ pub enum FrontendEvent {
     ApprovalNeeded(ApprovalNeededDto),
     AgentStateChanged(AgentStateDto),
     AgentTurnDone(AgentTurnDoneDto),
+    // §19.3: the shared subagent runtime's completion rail. Additive to
+    // protocol_version 1.
+    SubagentStarted(SubagentStartedDto),
+    SubagentCompleted(SubagentCompletedDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     // Phase Z4b — the LSP request answers (each echoes the buffer so the
     // editor can drop a result for a tab that closed mid-flight).
@@ -2089,6 +2190,8 @@ mod tests {
                 path_or_command: "src/main.rs".into(),
                 diff_or_input: Some("+fn main() {}".into()),
                 workflow: None,
+                question: None,
+                subagent_id: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"src/main.rs","diff_or_input":"+fn main() {}"}}"#
@@ -2104,6 +2207,8 @@ mod tests {
                 path_or_command: "cargo test".into(),
                 diff_or_input: None,
                 workflow: None,
+                question: None,
+                subagent_id: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
@@ -2125,6 +2230,8 @@ mod tests {
                 commands: vec!["cargo test".into(), "git status".into()],
                 max_cost_usd: 5.0,
             }),
+            question: None,
+            subagent_id: None,
         };
         let workflow_json =
             serde_json::to_string(&FrontendEvent::ApprovalNeeded(workflow_card.clone())).unwrap();
@@ -2323,6 +2430,7 @@ mod tests {
             session_id: sid("session"),
             summary: "write".into(),
             can_approve_all_this_turn: false,
+            question: None,
         });
         assert_eq!(
             validate_and_consume_approval(
@@ -2346,6 +2454,105 @@ mod tests {
                 DecisionDto::Approve
             ),
             Err(ApprovalValidationError::NoPendingApproval)
+        );
+    }
+
+    #[test]
+    fn question_card_round_trips_and_answer_is_single_use() {
+        let answer = DecisionDto::Answer(QuestionAnswerDto {
+            answers: vec![QuestionResponseDto {
+                question: "Which file?".into(),
+                answer: "src/b.rs".into(),
+            }],
+        });
+        let encoded = serde_json::to_string(&answer).unwrap();
+        assert!(encoded.contains("answer"));
+        assert_eq!(
+            serde_json::from_str::<DecisionDto>(&encoded).unwrap(),
+            answer
+        );
+
+        let mut pending = Some(ApprovalDto {
+            approval_id: aid("approval"),
+            request_id: rid("request"),
+            turn_id: tid("turn"),
+            session_id: sid("session"),
+            summary: "ask_user_question Which file?".into(),
+            can_approve_all_this_turn: false,
+            question: Some(QuestionApprovalDto {
+                questions: vec![QuestionDto {
+                    question: "Which file?".into(),
+                    options: vec![
+                        QuestionOptionDto {
+                            label: "src/a.rs".into(),
+                            description: "left".into(),
+                        },
+                        QuestionOptionDto {
+                            label: "src/b.rs".into(),
+                            description: "right".into(),
+                        },
+                    ],
+                    allow_free_text: true,
+                }],
+            }),
+        });
+        assert_eq!(
+            validate_and_consume_approval(
+                &mut pending,
+                &rid("request"),
+                &sid("session"),
+                &tid("turn"),
+                &aid("approval"),
+                answer.clone()
+            ),
+            Ok(answer.clone())
+        );
+        assert!(pending.is_none());
+        // A duplicate answer can never resume the same card again.
+        assert_eq!(
+            validate_and_consume_approval(
+                &mut pending,
+                &rid("request"),
+                &sid("session"),
+                &tid("turn"),
+                &aid("approval"),
+                answer
+            ),
+            Err(ApprovalValidationError::NoPendingApproval)
+        );
+    }
+
+    #[test]
+    fn question_approval_payload_is_additive_and_defaults_free_text_on() {
+        let dto = ApprovalNeededDto {
+            request_id: rid("request"),
+            session_id: sid("session"),
+            turn_id: tid("turn"),
+            approval_id: aid("approval"),
+            tool_name: "ask_user_question".into(),
+            path_or_command: "Which file?".into(),
+            diff_or_input: None,
+            workflow: None,
+            question: Some(QuestionApprovalDto {
+                questions: vec![QuestionDto {
+                    question: "Which file?".into(),
+                    options: Vec::new(),
+                    allow_free_text: true,
+                }],
+            }),
+            subagent_id: Some("sub-1".into()),
+        };
+        let encoded = serde_json::to_string(&dto).unwrap();
+        assert!(!encoded.contains("\"workflow\""));
+        let decoded: ApprovalNeededDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, dto);
+        assert!(
+            decoded
+                .question
+                .as_ref()
+                .expect("question payload")
+                .questions[0]
+                .allow_free_text
         );
     }
 

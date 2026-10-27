@@ -165,6 +165,14 @@ export type ApiKeyStatus = {
 };
 
 export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'stop';
+
+/** §19.4: an escalation answer. It rides the same single-use decision route. */
+export type QuestionOption = { label: string; description: string };
+export type Question = { question: string; options: QuestionOption[]; allow_free_text: boolean };
+export type QuestionApproval = { questions: Question[] };
+export type QuestionResponse = { question: string; answer: string };
+export type QuestionAnswer = { answers: QuestionResponse[] };
+export type DecisionPayload = Decision | { answer: QuestionAnswer };
 export type AgentMode = 'execute' | 'explore' | 'auto';
 export type AgentPhase = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
 
@@ -199,6 +207,34 @@ export type ApprovalNeededPayload = {
    * a workflow card; absent on every other card and on pre-8 payloads.
    */
   workflow?: WorkflowApproval;
+  /** §19.4: the structured question card. Mutually exclusive with `workflow`. */
+  question?: QuestionApproval;
+  /** §19.3: the child that raised this card, when it is a subagent's card. */
+  subagent_id?: string;
+};
+
+export type SubagentStartedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  subagent_id: string;
+  name: string;
+  policy: string;
+  mission: string;
+};
+
+export type SubagentCompletedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  subagent_id: string;
+  name: string;
+  policy: string;
+  ok: boolean;
+  cancelled: boolean;
+  result: string;
+  tokens: number;
+  cost_usd: number;
 };
 
 export type AgentStateChangedPayload = {
@@ -333,7 +369,7 @@ export type FrontendCommand =
   | { type: 'send_chat'; payload: { request_id: Id; request: { session_id: Id; message: string; model_id: string | null } } }
   | { type: 'stop_chat'; payload: { request_id: Id } }
   | { type: 'send_agent'; payload: { request_id: Id; request: { session_id: Id; prompt: string; model_id: string | null; mode: AgentMode; reasoning_effort?: 'quick' | 'standard' | 'max'; system_instructions?: string; temperature?: number; editor_context?: EditorContextDto } } }
-  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
+  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: DecisionPayload } }
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
@@ -380,6 +416,8 @@ export type FrontendEvent =
   | { type: 'approval_needed'; payload: ApprovalNeededPayload }
   | { type: 'agent_state_changed'; payload: AgentStateChangedPayload }
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
+  | { type: 'subagent_started'; payload: SubagentStartedPayload }
+  | { type: 'subagent_completed'; payload: SubagentCompletedPayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'hover_result'; payload: HoverResult }
@@ -697,7 +735,7 @@ export const sendAgent = (
 export const agentDecision = (
   requestId: Id,
   approvalId: Id,
-  decision: Decision,
+  decision: DecisionPayload,
   ctx: EnvelopeContext,
 ): Promise<unknown> =>
   dispatchZ2Command(

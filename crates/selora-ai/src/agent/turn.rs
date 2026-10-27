@@ -55,6 +55,38 @@ const ABORT_GRACE: Duration = Duration::from_millis(500);
 /// The §17.4 words a denied tool returns to the model (it usually adapts).
 pub const DENIED_MESSAGE: &str = "user denied this action";
 
+/// Validate an answer against the parked question card. The answer must
+/// address every question once, in order; a no-free-text question must use
+/// one of its options verbatim. A mismatch is rejected rather than coerced.
+fn validate_question_answer(
+    card: &crate::agent::QuestionCard,
+    answer: &crate::agent::QuestionAnswer,
+) -> Result<(), String> {
+    if card.questions.len() != answer.answers.len() {
+        return Err(format!(
+            "the answer must address all {} question(s) — received {}",
+            card.questions.len(),
+            answer.answers.len()
+        ));
+    }
+    for (index, (question, response)) in card.questions.iter().zip(&answer.answers).enumerate() {
+        if question.question.trim() != response.question.trim() {
+            return Err(format!(
+                "answer {index} does not match the pending question — it is stale"
+            ));
+        }
+        let text = response.answer.trim();
+        if text.is_empty() {
+            return Err(format!("answer {index} is empty"));
+        }
+        if !question.allow_free_text && !question.options.iter().any(|option| option.label == text)
+        {
+            return Err(format!("answer {index} must be one of the offered options"));
+        }
+    }
+    Ok(())
+}
+
 /// The loop's hard limits for one turn. The shell builds this from
 /// `settings.agent` (the three §17.3 caps) plus the active model's
 /// context window; the tests prove the mapping.
@@ -386,6 +418,11 @@ impl ToolRunner for RouterToolRunner {
         // must not run further bash commands even if a straggler future
         // resolves.
         self.ctx.abort.kill();
+        // §19.3: a parent Stop cancels its children, including a child a
+        // blocking `wait` call is parked on.
+        if let Some(subagents) = &self.ctx.subagents {
+            subagents.cancel_all();
+        }
     }
 }
 
@@ -899,13 +936,15 @@ where
                     // turn` must not silently skip the confirmation.
                     let workflow_card =
                         matches!(&card, crate::agent::ApprovalCard::Workflow { .. });
+                    let question_card = matches!(&card, crate::agent::ApprovalCard::Question(_));
                     let auto_write = auto_approve_writes
                         && !matches!(
                             &card,
                             crate::agent::ApprovalCard::Command { .. }
                                 | crate::agent::ApprovalCard::Workflow { .. }
+                                | crate::agent::ApprovalCard::Question(_)
                         );
-                    if (turn.approve_all && !workflow_card) || auto_write {
+                    if (turn.approve_all && !workflow_card && !question_card) || auto_write {
                         // §17.4: ApproveAllThisTurn pre-approves the rest
                         // of this turn's write/bash cards; full access
                         // pre-approves the file side effects for the session.
@@ -914,7 +953,13 @@ where
                         let approval_id = Uuid::new_v4();
                         turn.state = AgentTurnState::AwaitingApproval(approval_id);
                         if !emit(&events, AgentEvent::State(turn.state.clone()))
-                            || !emit(&events, AgentEvent::ApprovalNeeded { approval_id, card })
+                            || !emit(
+                                &events,
+                                AgentEvent::ApprovalNeeded {
+                                    approval_id,
+                                    card: card.clone(),
+                                },
+                            )
                         {
                             end = Some(TurnEnd::Failed("agent event receiver dropped".into()));
                             break 'turn;
@@ -934,14 +979,49 @@ where
                                 end = Some(TurnEnd::Failed("agent decision channel closed".into()));
                                 break 'turn;
                             }
-                            Parked::Decided(AgentDecision::Approve) => turn.approved += 1,
+                            Parked::Decided(AgentDecision::Approve) => {
+                                if question_card {
+                                    result = Some(ToolResult::error(
+                                        &call.id,
+                                        "this card needs an answer, not approval",
+                                    ));
+                                } else {
+                                    turn.approved += 1;
+                                }
+                            }
                             Parked::Decided(AgentDecision::ApproveAllThisTurn) => {
-                                turn.approved += 1;
-                                turn.approve_all = true;
+                                if question_card {
+                                    result = Some(ToolResult::error(
+                                        &call.id,
+                                        "this card needs an answer, not approval",
+                                    ));
+                                } else {
+                                    turn.approved += 1;
+                                    turn.approve_all = true;
+                                }
                             }
                             Parked::Decided(AgentDecision::Deny) => {
                                 turn.denied += 1;
                                 result = Some(router::denied_result(&call));
+                            }
+                            Parked::Decided(AgentDecision::Answer(answer)) => {
+                                // Answer only resumes a question card. A
+                                // malformed or wrong-card answer is a
+                                // model-visible error and never an approval.
+                                result = Some(match &card {
+                                    crate::agent::ApprovalCard::Question(card) => {
+                                        match validate_question_answer(card, &answer) {
+                                            Ok(()) => {
+                                                router::question_answer_result(&call, &answer)
+                                            }
+                                            Err(message) => ToolResult::error(&call.id, message),
+                                        }
+                                    }
+                                    _ => ToolResult::error(
+                                        &call.id,
+                                        "this card is not a question — an answer cannot approve it",
+                                    ),
+                                });
                             }
                             // Defensive: park never returns Stop here (it
                             // is handled before the id match) — but if it
@@ -2101,7 +2181,7 @@ mod tests {
         )));
 
         decision_tx
-            .send((approval_id, decision))
+            .send((approval_id, decision.clone()))
             .expect("answer workflow card");
         let report = tokio::time::timeout(Duration::from_secs(1), task)
             .await

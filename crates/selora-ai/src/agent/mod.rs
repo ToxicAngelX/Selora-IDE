@@ -19,6 +19,7 @@
 //! implementations build on these seams.
 
 pub mod router;
+pub mod subagent;
 pub mod tools;
 pub mod turn;
 
@@ -28,6 +29,11 @@ pub mod turn;
 pub use router::{
     denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
     ToolOutcome,
+};
+pub use subagent::{
+    run_subagent_turn, run_subagent_turn_blocking, SubagentBackend, SubagentCompletion,
+    SubagentError, SubagentEvent, SubagentId, SubagentInfo, SubagentPolicy, SubagentRequest,
+    SubagentRuntime, SubagentSession, SubagentStatus,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{
@@ -50,12 +56,61 @@ pub type ApprovalId = Uuid;
 /// non-allowlisted bash for the rest of this turn only — never persisted
 /// across turns or sessions. `Deny` continues the loop with a
 /// "user denied this action" tool result; `Stop` aborts the turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentDecision {
     Approve,
     ApproveAllThisTurn,
     Deny,
     Stop,
+    /// The user's answer to a question card (§19.4). This rides the same
+    /// single-use approval id route as the three approval decisions: the
+    /// answer resumes the parked turn as the tool's result. Boxed: the
+    /// session card's decision slot must stay small.
+    Answer(Box<QuestionAnswer>),
+}
+
+/// One option on an escalation question (§19.4). Descriptions are shown
+/// under the label and make the options decide-able without prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One question on an escalation card (§19.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentQuestion {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// Free text is available unless the model explicitly disables it.
+    #[serde(default = "default_allow_free_text")]
+    pub allow_free_text: bool,
+}
+
+fn default_allow_free_text() -> bool {
+    true
+}
+
+/// The question card's payload. It rides [`ApprovalCard::Question`] and is
+/// answered through the existing §17.4 decision route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionCard {
+    pub questions: Vec<AgentQuestion>,
+}
+
+/// The user's verbatim answer to one question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionResponse {
+    pub question: String,
+    pub answer: String,
+}
+
+/// One question card's answer set, in the order the questions were asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    pub answers: Vec<QuestionResponse>,
 }
 
 /// What a side-effecting tool needs the user to approve before the
@@ -100,4 +155,8 @@ pub enum ApprovalCard {
         /// checked between every step.
         max_cost_usd: f64,
     },
+    /// `ask_user_question` (§19.4): a structured escalation. It parks on
+    /// the same §17.4 channel as an approval; the answer comes back as this
+    /// tool call's result.
+    Question(QuestionCard),
 }
