@@ -19,6 +19,7 @@ WebView2.
 - [Selora AI](ai.md) — chat, ghost text, cost meter
 - [Agent Mode](agent-mode.md) — tool cards, approvals, caps
 - [Keyboard shortcuts](keybinds.md) — the default keybind table
+- [Performance](PERFORMANCE.md) — the reproducible harness and current numbers
 
 ## Project documents
 

@@ -29,6 +29,7 @@ fn main() {
             .app_manifest(tauri_build::AppManifest::new().commands(&[
                 "get_bootstrap_state",
                 "dispatch_command",
+                "frontend_ready",
                 "get_events_after",
                 "connect_api_key",
                 "disconnect_api_key",

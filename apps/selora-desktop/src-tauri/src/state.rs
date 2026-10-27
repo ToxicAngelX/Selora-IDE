@@ -4795,6 +4795,68 @@ mod tests {
         assert!(matches!(reply, CommandResultDto::Snapshot(_)));
     }
 
+    /// The two per-keystroke commands answer the ack, never the bootstrap: no
+    /// tree walk, no git status read, and no buffer-text clone in the IPC body.
+    #[test]
+    fn keystroke_commands_answer_the_ack_not_a_bootstrap() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _workspace = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+
+        let edit = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: opened.buffer_id.clone(),
+                        version: opened.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            replacement: "x".into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("edit");
+        match edit {
+            CommandResultDto::Ack(ack) => assert!(ack.acknowledged),
+            CommandResultDto::Snapshot(_) => panic!("an edit answers the small ack"),
+        }
+
+        let selection = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetSelection {
+                        buffer_id: opened.buffer_id.clone(),
+                        selection: selora_protocol::Selection {
+                            anchor: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            active: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 1,
+                            },
+                            version: opened.version + 1,
+                        },
+                    },
+                ),
+            )
+            .expect("selection");
+        assert!(matches!(selection, CommandResultDto::Ack(_)));
+    }
+
     #[test]
     fn concurrent_emitters_deliver_in_assigned_sequence_order() {
         let state = DesktopState::with_settings(selora_settings::Settings::default());
@@ -7958,6 +8020,265 @@ mod tests {
                 .unwrap()
                 .text,
             "fn local() {}\n"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Performance harness (scripts/perf.ps1).
+    //
+    // These tests are `#[ignore]`d so the normal suite stays fast. Run them in
+    // release mode with `--ignored --nocapture`; each prints one `PERF_JSON`
+    // line the PowerShell harness records. Timings are informational (a busy
+    // machine must not fail the suite); the assertions cover correctness only.
+    // ------------------------------------------------------------------
+
+    fn perf_percentile(sorted: &[u128], fraction: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let rank = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        sorted[rank]
+    }
+
+    fn perf_micros(samples: &mut [u128]) -> serde_json::Value {
+        samples.sort_unstable();
+        serde_json::json!({
+            "n": samples.len(),
+            "p50_us": perf_percentile(samples, 0.50),
+            "p95_us": perf_percentile(samples, 0.95),
+            "max_us": samples.last().copied().unwrap_or(0),
+            "mean_us": if samples.is_empty() { 0 } else { samples.iter().sum::<u128>() / samples.len() as u128 },
+        })
+    }
+
+    /// Event throughput under concurrent producers, and the ordering invariant
+    /// the frontend gate relies on: one global sequence, strictly increasing in
+    /// the replay ring, no duplicates, no gaps.
+    #[test]
+    #[ignore = "performance harness: run scripts/perf.ps1"]
+    fn perf_event_log_concurrent_soak() {
+        const PRODUCERS: usize = 8;
+        const PER_PRODUCER: usize = 12_500;
+        let total = u64::try_from(PRODUCERS * PER_PRODUCER).expect("fits");
+        let core = CoreInstanceId::new(Uuid::new_v4().to_string()).expect("valid id");
+        let log = Arc::new(EventLog::new(core));
+
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(PRODUCERS);
+        for producer in 0..PRODUCERS {
+            let log = Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                let mut sequences = Vec::with_capacity(PER_PRODUCER);
+                for index in 0..PER_PRODUCER {
+                    let event = log.push(
+                        FrontendEvent::Toast(ToastDto {
+                            severity: ToastSeverity::Info,
+                            message: format!("producer {producer} event {index}"),
+                        }),
+                        None,
+                        None,
+                    );
+                    sequences.push(event.sequence);
+                }
+                sequences
+            }));
+        }
+        let mut sequences = Vec::with_capacity(PRODUCERS * PER_PRODUCER);
+        for handle in handles {
+            sequences.extend(handle.join().expect("producer thread"));
+        }
+        let elapsed = started.elapsed();
+
+        sequences.sort_unstable();
+        assert_eq!(sequences.len(), PRODUCERS * PER_PRODUCER);
+        assert!(
+            sequences
+                .iter()
+                .enumerate()
+                .all(|(index, sequence)| *sequence == index as u64 + 1),
+            "every sequence is assigned exactly once and stays contiguous"
+        );
+
+        let retained = log.events_after(0);
+        assert_eq!(retained.len(), EVENT_RETENTION_CAP, "retention cap holds");
+        assert!(
+            retained
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "replay ring stays strictly sequence-ordered under contention"
+        );
+        assert_eq!(
+            retained.last().map(|event| event.sequence),
+            Some(total),
+            "the newest event survives the cap"
+        );
+
+        let mut replay_samples = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let timer = Instant::now();
+            let replay = log.events_after(0);
+            replay_samples.push(timer.elapsed().as_micros());
+            std::hint::black_box(replay);
+        }
+
+        println!(
+            "PERF_JSON {}",
+            serde_json::json!({
+                "metric": "event_log_concurrent_soak",
+                "producers": PRODUCERS,
+                "events_per_producer": PER_PRODUCER,
+                "total_events": total,
+                "elapsed_ms": elapsed.as_millis(),
+                "events_per_second": (total as f64 / elapsed.as_secs_f64()).round() as u64,
+                "retained": retained.len(),
+                "replay_1024": perf_micros(&mut replay_samples),
+            })
+        );
+    }
+
+    /// The per-keystroke backend path: `ApplyEditorChange` on the typed command
+    /// surface (apply, record event, answer the small ack) and the JSON body
+    /// Tauri serializes back, with the legacy `BootstrapState` reply as the
+    /// control. Also times a bare `bootstrap()` for comparison.
+    #[test]
+    #[ignore = "performance harness: run scripts/perf.ps1"]
+    fn perf_apply_editor_change_round_trip() {
+        const EXTRA_FILES: usize = 200;
+        const LINES: usize = 5_000;
+        const FULL_EDITS: usize = 100;
+        const ACK_EDITS: usize = 100;
+        const EDITS: usize = FULL_EDITS + ACK_EDITS;
+
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("src")).expect("src dir");
+        for index in 0..EXTRA_FILES {
+            std::fs::write(
+                dir.path().join("src").join(format!("file_{index}.rs")),
+                format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+            )
+            .expect("seed file");
+        }
+        let big: String = (0..LINES)
+            .map(|line| format!("fn line_{line}() {{ let value = {line}; }}\n"))
+            .collect();
+        std::fs::write(dir.path().join("big.rs"), &big).expect("seed big file");
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFolderAt {
+                        root: dir.path().to_string_lossy().to_string(),
+                    },
+                ),
+            )
+            .expect("open folder");
+        let opened = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: selora_protocol::WorkspacePath::new("big.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open file");
+        let buffer = opened
+            .buffers
+            .iter()
+            .find(|candidate| candidate.path.as_str() == "big.rs")
+            .expect("big buffer")
+            .clone();
+        assert_eq!(buffer.text.len(), big.len());
+
+        for _ in 0..10 {
+            state
+                .dispatch(&app, envelope(&state, FrontendCommand::GetBootstrapState))
+                .expect("warmup");
+        }
+
+        let mut dispatch_samples = Vec::with_capacity(FULL_EDITS);
+        let mut ack_samples = Vec::with_capacity(ACK_EDITS);
+        let mut response_bytes = 0usize;
+        let mut ack_response_bytes = 0usize;
+        let edit_command = |version: u64| FrontendCommand::ApplyEditorChange {
+            buffer_id: buffer.buffer_id.clone(),
+            version,
+            changes: vec![selora_protocol::TextChange {
+                start: selora_protocol::TextPosition {
+                    line: 0,
+                    utf16_column: 0,
+                },
+                end: selora_protocol::TextPosition {
+                    line: 0,
+                    utf16_column: 0,
+                },
+                replacement: "x".into(),
+            }],
+        };
+
+        for edit in 0..FULL_EDITS {
+            let version = buffer.version + u64::try_from(edit).expect("fits");
+            let timer = Instant::now();
+            let response = state
+                .dispatch(&app, envelope(&state, edit_command(version)))
+                .expect("apply change (full response)");
+            dispatch_samples.push(timer.elapsed().as_micros());
+            response_bytes = serde_json::to_vec(&response).expect("response json").len();
+        }
+
+        for edit in FULL_EDITS..EDITS {
+            let version = buffer.version + u64::try_from(edit).expect("fits");
+            let timer = Instant::now();
+            let response = state
+                .dispatch_result(&app, envelope(&state, edit_command(version)))
+                .expect("apply change (ack path)");
+            ack_samples.push(timer.elapsed().as_micros());
+            ack_response_bytes = serde_json::to_vec(&response).expect("ack json").len();
+        }
+        let after = state.bootstrap();
+        let edited = after
+            .buffers
+            .iter()
+            .find(|candidate| candidate.buffer_id == buffer.buffer_id)
+            .expect("edited buffer");
+        assert_eq!(
+            edited.version,
+            buffer.version + u64::try_from(EDITS).expect("fits")
+        );
+
+        let mut bootstrap_samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let timer = Instant::now();
+            let snapshot = state.bootstrap();
+            bootstrap_samples.push(timer.elapsed().as_micros());
+            std::hint::black_box(snapshot);
+        }
+        let snapshot = state.bootstrap();
+        let timer = Instant::now();
+        let bootstrap_bytes = serde_json::to_vec(&snapshot).expect("bootstrap json").len();
+        let bootstrap_json_us = timer.elapsed().as_micros();
+
+        println!(
+            "PERF_JSON {}",
+            serde_json::json!({
+                "metric": "apply_editor_change",
+                "lines": LINES,
+                "extra_files": EXTRA_FILES,
+                "edits": EDITS,
+                "dispatch_full_response": perf_micros(&mut dispatch_samples),
+                "dispatch_ack": perf_micros(&mut ack_samples),
+                "bootstrap": perf_micros(&mut bootstrap_samples),
+                "bootstrap_json_us": bootstrap_json_us,
+                "bootstrap_json_bytes": bootstrap_bytes,
+                "dispatch_response_bytes": response_bytes,
+                "ack_response_bytes": ack_response_bytes,
+                "edited_buffer_chars": big.len() + EDITS,
+            })
         );
     }
 
