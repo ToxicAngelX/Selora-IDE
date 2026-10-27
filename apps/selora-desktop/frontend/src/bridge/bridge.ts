@@ -407,6 +407,26 @@ export type ChatCompletedPayload = {
   cost_usd: number;
 };
 
+// --- Terminal slice (PTY wire) ----------------------------------------------
+//
+// The exact terminal wire contract. Commands:
+//   TerminalCreate { request_id, cols, rows }
+//   TerminalInput  { terminal_id, data }
+//   TerminalResize { terminal_id, cols, rows }
+//   TerminalClose  { terminal_id }
+// Events:
+//   TerminalCreated { terminal_id, shell, cwd }
+//   TerminalOutput  { terminal_id, data }
+//   TerminalExited  { terminal_id, code }
+//
+// The command `type` strings stay snake_case like every other protocol
+// command. The payload field names are the wire names above and must not be
+// rewritten by the UI.
+
+export type TerminalCreatedPayload = { terminal_id: Id; shell: string; cwd: string };
+export type TerminalOutputPayload = { terminal_id: Id; data: string };
+export type TerminalExitedPayload = { terminal_id: Id; code: number };
+
 // --- Phase 8 workflow additions (ARCHITECTURE §18) --------------------------
 // Additive to protocol_version 1. IDs are engine-minted opaque strings (script
 // names are common), not the stable-id types used by chat/agent ids.
@@ -560,6 +580,10 @@ export type FrontendCommand =
     }
   | { type: 'workflow_stop'; payload: { request_id: Id } }
   | { type: 'workflow_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
+  | { type: 'terminal_create'; payload: { request_id: Id; cols: number; rows: number } }
+  | { type: 'terminal_input'; payload: { terminal_id: Id; data: string } }
+  | { type: 'terminal_resize'; payload: { terminal_id: Id; cols: number; rows: number } }
+  | { type: 'terminal_close'; payload: { terminal_id: Id } }
   | { type: 'open_external'; payload: { url: string } };
 
 export type RequestEnvelope = {
@@ -620,6 +644,9 @@ export type FrontendEvent =
   | { type: 'workflow_finished'; payload: WorkflowFinishedPayload }
   | { type: 'plan_state_changed'; payload: PlanStateChangedPayload }
   | { type: 'todos_changed'; payload: TodosChangedPayload }
+  | { type: 'terminal_created'; payload: TerminalCreatedPayload }
+  | { type: 'terminal_output'; payload: TerminalOutputPayload }
+  | { type: 'terminal_exited'; payload: TerminalExitedPayload }
   | { type: 'toast'; payload: { severity: ToastSeverity; message: string } }
   | { type: 'error'; payload: ProtocolError };
 
@@ -1053,6 +1080,48 @@ export const workflowDecision = (
     },
     ctx,
   );
+
+// --- Terminal slice commands -------------------------------------------------
+//
+// `terminal_create` returns no payload the UI needs: TerminalCreated carries
+// the id, shell and cwd. `requestId` is returned so the store can correlate
+// the create round-trip for its timeout/diagnostic message.
+
+export const createTerminal = (
+  cols: number,
+  rows: number,
+  ctx: EnvelopeContext,
+): { requestId: string; promise: Promise<unknown> } => {
+  const requestId = newRequestId();
+  return {
+    requestId,
+    promise: dispatchZ2Command(
+      { type: 'terminal_create', payload: { request_id: requestId, cols, rows } },
+      ctx,
+    ),
+  };
+};
+
+export const terminalInput = (
+  terminalId: Id,
+  data: string,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command({ type: 'terminal_input', payload: { terminal_id: terminalId, data } }, ctx);
+
+export const terminalResize = (
+  terminalId: Id,
+  cols: number,
+  rows: number,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'terminal_resize', payload: { terminal_id: terminalId, cols, rows } },
+    ctx,
+  );
+
+export const terminalClose = (terminalId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'terminal_close', payload: { terminal_id: terminalId } }, ctx);
 
 export const getEventsAfter = (afterSequence: number): Promise<EventEnvelope[]> =>
   invoke('get_events_after', { afterSequence });

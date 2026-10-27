@@ -5,14 +5,19 @@
 // click and the × dispatch ToggleSurface per the routing table; content
 // renders rich modular developer panels: ProblemsPanel, OutputPanel, TerminalPanel.
 // The active view comes from the live layout store.
-import { useSyncExternalStore, type KeyboardEvent } from 'react';
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
 import type { SurfaceId } from '../bridge/bridge';
 import { getLayoutSnapshot, subscribeLayout, type LayoutState } from '../features/layout/layout-store';
 import { layoutStore } from '../features/layout/layout-store';
 import { Icon } from '../components/Icon';
 import { ProblemsPanel } from '../features/dock/ProblemsPanel';
 import { OutputPanel } from '../features/dock/OutputPanel';
-import { TerminalPanel } from '../features/dock/TerminalPanel';
+// xterm is a substantial dependency; keep it out of the dock chunk until the
+// terminal view is actually selected.
+const TerminalPanel = lazy(async () => {
+  const module = await import('../features/dock/TerminalPanel');
+  return { default: module.TerminalPanel };
+});
 // CSS ownership follows the component (P1 startup split): ShellGrid loads this
 // module lazily, so a closed dock never downloads dock.css. The slot skeleton
 // in shell.css keeps the region laid out until the chunk arrives.
@@ -25,16 +30,36 @@ const BOTTOM_TABS: Array<{ surface: SurfaceId; label: string }> = [
 ];
 
 function BottomDockContent({ view }: { view: SurfaceId }) {
-  if (view === 'problems') {
-    return <ProblemsPanel />;
-  }
-  if (view === 'terminal_placeholder') {
-    return <TerminalPanel />;
-  }
-  if (view === 'output') {
-    return <OutputPanel />;
-  }
-  return <OutputPanel />;
+  // Once the terminal view is opened, keep it mounted while the dock shows
+  // another view. Unmounting would dispose xterm and lose the scrollback;
+  // TerminalCreated/TerminalOutput carry no replay, so the buffer cannot be
+  // rebuilt from the backend.
+  const [terminalMounted, setTerminalMounted] = useState(view === 'terminal_placeholder');
+  useEffect(() => {
+    if (view === 'terminal_placeholder') setTerminalMounted(true);
+  }, [view]);
+
+  return (
+    <>
+      {view === 'problems' ? <ProblemsPanel /> : null}
+      {view === 'output' || (view !== 'problems' && view !== 'terminal_placeholder') ? (
+        <OutputPanel />
+      ) : null}
+      {terminalMounted || view === 'terminal_placeholder' ? (
+        <div className="terminal-host" hidden={view !== 'terminal_placeholder'}>
+          <Suspense
+            fallback={
+              <div className="dock-panel terminal-panel" data-testid="terminal-panel" role="status">
+                <span className="terminal-loading">Loading terminal…</span>
+              </div>
+            }
+          >
+            <TerminalPanel />
+          </Suspense>
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 export function BottomDock() {
