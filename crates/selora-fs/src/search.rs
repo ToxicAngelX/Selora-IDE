@@ -4,19 +4,23 @@
 //! text?" with plain substring semantics (UI_SPEC.md §9: the `case` and
 //! `word` toggles). [`search_in_files_regex`] answers the same question
 //! with the user's regular expression (the panel's `.*` toggle) and emits
-//! the same [`SearchHit`] shape. Two engines implement the literal
-//! contract:
+//! the same [`SearchHit`] shape. Both engines — literal and regex — use
+//! ripgrep when an `rg` binary is on PATH and the built-in scanner otherwise:
 //!
 //! 1. **ripgrep, when an `rg` binary is on PATH** (ARCHITECTURE.md §10.2:
 //!    we shell out because a full grep engine is a big dependency and
-//!    the subprocess is ~40 LOC). `--fixed-strings` keeps the pattern
-//!    literal; `--json` gives line-delimited match records that
-//!    [`parse_rg_json`] reduces into [`SearchHit`]s. `rg` respects
-//!    `.gitignore` and skips hidden and binary files natively.
+//!    the subprocess is ~40 LOC). The same regex source the built-in
+//!    engine compiles is handed to `rg`, so literal escaping, the case
+//!    toggle and whole-word edges agree on both paths. `--json` gives
+//!    line-delimited match records that [`parse_rg_line`] reduces into
+//!    [`SearchHit`]s. `rg` respects `.gitignore` and skips hidden and binary
+//!    files natively.
 //! 2. **The built-in line scanner** over the `ignore`-crate walker (the
 //!    same `hidden` / `git_ignore` / `ignore` configuration as
-//!    [`crate::tree::build_tree`]) when `rg` is absent. Slow but
-//!    functional; per-line matching is [`find_matches`].
+//!    [`crate::tree::build_tree`]) when `rg` is absent. It streams each
+//!    file line by line: there is no whole-file size cap, so a huge file
+//!    is still searched, while a single pathological line is bounded by
+//!    [`MAX_SCANNED_LINE_BYTES`] rather than exhausting memory.
 //!
 //! Synchronous and pure like `build_tree`: the app shell calls it off the
 //! frame path (`spawn_blocking` + `Effect::Search`, ARCHITECTURE.md §2.2)
@@ -43,9 +47,17 @@ use regex::Regex;
 /// here. (Result streaming is a v2 concern.)
 pub const MAX_HITS: usize = 10_000;
 
-/// Files above this size are skipped by the built-in scanner (ripgrep
-/// applies its own large-file and binary heuristics natively).
-pub const MAX_SCANNED_FILE_BYTES: u64 = 1024 * 1024;
+/// The longest single line the built-in scanner buffers. This is a
+/// memory-safety guard, not a file-size limit: files of any size are
+/// streamed to the end. A line over the cap is skipped (the rest of the
+/// file is still searched) so a generated one-line file cannot exhaust
+/// memory.
+pub const MAX_SCANNED_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The longest ripgrep JSON record the subprocess reader buffers. A record
+/// embeds its matched line (plus JSON escaping), so this bounds one record
+/// while keeping the hit stream and its [`MAX_HITS`] cap.
+pub const MAX_RG_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Query / results types
@@ -216,8 +228,15 @@ fn rg_on_path() -> bool {
 /// (above all `PATH`, without which `rg` cannot be found) stays inherited.
 const KEY_ENV_VARS: [&str; 2] = ["SELORA_API_KEY", "OPENAI_API_KEY"];
 
-/// Run `rg` in JSON mode and reduce its output to hits.
+/// Run the literal engine through `rg`.
 fn run_rg(root: &Path, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchError> {
+    run_rg_source(root, &rg_source(query, true))
+}
+
+/// Run one regex source through `rg` in JSON mode. The caller built the
+/// source with [`rg_source`], the same shape the built-in engine compiles,
+/// so both paths share literal escaping, case folding and word edges.
+fn run_rg_source(root: &Path, source: &str) -> Result<Vec<SearchHit>, SearchError> {
     let mut command = Command::new("rg");
     // A search subprocess never needs the gateway key.
     for name in KEY_ENV_VARS {
@@ -225,29 +244,68 @@ fn run_rg(root: &Path, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchErro
     }
     command
         .arg("--json") // line-delimited JSON events
-        .arg("--fixed-strings") // the pattern is literal (UI_SPEC.md §9)
         .arg("--no-config") // never surprising RIPGREP_CONFIG_PATH behavior
-        // rg ≥14 only applies .gitignore inside a git repo; the builtin
-        // scanner applies it unconditionally, so without this flag the two
-        // engines disagree in non-repo folders (parity test catches it).
-        .arg("--no-require-git");
-    if !query.case_sensitive {
-        command.arg("--ignore-case");
-    }
-    if query.whole_word {
-        command.arg("--word-regexp");
-    }
-    command
-        .arg("--") // the pattern is never parsed as a flag
-        .arg(&query.pattern)
-        .arg(root);
+        .arg("--no-require-git") // the builtin applies .gitignore everywhere
+        // A missing `rg` regex feature must fail loudly rather than silently
+        // fall back to a different matcher.
+        .arg("--engine")
+        .arg("default")
+        .arg("--")
+        .arg(source)
+        .arg(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    let output = command.output()?;
-    let status = output.status;
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SearchError::Rg("ripgrep produced no stdout pipe".into()))?;
+    let stderr = child.stderr.take();
+    // Drain stderr concurrently: a full pipe would block rg's exit.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        }
+        text
+    });
+
+    // Stream records and stop at the cap: `Command::output` would buffer every
+    // match in a monorepo-sized result set.
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
+    let mut record = Vec::new();
+    let mut hits = Vec::new();
+    loop {
+        let read = read_bounded_line(&mut reader, &mut record, MAX_RG_RECORD_BYTES);
+        let overflow = match read {
+            Ok(None) => break,
+            Ok(Some(overflow)) => overflow,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(error.into());
+            }
+        };
+        if overflow {
+            continue; // an unrepresentable record: skip it
+        }
+        if let Some(hit) = parse_rg_line(&String::from_utf8_lossy(&record)) {
+            hits.push(hit);
+            if hits.len() >= MAX_HITS {
+                let _ = child.kill();
+                break;
+            }
+        }
+    }
+    let status = child.wait()?;
+    let stderr = stderr_reader.join().unwrap_or_default();
     // rg exits 1 for "no matches" (a normal outcome); anything other than
     // 0/1 is a real failure to surface (no silent fallback — PLAN.md §8).
-    if !status.success() && status.code() != Some(1) {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // A deliberate kill after the hit cap is not a failure.
+    let capped = hits.len() >= MAX_HITS;
+    if !capped && !status.success() && status.code() != Some(1) {
         return Err(SearchError::Rg(format!(
             "exit {}: {}",
             status
@@ -257,10 +315,6 @@ fn run_rg(root: &Path, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchErro
             stderr.trim()
         )));
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut hits = parse_rg_json(&stdout);
-    hits.truncate(MAX_HITS);
     Ok(hits)
 }
 
@@ -272,9 +326,9 @@ fn run_rg(root: &Path, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchErro
 ///
 /// The walker mirrors [`crate::tree::build_tree`]: hidden entries and
 /// `.gitignore`/`.ignore` rules are respected (with `require_git(false)`
-/// so a plain folder behaves like a workspace). Files over
-/// [`MAX_SCANNED_FILE_BYTES`] or containing NUL bytes (a cheap binary
-/// heuristic) are skipped, like `rg` skips them.
+/// so a plain folder behaves like a workspace). Files are streamed line by
+/// line — no file-size cap — and a NUL byte marks the file binary (its
+/// already-collected hits are retracted, like `rg` skips it).
 ///
 /// `spans_for_line` is the engine: [`find_matches`] for literal queries,
 /// [`find_regex_matches`] for regex ones.
@@ -290,7 +344,7 @@ fn scan_builtin(
         .ignore(true)
         .build();
 
-    for entry in walker.flatten() {
+    'files: for entry in walker.flatten() {
         if hits.len() >= MAX_HITS {
             break;
         }
@@ -298,25 +352,39 @@ fn scan_builtin(
             continue;
         }
         let path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.len() > MAX_SCANNED_FILE_BYTES {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(path) else {
+        let Ok(file) = std::fs::File::open(path) else {
             continue; // unreadable (locked, permissions): skip, not fail
         };
-        if bytes.contains(&0) {
-            continue; // binary
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        for (index, line) in text.lines().enumerate() {
+        let first_hit = hits.len();
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+        let mut line_bytes = Vec::new();
+        let mut line_number = 0usize;
+        loop {
+            match read_bounded_line(&mut reader, &mut line_bytes, MAX_SCANNED_LINE_BYTES) {
+                Ok(None) => break,
+                Ok(Some(overflow)) => {
+                    // An over-long line is not represented as a hit; keep
+                    // scanning the rest of the file (huge generated files
+                    // must not disappear).
+                    if overflow {
+                        line_number += 1;
+                        continue;
+                    }
+                }
+                Err(_) => break, // read error: the rest of this file is unknown
+            }
+            if line_bytes.contains(&0) {
+                hits.truncate(first_hit); // binary: retract this file's hits
+                continue 'files;
+            }
+            let text = String::from_utf8_lossy(&line_bytes);
+            let line = text.trim_end_matches(['\r', '\n']);
+            line_number += 1;
             let spans = spans_for_line(line);
             if !spans.is_empty() {
                 hits.push(SearchHit {
                     path: path.to_path_buf(),
-                    line_number: index + 1,
+                    line_number,
                     line_text: line.to_owned(),
                     spans,
                 });
@@ -327,6 +395,48 @@ fn scan_builtin(
         }
     }
     hits
+}
+
+/// Read one newline-terminated line into `buf`, never keeping more than
+/// `limit` bytes. Returns `None` at end of input, `Some(true)` when the
+/// line exceeded the limit (it was consumed and dropped), and
+/// `Some(false)` for a stored line. The line may be returned without its
+/// trailing newline at end of file; callers trim `\r\n` themselves.
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut overflow = false;
+    let mut saw_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if saw_any { Some(overflow) } else { None });
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if !overflow {
+            if buf.len().saturating_add(take) > limit {
+                overflow = true;
+                buf.clear();
+                buf.shrink_to(64 * 1024);
+            } else {
+                buf.extend_from_slice(&available[..take]);
+            }
+        }
+        let ended = available
+            .get(take.saturating_sub(1))
+            .is_some_and(|byte| *byte == b'\n');
+        reader.consume(take);
+        saw_any = true;
+        if ended {
+            return Ok(Some(overflow));
+        }
+    }
 }
 
 /// [`scan_builtin`] driven by the literal matcher: the `rg`-absent path of
@@ -435,36 +545,54 @@ pub fn search_in_files_regex(
     if query.is_empty() {
         return Ok(Vec::new());
     }
+    // Validate locally first: an invalid pattern is the same typed error on
+    // both engines, and rg must never be the thing that reports the typo.
     let regex = build_regex(query)?;
-    Ok(scan_builtin(root, |line| find_regex_matches(line, &regex)))
+    if rg_on_path() {
+        run_rg_source(root, &rg_source(query, false))
+    } else {
+        Ok(scan_builtin(root, |line| find_regex_matches(line, &regex)))
+    }
 }
 
-/// Compile `query` into a matcher: `(?i)` only when the `case` toggle is
-/// off, and `\b(?:…)` around the pattern when the `word` toggle is on (the
-/// non-capturing group keeps an alternation inside the boundaries).
-fn build_regex(query: &SearchQuery) -> Result<Regex, SearchError> {
+/// The one regex source both engines use. `literal` escapes the pattern
+/// (`regex::escape`) so the literal path keeps substring semantics; regex
+/// mode passes the user's pattern through unchanged.
+///
+/// `(?i)` is the case toggle. Whole-word boundaries use the same per-edge
+/// rule as [`find_matches`]: add `\b` only when the corresponding pattern
+/// edge is a word character, so `@foo`, `C++` and `->` match exactly like
+/// the literal engine. (The `regex` crate has no look-around.)
+fn rg_source(query: &SearchQuery, literal: bool) -> String {
+    let pattern = if literal {
+        regex::escape(&query.pattern)
+    } else {
+        query.pattern.clone()
+    };
     let mut source = String::new();
     if !query.case_sensitive {
         source.push_str("(?i)");
     }
     if query.whole_word {
-        // Match the literal engine per edge: `@foo` and `C++` start/end with
-        // a non-word character, so a `\b` there would never match. The
-        // `regex` crate has no look-around, so add each boundary only when
-        // the corresponding edge can satisfy it.
         if edge_is_word(query.pattern.chars().next()) {
             source.push_str(r"\b");
         }
         source.push_str("(?:");
-        source.push_str(&query.pattern);
+        source.push_str(&pattern);
         source.push(')');
         if edge_is_word(query.pattern.chars().last()) {
             source.push_str(r"\b");
         }
     } else {
-        source.push_str(&query.pattern);
+        source.push_str(&pattern);
     }
-    Regex::new(&source).map_err(|err| SearchError::InvalidPattern(err.to_string()))
+    source
+}
+
+/// Compile `query` with the shared source. The built-in regex engine uses
+/// the result directly; the `rg` path runs the same string.
+fn build_regex(query: &SearchQuery) -> Result<Regex, SearchError> {
+    Regex::new(&rg_source(query, false)).map_err(|err| SearchError::InvalidPattern(err.to_string()))
 }
 
 /// Whether a whole-word boundary can apply at this pattern edge. The literal
@@ -499,68 +627,56 @@ fn find_regex_matches(line: &str, regex: &Regex) -> Vec<MatchSpan> {
 /// hits. Malformed lines, `begin`/`end`/`summary`/`context` events, and
 /// non-UTF-8 records (rg base64-encodes those in a `bytes` field instead
 /// of `text`) are skipped — they cannot be displayed as text lines.
+#[cfg(test)]
 fn parse_rg_json(output: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    for line in output.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(value) = Json::parse(line) else {
-            continue;
-        };
-        let Some(record) = value.as_object() else {
-            continue;
-        };
-        if lookup(record, "type").and_then(Json::as_str) != Some("match") {
-            continue;
-        }
-        let Some(data) = lookup(record, "data").and_then(Json::as_object) else {
-            continue;
-        };
-        let Some(path) = json_text(lookup(data, "path")) else {
-            continue;
-        };
-        let Some(line_text) = json_text(lookup(data, "lines")) else {
-            continue;
-        };
-        let Some(line_number) = lookup(data, "line_number")
-            .and_then(Json::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-        else {
-            continue;
-        };
-        let Some(submatches) = lookup(data, "submatches").and_then(Json::as_array) else {
-            continue;
-        };
+    output.lines().filter_map(parse_rg_line).collect()
+}
 
-        // Display text: trim the trailing newline rg includes in `lines`.
-        let line_text = line_text.trim_end_matches(['\r', '\n']);
-        let mut spans = Vec::new();
-        for submatch in submatches {
-            let Some(fields) = submatch.as_object() else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (
-                lookup(fields, "start").and_then(Json::as_u64),
-                lookup(fields, "end").and_then(Json::as_u64),
-            ) else {
-                continue;
-            };
-            if let Some(span) = byte_span_to_char_span(line_text, start, end) {
-                spans.push(span);
-            }
-        }
-        if spans.is_empty() {
-            continue; // a match whose spans we cannot place is useless
-        }
-        hits.push(SearchHit {
-            path: PathBuf::from(path),
-            line_number,
-            line_text: line_text.to_owned(),
-            spans,
-        });
+/// Reduce one `rg --json` record. `None` for every non-match, malformed, or
+/// non-UTF-8 record.
+fn parse_rg_line(line: &str) -> Option<SearchHit> {
+    if line.trim().is_empty() {
+        return None;
     }
-    hits
+    let value = Json::parse(line).ok()?;
+    let record = value.as_object()?;
+    if lookup(record, "type").and_then(Json::as_str) != Some("match") {
+        return None;
+    }
+    let data = lookup(record, "data").and_then(Json::as_object)?;
+    let path = json_text(lookup(data, "path"))?;
+    let line_text = json_text(lookup(data, "lines"))?;
+    let line_number = lookup(data, "line_number")
+        .and_then(Json::as_u64)
+        .and_then(|n| usize::try_from(n).ok())?;
+    let submatches = lookup(data, "submatches").and_then(Json::as_array)?;
+
+    // Display text: trim the trailing newline rg includes in `lines`.
+    let line_text = line_text.trim_end_matches(['\r', '\n']);
+    let mut spans = Vec::new();
+    for submatch in submatches {
+        let Some(fields) = submatch.as_object() else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            lookup(fields, "start").and_then(Json::as_u64),
+            lookup(fields, "end").and_then(Json::as_u64),
+        ) else {
+            continue;
+        };
+        if let Some(span) = byte_span_to_char_span(line_text, start, end) {
+            spans.push(span);
+        }
+    }
+    if spans.is_empty() {
+        return None; // a match whose spans we cannot place is useless
+    }
+    Some(SearchHit {
+        path: PathBuf::from(path),
+        line_number,
+        line_text: line_text.to_owned(),
+        spans,
+    })
 }
 
 /// The `{"text": "…"}` payload of an rg JSON field, when the value is
@@ -606,7 +722,7 @@ fn byte_span_to_char_span(line: &str, start: u64, end: u64) -> Option<MatchSpan>
 // A minimal JSON parser (rg --json records only)
 // -----------------------------------------------------------------------------
 
-/// A parsed JSON value. Just enough for [`parse_rg_json`]: no numbers
+/// A parsed JSON value. Just enough for [`parse_rg_line`]: no numbers
 /// beyond `f64`, no streaming, no `serde` (the crate's dependencies are
 /// orchestrator-owned; rg's records are a fixed, tiny shape).
 #[derive(Clone, Debug, PartialEq)]
@@ -1080,18 +1196,57 @@ mod tests {
     }
 
     #[test]
-    fn builtin_skips_binary_and_oversize_files() {
+    fn builtin_skips_binary_and_streams_oversize_files() {
         let root = temp_root("binary");
         write(&root, "binary.bin", "ropey\x00ropey");
         let hits = search_builtin(&root, &SearchQuery::new("ropey"));
         assert!(hits.is_empty(), "NUL-containing file must be skipped");
 
-        let big = root.join("big.txt");
-        let file = std::fs::File::create(&big).expect("create big");
-        file.set_len(MAX_SCANNED_FILE_BYTES + 1).expect("grow big");
-        drop(file);
+        // Before P1 the builtin silently dropped every file over 1 MiB. The
+        // scanner now streams: a 2 MiB text file must be searched to its end.
+        let mut big = String::with_capacity(2 * 1024 * 1024 + 16);
+        while big.len() < 2 * 1024 * 1024 {
+            big.push_str("filler line without the needle\n");
+        }
+        big.push_str("ropey at the end\n");
+        write(&root, "big.txt", &big);
         let hits = search_builtin(&root, &SearchQuery::new("ropey"));
-        assert!(hits.is_empty(), "oversize file must be skipped");
+        assert_eq!(hits.len(), 1, "huge file must not silently disappear");
+        assert!(hits[0].path.ends_with("big.txt"));
+        assert_eq!(hits[0].line_number, 1 + big.matches('\n').count() - 1);
+    }
+
+    #[test]
+    fn bounded_line_reader_skips_one_overlong_line_and_keeps_the_rest() {
+        let root = temp_root("long-line");
+        let long = "x".repeat(64);
+        write(
+            &root,
+            "long.txt",
+            &format!("{long}\nneedle\n{long}needle\n"),
+        );
+        // A 32-byte cap skips the two overlong lines but keeps the short match.
+        let mut reader = std::io::BufReader::new(
+            std::fs::File::open(root.join("long.txt")).expect("open fixture"),
+        );
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 32).unwrap(),
+            Some(true),
+            "the 64-byte line overflows"
+        );
+        assert!(buf.is_empty());
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 32).unwrap(),
+            Some(false)
+        );
+        assert_eq!(buf, b"needle\n");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 32).unwrap(),
+            Some(true),
+            "the last overlong line is consumed"
+        );
+        assert_eq!(read_bounded_line(&mut reader, &mut buf, 32).unwrap(), None);
     }
 
     #[test]
@@ -1357,6 +1512,90 @@ mod tests {
         // A word-edge pattern still respects both boundaries.
         let literal = search_builtin(&root, &SearchQuery::new("foo").whole_word(true));
         assert_eq!(spans_of(&literal[0]), vec![(1, 4), (11, 14)]);
+    }
+
+    #[test]
+    fn rg_literal_parity_covers_symbols_case_and_whole_word() {
+        if !rg_on_path() {
+            eprintln!("skipping: no `rg` on PATH");
+            return;
+        }
+        let root = temp_root("rg-literal-parity");
+        write(
+            &root,
+            "symbols.txt",
+            "@foo and x@foo\nC++ and xC++\na->b and xa->b\nHello HELLO hello\nneedle needleless\n",
+        );
+        for query in [
+            SearchQuery::new("@foo"),
+            SearchQuery::new("C++"),
+            SearchQuery::new("->"),
+            SearchQuery::new("hello"),
+            SearchQuery::new("hello").case_sensitive(true),
+            SearchQuery::new("needle").whole_word(true),
+            SearchQuery::new("@foo").whole_word(true),
+            SearchQuery::new("C++").whole_word(true),
+            SearchQuery::new("->").whole_word(true),
+        ] {
+            let via_rg = run_rg(&root, &query).expect("rg run");
+            let via_builtin = search_builtin(&root, &query);
+            assert_eq!(sorted_keys(&via_rg), sorted_keys(&via_builtin), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn rg_regex_parity_covers_symbols_case_whole_word_and_invalid_patterns() {
+        if !rg_on_path() {
+            eprintln!("skipping: no `rg` on PATH");
+            return;
+        }
+        let root = temp_root("rg-regex-parity");
+        write(
+            &root,
+            "symbols.txt",
+            "@foo and x@foo\nC++ and xC++\na->b and xa->b\nHello HELLO hello\nlet value = 41;\n",
+        );
+        for query in [
+            SearchQuery::new(r"@foo"),
+            SearchQuery::new(r"C\+\+"),
+            SearchQuery::new("->"),
+            SearchQuery::new("hello"),
+            SearchQuery::new("hello").case_sensitive(true),
+            SearchQuery::new(r"\d+"),
+            SearchQuery::new("needle").whole_word(true),
+            SearchQuery::new(r"@foo").whole_word(true),
+            SearchQuery::new(r"C\+\+").whole_word(true),
+        ] {
+            let source = rg_source(&query, false);
+            let via_rg = run_rg_source(&root, &source).expect("rg regex run");
+            let regex = build_regex(&query).expect("valid regex");
+            let via_builtin = scan_builtin(&root, |line| find_regex_matches(line, &regex));
+            assert_eq!(sorted_keys(&via_rg), sorted_keys(&via_builtin), "{query:?}");
+        }
+
+        // The local validation is what makes invalid regex typed on both
+        // engines; `rg` is never spawned for it.
+        let invalid = search_in_files_regex(&root, &SearchQuery::new("(unclosed"));
+        assert!(matches!(invalid, Err(SearchError::InvalidPattern(_))));
+    }
+
+    /// Stable comparison key for hit lists from the two engines.
+    type HitKey = (PathBuf, usize, String, Vec<(usize, usize)>);
+
+    fn sorted_keys(hits: &[SearchHit]) -> Vec<HitKey> {
+        let mut keys: Vec<_> = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.clone(),
+                    hit.line_number,
+                    hit.line_text.clone(),
+                    spans_of(hit),
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
     }
 
     #[test]

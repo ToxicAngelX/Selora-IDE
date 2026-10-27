@@ -2,6 +2,7 @@
 import { useState, useMemo, type FC } from 'react';
 import {
   updateSettings,
+  restartLsp,
   type BootstrapState,
   type EnvelopeContext,
   type SettingsPatch,
@@ -67,6 +68,15 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
       .catch((cause: unknown) => setSettingsError(formatError(cause)))
       .finally(() => setSaving(false));
   };
+
+  const restartServer = (language: string): void => {
+    setSettingsError(null);
+    void restartLsp(language, context).catch((cause: unknown) =>
+      setSettingsError(formatError(cause)),
+    );
+  };
+
+  const lspServers = bootstrap.lsp_servers ?? [];
 
   // The cheat sheet is built from the real command registry, so it can never
   // advertise a command the shell does not dispatch. Commands without a
@@ -268,6 +278,51 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
       {/* Tab 2: Editor */}
       {activeTab === 'editor' && (
         <div className="settings-section-content">
+          <div className="settings-card">
+            <div className="settings-card-header">
+              <span className="settings-card-title">Language Servers</span>
+              <span className="settings-card-hint">
+                {lspServers.length === 0 ? 'Not started' : String(lspServers.length) + ' tracked'}
+              </span>
+            </div>
+            <p className="settings-card-hint">
+              Servers start when a file of their language opens. Restart re-runs the
+              server for this workspace; paths, arguments and the master switch come
+              from the <code>lsp</code> section of settings.json.
+            </p>
+            {lspServers.length === 0 ? (
+              <p className="settings-card-hint" role="status">
+                No language server has started in this workspace yet.
+              </p>
+            ) : (
+              <div className="settings-group">
+                {lspServers.map((server) => (
+                  <div className="settings-row" key={server.language}>
+                    <span className="settings-label">
+                      {server.server}
+                      <span
+                        className="settings-card-hint"
+                        data-testid={`lsp-state-${server.language}`}
+                        role="status"
+                      >
+                        {' '}
+                        — {server.state}
+                        {server.error ? `: ${server.error}` : ''}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="settings-primary-btn"
+                      onClick={() => restartServer(server.language)}
+                      aria-label={`Restart ${server.server}`}
+                    >
+                      Restart
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           <p className="settings-card-hint">
             Editor preferences exist in settings.json but are not exposed by this build&apos;s
             settings protocol, so every value shows —.
