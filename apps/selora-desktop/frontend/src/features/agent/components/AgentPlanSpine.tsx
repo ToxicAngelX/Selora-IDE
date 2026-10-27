@@ -451,7 +451,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
               <div className="zcode-dashboard-card zcode-active-task-hero-card is-active-shimmer">
                 <div className="zcode-card-header">
                   <div className="zcode-card-title">
-                    <span className="zcode-pulse-dot" style={{ background: '#3b82f6' }} />
+                    <span className="zcode-pulse-dot" style={{ background: 'var(--c-3b82f6)' }} />
                     <span>CURRENT OBJECTIVE</span>
                   </div>
                   <span className="zcode-card-badge" style={{ color: 'var(--c-60a5fa)' }}>Active Step</span>
@@ -531,13 +531,13 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                 </div>
               </div>
             ) : todos.length > 0 && completedCount === todos.length ? (
-              <div className="zcode-dashboard-card" style={{ borderColor: 'rgba(34, 197, 94, 0.25)' }}>
+              <div className="zcode-dashboard-card" style={{ borderColor: 'var(--c-rgba-34-197-94-0p25)' }}>
                 <div className="zcode-card-header">
-                  <div className="zcode-card-title" style={{ color: '#4ade80' }}>
+                  <div className="zcode-card-title" style={{ color: 'var(--c-4ade80)' }}>
                     <ZCodeCheckRing />
                     <span>PLAN COMPLETED</span>
                   </div>
-                  <span className="zcode-card-badge" style={{ color: '#4ade80' }}>100%</span>
+                  <span className="zcode-card-badge" style={{ color: 'var(--c-4ade80)' }}>100%</span>
                 </div>
                 <div className="zcode-hero-body">
                   <div style={{ color: 'var(--fg-muted)', fontSize: '13px' }}>
@@ -551,7 +551,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-tasks-breakdown-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <FileText size={15} style={{ color: '#71717a' }} />
+                  <FileText size={15} style={{ color: 'var(--c-71717a)' }} />
                   <span>Tasks &amp; Execution Breakdown</span>
                 </div>
                 <span className="zcode-card-badge">
@@ -687,7 +687,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-git-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <GitBranch size={15} style={{ color: '#71717a' }} />
+                  <GitBranch size={15} style={{ color: 'var(--c-71717a)' }} />
                   <span>Git Workspace</span>
                 </div>
                 <div className="zcode-git-actions">
@@ -743,7 +743,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-swarm-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <Sparkles size={15} style={{ color: '#a855f7' }} />
+                  <Sparkles size={15} style={{ color: 'var(--c-a855f7)' }} />
                   <span>Subagents Swarm</span>
                 </div>
                 <span className="zcode-card-badge">
@@ -813,7 +813,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-artifacts-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <Code2 size={15} style={{ color: '#71717a' }} />
+                  <Code2 size={15} style={{ color: 'var(--c-71717a)' }} />
                   <span>Artifacts</span>
                 </div>
                 <span className="zcode-card-badge">
@@ -823,7 +823,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
 
               <div style={{ padding: '12px 16px' }}>
                 {artifacts.length === 0 ? (
-                  <div style={{ fontSize: '12px', color: '#71717a', textAlign: 'center', padding: '12px 0' }}>
+                  <div style={{ fontSize: '12px', color: 'var(--c-71717a)', textAlign: 'center', padding: '12px 0' }}>
                     No artifacts generated yet
                   </div>
                 ) : (
