@@ -354,6 +354,12 @@ function reduceEvent(event: EventEnvelope): void {
     case 'agent_turn_done':
       agentStore.handleAgentTurnDone(payload.payload);
       return;
+    case 'plan_state_changed':
+      agentStore.handlePlanStateChanged(payload.payload);
+      return;
+    case 'todos_changed':
+      agentStore.handleTodosChanged(payload.payload);
+      return;
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;

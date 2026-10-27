@@ -35,6 +35,11 @@ import {
   type EditorContextDto,
   type EnvelopeContext,
   type Model,
+  type PlanApproval,
+  type PlanPhase,
+  type PlanStateChangedPayload,
+  type TodoItem,
+  type TodosChangedPayload,
   type ToolCallStartedPayload,
   type ToolResultPayload,
   type WorkflowApproval,
@@ -51,6 +56,10 @@ export type AgentState = {
   activeSessionId: string;
   messages: ChatMessage[];
   todos: AgentTodo[];
+  /** Phase 9b: the session's plan phase (hydrated + live). */
+  planPhase: PlanPhase;
+  /** Phase 9b: the approved/proposed plan, when any. */
+  plan: PlanApproval | null;
   subagents: SubagentInfo[];
   artifacts: ArtifactItem[];
   inFlight: boolean;
@@ -184,6 +193,8 @@ let state: AgentState = {
   activeSessionId: DEFAULT_SESSION_ID,
   messages: [],
   todos: INITIAL_TODOS,
+  planPhase: 'executing',
+  plan: null,
   subagents: INITIAL_SUBAGENTS,
   artifacts: INITIAL_ARTIFACTS,
   inFlight: false,
@@ -302,8 +313,58 @@ const listeners = new Set<Listener>();
  */
 export type WorkflowToolCall = AgentToolCall & {
   workflow?: WorkflowApproval;
+  /** Phase 9b: the plan payload on an `exit_plan_mode` card. */
+  plan?: PlanApproval;
   approvalSubmitting?: boolean;
 };
+
+/** Map the bridge's snake_case todo items onto the dock's `AgentTodo`. */
+export function todosFromSnapshot(items: TodoItem[] | undefined): AgentTodo[] {
+  if (!items) return [];
+  return items
+    .filter((item) => item && typeof item.title === 'string' && item.title.trim())
+    .map((item) => ({
+      id: item.id || `todo_${item.title}`,
+      title: item.title,
+      status:
+        item.status === 'completed'
+          ? 'completed'
+          : item.status === 'in_progress'
+            ? 'in_progress'
+            : 'pending',
+    }));
+}
+
+/** Validate a plan payload before it drives the approval card. */
+export function validPlanApproval(
+  plan: PlanApproval | null | undefined,
+): plan is PlanApproval {
+  return Boolean(
+    plan &&
+      Array.isArray(plan.steps) &&
+      plan.steps.length > 0 &&
+      plan.steps.every((step) => typeof step === 'string' && step.trim()),
+  );
+}
+
+/**
+ * The plan payload from an `exit_plan_mode` call's arguments. The
+ * authoritative repeat rides `approval_needed`; this lets the running card
+ * render before that arrives, without inventing steps.
+ */
+export function planApprovalFromArgs(
+  args: Record<string, unknown> | undefined,
+): PlanApproval | undefined {
+  if (!args || !Array.isArray(args.plan)) return undefined;
+  const steps = args.plan.filter(
+    (step): step is string => typeof step === 'string' && Boolean(step.trim()),
+  );
+  if (steps.length === 0) return undefined;
+  return {
+    summary: typeof args.summary === 'string' ? args.summary : undefined,
+    steps,
+  };
+}
 
 /** §18.1's workflow-level cap default, mirroring `WorkflowApprovalDto`. */
 const DEFAULT_WORKFLOW_MAX_COST_USD = 5;
@@ -576,6 +637,17 @@ export const agentStore = {
       sessions[0]?.id ??
       state.activeSessionId;
 
+    // Phase 9b: the active session's plan/todos hydrate the dock's spine
+    // from the Rust snapshot (session-scoped state, not a turn artifact).
+    const activeSession = bootstrap.chat.sessions.find(
+      (session) => session.session_id === activeSessionId,
+    );
+    const hydratedTodos = todosFromSnapshot(activeSession?.todos);
+    const hydratedPlanPhase: PlanPhase = activeSession?.plan_phase ?? 'executing';
+    const hydratedPlan = validPlanApproval(activeSession?.plan)
+      ? activeSession.plan
+      : null;
+
     // Keep request routing aligned with the turn Rust says is live.
     activeRequestId = bootstrap.chat.active_request_id ?? null;
 
@@ -594,6 +666,9 @@ export const agentStore = {
       const previousConfirmation = previousConfirmations.get(pending.approval_id);
       const isWorkflow = /^run_workflow(?:\s|$)/.test(pending.summary) ||
         previousCall?.toolName === 'run_workflow' || Boolean(previousCall?.workflow) || Boolean(previousConfirmation);
+      const isPlan = Boolean(pending.plan) || Boolean(previousCall?.plan) ||
+        /^exit_plan_mode(?:\s|$)/.test(pending.summary) ||
+        previousCall?.toolName === 'exit_plan_mode';
       if (isWorkflow) {
         const sameOrigin = previousConfirmation?.requestId === pending.request_id &&
           previousConfirmation.sessionId === pending.session_id &&
@@ -610,12 +685,15 @@ export const agentStore = {
         confirmation.workflow = null;
         workflowConfirmations.set(pending.approval_id, confirmation);
       }
-      const approvalCall: AgentToolCall = {
+      const approvalCall: WorkflowToolCall = {
         id: `call_appr_${pending.approval_id}`,
-        toolName: isWorkflow ? 'run_workflow' : 'operation',
+        toolName: isPlan ? 'exit_plan_mode' : isWorkflow ? 'run_workflow' : 'operation',
         argsSummary: pending.summary,
         status: 'needs_approval',
         approvalId: pending.approval_id,
+        plan: isPlan
+          ? (pending.plan ?? previousCall?.plan ?? undefined)
+          : undefined,
         resultSummary: isWorkflow
           ? 'Workflow confirmation is unavailable after refresh. Wait for the full approval_needed payload before deciding.'
           : undefined,
@@ -651,6 +729,9 @@ export const agentStore = {
       sessions,
       messages,
       activeSessionId,
+      todos: hydratedTodos,
+      planPhase: hydratedPlanPhase,
+      plan: hydratedPlan,
       inFlight: Boolean(bootstrap.chat.active_request_id),
     };
     notify();
@@ -685,6 +766,8 @@ export const agentStore = {
       ...state,
       messages: [],
       todos: [],
+      planPhase: 'executing',
+      plan: null,
       inFlight: false,
       thinkingState: 'breathing',
       streamingActivityLevel: 0,
@@ -712,6 +795,8 @@ export const agentStore = {
       activeSessionId: newId,
       messages: [],
       todos: [],
+      planPhase: 'executing',
+      plan: null,
       inFlight: false,
       thinkingState: 'breathing',
       promptQueue: [],
@@ -1118,16 +1203,11 @@ export const agentStore = {
     const newMessages = [...state.messages];
     newMessages[lastMsgIndex] = updated;
 
-    let updatedTodos = state.todos;
-    const mdTodos = extractMarkdownChecklist(newContent);
-    if (mdTodos && mdTodos.length > 0) {
-      updatedTodos = mdTodos;
-    }
-
+    // Todos are owned by the session store (`todos_changed`), never
+    // derived from assistant prose.
     state = {
       ...state,
       messages: newMessages,
-      todos: updatedTodos,
       thinkingState: 'connecting',
       streamingActivityLevel: Math.min(1.0, state.streamingActivityLevel + 0.1),
     };
@@ -1191,10 +1271,18 @@ export const agentStore = {
     notify();
   },
 
-  handleApprovalDecision(approvalId: string, decision: 'approve' | 'deny' | 'approve_all'): void | Promise<void> {
+  handleApprovalDecision(
+    approvalId: string,
+    decision: 'approve' | 'deny' | 'approve_all' | 'revise',
+  ): void | Promise<void> {
     const target = state.messages.flatMap((message) => message.toolCalls ?? [])
       .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
-    if (target?.toolName === 'run_workflow' || target?.workflow || workflowConfirmations.has(approvalId)) {
+    const planCard = Boolean(target?.plan) || target?.toolName === 'exit_plan_mode';
+    // A plan card only offers Approve/Revise: a blanket approval is a
+    // different grant and must never skip the plan decision.
+    if (planCard && decision === 'approve_all') return;
+    if (!planCard && (target?.toolName === 'run_workflow' || target?.workflow || workflowConfirmations.has(approvalId))) {
+      if (decision === 'revise') return;
       return submitWorkflowConfirmation(approvalId, decision);
     }
     // Route to the request that raised this approval, not whatever request
@@ -1218,10 +1306,14 @@ export const agentStore = {
     if (!lastMsg || !lastMsg.toolCalls) return;
 
     const updatedCalls = lastMsg.toolCalls.map((c) => {
-      if (c.approvalId === approvalId || (decision === 'approve_all' && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow)) {
+      const isPlan = c.approvalId === approvalId && (Boolean((c as WorkflowToolCall).plan) || c.toolName === 'exit_plan_mode');
+      if (c.approvalId === approvalId || (decision === 'approve_all' && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow && !(c as WorkflowToolCall).plan)) {
         return {
           ...c,
-          status: (decision === 'deny' ? 'denied' : 'approved') as AgentToolCall['status'],
+          status: (decision === 'deny' || decision === 'revise' ? 'denied' : 'approved') as AgentToolCall['status'],
+          resultSummary: isPlan && decision === 'revise'
+            ? 'Revision requested — the session stays in plan mode.'
+            : c.resultSummary,
         };
       }
       return c;
@@ -1234,7 +1326,7 @@ export const agentStore = {
     state = {
       ...state,
       messages: newMessages,
-      thinkingState: decision === 'deny' ? 'breathing' : 'solving',
+      thinkingState: decision === 'deny' || decision === 'revise' ? 'breathing' : 'solving',
     };
     notify();
   },
@@ -1330,27 +1422,16 @@ export const agentStore = {
       payload.tool_name === 'run_workflow'
         ? workflowApprovalFromArgs(parsedArgs)
         : undefined;
+    // Phase 9b: an `exit_plan_mode` call carries its steps before the card.
+    const plan =
+      payload.tool_name === 'exit_plan_mode'
+        ? planApprovalFromArgs(parsedArgs)
+        : undefined;
 
-    // 1. If tool is manage_todo or update_plan, extract and update todos
-    let updatedTodos = state.todos;
-    if (payload.tool_name === 'manage_todo' || payload.tool_name === 'update_plan') {
-      const raw = parsedArgs ? (parsedArgs.todos ?? parsedArgs.tasks ?? parsedArgs.steps ?? parsedArgs) : payload.args_json;
-      const modelTodos = parseModelTodos(raw);
-      if (modelTodos && modelTodos.length > 0) {
-        updatedTodos = modelTodos;
-      }
-    } else {
-      // If there are pending todos and one is in_progress, keep it; if none in_progress, make first pending in_progress
-      const hasInProgress = updatedTodos.some((t) => t.status === 'in_progress');
-      if (!hasInProgress && updatedTodos.length > 0) {
-        const firstPending = updatedTodos.find((t) => t.status === 'pending');
-        if (firstPending) {
-          updatedTodos = updatedTodos.map((t) =>
-            t.id === firstPending.id ? { ...t, status: 'in_progress' as const } : t
-          );
-        }
-      }
-    }
+    // Phase 9b: todos are session state owned by Rust. The store is updated
+    // only by the authoritative `todos_changed` event — never inferred from
+    // a tool's arguments and never advanced by another tool's start.
+    const updatedTodos = state.todos;
 
     // 2. Update subagents active step
     const updatedSubagents = state.subagents.map((sub, i) =>
@@ -1366,11 +1447,14 @@ export const agentStore = {
     const toolCall: WorkflowToolCall = {
       id: payload.call_id,
       toolName: payload.tool_name,
-      argsSummary: workflow?.name ? workflow.name : argsSummary,
+      argsSummary: workflow?.name
+        ? workflow.name
+        : plan?.summary || (plan ? `${plan.steps.length}-step plan` : argsSummary),
       argsRaw: parsedArgs,
       status: 'running',
       // A workflow grant renders from this payload even before its approval.
       workflow,
+      plan,
       startedAt: Date.now(),
     };
 
@@ -1450,15 +1534,17 @@ export const agentStore = {
     // A workflow card is a grant, not a diff: the payload rides `workflow`
     // and its script is never counted as a diff hunk.
     const workflow = payload.workflow;
+    const plan = payload.plan;
     const diffHunks =
-      !workflow && payload.diff_or_input ? [payload.diff_or_input] : undefined;
+      !workflow && !plan && payload.diff_or_input ? [payload.diff_or_input] : undefined;
     const approvalCall: WorkflowToolCall = {
       id: `call_appr_${payload.approval_id}`,
       toolName: payload.tool_name,
-      argsSummary: payload.path_or_command,
+      argsSummary: plan?.summary || payload.path_or_command,
       status: 'needs_approval',
       approvalId: payload.approval_id,
       workflow,
+      plan,
       resultSummary: undefined,
       diff: diffHunks
         ? {
@@ -1516,6 +1602,27 @@ export const agentStore = {
       messages: newMessages,
       thinkingState: 'breathing',
     };
+    notify();
+  },
+
+  handlePlanStateChanged(payload: PlanStateChangedPayload) {
+    if (payload.session_id && state.activeSessionId && payload.session_id !== state.activeSessionId) {
+      return;
+    }
+    const plan = validPlanApproval(payload.plan) ? payload.plan : null;
+    state = {
+      ...state,
+      planPhase: payload.phase ?? 'executing',
+      plan,
+    };
+    notify();
+  },
+
+  handleTodosChanged(payload: TodosChangedPayload) {
+    if (payload.session_id && state.activeSessionId && payload.session_id !== state.activeSessionId) {
+      return;
+    }
+    state = { ...state, todos: todosFromSnapshot(payload.todos) };
     notify();
   },
 

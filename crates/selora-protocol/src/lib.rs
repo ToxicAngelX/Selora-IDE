@@ -248,6 +248,9 @@ pub enum DecisionDto {
     Approve,
     Deny,
     ApproveAllThisTurn,
+    /// Phase 9b: request a revised plan. A plan card answers with this; the
+    /// session stays in plan mode and the model proposes again.
+    Revise,
     Stop,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -597,6 +600,76 @@ pub struct SessionDto {
     pub title: String,
     pub message_ids: Vec<MessageId>,
     pub active: bool,
+    /// Phase 9b: the session's plan phase, hydrated into the dock's plan
+    /// spine. Defaulted so a pre-9b snapshot still loads (as executing).
+    #[serde(default)]
+    pub plan_phase: PlanPhaseDto,
+    /// Phase 9b: the approved/proposed plan, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
+    /// Phase 9b: the session's stored todos.
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9b — plan mode and live todos (ROADMAP Phase 9b). Additive to
+// protocol_version 1; every field has a serde default so pre-9b payloads
+// still load.
+// ---------------------------------------------------------------------------
+
+/// The session's plan phase. `executing` is the pre-9b behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPhaseDto {
+    Planning,
+    #[default]
+    Executing,
+}
+
+/// The plan card's payload: optional one-line context and the ordered steps.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanApprovalDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+/// One stored todo item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodoDto {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub status: TodoStatusDto,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatusDto {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// `PlanStateChanged` — the session's phase or proposed/approved plan moved.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanStateDto {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub phase: PlanPhaseDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
+}
+
+/// `TodosChanged` — the session's stored list was replaced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodosDto {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageDto {
@@ -621,6 +694,10 @@ pub struct ApprovalDto {
     pub session_id: SessionId,
     pub summary: String,
     pub can_approve_all_this_turn: bool,
+    /// Phase 9b: the plan payload for a parked `exit_plan_mode` card, so a
+    /// reload can rebuild the same plan card. Absent on every other card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelDto {
@@ -1099,6 +1176,10 @@ pub struct ApprovalNeededDto {
     /// field absent) and every non-workflow card omits the key entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowApprovalDto>,
+    /// Phase 9b: the `exit_plan_mode` plan card — steps plus optional
+    /// summary. Additive/defaulted like `workflow`; absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
 }
 /// The agent status line's phase (drives the dock's ThinkingOrb state).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1481,6 +1562,10 @@ pub enum FrontendEvent {
     WorkflowArtifact(WorkflowArtifactEventDto),
     WorkflowApprovalNeeded(WorkflowApprovalNeededDto),
     WorkflowFinished(WorkflowFinishedDto),
+    // Phase 9b — plan mode and live todos. Additive; a pre-9b consumer
+    // ignores the arms it does not know.
+    PlanStateChanged(PlanStateDto),
+    TodosChanged(TodosDto),
     Error(ProtocolErrorDto),
 }
 
@@ -1686,6 +1771,9 @@ mod tests {
                     title: "Welcome".into(),
                     message_ids: vec![],
                     active: true,
+                    plan_phase: PlanPhaseDto::Executing,
+                    plan: None,
+                    todos: vec![],
                 }],
                 messages: vec![],
                 active_session_id: None,
@@ -2183,6 +2271,7 @@ mod tests {
                 path_or_command: "src/main.rs".into(),
                 diff_or_input: Some("+fn main() {}".into()),
                 workflow: None,
+                plan: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"src/main.rs","diff_or_input":"+fn main() {}"}}"#
@@ -2198,6 +2287,7 @@ mod tests {
                 path_or_command: "cargo test".into(),
                 diff_or_input: None,
                 workflow: None,
+                plan: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
@@ -2219,6 +2309,7 @@ mod tests {
                 commands: vec!["cargo test".into(), "git status".into()],
                 max_cost_usd: 5.0,
             }),
+            plan: None,
         };
         let workflow_json =
             serde_json::to_string(&FrontendEvent::ApprovalNeeded(workflow_card.clone())).unwrap();
@@ -2417,6 +2508,7 @@ mod tests {
             session_id: sid("session"),
             summary: "write".into(),
             can_approve_all_this_turn: false,
+            plan: None,
         });
         assert_eq!(
             validate_and_consume_approval(
@@ -2707,6 +2799,80 @@ mod tests {
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
+    }
+
+    #[test]
+    fn p9b_plan_and_todo_wire_is_additive_and_round_trips() {
+        // A plan approval card carries the steps where the user decides.
+        let card = ApprovalNeededDto {
+            request_id: rid("request-1"),
+            session_id: sid("session-1"),
+            turn_id: tid("turn-1"),
+            approval_id: ApprovalId::new("approval-1").unwrap(),
+            tool_name: "exit_plan_mode".into(),
+            path_or_command: "Make the change".into(),
+            diff_or_input: None,
+            workflow: None,
+            plan: Some(PlanApprovalDto {
+                summary: Some("Make the change".into()),
+                steps: vec!["Inspect".into(), "Write".into()],
+            }),
+        };
+        let json = serde_json::to_string(&FrontendEvent::ApprovalNeeded(card.clone())).unwrap();
+        assert!(json.contains("\"plan\""));
+        assert!(!json.contains("\"workflow\""));
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&json).unwrap(),
+            FrontendEvent::ApprovalNeeded(card)
+        );
+
+        // Pre-9b approval_needed JSON still loads with no plan.
+        let legacy: FrontendEvent = serde_json::from_str(
+            r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"a.rs"}}"#,
+        )
+        .unwrap();
+        match legacy {
+            FrontendEvent::ApprovalNeeded(dto) => assert!(dto.plan.is_none()),
+            other => panic!("expected an approval card, got {other:?}"),
+        }
+
+        // The two live events and the revise decision round-trip.
+        let plan_state = FrontendEvent::PlanStateChanged(PlanStateDto {
+            session_id: sid("session-1"),
+            phase: PlanPhaseDto::Planning,
+            plan: None,
+        });
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&serde_json::to_string(&plan_state).unwrap())
+                .unwrap(),
+            plan_state
+        );
+        let todos = FrontendEvent::TodosChanged(TodosDto {
+            session_id: sid("session-1"),
+            todos: vec![TodoDto {
+                id: "todo-1".into(),
+                title: "Inspect".into(),
+                status: TodoStatusDto::InProgress,
+            }],
+        });
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&serde_json::to_string(&todos).unwrap()).unwrap(),
+            todos
+        );
+        assert_eq!(
+            serde_json::to_string(&DecisionDto::Revise).unwrap(),
+            "\"revise\""
+        );
+
+        // A pre-9b session snapshot hydrates as executing with no plan and
+        // no todos.
+        let session: SessionDto = serde_json::from_str(
+            r#"{"session_id":"session-1","title":"Old","message_ids":[],"active":false}"#,
+        )
+        .unwrap();
+        assert_eq!(session.plan_phase, PlanPhaseDto::Executing);
+        assert!(session.plan.is_none());
+        assert!(session.todos.is_empty());
     }
 
     #[test]
