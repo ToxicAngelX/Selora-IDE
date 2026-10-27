@@ -1,11 +1,18 @@
-// Selora IDE — Phase Z3 Agent Dock / Agentic Window (DESIGN §3.5, REVAMP_SPEC §2/§8, ZCode benchmark)
+// Selora IDE — Phase 9a Agent Workbench (ROADMAP §"Phase 9", task 9a).
+// The dedicated agent surface: backend session tabs, transcript reuse
+// (AgentExecutionFeed's cards/thinking states), a live todo spine, structured
+// question / plan review cards inside ToolCard, the composer's Ask / Agent /
+// Plan row, and an explicit way back to the editor or split view.
 //
-// The flagship agentic surface: multi-session rail, execution feed with tool cards,
-// plan spine with backend-authoritative todos, and hero composer card.
-import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ChevronDown, ShieldCheck } from '../components/icons';
+// Every session and todo shown here comes from Rust (`bootstrap.chat`) or a
+// real protocol event. New/select go through the real NewSession /
+// SwitchSession commands; a rejected command shows its message and creates
+// nothing locally.
+import React, { useState, useSyncExternalStore } from 'react';
+import { ChevronDown, Code2, Columns, ShieldCheck, Square } from '../components/icons';
 import { agentStore, getComposerGate } from '../features/agent/agent-store';
-import { AgentSessionRail } from '../features/agent/components/AgentSessionRail';
+import { AgentSessionTabs } from '../features/agent/components/AgentSessionTabs';
+import { AgentTodoSpine } from '../features/agent/components/AgentTodoSpine';
 import { AgentExecutionFeed } from '../features/agent/components/AgentExecutionFeed';
 import { AgentPlanSpine } from '../features/agent/components/AgentPlanSpine';
 import { AgentComposer } from '../features/agent/components/AgentComposer';
@@ -22,9 +29,11 @@ const SUGGESTIONS = [
 
 export type AgentDockProps = {
   bootstrap?: BootstrapState;
+  /** Leave the dedicated agent view for the editor or split shell. */
+  onExit?: (mode: 'editor' | 'split') => void;
 };
 
-export function AgentDock({ bootstrap }: AgentDockProps = {}) {
+export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
   const state = useSyncExternalStore(
     agentStore.subscribe,
     agentStore.getSnapshot
@@ -35,66 +44,32 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
   );
 
   const [activeTab, setActiveTab] = useState<'feed' | 'plan'>('feed');
-  const [showSessionRail, setShowSessionRail] = useState(false);
   const [showFloatingPlan, setShowFloatingPlan] = useState(false);
   const [infeedPlanExpanded, setInfeedPlanExpanded] = useState(false);
-  const sessionButtonRef = useRef<HTMLButtonElement>(null);
-  const sessionDrawerRef = useRef<HTMLDivElement>(null);
-
-  const closeSessionRail = () => {
-    setShowSessionRail(false);
-    sessionButtonRef.current?.focus();
-  };
-
-  useEffect(() => {
-    if (!showSessionRail) return;
-    const drawer = sessionDrawerRef.current;
-    drawer
-      ?.querySelector<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      )
-      ?.focus();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        closeSessionRail();
-        return;
-      }
-      if (event.key !== 'Tab') return;
-      const focusables = Array.from(
-        drawer?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ) ?? [],
-      );
-      if (focusables.length === 0) {
-        event.preventDefault();
-        drawer?.focus();
-        return;
-      }
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      if (!drawer?.contains(document.activeElement)) {
-        event.preventDefault();
-        first.focus();
-      } else if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showSessionRail]);
 
   const activeSession =
-    state.sessions.find((s) => s.id === state.activeSessionId) ||
-    state.sessions[0];
+    state.sessions.find((session) => session.id === state.activeSessionId) ?? null;
 
   const hasMessages = state.messages.length > 0;
   const gate = getComposerGate(state);
   const autoApplyArmed = state.permissionMode === 'full';
+  const activeSessionTabId = activeSession
+    ? `agent-session-tab-${activeSession.id}`
+    : undefined;
+
+  const exitWorkbench = (mode: 'editor' | 'split') => {
+    if (onExit) {
+      onExit(mode);
+      return;
+    }
+    // The shell listens for this when AgentDock is rendered outside ShellGrid
+    // (tests, isolated previews). One event, no local layout fiction.
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('selora:set-view-mode', { detail: { mode } }),
+      );
+    }
+  };
 
   const suggestions = SUGGESTIONS.filter((suggestion) => {
     if (suggestion === 'Explain this file') return editor.activeBuffer !== null;
@@ -103,79 +78,47 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
   });
 
   return (
-    <div className="agent-dock agent-workbench-root" role="region" aria-label="Agentic Workbench">
-      {/* 1. Header Bar */}
+    <div className="agent-dock agent-workbench-root" role="region" aria-label="Agent workbench">
+      {/* 1. Workbench header: presence, active session badge, view actions. */}
       <header className="agent-header agent-workbench-header">
         <div className="header-left-group">
-          {/* Presence Orb slot */}
           <span className="agent-presence-slot" aria-hidden="true">
             <ThinkingOrb state={state.thinkingState} size={20} />
-            <span className="agent-presence-dot" style={{ display: 'none' }} />
           </span>
 
           <span className="agent-session-label">Agent</span>
 
-          {/* Session Switcher toggle */}
-          <button
-            ref={sessionButtonRef}
-            type="button"
-            className="header-session-title-btn"
-            onClick={() => setShowSessionRail(!showSessionRail)}
-            title="Toggle session history drawer"
-            aria-expanded={showSessionRail}
-            aria-controls={showSessionRail ? 'agent-session-drawer' : undefined}
-            style={{
-              background: 'transparent',
-              border: 'none',
-              padding: '0 6px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '4px',
-            }}
+          <span
+            className="agent-session-badge"
+            role="status"
+            title={
+              activeSession
+                ? `Active session: ${activeSession.title}`
+                : 'The backend has not reported an agent session yet'
+            }
           >
-            <span className="header-session-title">
-              {activeSession ? activeSession.title : 'New Session'}
-            </span>
-            <ChevronDown
-              size={12}
-              style={{
-                color: 'var(--fg-faint)',
-                transform: showSessionRail ? 'rotate(180deg)' : 'none',
-                transition: 'transform 150ms ease',
-              }}
+            <span
+              className={`agent-session-badge-dot${state.inFlight ? ' is-live' : ''}`}
+              aria-hidden="true"
             />
-          </button>
+            <span className="agent-session-badge-title">
+              {activeSession ? activeSession.title : 'No session'}
+            </span>
+          </span>
         </div>
 
         <div className="header-right-group">
-          {/* Armed auto-apply indicator: session writes land without cards */}
           {autoApplyArmed && (
             <span
               className="agent-auto-apply-badge"
               role="status"
               title="Full auto-apply is active: file writes, edits and deletes apply immediately for this session. Bash commands still require approval."
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                padding: '2px 7px',
-                marginRight: 4,
-                fontSize: 10,
-                fontWeight: 600,
-                letterSpacing: '0.02em',
-                color: '#34d399',
-                background: 'rgba(16, 185, 129, 0.12)',
-                border: '1px solid rgba(16, 185, 129, 0.35)',
-                borderRadius: 4,
-              }}
             >
               <ShieldCheck size={11} aria-hidden="true" />
               Auto-apply armed
             </span>
           )}
 
-          {/* View Mode switcher (Chat vs Plan) */}
           <button
             type="button"
             className={`agent-view-tab ${activeTab === 'feed' ? 'is-active' : ''}`}
@@ -194,7 +137,6 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
             {state.todos.length})
           </button>
 
-          {/* Quick Floating Plan Toggle for ZCode parity */}
           {activeTab === 'feed' && (
             <button
               type="button"
@@ -202,6 +144,7 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
               onClick={() => setShowFloatingPlan(!showFloatingPlan)}
               title={showFloatingPlan ? 'Hide floating plan card' : 'Show floating plan card'}
               aria-label="Toggle floating plan"
+              aria-pressed={showFloatingPlan}
             >
               <svg
                 width="13"
@@ -218,48 +161,63 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
               </svg>
             </button>
           )}
+
+          <button
+            type="button"
+            className="agent-header-stop"
+            onClick={() => agentStore.stopActiveTurn()}
+            disabled={!state.inFlight}
+            title={state.inFlight ? 'Stop the running agent turn (Esc)' : 'No agent turn is running'}
+            aria-label="Stop agent run"
+          >
+            <Square size={11} aria-hidden="true" />
+            <span>Stop</span>
+          </button>
+
+          <div className="agent-exit-group" role="group" aria-label="Switch workspace view">
+            <button
+              type="button"
+              className="agent-exit-btn"
+              onClick={() => exitWorkbench('editor')}
+              title="Return to the editor view"
+              aria-label="Editor view"
+            >
+              <Code2 size={12} aria-hidden="true" />
+              <span>Editor</span>
+            </button>
+            <button
+              type="button"
+              className="agent-exit-btn"
+              onClick={() => exitWorkbench('split')}
+              title="Show the agent beside the editor"
+              aria-label="Split view"
+            >
+              <Columns size={12} aria-hidden="true" />
+              <span>Split</span>
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* 2. Main Workbench Body */}
-      <div className="agent-workbench-body">
-        {/* Optional Collapsible Session Drawer Overlay */}
-        {showSessionRail && (
-          <div
-            ref={sessionDrawerRef}
-            id="agent-session-drawer"
-            className="agent-session-drawer-overlay"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="agent-session-drawer-title"
-            tabIndex={-1}
-          >
-            <h2 id="agent-session-drawer-title" className="visually-hidden">Agent sessions</h2>
-            <AgentSessionRail
-              sessions={state.sessions}
-              activeSessionId={state.activeSessionId}
-              onClose={closeSessionRail}
-            />
-            <div
-              className="agent-session-drawer-backdrop"
-              onClick={closeSessionRail}
-              aria-hidden="true"
-            />
-          </div>
-        )}
+      {/* 2. Backend session tabs (new / select via real protocol commands). */}
+      <AgentSessionTabs
+        sessions={state.sessions}
+        activeSessionId={state.activeSessionId}
+        busy={state.sessionBusy}
+        error={state.sessionError}
+        onNew={() => void agentStore.requestNewSession()}
+        onSelect={(sessionId) => void agentStore.requestSwitchSession(sessionId)}
+      />
 
-        {/* Center: Execution Feed or Empty State */}
+      {/* 3. Workbench body */}
+      <div
+        className="agent-workbench-body"
+        id="agent-session-panel"
+        role="tabpanel"
+        aria-labelledby={activeSessionTabId}
+      >
         {activeTab === 'feed' ? (
-          <div
-            style={{
-              position: 'relative',
-              flex: 1,
-              minWidth: 0,
-              display: 'flex',
-              flexDirection: 'column',
-              overflow: 'hidden',
-            }}
-          >
+          <div className="agent-feed-column">
             {showFloatingPlan && (
               <div className="zcode-floating-plan-popover">
                 <AgentPlanSpine
@@ -271,7 +229,10 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
               </div>
             )}
 
-            {/* Quick in-feed progress card whenever todos are present */}
+            {/* The live spine is always present; an absent list says so. */}
+            <AgentTodoSpine todos={state.todos} inFlight={state.inFlight} />
+
+            {/* Quick in-feed progress card whenever todos are present. */}
             {state.todos.length > 0 && (
               <div className="zcode-infeed-progress-wrap">
                 <button
@@ -350,7 +311,6 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
               </div>
             )}
 
-            {/* Sacred Composer Card */}
             <AgentComposer
               inFlight={state.inFlight}
               streamingActivityLevel={state.streamingActivityLevel}
@@ -360,25 +320,14 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
             />
           </div>
         ) : (
-          /* Plan Tab */
-          <div
-            style={{
-              position: 'relative',
-              flex: 1,
-              minWidth: 0,
-              display: 'flex',
-              flexDirection: 'column',
-              overflow: 'hidden',
-            }}
-          >
-            <div style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
+<div className="agent-feed-column">
+            <div className="agent-plan-scroll">
               <AgentPlanSpine
                 todos={state.todos}
                 gitStatus={bootstrap?.git}
               />
             </div>
 
-            {/* Sacred Composer Card also available in Plan view */}
             <AgentComposer
               inFlight={state.inFlight}
               streamingActivityLevel={state.streamingActivityLevel}

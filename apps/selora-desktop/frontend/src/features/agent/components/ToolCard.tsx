@@ -26,6 +26,8 @@ import {
 import type { AgentToolCall } from '../types';
 import { agentStore, type WorkflowToolCall } from '../agent-store';
 import { WorkflowCard } from './WorkflowCard';
+import { AgentQuestionCard } from './AgentQuestionCard';
+import { AgentPlanCard } from './AgentPlanCard';
 
 export type ToolCardProps = {
   /** A workflow card carries the §18.1 confirmation payload on the call. */
@@ -212,6 +214,11 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
     ? 'deny'
     : 'approve';
 
+  // Phase 9a: a structured question / plan is the body of the same parked
+  // card. It stays expanded after the decision so the answer remains visible.
+  const decisionPrompt = tool.decisionPrompt;
+  const showDecisionPrompt = Boolean(decisionPrompt);
+
   // Live timer for running tools
   useEffect(() => {
     if (!isRunning) return;
@@ -226,14 +233,14 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   // already on screen while `running` (the `run_workflow` grant is upgraded in
   // place) has to open when it becomes `needs_approval`.
   useEffect(() => {
-    if (tool.status === 'needs_approval') setExpanded(true);
-  }, [tool.status]);
+    if (tool.status === 'needs_approval' || tool.decisionPrompt) setExpanded(true);
+  }, [tool.status, tool.decisionPrompt]);
 
   // Keyboard decisions are handled on the card itself (see handleCardKeyDown),
   // never through a global listener: only keystrokes routed to this card — and
   // not owned by a form/button/contentEditable descendant — may decide.
   const handleCardKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!isApproval || !tool.approvalId) return;
+    if (!isApproval || !tool.approvalId || tool.decisionPrompt) return;
 
     // Modified keystrokes belong to global shortcuts (Ctrl+Enter, Cmd+K, ...).
     if (e.ctrlKey || e.altKey || e.metaKey) return;
@@ -412,6 +419,35 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
             </div>
           )}
 
+          {/* Phase 9a: structured question / plan review on the park channel. */}
+          {decisionPrompt?.kind === 'question' && tool.approvalId ? (
+            <div className="tool-decision-prompt" data-testid="tool-question-card">
+              <AgentQuestionCard
+                prompt={decisionPrompt}
+                submitting={tool.decisionSubmitting}
+                error={tool.decisionError}
+                resolution={tool.resolution}
+                onAnswer={(optionId, text) =>
+                  void agentStore.answerQuestion(tool.approvalId!, optionId, text)
+                }
+              />
+            </div>
+          ) : null}
+
+          {decisionPrompt?.kind === 'plan' && tool.approvalId ? (
+            <div className="tool-decision-prompt" data-testid="tool-plan-card">
+              <AgentPlanCard
+                prompt={decisionPrompt}
+                submitting={tool.decisionSubmitting}
+                error={tool.decisionError}
+                resolution={tool.resolution}
+                onDecide={(decision, feedback) =>
+                  void agentStore.resolvePlan(tool.approvalId!, decision, feedback)
+                }
+              />
+            </div>
+          ) : null}
+
           {/* A workflow grant owns the body: script, command set, cap, and the
               Approve/Deny pair the session routes through the existing
               decision callback. */}
@@ -434,7 +470,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
           )}
 
           {/* Interactive Approval Gate & Diff View */}
-          {isApproval && !showWorkflowGrant && (
+          {isApproval && !showWorkflowGrant && !showDecisionPrompt && (
             <div className="tool-approval-gate">
               <div className="approval-banner">
                 <div className="approval-banner-left">

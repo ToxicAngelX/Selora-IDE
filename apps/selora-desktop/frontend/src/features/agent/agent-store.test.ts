@@ -86,6 +86,8 @@ function resetAndHydrate(sessionId = 'sess-hydrated') {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  bridgeMocks.newSession.mockImplementation(() => Promise.resolve());
+  bridgeMocks.switchSession.mockImplementation(() => Promise.resolve());
   agentStore.reset();
   // A hydrated store: real workspace + real catalog model, no custom override.
   agentStore.updateModelSettings({ customModelId: '' });
@@ -348,6 +350,52 @@ describe('agentStore', () => {
 
     agentStore.reset();
     await expect(agentStore.createSession()).resolves.toBe(false);
+  });
+
+  it('routes NewSession/SwitchSession through the bridge and never fabricates on failure', async () => {
+    agentStore.reset();
+    agentStore.hydrate(
+      makeAgentBootstrap('sess-a', {
+        chat: {
+          sessions: [
+            { session_id: 'sess-a', title: 'First', message_ids: [], active: false },
+            { session_id: 'sess-b', title: 'Second', message_ids: [], active: false },
+          ],
+          messages: [],
+          active_session_id: 'sess-a',
+          active_request_id: null,
+          active_turn_id: null,
+          pending_approval: null,
+        },
+      }),
+    );
+
+    await expect(agentStore.requestSwitchSession('sess-b')).resolves.toBe(true);
+    expect(bridgeMocks.switchSession).toHaveBeenCalledWith(
+      'sess-b',
+      expect.objectContaining({ session_id: null, core_instance_id: 'core-01' }),
+    );
+    expect(agentStore.getSnapshot().activeSessionId).toBe('sess-b');
+
+    bridgeMocks.switchSession.mockRejectedValueOnce({
+      code: 'unsupported_phase_slice',
+      message: 'not supported',
+    });
+    await expect(agentStore.requestSwitchSession('sess-a')).resolves.toBe(false);
+    expect(agentStore.getSnapshot().activeSessionId).toBe('sess-b');
+    expect(agentStore.getSnapshot().sessionError).toContain('not supported by this backend build');
+
+    bridgeMocks.newSession.mockRejectedValueOnce({
+      code: 'unsupported_phase_slice',
+      message: 'not supported',
+    });
+    await expect(agentStore.requestNewSession()).resolves.toBe(false);
+    expect(agentStore.getSnapshot().sessions.map((session) => session.id)).toEqual([
+      'sess-a',
+      'sess-b',
+    ]);
+    expect(agentStore.getSnapshot().sessionError).toContain('Creating agent sessions is not supported');
+    expect(agentStore.getSnapshot().sessionBusy).toBe(false);
   });
 
   it('manages conversation turns, deltas, and in-flight states', () => {

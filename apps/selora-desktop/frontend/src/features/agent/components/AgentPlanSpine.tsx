@@ -184,7 +184,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
   const completedCount = completedTodos.length;
   const progressPct = todos.length > 0 ? Math.round((completedCount / todos.length) * 100) : 0;
 
-  // --- Compact View (in-feed progress bar and floating popover) ---
+// --- Compact View (in-feed progress bar and floating popover) ---
   if (isFloatingPopover || isCompactInfeed) {
     return (
       <div
@@ -269,7 +269,10 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                   textAlign: 'center',
                 }}
               >
-                No plan yet. The agent writes one with the manage_todo tool.
+<div>No todos yet</div>
+                <div style={{ fontSize: '11px', opacity: 0.75, marginTop: '4px' }}>
+                  The session's todo list appears here when the agent reports one.
+                </div>
               </div>
             ) : (
               <div className="zcode-todos-list">
@@ -443,11 +446,11 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
 
                 {todos.length === 0 ? (
                   <div className="zcode-todos-empty-full">
-                    <div style={{ fontSize: '13px', fontWeight: 500, color: '#e4e4e7' }}>
-                      No execution tasks currently planned
+                    <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--fg-default)' }}>
+                      No todos yet
                     </div>
-                    <div style={{ fontSize: '12px', color: '#71717a', marginTop: '4px', lineHeight: 1.5 }}>
-                      The agent writes the plan with the manage_todo tool; this view is read-only.
+<div style={{ fontSize: '12px', color: 'var(--fg-faint)', marginTop: '4px', lineHeight: 1.5 }}>
+                      The session's real todo list appears here when the agent reports it.
                     </div>
                   </div>
                 ) : (

@@ -104,6 +104,23 @@ export function ShellGrid({ bootstrap, commands, onRunCommand, onOpenConnect }: 
     return () => observer.disconnect();
   }, []);
 
+  // The dedicated agent window exposes its own exit switch; route it back into
+  // the same view-mode state the title bar and activity bar own.
+  useEffect(() => {
+    const onSetViewMode = (event: Event) => {
+      const mode = (event as CustomEvent<{ mode?: unknown }>).detail?.mode;
+      if (mode === 'agent' || mode === 'split' || mode === 'editor') {
+        setViewMode(mode);
+        const layout = layoutStore.getSnapshot().layout;
+        if ((mode === 'agent' || mode === 'split') && layout && !regionOpen(layout, 'agent_dock')) {
+          void layoutStore.toggle('agent');
+        }
+      }
+    };
+    window.addEventListener('selora:set-view-mode', onSetViewMode);
+    return () => window.removeEventListener('selora:set-view-mode', onSetViewMode);
+  }, []);
+
   // The drag preview: a direct CSSOM write, zero IPC, zero re-render
   // (ARCHITECTURE §3.1/§6.2).
   const onPreview = (region: RegionId, sizePx: number) => {
@@ -198,7 +215,7 @@ export function ShellGrid({ bootstrap, commands, onRunCommand, onOpenConnect }: 
         {agentOpen ? (
           <aside className="agent-dock-slot" aria-label="Agent dock">
             <Suspense fallback={<div className="agent-dock-loading" aria-busy="true" />}>
-              <AgentDock bootstrap={bootstrap} />
+              <AgentDock bootstrap={bootstrap} onExit={(mode) => setViewMode(mode)} />
             </Suspense>
           </aside>
         ) : null}
