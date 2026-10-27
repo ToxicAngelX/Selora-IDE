@@ -372,7 +372,7 @@ roadmap steps    : 0 with an automated failure, 3 with pending evidence,
 | 3. Edit card / Deny | PASS | deny/approve host tests, desktop decision mapping |
 | 4. Kill/relaunch/Resume | **PENDING** | replay, fail-closed refusal, partial-effect command refusal and shell consent pass; exactly-once subagent effects are not claimed |
 | 5. Failing gate fix loop | PASS | engine loop test with three gate exits and two visible fix phases |
-| 6. Stop kills children | **PENDING** | engine Stop, shell cancel and Job Object grandchild-kill tests pass; a child spawned before Job assignment can escape |
+| 6. Stop kills children | **PENDING** | engine Stop, shell cancel and Job Object grandchild-kill tests pass; the post-exit audit fails a run with a surviving member, but a broker process created outside the job can escape |
 | 7. Cost meter/summary | **PENDING** | run tokens/USD/cap match the host receipts; no per-phase USD exists in the protocol DTO |
 | 8. Journal in `.selora`, never git | PASS | durable path test, workspace `.selora/.gitignore`, repo rule, `git check-ignore`, completed/multi-phase history |
 | 9. `fetch`/`fs`/`process` denied | PASS | direct calls fail as typed ambient-global errors before any host effect; realm hardening tests |
