@@ -390,6 +390,66 @@ describe('WorkflowsPanel', () => {
     expect(within(log).getByText('Recovered from journal: Recovered completed review')).toBeTruthy();
   });
 
+  it('hydrates multi-phase completed history with phase-grouped reports and artifacts', () => {
+    act(() => workflowsStore.hydratePersisted([{
+      run_id: 'run_history_phases',
+      name: 'Recovered multi-phase review',
+      status: 'completed',
+      resumable: false,
+      phases: ['scan', 'fix', 'verify'],
+      steps: [
+        { id: 'step-1', phase: '', label: 'pre report', status: 'completed' },
+        { id: 'step-2', phase: 'scan', label: 'scan step', status: 'completed' },
+        { id: 'step-3', phase: 'scan', label: 'inspect', status: 'completed' },
+        { id: 'step-4', phase: 'fix', label: 'apply', status: 'completed' },
+        { id: 'step-5', phase: 'verify', label: 'check', status: 'completed' },
+      ],
+      reports: [
+        { id: 'report-1', item: 'pre', phase: null },
+        { id: 'report-2', item: 'found', phase: 'scan', artifact_id: 'summary' },
+        { id: 'report-3', item: 'fixed', phase: 'fix' },
+        { id: 'report-4', item: 'verified', phase: 'verify' },
+      ],
+      artifacts: [
+        { id: 'summary', title: '', kind: 'markdown', body: '## Body', phase: 'scan' },
+      ],
+      tokens: 99,
+      cost_usd: 0.5,
+    }]));
+    render(<WorkflowsPanel />);
+
+    const run = workflowsStore.getSnapshot().runs[0];
+    expect(run?.phases).toEqual([
+      { name: 'scan', status: 'completed' },
+      { name: 'fix', status: 'completed' },
+      { name: 'verify', status: 'completed' },
+    ]);
+    expect(run?.steps.map((step) => step.phase)).toEqual([null, 'scan', 'scan', 'fix', 'verify']);
+    expect(run?.reports.map((report) => report.phase)).toEqual([null, 'scan', 'fix', 'verify']);
+    expect(run?.artifacts[0]).toMatchObject({ phase: 'scan', title: null, content: '## Body' });
+
+    const graph = screen.getByRole('list', { name: 'Workflow phase graph' });
+    expect(within(graph).getByText('scan')).toBeTruthy();
+    expect(within(graph).getByText('fix')).toBeTruthy();
+    expect(within(graph).getByText('verify')).toBeTruthy();
+
+    const steps = screen.getByRole('list', { name: 'Workflow steps' });
+    expect(within(steps).getAllByText('scan')).toHaveLength(2);
+    expect(within(steps).getByText('fix')).toBeTruthy();
+    expect(within(steps).getByText('verify')).toBeTruthy();
+
+    const reports = screen.getByRole('list', { name: 'Run reports' });
+    expect(within(reports).getByText('found')).toBeTruthy();
+    expect(within(reports).getByText('fixed')).toBeTruthy();
+    expect(within(reports).getByText('verified')).toBeTruthy();
+    expect(within(reports).getAllByText('scan')).toHaveLength(1);
+
+    const artifacts = screen.getByRole('list', { name: 'Run artifacts' });
+    expect(within(artifacts).getByText('## Body')).toBeTruthy();
+    expect(within(artifacts).getByText('scan')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
+  });
+
   it('never offers resume for an ambiguous durable run', () => {
     workflowsStore.setResumeHandler(() => undefined);
     act(() => workflowsStore.hydratePersisted([{

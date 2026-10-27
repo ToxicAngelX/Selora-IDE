@@ -249,9 +249,22 @@ export type WorkflowStep = {
   detail?: string;
 };
 
-export type WorkflowReport = { id: string; item: string; artifact_id?: string };
+export type WorkflowReport = {
+  id: string;
+  item: string;
+  artifact_id?: string;
+  /** Phase marker in effect when the item was reported, when known. */
+  phase?: string;
+};
 
-export type WorkflowArtifact = { id: string; title: string; kind: string; body: string };
+export type WorkflowArtifact = {
+  id: string;
+  title: string;
+  kind: string;
+  body: string;
+  /** Phase marker in effect when the artifact was produced, when known. */
+  phase?: string;
+};
 
 /** The full run snapshot (WorkflowRunDto) — the panel's resume/start state. */
 export type WorkflowRun = {

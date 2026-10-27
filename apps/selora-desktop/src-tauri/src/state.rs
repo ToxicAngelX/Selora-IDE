@@ -36,11 +36,12 @@ fn workspace_id_for(root: &std::path::Path) -> WorkspaceId {
     WorkspaceId::new(format!("ws_{hash:016x}")).expect("hex id is valid")
 }
 
-/// The history a durable journal can prove: its terminal run report plus the
-/// report items its step inputs reconstruct.
+/// The history a durable journal can prove: its explicit per-step, report and
+/// artifact records, with the terminal run report filling only the fields the
+/// older format never wrote.
 ///
-/// Every field stays empty when the terminal payload is absent or malformed:
-/// the bootstrap must never fabricate progress the journal did not record.
+/// Every field stays empty when the journal did not record it: the bootstrap
+/// must never fabricate progress the journal did not record.
 #[derive(Default)]
 struct WorkflowRunHistory {
     phases: Vec<String>,
@@ -50,104 +51,266 @@ struct WorkflowRunHistory {
     tokens: u64,
     cost_usd: f64,
     error: Option<String>,
+    /// Non-fabricated explanation when part of the journal could not be read.
+    note: Option<String>,
 }
 
 /// Rebuild a completed (or interrupted) run's history from its journal.
 ///
-/// The terminal `engine_run_finished` record carries the engine's own
-/// [`selora_workflow::WorkflowReport`] (phases, steps, artifacts, tokens, cost,
-/// error). Report items are not in that report, so they come from the
-/// `engine_step_started` inputs of successful `report` steps; a step whose
-/// inputs are missing is skipped rather than invented.
+/// Explicit records are the source of truth:
+///
+/// * `engine_step_started` / `engine_step_finished` — every step, its phase
+///   and its final status;
+/// * `engine_report_item` — every `report(item, artifactId)` that reached the
+///   host, with its run-wide ordinal so `report-N` ids never shift;
+/// * `engine_artifact` — every artifact with its full markdown/file content,
+///   independent of the terminal report or a `null` step value.
+///
+/// A journal written before those records existed still loads: steps come
+/// from the step records (with an unknown phase), reports from the successful
+/// report steps' inputs, and artifacts from the terminal report. Anything the
+/// journal cannot prove is omitted, never invented.
 fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> WorkflowRunHistory {
-    let Some(report) = journal
-        .entries
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == "engine_run_finished")
-        .and_then(|entry| {
-            serde_json::from_value::<selora_workflow::WorkflowReport>(entry.payload.clone()).ok()
-        })
-    else {
-        return WorkflowRunHistory::default();
-    };
+    use selora_workflow::{ArtifactContent, ReportItemRecord, StepFinishRecord, StepStartRecord};
 
-    let mut start_inputs = std::collections::BTreeMap::new();
+    let mut history = WorkflowRunHistory::default();
+    let mut terminal: Option<selora_workflow::WorkflowReport> = None;
+    let mut starts: std::collections::BTreeMap<u64, StepStartRecord> =
+        std::collections::BTreeMap::new();
+    let mut finishes: std::collections::BTreeMap<u64, StepFinishRecord> =
+        std::collections::BTreeMap::new();
+    let mut report_records: std::collections::BTreeMap<u64, ReportItemRecord> =
+        std::collections::BTreeMap::new();
+    let mut artifact_records: Vec<selora_workflow::ArtifactRecord> = Vec::new();
+    let mut seen_artifacts = std::collections::HashSet::new();
+    let mut has_report_records = false;
+    let mut has_artifact_records = false;
+    let mut dropped = false;
+
     for entry in &journal.entries {
-        if entry.kind != "engine_step_started" {
-            continue;
-        }
-        let index = entry
-            .payload
-            .get("step")
-            .and_then(|step| step.get("index"))
-            .and_then(serde_json::Value::as_u64);
-        if let (Some(index), Some(inputs)) = (index, entry.payload.get("inputs")) {
-            start_inputs.insert(index, inputs.clone());
-        }
-    }
-
-    let mut reports = Vec::new();
-    let mut report_ordinal = 0u64;
-    for step in &report.steps {
-        if step.kind != selora_workflow::StepKind::Report
-            || step.status != selora_workflow::StepStatus::Ok
-        {
-            continue;
-        }
-        // The live stream ids report items by their 1-based report ordinal;
-        // advance it even when this item cannot be reconstructed so later ids
-        // still match what the run emitted.
-        report_ordinal += 1;
-        let Some(items) = start_inputs
-            .get(&step.index)
-            .and_then(|inputs| inputs.as_array())
-        else {
-            continue;
-        };
-        let Some(item) = items.first() else {
-            continue;
-        };
-        reports.push(selora_protocol::WorkflowReportDto {
-            id: format!("report-{report_ordinal}"),
-            item: workflow_report_item_text(item),
-            artifact_id: items
-                .get(1)
+        match entry.kind.as_str() {
+            "phase_started" => match entry
+                .payload
+                .get("phase")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-        });
-    }
-
-    let artifacts = report
-        .artifacts
-        .into_iter()
-        .map(|artifact| {
-            let (kind, body) = match artifact.content {
-                selora_workflow::ArtifactContent::Markdown(body) => ("markdown".to_owned(), body),
-                selora_workflow::ArtifactContent::File(path) => ("file".to_owned(), path),
-            };
-            selora_protocol::WorkflowArtifactDto {
-                id: artifact.id,
-                title: artifact.title.unwrap_or_default(),
-                kind,
-                body,
+            {
+                Some(name) if !name.trim().is_empty() => {
+                    if !history.phases.iter().any(|phase| phase == name) {
+                        history.phases.push(name.to_owned());
+                    }
+                }
+                _ => dropped = true,
+            },
+            "engine_step_started" => {
+                match serde_json::from_value::<StepStartRecord>(entry.payload.clone()) {
+                    Ok(start) => {
+                        starts.insert(start.step.index, start);
+                    }
+                    Err(_) => dropped = true,
+                }
             }
-        })
-        .collect();
-
-    WorkflowRunHistory {
-        phases: report.phases,
-        steps: report
-            .steps
-            .into_iter()
-            .map(|step| workflow_step_dto(step, String::new()))
-            .collect(),
-        reports,
-        artifacts,
-        tokens: report.tokens,
-        cost_usd: report.cost_usd,
-        error: report.error,
+            "engine_step_finished" => {
+                match serde_json::from_value::<StepFinishRecord>(entry.payload.clone()) {
+                    Ok(finish) => {
+                        finishes.insert(finish.step.index, finish);
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_report_item" => {
+                has_report_records = true;
+                match serde_json::from_value::<ReportItemRecord>(entry.payload.clone()) {
+                    // First record per ordinal wins: a resumed run may append
+                    // again, and the original live id must not move.
+                    Ok(record) => {
+                        report_records.entry(record.index).or_insert(record);
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_artifact" => {
+                has_artifact_records = true;
+                match serde_json::from_value::<selora_workflow::ArtifactRecord>(
+                    entry.payload.clone(),
+                ) {
+                    Ok(record) => {
+                        if seen_artifacts.insert(record.artifact.id.clone()) {
+                            artifact_records.push(record);
+                        }
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_run_finished" => {
+                match serde_json::from_value::<selora_workflow::WorkflowReport>(
+                    entry.payload.clone(),
+                ) {
+                    Ok(report) => terminal = Some(report),
+                    Err(_) => dropped = true,
+                }
+            }
+            _ => {}
+        }
     }
+
+    // Steps in engine order. A terminal report covers a journal that predates
+    // the explicit step records; its phase stays unknown (empty).
+    if starts.is_empty() {
+        if let Some(report) = &terminal {
+            history.steps = report
+                .steps
+                .iter()
+                .map(|step| workflow_step_dto(step.clone(), String::new()))
+                .collect();
+        }
+    } else {
+        let mut spent_usd = 0.0;
+        let mut tokens = 0u64;
+        for (index, start) in &starts {
+            let finish = finishes.get(index);
+            if let Some(finish) = finish {
+                spent_usd += finish.cost_usd;
+                tokens = tokens.saturating_add(finish.tokens);
+            }
+            let step = finish.map_or(&start.step, |finish| &finish.step);
+            // Finish phase wins for a `phase()` step: it is the marker that
+            // just opened. Every other step keeps the phase it started in.
+            let phase = finish
+                .and_then(|finish| finish.phase.clone())
+                .or_else(|| start.phase.clone())
+                .unwrap_or_default();
+            if step.kind == selora_workflow::StepKind::Phase
+                && !phase.trim().is_empty()
+                && !history.phases.iter().any(|known| known == &phase)
+            {
+                history.phases.push(phase.clone());
+            }
+            let (status, error) = match finish {
+                Some(finish) => (
+                    workflow_step_status(finish.step.status),
+                    finish.step.error.clone(),
+                ),
+                None => (WorkflowStatus::Running, None),
+            };
+            history.steps.push(selora_protocol::WorkflowStepDto {
+                id: format!("step-{}", index),
+                phase,
+                label: if step.detail.is_empty() {
+                    workflow_step_label(step.kind).to_owned()
+                } else {
+                    step.detail.clone()
+                },
+                status,
+                agent: step.agent.clone(),
+                detail: error,
+            });
+        }
+        history.cost_usd = spent_usd;
+        history.tokens = tokens;
+    }
+
+    // Reports: the explicit ordinal is the live `report-N` id.
+    if has_report_records {
+        for (ordinal, record) in &report_records {
+            history.reports.push(selora_protocol::WorkflowReportDto {
+                id: format!("report-{ordinal}"),
+                item: workflow_report_item_text(&record.item),
+                artifact_id: record.artifact_id.clone(),
+                phase: record.phase.clone(),
+            });
+        }
+    } else if let Some(report) = &terminal {
+        // Pre-explicit journal: only a report step recorded as Ok can prove the
+        // item reached the host. A failed report step is omitted.
+        let mut ordinal = 0u64;
+        for step in &report.steps {
+            if step.kind != selora_workflow::StepKind::Report
+                || step.status != selora_workflow::StepStatus::Ok
+            {
+                continue;
+            }
+            ordinal += 1;
+            let Some(items) = starts
+                .get(&step.index)
+                .and_then(|start| start.inputs.as_array())
+            else {
+                dropped = true;
+                continue;
+            };
+            let Some(item) = items.first() else {
+                dropped = true;
+                continue;
+            };
+            history.reports.push(selora_protocol::WorkflowReportDto {
+                id: format!("report-{ordinal}"),
+                item: workflow_report_item_text(item),
+                artifact_id: items
+                    .get(1)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                phase: starts
+                    .get(&step.index)
+                    .and_then(|start| start.phase.clone()),
+            });
+        }
+    }
+
+    // Artifacts: explicit records carry content and title even when the step
+    // value was null or the terminal report is missing.
+    if has_artifact_records {
+        for record in &artifact_records {
+            let (kind, body) = match &record.artifact.content {
+                ArtifactContent::Markdown(body) => ("markdown".to_owned(), body.clone()),
+                ArtifactContent::File(path) => ("file".to_owned(), path.clone()),
+            };
+            history
+                .artifacts
+                .push(selora_protocol::WorkflowArtifactDto {
+                    id: record.artifact.id.clone(),
+                    title: record.artifact.title.clone().unwrap_or_default(),
+                    kind,
+                    body,
+                    phase: record.phase.clone(),
+                });
+        }
+    } else if let Some(report) = &terminal {
+        history.artifacts = report
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let (kind, body) = match &artifact.content {
+                    ArtifactContent::Markdown(body) => ("markdown".to_owned(), body.clone()),
+                    ArtifactContent::File(path) => ("file".to_owned(), path.clone()),
+                };
+                selora_protocol::WorkflowArtifactDto {
+                    id: artifact.id.clone(),
+                    title: artifact.title.clone().unwrap_or_default(),
+                    kind,
+                    body,
+                    phase: None,
+                }
+            })
+            .collect();
+    }
+
+    if let Some(report) = terminal {
+        history.cost_usd = history.cost_usd.max(report.cost_usd);
+        history.tokens = history.tokens.max(report.tokens);
+        history.error = report.error;
+    }
+    if history.error.is_none() {
+        history.error = finishes
+            .values()
+            .rev()
+            .find(|finish| finish.step.status == selora_workflow::StepStatus::Failed)
+            .and_then(|finish| finish.step.error.clone());
+    }
+    if dropped || journal.is_damaged() {
+        history.note = Some(
+            "Some journal records could not be reconstructed; missing items are omitted.".into(),
+        );
+    }
+    history
 }
 
 /// Discover durable runs for the bootstrap. Corrupt or foreign directories are
@@ -243,7 +406,7 @@ fn persisted_workflow_runs(
             } else if journal.is_damaged() {
                 Some("The run journal is damaged and cannot resume safely.".into())
             } else {
-                detail
+                detail.or_else(|| history.note.clone())
             },
             phases: history.phases,
             steps: history.steps,
@@ -829,16 +992,27 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
                 }));
             }
             WorkflowEvent::Report { item } => {
+                let phase = self
+                    .phase
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
                 self.record(FrontendEvent::WorkflowReport(WorkflowReportEventDto {
                     run_id: self.current_run_id(),
                     report: WorkflowReportDto {
                         id: format!("report-{}", item.index),
                         item: workflow_report_item_text(&item.item),
                         artifact_id: item.artifact_id,
+                        phase: (!phase.trim().is_empty()).then_some(phase),
                     },
                 }));
             }
             WorkflowEvent::Artifact { artifact } => {
+                let phase = self
+                    .phase
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
                 let (kind, body) = match artifact.content {
                     selora_workflow::ArtifactContent::Markdown(body) => {
                         ("markdown".to_owned(), body)
@@ -852,6 +1026,7 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
                         title: artifact.title.unwrap_or_default(),
                         kind,
                         body,
+                        phase: (!phase.trim().is_empty()).then_some(phase),
                     },
                 }));
             }
@@ -3645,6 +3820,9 @@ mod tests {
         /// Make `ask` fail so a durable run can end with an unfinished ask
         /// (`incomplete_asks` then sees it).
         ask_fails: bool,
+        /// The 1-based `report` call that fails; 0 never fails.
+        report_fails_at: u64,
+        report_calls: std::sync::atomic::AtomicU64,
         /// Disk edits the fake performs when `world.run` starts: `Some` writes,
         /// `None` deletes. This is how a test makes a "workflow edits disk"
         /// happen while the tab is open.
@@ -3662,6 +3840,13 @@ mod tests {
         fn with_failing_ask() -> Self {
             Self {
                 ask_fails: true,
+                ..Self::default()
+            }
+        }
+
+        fn with_report_failure(at: u64) -> Self {
+            Self {
+                report_fails_at: at,
                 ..Self::default()
             }
         }
@@ -3762,6 +3947,10 @@ mod tests {
             _item: &serde_json::Value,
             _artifact_id: Option<&str>,
         ) -> Result<(), HostError> {
+            let call = self.report_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.report_fails_at == call {
+                return Err(HostError::new("workflow report failed"));
+            }
             Ok(())
         }
 
@@ -4787,13 +4976,257 @@ mod tests {
             .find(|run| run.run_id == summary.run_id)
             .expect("a damaged journal stays listed");
         assert!(!saved.resumable);
-        assert!(saved.detail.is_some(), "the damage is explained");
-        assert!(saved.phases.is_empty(), "no phase is invented");
-        assert!(saved.steps.is_empty(), "no step is invented");
-        assert!(saved.reports.is_empty(), "no report is invented");
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("damaged")),
+            "the damage is explained: {:?}",
+            saved.detail
+        );
+        // Only the corrupt terminal record is omitted: the explicit step,
+        // phase and report records still reconstruct what actually happened.
+        assert_eq!(saved.phases, vec!["scan".to_string()]);
+        assert_eq!(saved.steps.len(), 2, "phase step and report step");
+        assert_eq!(saved.steps[1].phase, "scan");
+        assert_eq!(saved.steps[1].status, WorkflowStatus::Completed);
+        assert_eq!(saved.reports.len(), 1, "the report that happened is kept");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        assert_eq!(saved.reports[0].phase.as_deref(), Some("scan"));
         assert!(saved.artifacts.is_empty(), "no artifact is invented");
-        assert_eq!(saved.tokens, 0);
+        assert_eq!(saved.tokens, 0, "the fake host pre-charges before the run");
         assert_eq!(saved.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn p8_workflow_multi_phase_history_keeps_reports_phases_and_artifact_content() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-multi-phase-history",
+                        r#"
+                            report("pre");
+                            phase("scan");
+                            files.read("a");
+                            report("scan item", "summary");
+                            artifact.markdown("summary", "Body without title");
+                            phase("fix");
+                            files.read("b");
+                            report({ stage: "fix" });
+                            phase("verify");
+                            report("final");
+                        "#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary.status, WorkflowStatus::Completed);
+
+        // A fresh bootstrap is the reload path: everything comes from the journal.
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("the completed run reloads as history");
+        assert_eq!(saved.status, WorkflowStatus::Completed);
+        assert!(saved.detail.is_none(), "{:?}", saved.detail);
+        assert_eq!(
+            saved.phases,
+            vec!["scan".to_string(), "fix".to_string(), "verify".to_string()]
+        );
+        assert_eq!(saved.steps.len(), 10);
+        assert_eq!(saved.steps[0].phase, "", "the first report has no phase");
+        assert_eq!(
+            saved.steps[1].phase, "scan",
+            "a phase step lands in its phase"
+        );
+        assert_eq!(saved.steps[3].phase, "scan");
+        assert_eq!(saved.steps[4].phase, "scan", "artifact phase");
+        assert_eq!(saved.steps[6].phase, "fix");
+        assert_eq!(saved.steps[9].phase, "verify");
+        assert_eq!(saved.reports.len(), 4);
+        assert_eq!(
+            saved
+                .reports
+                .iter()
+                .map(|report| (report.id.as_str(), report.phase.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("report-1", None),
+                ("report-2", Some("scan")),
+                ("report-3", Some("fix")),
+                ("report-4", Some("verify")),
+            ]
+        );
+        assert_eq!(saved.reports[1].item, "scan item");
+        assert_eq!(saved.reports[1].artifact_id.as_deref(), Some("summary"));
+        assert_eq!(saved.reports[2].item, r#"{"stage":"fix"}"#);
+        assert_eq!(saved.artifacts.len(), 1);
+        assert_eq!(saved.artifacts[0].id, "summary");
+        assert_eq!(
+            saved.artifacts[0].title, "",
+            "an empty title is not invented"
+        );
+        assert_eq!(saved.artifacts[0].kind, "markdown");
+        assert_eq!(saved.artifacts[0].body, "Body without title");
+        assert_eq!(saved.artifacts[0].phase.as_deref(), Some("scan"));
+        assert_eq!(saved.tokens, summary.tokens);
+        assert_eq!(saved.cost_usd, summary.cost_usd);
+    }
+
+    #[test]
+    fn p8_workflow_failed_report_step_never_appears_as_reported() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_report_failure(2),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-failed-report",
+                        r#"phase("scan"); report("kept"); report("lost");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary.status, WorkflowStatus::Failed);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("the failed run reloads as history");
+        assert_eq!(saved.reports.len(), 1, "the failed report is not claimed");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        let failed = saved
+            .steps
+            .iter()
+            .find(|step| step.status == WorkflowStatus::Failed)
+            .expect("the failed report step is in history");
+        assert_eq!(failed.detail.as_deref(), Some("workflow report failed"));
+        assert_eq!(failed.phase, "scan");
+    }
+
+    #[test]
+    fn p8_workflow_old_format_journal_still_loads_with_unknown_phase() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-old-format",
+                        r#"phase("scan"); artifact.markdown("summary", "Body", { title: "T" }); report("kept", "summary");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let id = selora_workflow::RunId::from(summary.run_id.as_str());
+        let path = selora_workflow::journal::journal_path(dir.path(), &id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Strip the additive history records and every phase field, leaving the
+        // pre-history vocabulary (step records + terminal report).
+        let mut kept = Vec::new();
+        for line in text.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if matches!(
+                value["kind"].as_str(),
+                Some("engine_report_item" | "engine_artifact")
+            ) {
+                continue;
+            }
+            if matches!(
+                value["kind"].as_str(),
+                Some(
+                    "engine_step_started"
+                        | "engine_step_finished"
+                        | "engine_report_item"
+                        | "engine_artifact"
+                )
+            ) {
+                if let Some(payload) = value.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    payload.remove("phase");
+                }
+            }
+            value["seq"] = serde_json::json!(kept.len() as u64 + 1);
+            kept.push(value.to_string());
+        }
+        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("an old-format journal still loads");
+        assert_eq!(saved.status, WorkflowStatus::Completed);
+        assert_eq!(saved.phases, vec!["scan".to_string()]);
+        assert!(
+            saved.steps.iter().all(|step| step.phase.is_empty()),
+            "the old format has no per-step phase"
+        );
+        assert_eq!(saved.reports.len(), 1, "reports come from step inputs");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        assert_eq!(saved.reports[0].artifact_id.as_deref(), Some("summary"));
+        assert_eq!(saved.artifacts.len(), 1, "artifacts come from the terminal");
+        assert_eq!(saved.artifacts[0].title, "T");
+        assert_eq!(saved.artifacts[0].body, "Body");
+        assert!(saved.detail.is_none(), "{:?}", saved.detail);
     }
 
     #[test]
