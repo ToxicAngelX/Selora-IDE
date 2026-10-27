@@ -1216,6 +1216,9 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
             // Phase 9b plan cards belong to a chat session, not a workflow
             // subagent; an unexpected one is never rendered as a write.
             selora_ai::ApprovalCard::Plan { .. } => return,
+            // §19.4 question cards are a chat-session park, never a
+            // workflow grant.
+            selora_ai::ApprovalCard::Question(_) => return,
         };
         self.record(FrontendEvent::WorkflowApprovalNeeded(
             WorkflowApprovalNeededDto {

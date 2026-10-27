@@ -16,10 +16,10 @@ use std::{
 };
 
 use selora_ai::{
-    run_agent_turn, tool_manifest, AgentDecision, AgentEvent, AgentToolSettings, AgentTurnReport,
-    AgentTurnState, BashAbortHandle, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, ChatStream,
-    ClientChatStream, Model, Role, RouterToolRunner, SeloraClient, ToolCall, ToolContext,
-    ToolOutcome, ToolResult, ToolRunner, ToolSpec, TurnCaps, TurnDecision, TurnInput,
+    run_agent_turn, AgentDecision, AgentEvent, AgentToolSettings, AgentTurnReport, AgentTurnState,
+    BashAbortHandle, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, ChatStream,
+    ClientChatStream, Model, Role, RouterToolRunner, SeloraClient, SubagentPolicy, ToolCall,
+    ToolContext, ToolOutcome, ToolResult, ToolRunner, ToolSpec, TurnCaps, TurnDecision, TurnInput,
 };
 use selora_workflow::{
     subagent::{AskError, AskExecutor, AskReply, AskRequest},
@@ -102,28 +102,17 @@ impl AskExecutor for WorkflowAskExecutor {
     }
 }
 
-/// Closed policy on BOTH router entry points, not merely the advertised tools.
-/// Unknown future tools are disabled until explicitly included in this policy.
+/// The workflow host consumes the shared §19.3 policy. `full` is the §17.1
+/// surface only (no nested spawn/question tools), and both router entry points
+/// reject anything else structurally.
 fn allowed_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "fuzzy_find"
-            | "search_files"
-            | "write_file"
-            | "edit_file"
-            | "delete_file"
-            | "bash"
-            | "web_search"
-            | "web_fetch"
-    )
+    SubagentPolicy::Full.allows(name)
 }
 
 fn manifest() -> Vec<ToolSpec> {
-    tool_manifest()
+    SubagentPolicy::Full
+        .manifest()
         .into_iter()
-        .filter(|tool| allowed_tool(&tool.name))
         .map(|mut tool| {
             if tool.name == "bash" {
                 tool.description = "Run a workspace-rooted shell command. Every command requires \
@@ -540,7 +529,8 @@ impl WorkflowHost {
                 auto_approve_commands: Vec::new(),
                 ..AgentToolSettings::default()
             },
-        );
+        )
+        .with_policy(SubagentPolicy::Full);
         let tools = WorkflowTools::new(context, self.tool_effects.clone());
         let chat = WorkflowChat::Client(ClientChatStream::new(SeloraClient::new(
             &self.config.base_url,
@@ -573,7 +563,15 @@ impl WorkflowHost {
             host: self,
             turn_id,
         };
-        let turn = run_agent_turn(input, chat, tools, event_tx, decision_rx);
+        // The workflow host arms the shared §19.3 policy manifest and keeps its own
+        // turn settings (caps, temperature, compaction).
+        let turn = run_agent_turn(
+            input.with_manifest(SubagentPolicy::Full.manifest()),
+            chat,
+            tools,
+            event_tx,
+            decision_rx,
+        );
         tokio::pin!(turn);
         let mut approval_error = None;
         loop {

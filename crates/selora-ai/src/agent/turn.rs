@@ -455,6 +455,11 @@ impl ToolRunner for RouterToolRunner {
         // must not run further bash commands even if a straggler future
         // resolves.
         self.ctx.abort.kill();
+        // §19.3: a parent Stop cancels its children, including a child a
+        // blocking `wait` call is parked on.
+        if let (Some(subagents), Some(parent)) = (&self.ctx.subagents, &self.ctx.parent_session) {
+            subagents.cancel_parent(parent);
+        }
     }
 
     fn plan_snapshot(&self) -> Option<plan::PlanSnapshot> {
@@ -1070,11 +1075,12 @@ where
                     // A workflow or plan card is never pre-approved: the shell starts the
                     // run / flips the session from the card's explicit Approve, so
                     // an earlier `Approve all this turn` must not silently skip the
-                    // confirmation.
+                    // confirmation. A question card likewise needs its own answer.
                     let explicit_card = matches!(
                         &card,
                         crate::agent::ApprovalCard::Workflow { .. }
                             | crate::agent::ApprovalCard::Plan { .. }
+                            | crate::agent::ApprovalCard::Question(_)
                     );
                     let auto_write = auto_approve_writes
                         && !matches!(
@@ -1082,6 +1088,7 @@ where
                             crate::agent::ApprovalCard::Command { .. }
                                 | crate::agent::ApprovalCard::Workflow { .. }
                                 | crate::agent::ApprovalCard::Plan { .. }
+                                | crate::agent::ApprovalCard::Question(_)
                         );
                     if (turn.approve_all && !explicit_card) || auto_write {
                         // §17.4: ApproveAllThisTurn pre-approves the rest
@@ -1092,11 +1099,19 @@ where
                         let approval_id = Uuid::new_v4();
                         turn.state = AgentTurnState::AwaitingApproval(approval_id);
                         if !emit(&events, AgentEvent::State(turn.state.clone()))
-                            || !emit(&events, AgentEvent::ApprovalNeeded { approval_id, card })
+                            || !emit(
+                                &events,
+                                AgentEvent::ApprovalNeeded {
+                                    approval_id,
+                                    card: card.clone(),
+                                },
+                            )
                         {
                             end = Some(TurnEnd::Failed("agent event receiver dropped".into()));
                             break 'turn;
                         }
+                        let question_card =
+                            matches!(&card, crate::agent::ApprovalCard::Question(_));
                         match park_for_decision(&mut decisions, approval_id, deadline).await {
                             Parked::Stop => {
                                 end = Some(TurnEnd::StoppedByUser);
@@ -1112,12 +1127,30 @@ where
                                 end = Some(TurnEnd::Failed("agent decision channel closed".into()));
                                 break 'turn;
                             }
-                            Parked::Decided(AgentDecision::Approve) => turn.approved += 1,
+                            Parked::Decided(AgentDecision::Approve) => {
+                                if question_card {
+                                    result = Some(ToolResult::error(
+                                        &call.id,
+                                        "this card needs an answer, not approval",
+                                    ));
+                                } else {
+                                    turn.approved += 1;
+                                }
+                            }
                             Parked::Decided(AgentDecision::ApproveAllThisTurn) => {
-                                turn.approved += 1;
-                                if !matches!(call.name.as_str(), "exit_plan_mode" | "run_workflow")
-                                {
-                                    turn.approve_all = true;
+                                if question_card {
+                                    result = Some(ToolResult::error(
+                                        &call.id,
+                                        "this card needs an answer, not approval",
+                                    ));
+                                } else {
+                                    turn.approved += 1;
+                                    if !matches!(
+                                        call.name.as_str(),
+                                        "exit_plan_mode" | "run_workflow"
+                                    ) {
+                                        turn.approve_all = true;
+                                    }
                                 }
                             }
                             Parked::Decided(AgentDecision::Deny) => {
@@ -1128,7 +1161,18 @@ where
                             // It keeps the session planning (nothing was
                             // flipped) and tells the model to resubmit.
                             Parked::Decided(AgentDecision::Answer(answer)) => {
-                                result = Some(ToolResult::success(&call.id, answer));
+                                // An answer resumes a question card; it is
+                                // model input, never an effect grant.
+                                result = Some(if question_card {
+                                    crate::agent::subagent_turn::question_answer_result(
+                                        &call, &answer,
+                                    )
+                                } else {
+                                    ToolResult::error(
+                                        &call.id,
+                                        "this card is not a question — an answer cannot approve it",
+                                    )
+                                });
                             }
                             Parked::Decided(AgentDecision::Revise) => {
                                 turn.denied += 1;
@@ -2612,9 +2656,101 @@ mod tests {
         let report = task.await.unwrap();
         assert_eq!(report.end, TurnEnd::Completed);
         assert!(state.lock().unwrap().approved_runs.is_empty());
-        assert!(report.conversation.iter().any(
-            |message| message.role == crate::Role::Tool && message.content == "Use src/main.rs"
+        // §19.4: an answer never approves a non-question card. It is a
+        // model-visible error and no side effect ran.
+        assert!(report.conversation.iter().any(|message| {
+            message.role == crate::Role::Tool
+                && message.content.contains("an answer cannot approve it")
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_question_card_answers_only_with_an_answer_and_never_auto_approves() {
+        // Full access must not pre-approve a question: it needs an answer.
+        let question = ApprovalCard::Question(crate::agent::QuestionCard {
+            questions: vec![crate::agent::AgentQuestion {
+                question: "Which file?".into(),
+                options: vec![crate::agent::QuestionOption {
+                    label: "src/a.rs".into(),
+                    description: String::new(),
+                }],
+                allow_free_text: true,
+            }],
+        });
+        let (chat, _) = ScriptedChat::new(vec![
+            tool_round(&[("ask-1", "ask_user_question", "{}")], "", 0.0),
+            answer_round("Understood.", 0.0),
+        ]);
+        let (runner, state) = MockRunner::new(vec![(
+            "ask-1",
+            MockTool::Card {
+                card: question,
+                approved: ToolResult::success("ask-1", "must not execute"),
+            },
+        )]);
+        let (events, receiver) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(receiver);
+        let (decisions, decision_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_agent_turn(
+            TurnInput::new(model(), conversation()).with_auto_approve_writes(true),
+            chat,
+            runner,
+            events,
+            decision_rx,
         ));
+        let id = recorder.wait_for_approval().await;
+
+        // Approve is refused as a model-visible error, never an execution.
+        decisions.send((id, AgentDecision::Approve)).unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert!(state.lock().unwrap().approved_runs.is_empty());
+        assert!(report.conversation.iter().any(|message| {
+            message.role == crate::Role::Tool
+                && message.content.contains("needs an answer, not approval")
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_question_answer_resumes_the_card_as_the_tool_result() {
+        let question = ApprovalCard::Question(crate::agent::QuestionCard {
+            questions: vec![crate::agent::AgentQuestion {
+                question: "Which file?".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+            }],
+        });
+        let (chat, _) = ScriptedChat::new(vec![
+            tool_round(&[("ask-2", "ask_user_question", "{}")], "", 0.0),
+            answer_round("Understood.", 0.0),
+        ]);
+        let (runner, state) = MockRunner::new(vec![(
+            "ask-2",
+            MockTool::Card {
+                card: question,
+                approved: ToolResult::success("ask-2", "must not execute"),
+            },
+        )]);
+        let (events, receiver) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(receiver);
+        let (decisions, decision_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_agent_turn(
+            TurnInput::new(model(), conversation()),
+            chat,
+            runner,
+            events,
+            decision_rx,
+        ));
+        let id = recorder.wait_for_approval().await;
+        decisions
+            .send((id, AgentDecision::Answer("src/a.rs".into())))
+            .unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert!(state.lock().unwrap().approved_runs.is_empty());
+        assert!(report.conversation.iter().any(|message| {
+            message.role == crate::Role::Tool && message.content.contains("src/a.rs")
+        }));
     }
 
     // -----------------------------------------------------------------------

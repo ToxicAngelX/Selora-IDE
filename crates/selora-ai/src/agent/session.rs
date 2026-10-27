@@ -163,6 +163,11 @@ impl ParkedCard {
                     format!("{tool_name} plan with {} step(s)", steps.len())
                 }
                 ApprovalCard::Workflow { name, .. } => format!("{tool_name} {name}"),
+                ApprovalCard::Question(card) => card
+                    .questions
+                    .first()
+                    .map(|question| format!("{tool_name} {}", question.question))
+                    .unwrap_or_else(|| format!("{tool_name} question")),
             },
             Self::Question { prompt, .. } => prompt.clone(),
         }
@@ -695,6 +700,26 @@ impl AgentSessionStore {
                         commands: commands.iter().map(|line| self.scrub(line)).collect(),
                         max_cost_usd,
                     },
+                    ApprovalCard::Question(card) => {
+                        ApprovalCard::Question(crate::agent::QuestionCard {
+                            questions: card
+                                .questions
+                                .iter()
+                                .map(|question| crate::agent::AgentQuestion {
+                                    question: self.scrub(&question.question),
+                                    options: question
+                                        .options
+                                        .iter()
+                                        .map(|option| crate::agent::QuestionOption {
+                                            label: self.scrub(&option.label),
+                                            description: self.scrub(&option.description),
+                                        })
+                                        .collect(),
+                                    allow_free_text: question.allow_free_text,
+                                })
+                                .collect(),
+                        })
+                    }
                 };
                 ParkedCard::Approval {
                     approval_id,

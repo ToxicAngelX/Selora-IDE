@@ -334,6 +334,9 @@ export type ApprovalNeededPayload = {
    * summary. Present only on a plan card.
    */
   plan?: PlanApproval;
+  /** §19.3: the background child that raised this card, when it is a
+   * subagent's write/bash/question rather than the parent turn's own call. */
+  subagent_id?: string;
 };
 
 export type PlanStateChangedPayload = {
