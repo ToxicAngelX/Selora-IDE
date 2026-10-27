@@ -145,6 +145,12 @@ Important: the only registered Inno Setup install lives under `%TEMP%`. Windows
 or a cleanup tool can remove it. A durable owner/CI install is
 `winget install JRSoftware.InnoSetup` (6.3+ or 7.x).
 
+> **Resolved 2026-10-27:** `installer/prebuild.bat` now resolves ISCC through
+> `installer/find-iscc.ps1` (SELORA_ISCC, PATH, standard directories, then the
+> uninstall registry) and passes an absolute `/O`, so this `%TEMP%` compiler is
+> found and the setup lands in `installer/output/`. The manual `/O` override
+> below is kept as a record of the original run.
+
 ### 4.2 Staging and compile
 
 `prebuild.bat` was not run because it would have exited at the ISCC lookup after

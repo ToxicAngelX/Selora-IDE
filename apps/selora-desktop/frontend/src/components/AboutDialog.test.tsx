@@ -8,6 +8,7 @@ import {
   isNewerVersion,
   LATEST_RELEASE_URL,
   REPOSITORY_URL,
+  repositorySlug,
   useAboutTrigger,
 } from './AboutDialog';
 import { toastStore } from '../features/toasts/toast-store';
@@ -32,6 +33,15 @@ function releaseResponse(tag: string) {
 }
 
 describe('AboutDialog', () => {
+  it('derives the release endpoint from the package repository URL', () => {
+    expect(REPOSITORY_URL).toMatch(/^https:\/\/github\.com\/[^/]+\/[^/]+$/);
+    expect(repositorySlug()).toBe(REPOSITORY_URL.replace(/^https:\/\/github\.com\//, ''));
+    expect(LATEST_RELEASE_URL).toBe(
+      `https://api.github.com/repos/${repositorySlug(REPOSITORY_URL)}/releases/latest`,
+    );
+    expect(repositorySlug('https://github.com/a/b.git')).toBe('a/b');
+  });
+
   beforeEach(() => {
     bridgeMock.openExternal.mockClear();
     contextMock.mockClear();

@@ -13,10 +13,21 @@ import { openExternal } from '../bridge/bridge';
 import '../styles/onboarding.css';
 
 declare const __APP_VERSION__: string;
+declare const __REPOSITORY_URL__: string;
 
 export const ABOUT_EVENT = 'selora:about';
-export const LATEST_RELEASE_URL = 'https://api.github.com/repos/ToxicAngelX/Selora-IDE/releases/latest';
-export const REPOSITORY_URL = 'https://github.com/ToxicAngelX/Selora-IDE';
+
+// Derived from package.json repository.url via vite.config.ts; CI's
+// scripts/check-release-metadata.ps1 asserts Cargo.toml agrees. A rename must
+// not leave the update check on a stale slug (a 404 looked like "no release").
+export const REPOSITORY_URL = __REPOSITORY_URL__;
+
+/** `owner/repo` from the repository URL, without scheme or `.git`. */
+export function repositorySlug(url: string = REPOSITORY_URL): string {
+  return url.replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/+$/, '');
+}
+
+export const LATEST_RELEASE_URL = `https://api.github.com/repos/${repositorySlug()}/releases/latest`;
 
 export type ReleaseInfo = {
   tag: string;
@@ -192,7 +203,7 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
             void openExternal(REPOSITORY_URL, context).catch(() => undefined);
           }}
         >
-          github.com/ToxicAngelX/Selora-IDE
+          github.com/{repositorySlug()}
         </a>
 
         <div className="about-feedback" aria-live="polite">

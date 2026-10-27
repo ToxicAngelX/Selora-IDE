@@ -35,6 +35,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4.2.2
 
+      # Fails fast on a version or repository-slug mismatch (Cargo.toml,
+      # tauri.conf.json, frontend package.json, selora-ide.iss, mkdocs.yml).
+      # On a tag push it also requires the CHANGELOG section, mirroring
+      # release.yml. No build is needed.
+      - name: Verify release metadata
+        shell: pwsh
+        run: |
+          $params = @{}
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $params.Tag = $env:GITHUB_REF_NAME }
+          & .\scripts\check-release-metadata.ps1 @params
+          if ($LASTEXITCODE -ne 0) { throw "Release metadata check failed with $LASTEXITCODE" }
+
       - name: Set up Node.js
         uses: actions/setup-node@v4.1.0
         with:
@@ -85,7 +97,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
         run: cargo build --workspace --locked

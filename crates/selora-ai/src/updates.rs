@@ -12,10 +12,28 @@ use serde::Deserialize;
 
 use selora_core::SeloraError;
 
-/// The repo's "latest release" endpoint (RELEASE.md §7: the owner publishes
-/// GitHub Releases from the `v*.*.*` tag pipeline).
-pub const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/ToxicAngelX/Selora-IDE/releases/latest";
+/// The repository's public home, from the workspace manifest
+/// (`[workspace.package] repository`). Shared by the About dialog and the
+/// update check, so a rename is a one-line Cargo.toml change.
+pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// The `owner/repo` part of [`REPOSITORY_URL`] (no scheme, no `.git`).
+fn release_slug() -> &'static str {
+    let url = REPOSITORY_URL.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    url.strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .unwrap_or(url)
+}
+
+/// The repo's "latest release" endpoint, derived from the workspace manifest
+/// so a repository rename cannot leave the update check on a stale slug.
+pub fn latest_release_url() -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        release_slug()
+    )
+}
 
 /// What the update check learned about the latest published release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +71,7 @@ fn version_triple(tag: &str) -> Option<(u64, u64, u64)> {
 /// The update check (UI_SPEC.md §11): fetch the latest release and compare
 /// it against `current` (the running build's `CARGO_PKG_VERSION`).
 pub async fn check_latest_release(current: &str) -> Result<ReleaseInfo, SeloraError> {
-    check_latest_release_at(LATEST_RELEASE_URL, current).await
+    check_latest_release_at(&latest_release_url(), current).await
 }
 
 /// The same check against an explicit endpoint (the wiremock seam).
@@ -92,6 +110,21 @@ pub async fn check_latest_release_at(url: &str, current: &str) -> Result<Release
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_release_url_derives_from_the_manifest_repository() {
+        // A rename in [workspace.package] repository must move the update
+        // check with it. CI also runs scripts/check-release-metadata.ps1,
+        // which asserts this derivation still exists.
+        assert!(REPOSITORY_URL.starts_with("https://github.com/"));
+        let slug = release_slug();
+        assert_eq!(slug.matches('/').count(), 1, "slug is owner/repo");
+        assert!(!slug.contains("://"));
+        assert_eq!(
+            latest_release_url(),
+            format!("https://api.github.com/repos/{slug}/releases/latest")
+        );
+    }
 
     #[test]
     fn triples_parse_with_and_without_the_v_prefix() {

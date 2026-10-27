@@ -9,6 +9,12 @@ rem runtime DLL the release binary actually imports beside it, fetches the
 rem WebView2 Evergreen bootstrapper when it is not already cached, and runs
 rem Inno Setup with /DMyAppVersion, /DMyTargetDir, and /DMyCrtDlls.
 rem
+rem ISCC.exe is located by installer\find-iscc.ps1: SELORA_ISCC, PATH, the
+rem standard Inno Setup 6/7 directories, then the uninstall registry. The
+rem compiler's own install location no longer decides where the setup lands:
+rem /O is passed explicitly and the artifact is always written to
+rem installer\output\Selora-IDE-Setup-<version>.exe.
+rem
 rem Honors CARGO_TARGET_DIR: the release binary and the staged DLLs are read
 rem from %CARGO_TARGET_DIR%\release when it is set (cargo resolves a relative
 rem CARGO_TARGET_DIR against the directory it runs in, which is this repo
@@ -29,6 +35,7 @@ if errorlevel 1 (
     echo prebuild: could not enter the repository root 1>&2
     exit /b 1
 )
+set "REPO_ROOT=%CD%"
 
 rem Windows PowerShell 5.1 is the "powershell.exe" the script calls. Pin its
 rem module path to the in-box modules: an inherited PSModulePath from a
@@ -42,6 +49,20 @@ if not defined VERSION (
     exit /b 1
 )
 echo prebuild: version %VERSION%
+
+rem Resolve the compiler before the staging and download steps so a missing
+rem Inno Setup fails fast and writes nothing. find-iscc.ps1 covers PATH, the
+rem standard 6/7 directories, and the uninstall registry (a portable or
+rem extracted Inno Setup has no Program Files directory).
+set "ISCC="
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-iscc.ps1"`) do if not defined ISCC set "ISCC=%%i"
+if not defined ISCC (
+    echo prebuild: Inno Setup 6.3 or newer ^(or 7.x^) not found 1>&2
+    echo prebuild: install it with: winget install JRSoftware.InnoSetup 1>&2
+    echo prebuild: or set SELORA_ISCC to the full path of ISCC.exe 1>&2
+    exit /b 1
+)
+echo prebuild: using "%ISCC%"
 
 rem Resolve the build directory the same way cargo does. %%~fi turns a
 rem relative CARGO_TARGET_DIR into an absolute path so the Inno Setup script
@@ -70,28 +91,39 @@ if not defined CRT_DLLS (
 
 call :stage_webview2
 
-set "ISCC="
-for %%r in ("%ProgramFiles(x86)%" "%ProgramFiles%" "%LOCALAPPDATA%\Programs") do (
-    for %%v in (6 7) do (
-        if not defined ISCC if exist "%%~r\Inno Setup %%v\ISCC.exe" set "ISCC=%%~r\Inno Setup %%v\ISCC.exe"
-    )
-)
-if not defined ISCC (
-    echo prebuild: Inno Setup 6.3 or newer ^(or 7.x^) not found 1>&2
-    echo prebuild: install it with: winget install JRSoftware.InnoSetup 1>&2
+rem The output directory is explicit. Without /O, ISCC resolves the script's
+rem relative OutputDir against the script's own directory, so a relative or
+rem absolute invocation both happen to work - but a stray /O in the
+rem environment or a hand-run compile moved the setup out of the repository
+rem during the Phase 8 acceptance run. Pin it here: every prebuild produces
+rem installer\output\Selora-IDE-Setup-<version>.exe or fails.
+set "OUTPUT_DIR=%REPO_ROOT%\installer\output"
+if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
+if errorlevel 1 (
+    echo prebuild: could not create "%OUTPUT_DIR%" 1>&2
     exit /b 1
 )
-echo prebuild: using "%ISCC%"
+set "SETUP=%OUTPUT_DIR%\Selora-IDE-Setup-%VERSION%.exe"
+
+rem Remove a previous artifact for this version first: if ISCC fails, a stale
+rem setup must not survive to look like a fresh build.
+if exist "%SETUP%" del /q "%SETUP%" >nul 2>&1
 
 rem /DMyTargetDir and /DMyCrtDlls keep the installer in step with whatever was
 rem actually built and staged; selora-ide.iss defaults them for a hand-run ISCC.
-"%ISCC%" "/DMyAppVersion=%VERSION%" "/DMyTargetDir=%RELEASE_DIR%" "/DMyCrtDlls=%CRT_DLLS%" "%~dp0selora-ide.iss"
+"%ISCC%" "/DMyAppVersion=%VERSION%" "/DMyTargetDir=%RELEASE_DIR%" "/DMyCrtDlls=%CRT_DLLS%" "/O%OUTPUT_DIR%" "%~dp0selora-ide.iss"
 if errorlevel 1 (
     echo prebuild: ISCC failed 1>&2
     exit /b 1
 )
 
-echo prebuild: wrote installer\output\Selora-IDE-Setup-%VERSION%.exe
+if not exist "%SETUP%" (
+    echo prebuild: ISCC reported success but "%SETUP%" is missing 1>&2
+    echo prebuild: check the /O argument and the OutputDir/OutputBaseFilename directives 1>&2
+    exit /b 1
+)
+
+for %%s in ("%SETUP%") do echo prebuild: wrote "%SETUP%" (%%~zs bytes)
 exit /b 0
 
 
@@ -218,6 +250,9 @@ echo release binary: target\release\selora-desktop.exe, or
 echo %%CARGO_TARGET_DIR%%\release\selora-desktop.exe when CARGO_TARGET_DIR is set.
 echo.
 echo Requires Inno Setup 6.3 or newer ^(or 7.x^) and the MSVC x64 toolset.
+echo ISCC.exe is found via SELORA_ISCC, PATH, the standard 6/7 install
+echo directories, then the uninstall registry. The setup is always written to
+echo installer\output, regardless of where Inno Setup itself is installed.
 echo No files are written by this help text; running the script for real
 echo builds the installer.
 exit /b 0

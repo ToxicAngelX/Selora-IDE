@@ -55,16 +55,30 @@ and explicit `Resume anyway`; clean-buffer refresh with `BufferSnapshot` events;
 completed-run history from the terminal journal report; and a release binary plus
 a compiled installer. Every acceptance step still carries an `OWNER` row.
 
-### Packaging artifacts (built this tree, unsigned)
+### Packaging artifacts (Phase 8 build, unsigned - historical)
 
 | Artifact | Path | Size | SHA-256 |
 |---|---|---|---|
 | Release app | `target\release\selora-desktop.exe` | 18,823,168 | `167fcf8b4271bc558b413535dd2757d1d73168b48a1e134376b20ab21a4de50f` |
 | Installer | `%TEMP%\selora-phase8-installer\Selora-IDE-Setup-0.1.0.exe` | 9,388,643 | `7a20d776e9d31e9293036f9fb1314d3ec3008bde7fd841ffcdfc616abb806fa1` |
 
-The installer is outside `installer/output/` because ISCC lives in `%TEMP%`.
-Both artifacts are `NotSigned`. Release build process smoke: window created and
+These are the earlier Phase 8 smoke artifacts. The installer landed outside
+`installer/output/` because `prebuild.bat` could not find the `%TEMP%` ISCC
+copy. Both are `NotSigned`. Release build process smoke: window created and
 shown; no visual/manual UI acceptance was performed.
+
+### 0.1.0 release dry run (2026-10-27)
+
+| Artifact | Path | Size | SHA-256 |
+|---|---|---|---|
+| Release app | `target\release\selora-desktop.exe` | 18,875,904 | `acab5f75eb34a53525918c8b8e770f902adf8aa5c622419e3e13c4c1cc13cfd5` |
+| Installer | `installer\output\Selora-IDE-Setup-0.1.0.exe` | 9,408,027 | `95b2f4deb29fa851215fd08fd6f6a88918ec46757884b19866d4a829882360b0` |
+
+`installer\prebuild.bat` now resolves ISCC through `installer\find-iscc.ps1`
+(the local installer is registered under `%TEMP%`) and passes an absolute
+`/O`, so the setup lands in `installer\output`. The artifact is `NotSigned`,
+ProductVersion 0.1.0. Release metadata, tag gates, draft-asset checks, and
+owner-only steps are in `RELEASE_0.1.0_CHECKLIST.md`.
 
 Wave 3/4 review fixes include argument-safe `world.run`, approval retries,
 hydration, late events, concurrent folder switches, configured git diff helpers,
@@ -130,7 +144,7 @@ were yanked). No source API changed.
 | Workflows (Phase 8) | Engine, Host, approvals, durable resume/history, buffer refresh, live panel, and confirmation card are wired; owner acceptance pending |
 | Settings | Theme + reduced motion persist through Rust; every other control is disabled/read-only |
 | Terminal / Output | Intentionally inert placeholders |
-| Packaging | Release EXE and an unsigned installer were built from this tree; artifacts live in `target\release` and `%TEMP%`, not `installer/output` |
+| Packaging | Release EXE and an unsigned installer build from this tree into `target\release` and `installer\output` (the Phase 8 installer under `%TEMP%` is historical) |
 
 ## Next
 
@@ -141,8 +155,9 @@ were yanked). No source API changed.
    Open Folder, dirty-tab save/discard, LSP hover/definition with
    `rust-analyzer` on PATH, agent read/write + full auto-apply, agent approval
    for bash, Settings persistence, resize/restart.
-3. **Clean-VM installer test** — Windows 11, plus Windows 10 without WebView2.
-   The compiled installer is unsigned and currently under `%TEMP%`.
+3. **Clean-VM installer test** - Windows 11, plus Windows 10 without WebView2.
+   The compiled installer is unsigned and now at
+   `installer\output\Selora-IDE-Setup-0.1.0.exe`.
 4. **Session lifecycle** remains the main functional gap:
    `SwitchSession` / `NewSession` / `RetryMessage` are still local-only or
    `unsupported_phase_slice`. The design is recorded in the audit; implement it
@@ -152,12 +167,16 @@ were yanked). No source API changed.
 
 ## Blockers (owner decisions or human-only)
 
-1. **No `.git` in this checkout.** Nothing was committed. If history/rollback
-   matter, initialise a repository (or point the folder at
-   `github.com/ToxicAngelX/Selora-IDE`) before more parallel work.
-2. **Update check returns 404.** The About dialog queries
-   `api.github.com/repos/ToxicAngelX/Selora-IDE/releases/latest`; publish the
-   repo or change the slug.
+1. **Upstream repository not published.** Local git history now exists on
+   branch `selora-post-release` (no remote configured), but
+   `github.com/ToxicAngelX/Selora-IDE` returns HTTP 404. The tag merge gate
+   needs `origin/main`, and the update check needs a published release.
+   Create/push the repository, or change the slug in the four sources that
+   `scripts/check-release-metadata.ps1` enforces.
+2. **Update check returns 404.** The About dialog and the Rust update check
+   derive `api.github.com/repos/<owner>/<repo>/releases/latest` from
+   `Cargo.toml` / `package.json` `repository`; the endpoint is correct but the
+   repository has no published release yet. Publishing v0.1.0 resolves it.
 3. **Five of seven Libraries.dev packages are not installed**
    (`border-beam`, `thinking-orbs`, `bot-avatars`, `liquid-gooey`,
    `voice-glow`). The tree uses local ports; decide install-and-verify or
@@ -183,6 +202,7 @@ were yanked). No source API changed.
 - Gate logs (`*.log`) and the old `service.json` / empty text file are ignored
   by `.gitignore`; `target/`, `node_modules/`, `dist/`, and `installer/output/`
   were already ignored.
-- No `target/release/selora-desktop.exe` and no `installer/output/` exist in
-  this checkout; `bundle.active=false`, so the Inno script is the packaging
-  path.
+- `target/release/selora-desktop.exe` and
+  `installer/output/Selora-IDE-Setup-0.1.0.exe` exist in this worktree as
+  unsigned dry-run artifacts (gitignored); `bundle.active=false`, so the Inno
+  script is the packaging path.

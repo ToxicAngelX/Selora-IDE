@@ -161,23 +161,35 @@ script omitted them.
 ### 2.3 Build the installer
 
 ```powershell
-cd "C:\Users\Toxic\Desktop\Selora IDE"
 installer\prebuild.bat
 ```
 
+Run it from anywhere; the script enters the repository root itself.
 `prebuild.bat` is quote-safe for checkout paths with spaces. It:
 
 1. Runs `installer\read-version.ps1`, which reads
    `[workspace.package].version` from the root `Cargo.toml` and requires a
    numeric `x.y.z` (Inno Setup's `AppVersion`).
-2. Requires `target\release\selora-desktop.exe` to exist (it does not build
+2. Resolves `ISCC.exe` through `installer\find-iscc.ps1` **before** it stages
+   anything, so a missing compiler fails fast:
+   - `%SELORA_ISCC%` if set (absolute path to `ISCC.exe`),
+   - `ISCC.exe` on `PATH`,
+   - `Inno Setup 6` / `Inno Setup 7` under `%ProgramFiles%`,
+     `%ProgramFiles(x86)%`, and the per-user `%LOCALAPPDATA%\Programs`,
+   - the uninstall registry (`HKLM` 64-bit, `HKLM\WOW6432Node`, `HKCU`):
+     `InstallLocation`, `DisplayIcon`, and `Inno Setup: App Path`.
+
+   The registry pass is what finds a portable or extracted Inno Setup whose
+   only trace is an uninstall entry. The Phase 8 acceptance machine had one
+   under `%TEMP%`, which the old Program Files-only probe could not see.
+3. Requires `target\release\selora-desktop.exe` to exist (it does not build
    the app for you).
-3. Locates the newest MSVC x64 CRT redist under the Visual Studio
+4. Locates the newest MSVC x64 CRT redist under the Visual Studio
    installation found by `vswhere.exe` and copies `vcruntime140.dll` /
    `vcruntime140_1.dll` into `target\release\`. It runs
    `dumpbin /dependents` and adds `msvcp140.dll` only when the built exe
    imports it.
-4. Downloads Microsoft's Evergreen Bootstrapper to
+5. Downloads Microsoft's Evergreen Bootstrapper to
    `target\release\MicrosoftEdgeWebview2Setup.exe` when it is not cached and
    verifies its Authenticode signature is valid and signed by Microsoft. The
    download retries up to three times, deletes a partial file on failure, and
@@ -185,14 +197,21 @@ installer\prebuild.bat
    `PSModulePath` cannot break the signature check. Offline (or on a failed
    signature), it warns and continues; the installer then tells the user to
    install WebView2 manually if the runtime is missing.
-5. Finds Inno Setup 6 (or 7) under Program Files, Program Files (x86), or
-   the per-user winget location and runs
-   `ISCC.exe /DMyAppVersion=<version> installer\selora-ide.iss`.
+6. Creates `installer\output\`, deletes a previous setup for the same
+   version, and runs
+   `ISCC.exe /DMyAppVersion=<version> /DMyTargetDir=<abs> /DMyCrtDlls=<list> /O<repo>\installer\output installer\selora-ide.iss`.
+   The absolute `/O` is deliberate: the compiler's install directory and the
+   current directory cannot move the artifact.
+7. Fails unless `installer\output\Selora-IDE-Setup-X.Y.Z.exe` exists, then
+   prints its absolute path and size.
 
 Output: `installer\output\Selora-IDE-Setup-X.Y.Z.exe`. Size depends on the
 binary and on whether the WebView2 bootstrapper was staged.
 
-`installer\prebuild.bat --help` prints usage and writes nothing.
+`installer\prebuild.bat --help` prints usage and writes nothing. A hand-run
+`ISCC.exe /DMyAppVersion=X.Y.Z installer\selora-ide.iss` also writes to
+`installer\output\` (the `.iss` default), because `{#SourcePath}` resolves
+against the script's own directory.
 
 ### 2.4 Install on a test machine
 
@@ -263,19 +282,23 @@ Runs on every push to `main` and every pull request. The job is
 superseded runs. Steps, in order:
 
 1. `actions/checkout` (pinned release tag).
-2. `actions/setup-node` with Node 22 and npm caching keyed on
+2. `scripts\check-release-metadata.ps1`: the three manifests, the tag (on tag
+   pushes), the CHANGELOG section, one repository slug, and the update-check
+   derivation/CSP. No build needed.
+3. `actions/setup-node` with Node 22 and npm caching keyed on
    `apps/selora-desktop/frontend/package-lock.json`.
-3. `npm ci` in `apps/selora-desktop/frontend`.
-4. `npm run typecheck`.
-5. `npm test` (Vitest).
-6. `npm run build` (tsc + Vite) and a check that `dist/index.html` exists.
-7. Rust stable with `rustfmt` + `clippy`, then `Swatinem/rust-cache`.
-8. `cargo fmt --all -- --check`.
-9. `cargo clippy --workspace --all-targets -- -D warnings`.
-10. `cargo build --workspace --locked`.
-11. `cargo test --workspace --locked`.
-12. `cargo install cargo-deny --locked`, then `cargo deny check`
-    (licenses + advisories). The upstream `cargo-deny-action` is a Docker
+4. `npm ci` in `apps/selora-desktop/frontend`.
+5. `npm run typecheck`.
+6. `npm test` (Vitest).
+7. `npm run build` (tsc + Vite) and a check that `dist/index.html` exists.
+8. Rust stable with `rustfmt` + `clippy`, then `Swatinem/rust-cache`.
+9. `cargo fmt --all -- --check`.
+10. `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+11. `cargo build --workspace --locked`.
+12. `cargo test --workspace --locked`.
+13. `cargo install cargo-deny --version 0.20.2 --locked`, then
+    `cargo deny check` (licenses + advisories). The upstream
+    `cargo-deny-action` is a Docker
     container action, which GitHub Actions cannot run on `windows-latest`,
     so CI installs the tool natively instead.
 
@@ -299,17 +322,20 @@ them deliberately. Steps, in order:
    so this is the check that proves the commit was already merged and passed
    CI; the workflow fails when `origin/main` is absent or the tag is not
    contained in it.
-2. Resolve the version from the tag (it must be numeric `X.Y.Z`) and require
-   it to equal **all three** manifests: `Cargo.toml`
-   `[workspace.package].version` (through `installer\read-version.ps1`),
-   `tauri.conf.json` `version`, and `frontend/package.json` `version`. It also
-   requires `CHANGELOG.md` to contain a `## [<version>]` heading. Any mismatch
-   fails before anything is built or packaged.
+2. Resolve the version from the tag through
+   `scripts\check-release-metadata.ps1 -Tag <tag>`. That script requires a
+   numeric `X.Y.Z` tag and equality across **all three** manifests:
+   `Cargo.toml` `[workspace.package].version` (through
+   `installer\read-version.ps1`), `tauri.conf.json` `version`, and
+   `frontend/package.json` `version`. It also requires a `CHANGELOG.md`
+   `## [<version>]` heading and one consistent repository slug across
+   `Cargo.toml`, `frontend/package.json`, `installer/selora-ide.iss`, and
+   `docs/mkdocs.yml`. Any mismatch fails before anything is built.
 3. Node 22 + npm cache; `npm ci`, `npm run typecheck`, `npm test`,
    `npm run build`, then verify `dist/index.html`.
 4. Rust stable + `Swatinem/rust-cache` (shared `release-windows` key).
 5. `cargo fmt --all -- --check`.
-6. `cargo clippy --workspace --all-targets -- -D warnings`.
+6. `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 7. `cargo install cargo-deny --version 0.20.2 --locked`, then
    `cargo deny check` (licenses + advisories). A tag must not be able to skip
    the merge gate that `ci.yml` runs.
@@ -325,17 +351,31 @@ them deliberately. Steps, in order:
     (`https://go.microsoft.com/fwlink/p/?LinkId=2124703`) to
     `target\release\MicrosoftEdgeWebview2Setup.exe`, verify its Authenticode
     signature is valid and signed by Microsoft, and fail otherwise.
-13. `choco install innosetup --version=6.7.1` and verify the expected ISCC
-    path. The version is pinned so a future 7.x Chocolatey package cannot
-    silently change the compiler under a release.
+13. `choco install innosetup --version=6.7.1` (pinned so a future 7.x
+    Chocolatey package cannot silently change the compiler under a release),
+    then resolve the compiler with `installer\find-iscc.ps1`. The workflow
+    does not assume Chocolatey's install path.
 14. Optional: sign `target\release\selora-desktop.exe` (see §3).
-15. Run ISCC with `/DMyAppVersion=<tag version>`.
+15. Create `installer\output\`, delete a stale setup for the tag version, and
+    run ISCC with `/DMyAppVersion=<tag version> /DMyCrtDlls=<dumpbin list>
+    /O<runner>\installer\output`. The absolute `/O` makes the artifact path
+    independent of the compiler's install directory and the current
+    directory. The step fails if the setup is missing or smaller than 5 MiB.
 16. Optional: sign the installer.
-17. Generate `Selora-IDE-Setup-X.Y.Z.exe.sha256` from the final (possibly
-    signed) installer.
-18. Upload the installer and checksum as a workflow artifact (14 days).
-19. Open a **draft** GitHub Release and attach the installer + `.sha256`,
+17. Verify the installer signature matches the configuration: `Valid` when
+    `SIGNING_CERT_BASE64` is set, `NotSigned` when it is not. A half-signed
+    artifact cannot reach the draft.
+18. Generate `Selora-IDE-Setup-X.Y.Z.exe.sha256` from the final (possibly
+    signed) installer, assert the exact `<64 lowercase hex><two spaces><name>`
+    shape, then hash the installer again to prove it did not change.
+19. Upload the installer and checksum as a workflow artifact (14 days).
+20. Refuse to continue if a release for the tag already exists and is not a
+    draft; publishing is the owner's manual step.
+21. Open a **draft** GitHub Release and attach the installer + `.sha256`,
     with generated release notes. The workflow never publishes.
+22. Verify the draft: `isDraft` is true, both assets exist, the uploaded
+    installer size equals the local size, and a `gh release download`
+    round-trip re-hashes to the local SHA256.
 
 ### 4.3 The release flow
 
@@ -348,7 +388,9 @@ them deliberately. Steps, in order:
    section with a `## [X.Y.Z] - YYYY-MM-DD` heading, and leave `Unreleased`
    empty. The workflow requires a `## [<version>]` heading and fails the tag
    without one.
-3. Run the checks from §1.2 locally (frontend typecheck/test/build first).
+3. Run the checks from §1.2 locally (frontend typecheck/test/build first), plus
+   `scripts\check-release-metadata.ps1 -Tag vX.Y.Z` to prove the tag will pass
+   the release gate.
 4. Commit and push `main`; wait for CI. The tag must point at a commit that
    is already on `main`: the release workflow verifies the tagged commit is an
    ancestor of `origin/main` and re-runs `cargo fmt`, `cargo clippy`, and
@@ -377,6 +419,14 @@ The draft step is critical. We do not auto-publish releases. The owner always sm
 
 We use **Semantic Versioning 2.0**: the Lite Edition stays on `0.x.y` until the
 owner declares 1.0.0. All three manifests currently read **0.1.0**.
+
+**Decision (2026-10-27): the first published release is `v0.1.0`.** The
+project did not ship the per-phase `0.1.0` -> `0.6.0` ladder from the original
+egui plan, so the first public tag is `0.1.0`, not `0.6.0` and not `1.0.0`.
+No version bump is needed for this tag: `CHANGELOG.md` already carries a
+`## [0.1.0] - 2026-10-26` section, and all three manifests agree. The release
+stays a draft until the owner runs the clean-VM smoke test in section 8 and
+publishes it manually.
 
 A release tag `vX.Y.Z` must equal all three version fields, and the release
 workflow enforces all three plus the changelog:
@@ -480,6 +530,9 @@ gh repo edit --enable-discussions
 | `assets/screenshots/*.png` | Phase 6g | 5g |
 | `.github/workflows/ci.yml` | Phase 0 | 0 |
 | `.github/workflows/release.yml` | Phase 6d | 5d |
+| `scripts/check-release-metadata.ps1` | 2026-10-27: version + slug gate | release |
+| `installer/find-iscc.ps1` | 2026-10-27: ISCC resolution | release |
+| `RELEASE_0.1.0_CHECKLIST.md` | 2026-10-27: draft-asset checklist | 0.1.0 |
 | CI badge in README | Phase 6e | 5e |
 | `deny.toml` | Phase 0 | 0 |
 
@@ -505,12 +558,14 @@ gh repo edit --enable-discussions
 - [ ] All `Unreleased` CHANGELOG entries moved to a new versioned section
 - [ ] Root `Cargo.toml` (`[workspace.package]`), `tauri.conf.json`, **and**
       `frontend/package.json` versions set to the same value as the tag
+- [ ] `scripts\check-release-metadata.ps1 -Tag vX.Y.Z` green (version,
+      CHANGELOG heading, repository slug, update-check derivation, CSP)
 - [ ] `npm ci`, `npm run typecheck`, `npm test`, `npm run build` green
-- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
       `cargo test --workspace --locked`, `cargo deny check` all green
-- [ ] `installer\prebuild.bat` builds an installer from the local release
-      binary, and the install dir has `selora-desktop.exe`,
-      `vcruntime140.dll`, and `vcruntime140_1.dll`
+- [ ] `installer\prebuild.bat` builds `installer\output\Selora-IDE-Setup-X.Y.Z.exe`
+      (not `%TEMP%`; see section 2.3), and the install dir has
+      `selora-desktop.exe`, `vcruntime140.dll`, and `vcruntime140_1.dll`
 - [ ] Smoke test: install the locally-built release, verify the app launches
 - [ ] Tag created: `git tag vX.Y.Z`
 
@@ -518,6 +573,8 @@ gh repo edit --enable-discussions
 
 - [ ] `git push origin vX.Y.Z`
 - [ ] Wait for the release workflow to finish
+- [ ] Confirm the workflow's "Verify draft release assets" step passed
+      (draft=true, two assets, round-trip SHA256 match)
 - [ ] Download the attached `.exe` and `.exe.sha256` from the draft release
 - [ ] Verify the SHA256 (`Get-FileHash -Algorithm SHA256` or `certutil -hashfile`)
 - [ ] Install on a clean Windows 11 VM (and, when WebView2 changes, a Windows

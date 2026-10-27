@@ -4,7 +4,7 @@ description = "Workflow engine core: boa sandbox, facade, schema validation (ARC
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ToxicAngelX/Selora-IDE"
+repository.workspace = true
 publish = false
 
 # Phase 8 wave 2: this crate is now a root-workspace member (see the root

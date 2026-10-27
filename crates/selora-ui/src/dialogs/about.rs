@@ -25,10 +25,16 @@ const BUTTON_HEIGHT: f32 = 32.0;
 const BUTTON_WIDTH: f32 = 152.0;
 
 /// The repository's public home (RELEASE.md §7).
-pub const REPO_URL: &str = "https://github.com/ToxicAngelX/Selora-IDE";
+pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 /// The repo's short display form (UI_SPEC.md §11 shows it without the
 /// scheme).
-const REPO_DISPLAY: &str = "github.com/ToxicAngelX/Selora-IDE";
+fn repo_display() -> &'static str {
+    REPO_URL
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+}
 
 /// Events the dialog emits to the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +160,7 @@ impl AboutDialog {
         let mut link_ui = ui.new_child(egui::UiBuilder::new().max_rect(link_rect));
         link_ui.centered_and_justified(|ui| {
             ui.hyperlink_to(
-                egui::RichText::new(REPO_DISPLAY)
+                egui::RichText::new(repo_display())
                     .color(color::FG_MUTED)
                     .font(egui::FontId::new(type_scale::SM, font::FAMILY_SANS)),
                 REPO_URL,
@@ -224,6 +230,15 @@ impl AboutDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_repository_url_comes_from_the_manifest() {
+        assert!(REPO_URL.starts_with("https://github.com/"));
+        let display = repo_display();
+        assert!(!display.contains("://"));
+        assert!(display.starts_with("github.com/"));
+        assert_eq!(display, REPO_URL.trim_start_matches("https://"));
+    }
 
     struct Harness {
         ctx: egui::Context,
