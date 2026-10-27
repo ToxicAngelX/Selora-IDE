@@ -30,8 +30,12 @@ questions (9c commit unmerged), signing, clean-VM verification. See
   resume are on the `integration` branch pending merge.
 - Workflows (Phase 8): `world.run` creates the child suspended and assigns it
   to a Windows Job Object before execution, so the process tree is contained
-  on Stop, timeout, and cancel. `Resume anyway` is explicit and default-refused
-  for an unfinished ask.
+  on Stop, timeout, and cancel. After every exit it reads the job's membership
+  back and fails closed if a member survives. Known out-of-process broker
+  launches (WMI `Win32_Process`, Task Scheduler, Explorer, ShellExecute) are
+  refused before PowerShell is spawned; a broker process created outside the
+  job remains the documented residual. `Resume anyway` is explicit and
+  default-refused for an unfinished ask.
 - Agent Workbench (Phase 9a, on `selora-p3-window` pending merge): a dedicated
   Agent surface with truthful session tabs, a read-only todo spine, structured
   question and plan cards, Chat/Plan views, and a composer mode row mapped to

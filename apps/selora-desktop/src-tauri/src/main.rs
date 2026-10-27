@@ -7,6 +7,7 @@ mod lsp_bridge;
 mod security;
 mod sessions;
 mod state;
+mod workflow_broker;
 mod workflow_command;
 mod workflows_host;
 mod workflows_process;

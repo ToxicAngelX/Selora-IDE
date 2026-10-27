@@ -554,6 +554,66 @@ impl SessionEngine {
         Ok(session_id)
     }
 
+    /// Delete a session. Durable agent sessions also lose their on-disk store,
+    /// so a deleted tab cannot be resumed later. A running turn refuses the
+    /// delete (the user must stop it first).
+    ///
+    /// The active session changes only when the deleted session *was* active:
+    /// deleting a background tab leaves the user's selection alone. The
+    /// replacement is a real session the engine still owns (the most recently
+    /// touched one), never a synthesized placeholder.
+    pub(crate) fn delete_session(&self, session_id: &SessionId) -> Result<(), ProtocolErrorDto> {
+        let store = self.store();
+        let mut inner = self.inner.lock().expect("engine lock");
+        let open = inner.sessions.get(session_id);
+        if let Some(session) = open {
+            if session.active_request.is_some()
+                || inner
+                    .active
+                    .values()
+                    .any(|request| request.session_id() == session_id)
+            {
+                return Err(session_busy());
+            }
+        }
+        let known = open.is_some();
+        let durable = open.is_none_or(|session| session.durable);
+        match store.as_ref() {
+            Some(store) => {
+                // A disk-only durable session is known through its store; a
+                // session that exists in neither place is a stale tab.
+                if !known && !store.exists(session_id.as_str()) {
+                    return Err(unknown_session(session_id));
+                }
+                if durable {
+                    store
+                        .delete(session_id.as_str())
+                        .map_err(|error| session_persistence_error(&error))?;
+                }
+            }
+            None if !known => return Err(unknown_session(session_id)),
+            None => {}
+        }
+        inner.sessions.remove(session_id);
+        if inner.active_session.as_ref() == Some(session_id) {
+            inner.active_session = inner
+                .sessions
+                .iter()
+                .max_by_key(|(_, candidate)| candidate.last_activity)
+                .map(|(id, _)| id.clone());
+        }
+        // Normalize any dangling pointer (a session deleted without an active
+        // marker must not keep leaking the old id into the bootstrap).
+        if inner
+            .active_session
+            .as_ref()
+            .is_some_and(|id| !inner.sessions.contains_key(id))
+        {
+            inner.active_session = None;
+        }
+        Ok(())
+    }
+
     /// Arm/disarm session full access. The flag is session memory only.
     pub(crate) fn set_auto_approve(
         &self,
@@ -784,9 +844,6 @@ impl SessionEngine {
             if let Some(approval) = &session.pending_approval {
                 pending_approvals.push((session_id.clone(), approval.clone()));
             }
-        }
-        if active_session_id.is_none() {
-            active_session_id = inner.active_session.clone();
         }
         // Prefer the active session's park; otherwise the first in recency
         // order (the pre-9d behaviour).
@@ -4313,6 +4370,12 @@ mod tests {
         }
     }
 
+    fn delete_session_command(session: &str) -> FrontendCommand {
+        FrontendCommand::DeleteSession {
+            session_id: SessionId::new(session).expect("valid id"),
+        }
+    }
+
     fn retry_command(session: &str, message: MessageId) -> FrontendCommand {
         FrontendCommand::RetryMessage {
             session_id: SessionId::new(session).expect("valid id"),
@@ -4518,6 +4581,171 @@ mod tests {
             "session-a",
             "a refused switch changes nothing"
         );
+    }
+
+    #[test]
+    fn delete_session_removes_open_and_disk_only_sessions_and_refreshes_bootstrap() {
+        let app = mock_app_handle();
+        let root = temp_workspace("delete-session");
+        seed_session_store(&root, "sess-open");
+        seed_session_store(&root, "sess-disk");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = state.sessions();
+        engine.set_workspace_root(Some(root.clone()));
+        let open = SessionId::new("sess-open").expect("id");
+        engine.switch_session(&open).expect("open the session");
+
+        let before = state.bootstrap();
+        assert!(before
+            .agent_sessions
+            .iter()
+            .any(|session| session.session_id.as_str() == "sess-disk"));
+
+        // A disk-only durable session is not in the dock, but delete still
+        // removes its store and the next bootstrap no longer offers it.
+        state
+            .dispatch(&app, envelope(&state, delete_session_command("sess-disk")))
+            .expect("delete disk-only");
+        assert!(!root.join(".selora/agent-sessions/sess-disk").exists());
+        let after_disk = state.bootstrap();
+        assert!(!after_disk
+            .agent_sessions
+            .iter()
+            .any(|session| session.session_id.as_str() == "sess-disk"));
+        assert!(after_disk
+            .chat
+            .sessions
+            .iter()
+            .any(|session| session.session_id.as_str() == "sess-open"));
+
+        // Deleting the open durable session removes both the tab and its
+        // transcript, and leaves no stale active id behind.
+        state
+            .dispatch(&app, envelope(&state, delete_session_command("sess-open")))
+            .expect("delete open");
+        assert!(!root.join(".selora/agent-sessions/sess-open").exists());
+        let after_open = state.bootstrap();
+        assert!(after_open.chat.sessions.is_empty());
+        assert!(after_open.agent_sessions.is_empty());
+        assert!(after_open.chat.active_session_id.is_none());
+        assert!(state.events_after(0).iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BootstrapState(snapshot)
+                if snapshot.chat.sessions.is_empty() && snapshot.agent_sessions.is_empty()
+        )));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_session_keeps_a_non_active_tab_and_selects_a_real_replacement() {
+        let root = temp_workspace("delete-active");
+        for id in ["sess-a", "sess-b", "sess-c", "sess-disk"] {
+            seed_session_store(&root, id);
+        }
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = state.sessions();
+        engine.set_workspace_root(Some(root.clone()));
+        let a = SessionId::new("sess-a").expect("id");
+        let b = SessionId::new("sess-b").expect("id");
+        let c = SessionId::new("sess-c").expect("id");
+        let disk = SessionId::new("sess-disk").expect("id");
+        engine.switch_session(&a).expect("open a");
+        engine.switch_session(&b).expect("open b");
+        engine.switch_session(&c).expect("open c");
+
+        // Deleting another tab must not yank the user's active selection.
+        engine.delete_session(&a).expect("delete a");
+        engine.delete_session(&disk).expect("delete disk-only");
+        let active = state.bootstrap().chat;
+        assert_eq!(
+            active
+                .active_session_id
+                .as_ref()
+                .expect("still active")
+                .as_str(),
+            "sess-c"
+        );
+        assert_eq!(
+            active
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-b", "sess-c"]
+        );
+
+        // Deleting the active tab selects a real remaining session, not a
+        // synthetic row and not the stale id.
+        engine.delete_session(&c).expect("delete c");
+        let remaining = state.bootstrap().chat;
+        assert_eq!(
+            remaining
+                .active_session_id
+                .as_ref()
+                .expect("b replaces c")
+                .as_str(),
+            "sess-b"
+        );
+        assert_eq!(remaining.sessions.len(), 1);
+        assert_eq!(remaining.sessions[0].session_id.as_str(), "sess-b");
+
+        engine.delete_session(&b).expect("delete b");
+        assert!(state.bootstrap().chat.active_session_id.is_none());
+        assert!(state.bootstrap().chat.sessions.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_session_refuses_a_live_turn_without_removing_anything() {
+        let app = mock_app_handle();
+        let uri = stalling_gateway("delete-live ");
+        let state = DesktopState::with_settings(gateway_settings(uri));
+        let root = tempfile::tempdir().unwrap();
+        state
+            .sessions()
+            .set_workspace_root(Some(root.path().to_path_buf()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_chat("chat-delete", "session-delete", "stay live"),
+                ),
+            )
+            .expect("send accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatDelta(_))
+        });
+
+        let error = state
+            .dispatch(
+                &app,
+                envelope(&state, delete_session_command("session-delete")),
+            )
+            .expect_err("a live turn refuses delete");
+        assert_eq!(error.code, "session_busy");
+        let chat = state.bootstrap().chat;
+        assert!(chat
+            .sessions
+            .iter()
+            .any(|session| session.session_id.as_str() == "session-delete"));
+        assert_eq!(
+            chat.active_session_id
+                .as_ref()
+                .expect("still active")
+                .as_str(),
+            "session-delete"
+        );
+
+        state
+            .dispatch(&app, envelope(&state, stop_chat("chat-delete")))
+            .expect("stop accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatCompleted(_))
+        });
     }
 
     #[test]

@@ -60,7 +60,11 @@ The installer is unsigned. Windows SmartScreen will show an unknown publisher.
 ## Known limits
 
 - Workflow resume cannot guarantee exactly-once subagent side effects.
-- Broker/shell-service child processes can escape the Job Object.
+- Broker/shell-service child processes can escape the Job Object. Known broker
+  launch forms in the confirmed `world.run` command are refused before spawn,
+  and the job's membership is audited after every exit; a broker process
+  created outside the job (for example WMI code carried in an argument, or an
+  obfuscated command) still escapes.
 - Background children die on process crash.
 - Per-phase workflow cost is not implemented.
 - No clean-VM install has been performed.

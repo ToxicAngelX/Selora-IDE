@@ -258,7 +258,8 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
           onClick={() => setShowSessionRail(!showSessionRail)}>Resume sessions</button>
       )}
       {showSessionRail && <AgentSessionRail sessions={state.sessions} activeSessionId={state.activeSessionId}
-        resumableSessions={state.resumableSessions} onClose={() => setShowSessionRail(false)} />}
+        resumableSessions={state.resumableSessions} onClose={() => setShowSessionRail(false)}
+        onDelete={(sessionId) => void agentStore.requestDeleteSession(sessionId)} />}
 
       {/* 3. Workbench body */}
       <div
