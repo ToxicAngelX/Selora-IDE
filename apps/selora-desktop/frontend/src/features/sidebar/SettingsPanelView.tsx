@@ -39,6 +39,10 @@ interface KeybindingEntry {
 const unsupportedTitle = (label: string): string =>
   `${label} has no backend settings field in this build. This control is read-only; changes are not saved.`;
 
+/** For values that do persist in settings.json but have no settings-wire exposure. */
+const unexposedTitle = (label: string): string =>
+  `${label} is stored in settings.json, but this build's settings protocol does not expose it. This value is read-only; changes are not saved.`;
+
 function formatError(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -215,7 +219,7 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
                 title={
                   activeModel
                     ? 'The active model is reported by the connected gateway and cannot be changed in this build.'
-                    : unsupportedTitle('Model selection')
+                    : 'No active model is reported by the gateway. This build has no model-selection control, so changes are not saved.'
                 }
               >
                 <option value="">—</option>
@@ -321,25 +325,26 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
             )}
           </div>
           <p className="settings-card-hint">
-            Editor preferences exist in settings.json but are not exposed by this build&apos;s
-            settings protocol, so every value shows —.
+            Font family, size, tab size, word wrap, minimap, and line numbers are stored in
+            settings.json but are not exposed by this build&apos;s settings protocol, so their
+            values show —. Format on save has no settings field at all.
           </p>
           <div className="settings-group">
             {[
-              { label: 'Font Family', name: 'Font family' },
-              { label: 'Font Size (px)', name: 'Font size' },
-              { label: 'Tab Size', name: 'Tab size' },
-              { label: 'Word Wrap', name: 'Word wrap' },
-              { label: 'Format On Save', name: 'Format on save' },
-              { label: 'Minimap', name: 'Minimap' },
-              { label: 'Line Numbers', name: 'Line numbers' },
+              { label: 'Font Family', name: 'Font family', stored: true },
+              { label: 'Font Size (px)', name: 'Font size', stored: true },
+              { label: 'Tab Size', name: 'Tab size', stored: true },
+              { label: 'Word Wrap', name: 'Word wrap', stored: true },
+              { label: 'Format On Save', name: 'Format on save', stored: false },
+              { label: 'Minimap', name: 'Minimap', stored: true },
+              { label: 'Line Numbers', name: 'Line numbers', stored: true },
             ].map((row) => (
               <div className="settings-row" key={row.name}>
                 <span className="settings-label">{row.label}</span>
                 <span
                   className="settings-card-hint"
                   aria-label={`${row.name} value`}
-                  title={unsupportedTitle(row.name)}
+                  title={row.stored ? unexposedTitle(row.name) : unsupportedTitle(row.name)}
                 >
                   —
                 </span>
@@ -409,7 +414,7 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
       {activeTab === 'keybindings' && (
         <div
           className="settings-section-content keybindings-section"
-          title="Commands come from the shell's command registry. Keybinding editing has no backend field in this build, so this table is read-only."
+          title="Commands come from the shell's command registry. Keybindings are stored in settings.json, but this build exposes no keybinding-edit command, so this table is read-only."
         >
           {/* Filter Input */}
           <div className="keybind-search-wrapper">

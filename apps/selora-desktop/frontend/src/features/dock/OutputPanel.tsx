@@ -12,7 +12,7 @@ export function OutputPanel() {
           <span className="output-title">Output</span>
         </div>
         <div className="dock-toolbar-right">
-          <span className="dock-placeholder-badge">Placeholder</span>
+          <span className="dock-placeholder-badge">Not wired yet</span>
         </div>
       </div>
 

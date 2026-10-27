@@ -7,7 +7,8 @@ describe('TerminalPanel', () => {
     render(<TerminalPanel />);
 
     expect(screen.getByTestId('terminal-panel')).toBeTruthy();
-    expect(screen.getByText('Terminal placeholder')).toBeTruthy();
+    expect(screen.getByText('Terminal')).toBeTruthy();
+    expect(screen.getByText('Not wired yet')).toBeTruthy();
     expect(screen.getByText('No terminal session is running')).toBeTruthy();
     expect(screen.getByText('The integrated shell arrives with the terminal slice.')).toBeTruthy();
     expect(screen.queryByLabelText('Terminal command prompt')).toBeNull();
