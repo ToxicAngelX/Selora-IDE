@@ -48,22 +48,22 @@ export const ThinkingOrb: React.FC<ThinkingOrbProps> = ({
         <defs>
           {/* High-DPI Celestial Core Gradient */}
           <radialGradient id={coreGradId} cx="0.38" cy="0.32" r="0.9">
-            <stop offset="0%" stopColor="#FFFFFF" />
-            <stop offset="65%" stopColor="#F5F6F8" />
-            <stop offset="100%" stopColor="#CDD6E4" />
+            <stop offset="0%" stopColor="var(--fg-bright)" />
+            <stop offset="65%" stopColor="var(--c-f5f6f8)" />
+            <stop offset="100%" stopColor="var(--moonlight-400)" />
           </radialGradient>
 
           {/* Tilted Orbital Track Gradient */}
           <linearGradient id={ringGradId} x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#F2F5FA" stopOpacity="0.95" />
-            <stop offset="50%" stopColor="#CDD6E4" stopOpacity="0.6" />
-            <stop offset="100%" stopColor="#8B9AB5" stopOpacity="0.35" />
+            <stop offset="0%" stopColor="var(--moonlight-200)" stopOpacity="0.95" />
+            <stop offset="50%" stopColor="var(--moonlight-400)" stopOpacity="0.6" />
+            <stop offset="100%" stopColor="var(--moonlight-700)" stopOpacity="0.35" />
           </linearGradient>
 
           {/* Fluid Ring Pulse Gradient */}
           <radialGradient id={pulseGradId} cx="0.5" cy="0.5" r="0.5">
-            <stop offset="70%" stopColor="#CDD6E4" stopOpacity="0.4" />
-            <stop offset="100%" stopColor="#8B9AB5" stopOpacity="0" />
+            <stop offset="70%" stopColor="var(--moonlight-400)" stopOpacity="0.4" />
+            <stop offset="100%" stopColor="var(--moonlight-700)" stopOpacity="0" />
           </radialGradient>
 
           {/* Soft high-DPI glow filter */}
@@ -78,7 +78,7 @@ export const ThinkingOrb: React.FC<ThinkingOrbProps> = ({
           cx={center}
           cy={center}
           r={orbitRadius + (isHero ? 7 : 2.5)}
-          fill="rgba(205, 214, 228, 0.08)"
+          fill="var(--c-rgba-205-214-228-0p08)"
           className="selora-orb-halo"
         />
 
@@ -130,7 +130,7 @@ export const ThinkingOrb: React.FC<ThinkingOrbProps> = ({
             cx={center - coreRadius * 0.32}
             cy={center - coreRadius * 0.32}
             r={coreRadius * 0.25}
-            fill="#FFFFFF"
+            fill="var(--fg-bright)"
             opacity={0.9}
             className="orb-glint"
           />

@@ -52,6 +52,26 @@ describe('SettingsPanelView persistence wiring', () => {
     );
   });
 
+  it('reflects the persisted light theme after a bootstrap round-trip', () => {
+    const bootstrap = makeBootstrap();
+    const { rerender } = render(<SettingsPanelView bootstrap={bootstrap} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Theme' }));
+    fireEvent.change(screen.getByLabelText('Color Theme'), { target: { value: 'light' } });
+
+    rerender(
+      <SettingsPanelView
+        bootstrap={{
+          ...bootstrap,
+          settings: { ...bootstrap.settings, theme: 'light' },
+        }}
+      />,
+    );
+
+    expect((screen.getByLabelText('Color Theme') as HTMLSelectElement).value).toBe('light');
+    expect(screen.getByRole('option', { name: 'Selora Moonlight (Light)' })).toBeTruthy();
+  });
+
   it('offers exactly the theme values Rust accepts, including the stored "dark" alias', () => {
     render(<SettingsPanelView bootstrap={makeBootstrap()} />);
 

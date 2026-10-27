@@ -164,9 +164,9 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
                 fontSize: 10,
                 fontWeight: 600,
                 letterSpacing: '0.02em',
-                color: '#34d399',
-                background: 'rgba(16, 185, 129, 0.12)',
-                border: '1px solid rgba(16, 185, 129, 0.35)',
+                color: 'var(--c-34d399)',
+                background: 'var(--c-rgba-16-185-129-0p12)',
+                border: '1px solid var(--c-rgba-16-185-129-0p35)',
                 borderRadius: 4,
               }}
             >

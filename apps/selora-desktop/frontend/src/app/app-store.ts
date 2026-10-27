@@ -28,6 +28,7 @@ import {
   installWorkflowHandlers,
   toWorkflowStoreEvent,
 } from '../features/workflows/workflows-bridge';
+import { applyAppearance } from '../features/theme/theme';
 
 export type AppPhase = 'connecting' | 'ready' | 'error';
 
@@ -146,16 +147,6 @@ export function currentSessionEnvelopeContext(
   };
 }
 
-/** Reflect the `ui.reduce_motion` setting on the root (DESIGN §13.2). */
-function applyReducedMotion(reduced: boolean): void {
-  const root = document.documentElement;
-  if (reduced) {
-    root.dataset.reducedMotion = 'true';
-  } else {
-    delete root.dataset.reducedMotion;
-  }
-}
-
 /** Start the bootstrap flow once; StrictMode-safe (module singleton). */
 export function startApp(): Promise<void> {
   if (started) return Promise.resolve();
@@ -177,7 +168,7 @@ export async function refreshBootstrap(): Promise<BootstrapState | null> {
   try {
     const bootstrap = await getBootstrapState();
     state = { ...state, bootstrap, phase: 'ready' };
-    applyReducedMotion(bootstrap.settings.reduced_motion);
+    applyAppearance(bootstrap.settings);
     layoutStore.hydrate(bootstrap);
     agentStore.hydrate(bootstrap);
     workflowsStore.hydratePersisted(bootstrap.workflows ?? []);
@@ -204,7 +195,7 @@ async function runBootstrapFlow(): Promise<void> {
     const bootstrap = await getBootstrapState();
     if (gen !== generation) return;
     state = { ...state, phase: 'ready', bootstrap, error: null };
-    applyReducedMotion(bootstrap.settings.reduced_motion);
+    applyAppearance(bootstrap.settings);
     layoutStore.hydrate(bootstrap);
     agentStore.hydrate(bootstrap);
     workflowsStore.hydratePersisted(bootstrap.workflows ?? []);
@@ -297,7 +288,7 @@ function reduceEvent(event: EventEnvelope): void {
     case 'bootstrap_state':
       // Z4 — a workspace opened: the id, buffers and tree all move at once.
       state = { ...state, bootstrap: payload.payload, phase: 'ready' };
-      applyReducedMotion(payload.payload.settings.reduced_motion);
+      applyAppearance(payload.payload.settings);
       layoutStore.hydrate(payload.payload);
       agentStore.hydrate(payload.payload);
       notify();

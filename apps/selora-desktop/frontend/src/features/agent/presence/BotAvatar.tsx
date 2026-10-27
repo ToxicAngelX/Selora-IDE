@@ -64,14 +64,14 @@ export const BotAvatar: React.FC<BotAvatarProps> = ({
       >
         <defs>
           <radialGradient id={`${gradId}-core`} cx="0.38" cy="0.32" r="0.9">
-            <stop offset="0%" stopColor="#FFFFFF" />
-            <stop offset="70%" stopColor="#F5F6F8" />
-            <stop offset="100%" stopColor="#CDD6E4" />
+            <stop offset="0%" stopColor="var(--fg-bright)" />
+            <stop offset="70%" stopColor="var(--c-f5f6f8)" />
+            <stop offset="100%" stopColor="var(--moonlight-400)" />
           </radialGradient>
           <linearGradient id={`${gradId}-ring`} x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#F2F5FA" />
-            <stop offset="55%" stopColor="#CDD6E4" />
-            <stop offset="100%" stopColor="#8B9AB5" />
+            <stop offset="0%" stopColor="var(--moonlight-200)" />
+            <stop offset="55%" stopColor="var(--moonlight-400)" />
+            <stop offset="100%" stopColor="var(--moonlight-700)" />
           </linearGradient>
         </defs>
 
@@ -79,7 +79,7 @@ export const BotAvatar: React.FC<BotAvatarProps> = ({
           // --- Official Selora Living Logo-Mark / Orbital Planet Companion ---
           <g className="selora-planet-mark">
             {/* Soft moonlight atmospheric halo */}
-            <circle cx="12" cy="12" r="10" fill="rgba(205,214,228,0.12)" className="selora-orb-halo" />
+            <circle cx="12" cy="12" r="10" fill="var(--c-rgba-205-214-228-0p12)" className="selora-orb-halo" />
 
             {/* Tilted orbital ring (-18deg like logo-mark.svg) */}
             <ellipse
@@ -96,7 +96,7 @@ export const BotAvatar: React.FC<BotAvatarProps> = ({
             />
 
             {/* Satellite moon on the orbital ring */}
-            <circle cx="18" cy="8.5" r="1.5" fill="#E4E9F2" className="selora-orb-sat" />
+            <circle cx="18" cy="8.5" r="1.5" fill="var(--moonlight-300)" className="selora-orb-sat" />
 
             {/* Core planet star */}
             <circle
@@ -108,13 +108,13 @@ export const BotAvatar: React.FC<BotAvatarProps> = ({
             />
 
             {/* Specular glint */}
-            <circle cx="10" cy="10" r="1.4" fill="#E4E9F2" opacity="0.8" />
+            <circle cx="10" cy="10" r="1.4" fill="var(--moonlight-300)" opacity="0.8" />
 
             {/* Blinking eyes / expressions */}
             {status !== 'sleeping' ? (
               <g className="selora-eyes">
-                <circle cx="10.2" cy="12.2" r="0.9" fill="#0B0B0F" className="bot-avatar-eye" />
-                <circle cx="13.8" cy="12.2" r="0.9" fill="#0B0B0F" className="bot-avatar-eye" />
+                <circle cx="10.2" cy="12.2" r="0.9" fill="var(--c-0b0b0f)" className="bot-avatar-eye" />
+                <circle cx="13.8" cy="12.2" r="0.9" fill="var(--c-0b0b0f)" className="bot-avatar-eye" />
               </g>
             ) : (
               <line
@@ -123,7 +123,7 @@ export const BotAvatar: React.FC<BotAvatarProps> = ({
                 x2="15"
                 y2="12.5"
                 className="bot-avatar-sleep-line"
-                stroke="#0B0B0F"
+                stroke="var(--c-0b0b0f)"
                 strokeWidth="1.2"
                 strokeLinecap="round"
               />

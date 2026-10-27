@@ -454,9 +454,9 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
             padding: '6px 8px',
             fontSize: 11,
             lineHeight: 1.4,
-            color: 'var(--fg-secondary, #a1a1aa)',
-            background: 'rgba(251, 191, 36, 0.08)',
-            border: '1px solid rgba(251, 191, 36, 0.28)',
+            color: 'var(--fg-secondary, var(--c-a1a1aa))',
+            background: 'var(--c-rgba-251-191-36-0p08)',
+            border: '1px solid var(--c-rgba-251-191-36-0p28)',
             borderRadius: 6,
           }}
         >
@@ -509,7 +509,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
 
           {availableModels.length === 0 ? (
             <div className="model-no-results" role="status">
-              <div className="item-title" style={{ color: 'var(--fg-default, #e4e4e7)' }}>
+              <div className="item-title" style={{ color: 'var(--fg-default, var(--c-e4e4e7))' }}>
                 Connect and refresh models
               </div>
               <div className="item-desc" style={{ marginTop: 4 }}>
@@ -527,7 +527,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
                 <span className="item-title">Refresh models</span>
               </button>
               {modelError && (
-                <div className="item-desc" style={{ marginTop: 6, color: '#f87171' }}>
+                <div className="item-desc" style={{ marginTop: 6, color: 'var(--c-f87171)' }}>
                   {modelError}
                 </div>
               )}
@@ -685,9 +685,9 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
                 fontSize: 10,
                 fontWeight: 600,
                 letterSpacing: '0.02em',
-                color: '#34d399',
-                background: 'rgba(16, 185, 129, 0.12)',
-                border: '1px solid rgba(16, 185, 129, 0.35)',
+                color: 'var(--c-34d399)',
+                background: 'var(--c-rgba-16-185-129-0p12)',
+                border: '1px solid var(--c-rgba-16-185-129-0p35)',
                 borderRadius: 4,
               }}
             >

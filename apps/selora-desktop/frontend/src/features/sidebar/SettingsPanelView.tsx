@@ -14,6 +14,7 @@ import {
   Search,
 } from '../../components/icons';
 import { buildCommandList, commandCategory } from '../keymap/commands';
+import { THEME_OPTIONS, normalizeThemeValue } from '../theme/theme';
 
 export interface SettingsPanelViewProps {
   bootstrap: BootstrapState;
@@ -34,8 +35,6 @@ interface KeybindingEntry {
  * "selora-dark" | "dark" | "space-black" | "light". "dark" is a legacy alias
  * kept visible so a stored alias is not silently rewritten in the display.
  */
-const THEME_VALUES = ['selora-dark', 'dark', 'space-black', 'light'] as const;
-
 const unsupportedTitle = (label: string): string =>
   `${label} has no backend settings field in this build. This control is read-only; changes are not saved.`;
 
@@ -91,9 +90,7 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
     );
   }, [keybindingList, keybindQuery]);
 
-  const themeValue = (THEME_VALUES as readonly string[]).includes(settings.theme)
-    ? settings.theme
-    : 'selora-dark';
+  const themeValue = normalizeThemeValue(settings.theme);
 
   // The active model is the only model fact the bridge exposes. When the
   // bootstrap has one, show it read-only; never substitute a placeholder id.
@@ -311,10 +308,11 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
                 value={themeValue}
                 onChange={(e) => persist({ theme: e.target.value })}
               >
-                <option value="selora-dark">Selora Cosmic Dark</option>
-                <option value="dark">Dark (alias)</option>
-                <option value="space-black">True Black (OLED)</option>
-                <option value="light">Selora Moonlight (Light)</option>
+                {THEME_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </div>
 
