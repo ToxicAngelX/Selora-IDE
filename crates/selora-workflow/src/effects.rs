@@ -377,13 +377,17 @@ impl ToolEffectLedger {
             .writer
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // Another host may have opened this ledger before acquiring the run lock.
+        writer.next_seq = load_records_at(&self.path, &self.run_id)?
+            .last()
+            .map_or(1, |record| record.seq + 1);
         record.seq = writer.next_seq;
         let mut line = serde_json::to_vec(&record).map_err(ledger_error)?;
         line.push(b'\n');
         writer
             .file
             .write_all(&line)
-            .and_then(|()| writer.file.flush())
+            .and_then(|()| writer.file.sync_data())
             .map_err(|source| {
                 ledger_error(format!(
                     "cannot append to {}: {source}",

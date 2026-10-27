@@ -41,6 +41,7 @@ pub enum PlanPhase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: String,
+    #[serde(alias = "text")]
     pub title: String,
     /// Durable sessions persisted todos before Phase 9b, so a missing
     /// status hydrates as `Pending` instead of failing the load.
@@ -189,6 +190,7 @@ pub fn parse_todo_value(raw: &serde_json::Value) -> Result<Vec<TodoItem>, String
             .ok_or_else(|| format!("`todos[{index}]` must be an object with a `title`"))?;
         let title = object
             .get("title")
+            .or_else(|| object.get("text"))
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("`todos[{index}].title` must be a string"))?
             .trim();
@@ -214,8 +216,21 @@ pub fn parse_todo_value(raw: &serde_json::Value) -> Result<Vec<TodoItem>, String
                 )
             })?,
         };
+        let id = match object.get("id") {
+            Some(value) => value
+                .as_str()
+                .filter(|id| !id.trim().is_empty() && id.len() <= 64)
+                .ok_or_else(|| {
+                    format!("`todos[{index}].id` must be a non-empty string of at most 64 bytes")
+                })?
+                .to_owned(),
+            None => format!("todo-{}", index + 1),
+        };
+        if todos.iter().any(|todo: &TodoItem| todo.id == id) {
+            return Err(format!("`todos[{index}].id` duplicates {id}"));
+        }
         todos.push(TodoItem {
-            id: format!("todo-{}", index + 1),
+            id,
             title: title.to_owned(),
             status,
         });

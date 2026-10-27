@@ -555,8 +555,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $existing = & gh release view $env:GITHUB_REF_NAME --json isDraft,name 2>$null
-          if ($LASTEXITCODE -eq 0) {
+          $selector = '.[] | select(.tag_name == "' + $env:GITHUB_REF_NAME + '") | {isDraft: .draft, name: .name}'
+          $existing = & gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases" --jq $selector
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release lookup failed with $LASTEXITCODE; refusing to assume the release does not exist."
+          }
+          if (-not [string]::IsNullOrWhiteSpace(($existing -join "`n"))) {
             $release = $existing | ConvertFrom-Json
             if (-not $release.isDraft) {
               throw "Release $env:GITHUB_REF_NAME is already published. This workflow only creates or updates drafts; publish manually, or delete the release before re-running."

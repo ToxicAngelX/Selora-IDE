@@ -228,7 +228,7 @@ pub const WORKFLOW_CONFIRMED: &str = "workflow confirmed";
 /// the approval behavior, so it uses the tools correctly on the first
 /// try.
 pub fn tool_manifest() -> Vec<ToolSpec> {
-    vec![
+    let mut manifest = vec![
         ToolSpec::new(
             "read_file",
             "Read a text file from the workspace (≤4MB). Use start_line/end_line \
@@ -435,7 +435,15 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
         ),
         // -- Phase 9e: background subagent completion wait ------------------
         crate::agent::subagent::wait_tool_spec(),
-    ]
+    ];
+    let mut alias = manifest
+        .iter()
+        .find(|tool| tool.name == "todo_write")
+        .expect("todo tool")
+        .clone();
+    alias.name = "manage_todo".into();
+    manifest.push(alias);
+    manifest
 }
 
 /// Build a JSON-Schema object from `(name, type)` property pairs and the
@@ -690,6 +698,7 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
                 );
             }
             let draft = plan::parse_plan(&args)?;
+            plan::lock(&ctx.plan).plan = Some(draft.clone());
             Ok(ToolOutcome::NeedsApproval(ApprovalCard::Plan {
                 summary: draft.summary,
                 steps: draft.steps,
@@ -1104,6 +1113,7 @@ mod tests {
                 "todo_write",
                 // Phase 9e: the background completion wait.
                 "wait",
+                "manage_todo",
             ],
             "§17.1's closed set plus manifest v2/v3's additive tools"
         );

@@ -33,11 +33,10 @@ interface KeybindingEntry {
 }
 
 /**
- * The select mirrors Rust's accepted set (state.rs `apply_settings_update`):
- * "selora-dark" | "dark" | "space-black" | "light". "dark" is a legacy alias
- * kept visible so a stored alias is not silently rewritten in the display.
+ * The select offers the palettes users can choose. Rust still accepts the
+ * legacy `space-black` spelling but resolves it to dark; a stored alias is not
+ * silently rewritten in the display.
  */
-const THEME_VALUES = ['selora-dark', 'dark', 'space-black', 'light'] as const;
 
 /** Mirrors selora-settings' EDITOR_* range constants. */
 const FONT_SIZE_MIN = 8;

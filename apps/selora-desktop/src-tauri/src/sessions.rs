@@ -39,13 +39,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use selora_ai::{
     AgentSessionMode, AgentSessionState, AgentSessionStore, AgentSummary, AgentTurnState,
     ApprovalCard, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, CompactionConfig,
-    CompactionError, Model, ParkedCard, PlanState, RouterToolRunner, TodoItem, ToolContext,
-    ToolSpec, TranscriptEntry, TurnCaps, TurnInput,
+    CompactionError, Model, ParkedCard, RouterToolRunner, ToolContext, ToolSpec, TranscriptEntry,
+    TurnCaps, TurnInput,
 };
 use selora_core::SeloraError;
 use selora_protocol::{
@@ -66,7 +66,7 @@ use crate::state::EventLog;
 /// The read-only half of the §17.1 manifest — `explore` mode arms exactly
 /// these (the model cannot request a side effect). Phase 9b's todo tools
 /// are session state, not workspace writes, so they stay available.
-const EXPLORE_TOOLS: [&str; 10] = [
+const EXPLORE_TOOLS: [&str; 12] = [
     "read_file",
     "list_dir",
     "fuzzy_find",
@@ -77,6 +77,8 @@ const EXPLORE_TOOLS: [&str; 10] = [
     "todo_write",
     "manage_todo",
     "wait",
+    "enter_plan_mode",
+    "exit_plan_mode",
 ];
 
 /// Transcript bound (the egui panel's 100-entry cap, R3) on the web shell's
@@ -247,8 +249,6 @@ struct ChatSession {
     updated_at: u64,
     model: Option<String>,
     mode: AgentModeDto,
-    todos: Vec<TodoItem>,
-    plan: PlanState,
     /// Session full access. Deliberately never written to disk (the store
     /// has no field for it) and reset on switch/new/restart.
     auto_approve: bool,
@@ -278,9 +278,7 @@ impl ChatSession {
             updated_at: now,
             model: None,
             mode: AgentModeDto::Execute,
-            todos: Vec::new(),
             plan_store: selora_ai::new_store(),
-            plan: PlanState::default(),
             auto_approve: false,
             durable_entries: 0,
             durable: false,
@@ -438,7 +436,7 @@ impl SessionEngine {
                 start,
                 entries,
                 session_state(session_id, session),
-                session.todos.clone(),
+                selora_ai::plan::snapshot(&session.plan_store).todos,
             )
         };
         let mut appended = 0usize;
@@ -509,17 +507,6 @@ impl SessionEngine {
     /// transfers across a switch.
     pub(crate) fn switch_session(&self, session_id: &SessionId) -> Result<(), ProtocolErrorDto> {
         let mut inner = self.inner.lock().expect("engine lock");
-        if inner
-            .sessions
-            .get(session_id)
-            .is_some_and(|session| session.active_request.is_some())
-        {
-            return Err(ProtocolErrorDto {
-                code: "session_busy".into(),
-                message: "A request is already running for this session — stop it first.".into(),
-                retryable: false,
-            });
-        }
         if !inner.sessions.contains_key(session_id) {
             let loaded = self.load_session_from_disk(session_id)?;
             inner.sessions.insert(session_id.clone(), loaded);
@@ -589,21 +576,11 @@ impl SessionEngine {
     /// a plan or todo event. Phase 9b's events are the only writer of these
     /// fields, so this is where a reload's plan spine is captured.
     fn sync_plan_store(&self, session_id: &SessionId) {
-        let plan_store = {
-            let inner = self.inner.lock().expect("engine lock");
-            match inner.sessions.get(session_id) {
-                Some(session) => session.plan_store.clone(),
-                None => return,
-            }
-        };
-        let snapshot = selora_ai::plan::snapshot(&plan_store);
         {
             let mut inner = self.inner.lock().expect("engine lock");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
-            session.todos = snapshot.todos.clone();
-            session.plan = plan_state_from_live(&snapshot);
             session.updated_at = selora_ai::now_millis();
         }
         self.flush_session(session_id);
@@ -630,26 +607,25 @@ impl SessionEngine {
         session.durable = true;
         session.model = loaded.state.model.clone();
         session.mode = mode_from_disk(loaded.state.mode);
-        session.todos = loaded.todos.clone();
-        session.plan = loaded.state.plan.clone();
         // Phase 9b's live store hydrates from the durable record: the
         // resume picker must reopen the same plan phase, draft and todos.
         {
             let mut live = selora_ai::plan::lock(&session.plan_store);
-            live.phase = if session.plan.status == selora_ai::PlanStatus::Proposed {
+            live.phase = if loaded.state.plan.status == selora_ai::PlanStatus::Proposed {
                 selora_ai::PlanPhase::Planning
             } else {
                 selora_ai::PlanPhase::Executing
             };
-            live.plan = session.plan.plan.as_deref().and_then(plan_draft_from_disk);
-            live.todos = session.todos.clone();
+            live.plan = loaded
+                .state
+                .plan
+                .plan
+                .as_deref()
+                .and_then(plan_draft_from_disk);
+            live.todos = loaded.todos.clone();
         }
         session.compaction = loaded.state.compaction;
-        session.messages = loaded
-            .conversation()
-            .into_iter()
-            .map(|message| stored_message(&message, now))
-            .collect();
+        session.messages = stored_transcript(&loaded.transcript.entries);
         session.durable_entries = session.messages.len();
         // A restored park is shown once. It has no live request, so any
         // decision expires instead of executing (see `agent_decision`).
@@ -744,6 +720,13 @@ impl SessionEngine {
     /// transcript, the live request/turn ids, the newest parked approval,
     /// and the active session's authoritative todos.
     pub(crate) fn chat_state(&self) -> ChatStateDto {
+        let redaction_key = self
+            .config
+            .key_source
+            .get()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let inner = self.inner.lock().expect("engine lock");
         let mut sessions = Vec::new();
         let mut messages = Vec::new();
@@ -771,7 +754,10 @@ impl SessionEngine {
                     .collect(),
                 active: session.active_request.is_some(),
                 plan_phase: plan_phase_dto(plan.phase),
-                plan: plan.plan.as_ref().map(plan_approval_dto),
+                plan: plan
+                    .plan
+                    .as_ref()
+                    .map(|draft| plan_approval_dto(draft, &redaction_key)),
                 todos: plan.todos.iter().map(todo_dto).collect(),
             });
             for message in &session.messages {
@@ -783,8 +769,14 @@ impl SessionEngine {
                 });
             }
             if let Some(request_id) = &session.active_request {
-                active_session_id = Some(session_id.clone());
-                if let Some(active) = inner.active.get(request_id) {
+                if active_session_id.is_none() {
+                    active_session_id = Some(session_id.clone());
+                }
+                if let Some(active) = inner
+                    .active
+                    .get(request_id)
+                    .filter(|_| active_session_id.as_ref() == Some(session_id))
+                {
                     active_request_id = Some(request_id.clone());
                     active_turn_id = Some(active.turn_id().clone());
                 }
@@ -804,20 +796,28 @@ impl SessionEngine {
                 .find(|(session, _)| session == active)
                 .map(|(_, approval)| approval.clone());
         }
-        if pending_approval.is_none() {
-            pending_approval = pending_approvals
-                .into_iter()
-                .next()
-                .map(|(_, approval)| approval);
-        }
         ChatStateDto {
             sessions,
             messages,
-            active_session_id,
+            active_session_id: active_session_id.clone(),
             active_request_id,
             active_turn_id,
             pending_approval,
-            todos,
+            pending_approvals: pending_approvals
+                .into_iter()
+                .map(|(_, approval)| approval)
+                .collect(),
+            todos: active_session_id
+                .as_ref()
+                .and_then(|id| inner.sessions.get(id))
+                .map(|session| {
+                    selora_ai::plan::snapshot(&session.plan_store)
+                        .todos
+                        .iter()
+                        .map(todo_dto)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -837,54 +837,6 @@ impl SessionEngine {
     // NewSession / SwitchSession
     // -----------------------------------------------------------------
 
-    /// Create a real, empty session and make it active. Rejected while any
-    /// turn is live: the frontend's routing follows the live turn's session,
-    /// so creating-and-selecting another would show an empty transcript with
-    /// no way back to the stream.
-    pub(crate) fn new_session(&self) -> Result<SessionId, ProtocolErrorDto> {
-        let mut inner = self.inner.lock().expect("engine lock");
-        if !inner.active.is_empty() {
-            return Err(session_busy_switch());
-        }
-        let session_id =
-            SessionId::new(format!("sess_{}", Uuid::new_v4())).expect("uuid session id is valid");
-        inner.activity_counter += 1;
-        let activity = inner.activity_counter;
-        inner.sessions.insert(
-            session_id.clone(),
-            ChatSession {
-                title: "New session".into(),
-                messages: Vec::new(),
-                active_request: None,
-                pending_approval: None,
-                todos: Vec::new(),
-                last_activity: activity,
-            },
-        );
-        inner.active_session = Some(session_id.clone());
-        Ok(session_id)
-    }
-
-    /// Select an existing session. Unknown ids are refused (never created
-    /// implicitly), and a switch during any live turn is refused because the
-    /// live turn's events would otherwise land in another session's view.
-    pub(crate) fn switch_session(&self, session_id: &SessionId) -> Result<(), ProtocolErrorDto> {
-        let mut inner = self.inner.lock().expect("engine lock");
-        if !inner.sessions.contains_key(session_id) {
-            return Err(unknown_session(session_id));
-        }
-        if !inner.active.is_empty() {
-            return Err(session_busy_switch());
-        }
-        inner.activity_counter += 1;
-        let activity = inner.activity_counter;
-        inner.active_session = Some(session_id.clone());
-        if let Some(session) = inner.sessions.get_mut(session_id) {
-            session.last_activity = activity;
-        }
-        Ok(())
-    }
-
     // -----------------------------------------------------------------
     // RetryMessage
     // -----------------------------------------------------------------
@@ -902,6 +854,24 @@ impl SessionEngine {
         session_id: SessionId,
         message_id: MessageId,
     ) -> Result<RequestId, ProtocolErrorDto> {
+        if envelope_session
+            .as_ref()
+            .is_some_and(|session| session != &session_id)
+        {
+            return Err(stale_session());
+        }
+        if self
+            .inner
+            .lock()
+            .expect("engine lock")
+            .sessions
+            .get(&session_id)
+            .is_none_or(|session| session.durable)
+        {
+            let request_id = RequestId::new(Uuid::new_v4().to_string()).expect("uuid is valid");
+            self.retry_durable_message(log, app, request_id.clone(), session_id, message_id)?;
+            return Ok(request_id);
+        }
         let (spec, text) = {
             let inner = self.inner.lock().expect("engine lock");
             let session = inner
@@ -1127,11 +1097,12 @@ impl SessionEngine {
             session.restored_park = false;
         }
         let auto_approve = session.auto_approve;
-        let open_todos = session.todos.clone();
+        let open_todos = selora_ai::plan::snapshot(&session.plan_store).todos;
         let sys_prompt = system_prompt(&payload, &root);
         let mut conversation: Vec<ChatMessage> = vec![ChatMessage::system(sys_prompt)];
         conversation.extend(conversation_tail(session));
         let plan_store = session.plan_store.clone();
+        self.subagents.begin_turn(payload.session_id.as_str());
         drop(inner);
         self.flush_session(&payload.session_id);
 
@@ -1215,14 +1186,11 @@ impl SessionEngine {
     where
         F: std::future::Future<Output = selora_ai::ChildOutcome> + Send + 'static,
     {
-        let mut events = self.subagents.subscribe();
         let child_id = request.child_id.clone();
         let handle = self.subagents.spawn_background(request, work)?;
+        let runtime = self.subagents.clone();
         tauri::async_runtime::spawn(async move {
-            while let Ok(selora_ai::SubagentEvent::Completed(completion)) = events.recv().await {
-                if completion.child_id != child_id {
-                    continue;
-                }
+            if let Some(completion) = runtime.wait_for_child(&child_id).await {
                 let Ok(parent) = SessionId::new(completion.parent_session.clone()) else {
                     return;
                 };
@@ -1232,7 +1200,6 @@ impl SessionEngine {
                     None,
                     parent,
                 );
-                return;
             }
         });
         Ok(handle)
@@ -1275,6 +1242,7 @@ impl SessionEngine {
     /// The approval gate: the parked card is validated and consumed
     /// strictly here — only the matching decision gets through, exactly
     /// once. `Stop` needs no card and forwards to whatever is running.
+    #[cfg(test)]
     pub(crate) fn agent_decision(
         &self,
         request_id: &RequestId,
@@ -1282,6 +1250,65 @@ impl SessionEngine {
         decision: DecisionDto,
         envelope_session: Option<SessionId>,
     ) -> Result<(), ProtocolErrorDto> {
+        self.agent_decision_with_resolution(
+            request_id,
+            approval_id,
+            decision,
+            envelope_session,
+            None,
+        )
+    }
+
+    pub(crate) fn agent_decision_with_resolution(
+        &self,
+        request_id: &RequestId,
+        approval_id: &ApprovalId,
+        decision: DecisionDto,
+        envelope_session: Option<SessionId>,
+        resolution: Option<selora_protocol::AgentDecisionResolutionDto>,
+    ) -> Result<(), ProtocolErrorDto> {
+        let answer = match (decision, resolution) {
+            (
+                DecisionDto::Answer,
+                Some(selora_protocol::AgentDecisionResolutionDto::Question { option_id, text }),
+            ) => {
+                let answer = [option_id.unwrap_or_default(), text.unwrap_or_default()].join("\n");
+                if answer.trim().is_empty() || answer.len() > 8000 {
+                    return Err(ProtocolErrorDto {
+                        code: "invalid_answer".into(),
+                        message: "An answer must contain 1 to 8000 bytes.".into(),
+                        retryable: false,
+                    });
+                }
+                Some(answer)
+            }
+            (DecisionDto::Answer, _) => {
+                return Err(ProtocolErrorDto {
+                    code: "invalid_answer".into(),
+                    message: "A structured question answer is required.".into(),
+                    retryable: false,
+                })
+            }
+            (
+                DecisionDto::Revise,
+                Some(selora_protocol::AgentDecisionResolutionDto::Plan {
+                    feedback: Some(feedback),
+                    ..
+                }),
+            ) => {
+                if feedback.len() > 8000 {
+                    return Err(ProtocolErrorDto {
+                        code: "invalid_answer".into(),
+                        message: "Revision feedback exceeds 8000 bytes.".into(),
+                        retryable: false,
+                    });
+                }
+                Some(format!(
+                    "Revision requested; remain in plan mode. User feedback: {feedback}"
+                ))
+            }
+            _ => None,
+        };
         // Stop applies without a pending card (§17.4: honored regardless of
         // which card it names — the nil id carries no card).
         if decision == DecisionDto::Stop {
@@ -1313,6 +1340,25 @@ impl SessionEngine {
             .expect("found by pending approval")
             .turn_id
             .clone();
+        if envelope_session
+            .as_ref()
+            .is_some_and(|owner| owner != &session_id)
+        {
+            return Err(stale_session());
+        }
+        if decision == DecisionDto::ApproveAllThisTurn
+            && session
+                .pending_approval
+                .as_ref()
+                .is_some_and(|approval| !approval.can_approve_all_this_turn)
+        {
+            return Err(ProtocolErrorDto {
+                code: "invalid_decision".into(),
+                message: "This card requires its own decision and cannot grant blanket approval."
+                    .into(),
+                retryable: false,
+            });
+        }
         // A restored park has no live turn. Consume it exactly once and tell
         // the caller it expired — never execute the restored action.
         if session.restored_park {
@@ -1384,7 +1430,7 @@ impl SessionEngine {
             return Err(stale_session());
         }
         let result = decisions
-            .send((loop_id, map_decision(decision)))
+            .send((loop_id, map_decision(decision, answer)))
             .map_err(|_| ProtocolErrorDto {
                 code: "approval_expired".into(),
                 message: "The turn this approval belongs to has ended.".into(),
@@ -1402,7 +1448,7 @@ impl SessionEngine {
     /// Rewind the session to just before `message_id` and re-send that user
     /// message as a new turn. The rewritten transcript drops the abandoned
     /// branch; the full history of *other* sessions is untouched.
-    pub(crate) fn retry_message<R: tauri::Runtime>(
+    fn retry_durable_message<R: tauri::Runtime>(
         self: &Arc<Self>,
         log: Arc<EventLog>,
         app: tauri::AppHandle<R>,
@@ -1447,12 +1493,43 @@ impl SessionEngine {
                 });
             }
             let prompt = session.messages[index].text.clone();
-            let entries: Vec<TranscriptEntry> = session.messages[..index]
+            let loaded = store
+                .load(session_id.as_str())
+                .map_err(|error| session_persistence_error(&error))?
+                .ok_or_else(|| unknown_session(&session_id))?;
+            let durable_index = loaded
+                .transcript
+                .entries
                 .iter()
-                .map(message_entry)
-                .collect();
-            session.messages.truncate(index);
-            session.durable_entries = index;
+                .position(|entry| entry.id() == message_id.as_str())
+                .ok_or_else(|| unknown_message(&message_id))?;
+            if loaded.transcript.entries[durable_index..]
+                .iter()
+                .any(|entry| {
+                    let calls = match entry {
+                        TranscriptEntry::ToolCalls { calls, .. } => Some(calls),
+                        TranscriptEntry::Assistant { tool_calls, .. } => tool_calls.as_ref(),
+                        _ => None,
+                    };
+                    calls.is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| selora_ai::plan::is_side_effecting_tool(&call.name))
+                    })
+                })
+            {
+                return Err(ProtocolErrorDto {
+                    code: "retry_partial_effects".into(),
+                    message: "This turn attempted side effects. Start a new turn to inspect the result; retry could duplicate writes or commands.".into(),
+                    retryable: false,
+                });
+            }
+            let entries = loaded.transcript.entries[..durable_index].to_vec();
+            store
+                .rewrite_transcript(session_id.as_str(), &entries)
+                .map_err(|error| session_persistence_error(&error))?;
+            session.messages = stored_transcript(&entries);
+            session.durable_entries = session.messages.len();
             session.pending_approval = None;
             session.pending_card = None;
             session.pending_tool_name = None;
@@ -1463,9 +1540,7 @@ impl SessionEngine {
             inner.active_session = Some(session_id.clone());
             (prompt, model, mode, entries)
         };
-        store
-            .rewrite_transcript(session_id.as_str(), &entries)
-            .map_err(|error| session_persistence_error(&error))?;
+        let _ = entries;
         self.flush_session(&session_id);
         self.send_agent(
             log,
@@ -1570,7 +1645,7 @@ impl SessionEngine {
                     session.active_request = None;
                 }
                 if let Some((message_id, text)) = assistant {
-                    push_message(session, message_id, MessageRole::Assistant, text);
+                    push_message(session, message_id, MessageRole::Assistant, text, None);
                 }
                 session.updated_at = selora_ai::now_millis();
             }
@@ -1598,7 +1673,7 @@ impl SessionEngine {
                 session.pending_tool_name = None;
                 session.restored_park = false;
                 if let Some((message_id, text)) = assistant {
-                    push_message(session, message_id, MessageRole::Assistant, text);
+                    push_message(session, message_id, MessageRole::Assistant, text, None);
                 }
                 session.updated_at = selora_ai::now_millis();
             }
@@ -1709,81 +1784,6 @@ impl SessionEngine {
             #[cfg(test)]
             ApiKeySource::Fixed(_) => None,
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The `manage_todo` store — one sink per agent turn, bound to its session
-// ---------------------------------------------------------------------------
-
-/// Writes the router's validated todo list into the owning session and
-/// announces the whole stored list on `selora://event`. The engine is held
-/// weakly so a finished session never keeps the app state alive.
-struct SessionTodoSink<R: tauri::Runtime> {
-    engine: Weak<SessionEngine>,
-    session_id: SessionId,
-    log: Arc<EventLog>,
-    app: tauri::AppHandle<R>,
-}
-
-impl<R: tauri::Runtime> TodoSink for SessionTodoSink<R> {
-    fn load(&self) -> Result<Vec<TodoItem>, String> {
-        let engine = self
-            .engine
-            .upgrade()
-            .ok_or_else(|| "the session engine has shut down".to_string())?;
-        let inner = engine.inner.lock().expect("engine lock");
-        inner
-            .sessions
-            .get(&self.session_id)
-            .map(|session| session.todos.clone())
-            .ok_or_else(|| "the session no longer exists".to_string())
-    }
-
-    fn store(&self, todos: Vec<TodoItem>) -> Result<(), String> {
-        let engine = self
-            .engine
-            .upgrade()
-            .ok_or_else(|| "the session engine has shut down".to_string())?;
-        let announced: Vec<TodoDto>;
-        {
-            let mut inner = engine.inner.lock().expect("engine lock");
-            if !inner
-                .active
-                .values()
-                .any(|active| active.session_id() == &self.session_id)
-            {
-                return Err("the session has no live turn to own this list".to_string());
-            }
-            let session = inner
-                .sessions
-                .get_mut(&self.session_id)
-                .ok_or_else(|| "the session no longer exists".to_string())?;
-            session.todos.clone_from(&todos);
-            announced = todos.iter().map(todo_dto).collect();
-        }
-        self.log.record_session(
-            &self.app,
-            FrontendEvent::SessionTodosChanged(SessionTodosDto {
-                session_id: self.session_id.clone(),
-                todos: announced,
-            }),
-            None,
-            self.session_id.clone(),
-        );
-        Ok(())
-    }
-}
-
-fn todo_dto(todo: &TodoItem) -> TodoDto {
-    TodoDto {
-        id: todo.id.clone(),
-        text: todo.text.clone(),
-        status: match todo.status {
-            TodoStatus::Pending => TodoStatusDto::Pending,
-            TodoStatus::InProgress => TodoStatusDto::InProgress,
-            TodoStatus::Completed => TodoStatusDto::Completed,
-        },
     }
 }
 
@@ -2074,6 +2074,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                 );
             }
             selora_ai::AgentEvent::ApprovalNeeded { approval_id, card } => {
+                let card = redact_card(card, &api_key);
                 let tool_name = last_call
                     .as_ref()
                     .map(|call| call.name.clone())
@@ -2091,7 +2092,10 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         turn_id: turn_id.clone(),
                         session_id: session_id.clone(),
                         summary: format!("{tool_name} {path_or_command}"),
-                        can_approve_all_this_turn: !matches!(&card, ApprovalCard::Plan { .. }),
+                        can_approve_all_this_turn: !matches!(
+                            &card,
+                            ApprovalCard::Plan { .. } | ApprovalCard::Workflow { .. }
+                        ),
                         plan,
                     },
                     card.clone(),
@@ -2122,7 +2126,9 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                     FrontendEvent::PlanStateChanged(PlanStateDto {
                         session_id: session_id.clone(),
                         phase: plan_phase_dto(phase),
-                        plan: plan.as_ref().map(plan_approval_dto),
+                        plan: plan
+                            .as_ref()
+                            .map(|draft| plan_approval_dto(draft, &api_key)),
                     }),
                     Some(request_id.clone()),
                     session_id.clone(),
@@ -2551,6 +2557,7 @@ fn message_entry(message: &StoredMessage) -> TranscriptEntry {
 /// A restored transcript message in the in-memory shape.
 fn stored_message(message: &ChatMessage, timestamp: u64) -> StoredMessage {
     StoredMessage {
+        retry: None,
         message_id: fresh_message_id(),
         role: match message.role {
             selora_ai::Role::User => MessageRole::User,
@@ -2564,6 +2571,42 @@ fn stored_message(message: &ChatMessage, timestamp: u64) -> StoredMessage {
         ok: true,
         timestamp,
     }
+}
+
+/// Restore every durable record, including call batches and result pairing.
+fn stored_transcript(entries: &[TranscriptEntry]) -> Vec<StoredMessage> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (message, ok) = match entry {
+                TranscriptEntry::User { content, .. } => (ChatMessage::user(content), true),
+                TranscriptEntry::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    let mut message = ChatMessage::assistant(content);
+                    message.tool_calls = tool_calls.clone();
+                    (message, true)
+                }
+                TranscriptEntry::ToolCalls { calls, .. } => {
+                    let mut message = ChatMessage::assistant("");
+                    message.tool_calls = Some(calls.clone());
+                    (message, true)
+                }
+                TranscriptEntry::Tool {
+                    call_id,
+                    content,
+                    ok,
+                    ..
+                } => (ChatMessage::tool_result(call_id, content), *ok),
+            };
+            let mut stored = stored_message(&message, entry.timestamp());
+            stored.message_id = MessageId::new(entry.id()).unwrap_or_else(|_| fresh_message_id());
+            stored.ok = ok;
+            stored
+        })
+        .collect()
 }
 
 /// The metadata half of a session write. The auto-approve flag is absent by
@@ -2591,7 +2634,7 @@ fn session_state(session_id: &SessionId, session: &ChatSession) -> AgentSessionS
         updated_at: session.updated_at,
         model: session.model.clone(),
         mode: durable_mode(session.mode),
-        plan: session.plan.clone(),
+        plan: plan_state_from_live(&selora_ai::plan::snapshot(&session.plan_store)),
         parks,
         compaction: session.compaction,
     }
@@ -2621,8 +2664,8 @@ fn plan_state_from_live(snapshot: &selora_ai::PlanSnapshot) -> selora_ai::PlanSt
         .as_ref()
         .map(|draft| serde_json::to_string(draft).unwrap_or_else(|_| draft.steps.join("\n")));
     let status = match (&snapshot.plan, snapshot.phase) {
-        (None, _) => selora_ai::PlanStatus::None,
-        (Some(_), selora_ai::PlanPhase::Planning) => selora_ai::PlanStatus::Proposed,
+        (_, selora_ai::PlanPhase::Planning) => selora_ai::PlanStatus::Proposed,
+        (None, selora_ai::PlanPhase::Executing) => selora_ai::PlanStatus::None,
         (Some(_), selora_ai::PlanPhase::Executing) => selora_ai::PlanStatus::Approved,
     };
     selora_ai::PlanState {
@@ -2734,10 +2777,17 @@ fn plan_phase_dto(phase: selora_ai::PlanPhase) -> PlanPhaseDto {
     }
 }
 
-fn plan_approval_dto(plan: &selora_ai::PlanDraft) -> PlanApprovalDto {
+fn plan_approval_dto(plan: &selora_ai::PlanDraft, api_key: &str) -> PlanApprovalDto {
     PlanApprovalDto {
-        summary: plan.summary.clone(),
-        steps: plan.steps.clone(),
+        summary: plan
+            .summary
+            .as_deref()
+            .map(|summary| redact(summary, api_key)),
+        steps: plan
+            .steps
+            .iter()
+            .map(|step| redact(step, api_key))
+            .collect(),
     }
 }
 
@@ -2788,12 +2838,15 @@ fn subagent_completed_dto(completion: selora_ai::SubagentCompletion) -> Subagent
     }
 }
 
-fn map_decision(decision: DecisionDto) -> selora_ai::AgentDecision {
+fn map_decision(decision: DecisionDto, answer: Option<String>) -> selora_ai::AgentDecision {
     match decision {
+        DecisionDto::Answer => selora_ai::AgentDecision::Answer(answer.unwrap_or_default()),
         DecisionDto::Approve => selora_ai::AgentDecision::Approve,
         DecisionDto::Deny => selora_ai::AgentDecision::Deny,
         DecisionDto::ApproveAllThisTurn => selora_ai::AgentDecision::ApproveAllThisTurn,
-        DecisionDto::Revise => selora_ai::AgentDecision::Revise,
+        DecisionDto::Revise => answer
+            .map(selora_ai::AgentDecision::Answer)
+            .unwrap_or(selora_ai::AgentDecision::Revise),
         DecisionDto::Stop => selora_ai::AgentDecision::Stop,
     }
 }
@@ -2830,6 +2883,25 @@ fn redact(text: &str, api_key: &str) -> String {
     }
 }
 
+/// Apply the same approval redaction to plan summaries and every plan step.
+fn redact_card(card: ApprovalCard, api_key: &str) -> ApprovalCard {
+    fn scrub(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::String(text) => *text = redact(text, key),
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(|value| scrub(value, key))
+            }
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|value| scrub(value, key))
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(card).expect("approval card serializes");
+    scrub(&mut value, api_key);
+    serde_json::from_value(value).expect("redaction preserves approval schema")
+}
+
 fn stale_session() -> ProtocolErrorDto {
     ProtocolErrorDto {
         code: "stale_workspace_or_session".into(),
@@ -2842,14 +2914,6 @@ fn session_busy() -> ProtocolErrorDto {
     ProtocolErrorDto {
         code: "session_busy".into(),
         message: "A request is already running for this session — stop it first.".into(),
-        retryable: false,
-    }
-}
-
-fn session_busy_switch() -> ProtocolErrorDto {
-    ProtocolErrorDto {
-        code: "session_busy".into(),
-        message: "A turn is running. Stop it before creating or switching sessions.".into(),
         retryable: false,
     }
 }
@@ -2990,6 +3054,7 @@ mod tests {
         decision: DecisionDto,
     ) -> FrontendCommand {
         FrontendCommand::AgentDecision {
+            resolution: None,
             request_id: RequestId::new(request_id).expect("valid id"),
             approval_id: ApprovalId::new(approval_id).expect("valid id"),
             decision,
@@ -4319,7 +4384,7 @@ mod tests {
 
         // The live announcement carries the stored list (not the raw args).
         let changed = find_payload(&events, |payload| match payload {
-            FrontendEvent::SessionTodosChanged(dto) => Some(dto.clone()),
+            FrontendEvent::TodosChanged(dto) => Some(dto.clone()),
             _ => None,
         });
         assert_eq!(changed.session_id.as_str(), "session-todo");
@@ -4329,7 +4394,7 @@ mod tests {
             changed.todos[0].status,
             selora_protocol::TodoStatusDto::Completed
         );
-        assert_eq!(changed.todos[1].text, "store the todos");
+        assert_eq!(changed.todos[1].title, "store the todos");
 
         // The bootstrap (the hydrate path) carries the same list, both on
         // the active session and per session.
@@ -4371,7 +4436,7 @@ mod tests {
             "session-todo"
         );
         assert_eq!(back.todos.len(), 2);
-        assert_eq!(back.todos[0].text, "inspect the router");
+        assert_eq!(back.todos[0].title, "inspect the router");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4387,6 +4452,10 @@ mod tests {
             true,
         );
         let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        let root = tempfile::tempdir().unwrap();
+        state
+            .sessions()
+            .set_workspace_root(Some(root.path().to_path_buf()));
 
         state
             .dispatch(
@@ -4438,7 +4507,7 @@ mod tests {
                 envelope(&state, switch_session_command("no-such-session")),
             )
             .expect_err("unknown session");
-        assert_eq!(error.code, "unknown_session");
+        assert_eq!(error.code, "session_not_found");
         assert_eq!(
             state
                 .bootstrap()
@@ -4452,10 +4521,14 @@ mod tests {
     }
 
     #[test]
-    fn switch_and_new_are_refused_during_a_live_turn() {
+    fn switch_and_new_preserve_a_live_turn() {
         let app = mock_app_handle();
         let uri = stalling_gateway("first ");
         let state = DesktopState::with_settings(gateway_settings(uri));
+        let root = tempfile::tempdir().unwrap();
+        state
+            .sessions()
+            .set_workspace_root(Some(root.path().to_path_buf()));
 
         state
             .dispatch(
@@ -4467,17 +4540,23 @@ mod tests {
             matches!(event.payload, FrontendEvent::ChatDelta(_))
         });
 
-        let error = state
+        state
             .dispatch(&app, envelope(&state, new_session_command()))
-            .expect_err("new is refused while a turn is live");
-        assert_eq!(error.code, "session_busy");
-        let error = state
+            .expect("new session does not cancel another session's turn");
+        assert_ne!(
+            state.bootstrap().chat.active_session_id.unwrap().as_str(),
+            "session-live"
+        );
+        state
             .dispatch(
                 &app,
                 envelope(&state, switch_session_command("session-live")),
             )
-            .expect_err("switch is refused while a turn is live");
-        assert_eq!(error.code, "session_busy");
+            .expect("switch returns to the live turn");
+        assert_eq!(
+            state.bootstrap().chat.active_request_id.unwrap().as_str(),
+            "chat-live"
+        );
 
         state
             .dispatch(&app, envelope(&state, stop_chat("chat-live")))
@@ -5087,10 +5166,138 @@ mod tests {
     }
 
     #[test]
+    fn planning_without_a_draft_survives_restart_and_refuses_all_effects_until_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = state.sessions();
+        engine.set_workspace_root(Some(root.path().to_path_buf()));
+        let id = engine.new_session().unwrap();
+        let live = engine.inner.lock().unwrap().sessions[&id]
+            .plan_store
+            .clone();
+        selora_ai::plan::lock(&live).phase = selora_ai::PlanPhase::Planning;
+        engine.sync_plan_store(&id);
+        drop(engine);
+        drop(state);
+
+        let restarted = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = restarted.sessions();
+        engine.set_workspace_root(Some(root.path().to_path_buf()));
+        engine.switch_session(&id).unwrap();
+        let live = engine.inner.lock().unwrap().sessions[&id]
+            .plan_store
+            .clone();
+        assert!(selora_ai::plan::is_planning(&live));
+        let context = ToolContext::new(root.path(), selora_ai::AgentToolSettings::default())
+            .with_plan(live.clone());
+        tauri::async_runtime::block_on(async {
+            for (name, arguments) in [
+                ("write_file", r#"{"path":"never.txt","content":"no"}"#),
+                ("bash", r#"{"command":"Set-Content never.txt no"}"#),
+                ("run_workflow", r#"{"name":"no","script":"log('no');"}"#),
+            ] {
+                let call = selora_ai::ToolCall {
+                    id: name.into(),
+                    name: name.into(),
+                    arguments: arguments.into(),
+                };
+                let selora_ai::ToolOutcome::Ready(result) =
+                    selora_ai::execute_tool(&context, call.clone()).await
+                else {
+                    panic!("planning must refuse before a card");
+                };
+                assert!(!result.ok);
+                assert!(!selora_ai::execute_approved(&context, call).await.ok);
+            }
+            let todos = selora_ai::ToolCall {
+                id: "todos".into(),
+                name: "manage_todo".into(),
+                arguments: r#"{"todos":[{"id":"t1","text":"Inspect","status":"pending"}]}"#.into(),
+            };
+            assert!(
+                matches!(selora_ai::execute_tool(&context, todos).await, selora_ai::ToolOutcome::Ready(result) if result.ok)
+            );
+            let exit = selora_ai::ToolCall {
+                id: "exit".into(),
+                name: "exit_plan_mode".into(),
+                arguments: r#"{"summary":"Review","plan":["Inspect","Write"]}"#.into(),
+            };
+            assert!(matches!(
+                selora_ai::execute_tool(&context, exit.clone()).await,
+                selora_ai::ToolOutcome::NeedsApproval(ApprovalCard::Plan { .. })
+            ));
+            engine.sync_plan_store(&id);
+            let restored = engine.load_session_from_disk(&id).unwrap();
+            let snapshot = selora_ai::plan::snapshot(&restored.plan_store);
+            assert_eq!(snapshot.phase, selora_ai::PlanPhase::Planning);
+            assert_eq!(snapshot.todos[0].title, "Inspect");
+            assert_eq!(snapshot.plan.unwrap().steps, ["Inspect", "Write"]);
+            let context = ToolContext::new(root.path(), selora_ai::AgentToolSettings::default())
+                .with_plan(restored.plan_store);
+            assert!(selora_ai::execute_approved(&context, exit).await.ok);
+            let write = selora_ai::ToolCall {
+                id: "write".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"approved.txt","content":"yes"}"#.into(),
+            };
+            assert!(matches!(
+                selora_ai::execute_tool(&context, write.clone()).await,
+                selora_ai::ToolOutcome::NeedsApproval(ApprovalCard::Diff { .. })
+            ));
+            assert!(selora_ai::execute_approved(&context, write).await.ok);
+        });
+        assert!(!root.path().join("never.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("approved.txt")).unwrap(),
+            "yes"
+        );
+    }
+
+    #[test]
     fn retry_rewinds_the_durable_transcript_and_resends() {
         let app = mock_app_handle();
         let root = temp_workspace("retry");
         seed_session_store(&root, "sess-retry");
+        let durable = selora_ai::AgentSessionStore::new(&root);
+        let mut prefix = durable.load_transcript("sess-retry").unwrap().entries;
+        let split = prefix.iter().position(|entry| matches!(entry, TranscriptEntry::User { content, .. } if content == "second prompt")).unwrap();
+        prefix.splice(
+            split..split,
+            [
+                TranscriptEntry::ToolCalls {
+                    id: "batch-original".into(),
+                    timestamp: 1,
+                    calls: vec![
+                        selora_ai::ToolCall {
+                            id: "write-original".into(),
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"once.txt","content":"once"}"#.into(),
+                        },
+                        selora_ai::ToolCall {
+                            id: "bash-original".into(),
+                            name: "bash".into(),
+                            arguments: r#"{"command":"Add-Content once.txt duplicate"}"#.into(),
+                        },
+                    ],
+                },
+                TranscriptEntry::Tool {
+                    id: "write-result".into(),
+                    timestamp: 2,
+                    call_id: "write-original".into(),
+                    ok: true,
+                    content: "written once".into(),
+                },
+                TranscriptEntry::Tool {
+                    id: "bash-result".into(),
+                    timestamp: 3,
+                    call_id: "bash-original".into(),
+                    ok: true,
+                    content: "ran once".into(),
+                },
+            ],
+        );
+        durable.rewrite_transcript("sess-retry", &prefix).unwrap();
+        std::fs::write(root.join("once.txt"), "once").unwrap();
         let server = mock_gateway(
             vec![(
                 "second prompt",
@@ -5165,8 +5372,104 @@ mod tests {
             )),
             "the abandoned branch is gone from the durable transcript"
         );
+        assert!(transcript.entries.iter().any(|entry| matches!(entry, TranscriptEntry::ToolCalls { calls, .. } if calls.len() == 2 && calls[1].id == "bash-original")));
+        assert!(transcript.entries.iter().any(|entry| matches!(entry, TranscriptEntry::Tool { call_id, .. } if call_id == "write-original")));
+        let requests = tauri::async_runtime::block_on(server.received_requests()).unwrap();
+        assert_eq!(requests.len(), 1, "retry sends exactly one request");
+        let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["tool_call_id"] == "bash-original"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("once.txt")).unwrap(),
+            "once"
+        );
+
+        // An abandoned turn with attempted effects cannot be retried blindly.
+        durable
+            .append(
+                "sess-retry",
+                &TranscriptEntry::ToolCalls {
+                    id: "unfinished-effect".into(),
+                    timestamp: 4,
+                    calls: vec![selora_ai::ToolCall {
+                        id: "unsafe-bash".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        let target = transcript
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::User { .. }))
+            .unwrap();
+        let error = state
+            .sessions()
+            .retry_message(
+                state.event_log(),
+                app.clone(),
+                None,
+                session,
+                MessageId::new(target.id()).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "retry_partial_effects");
+        assert_eq!(
+            std::fs::read_to_string(root.join("once.txt")).unwrap(),
+            "once"
+        );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_text_is_redacted_on_approval_events_and_bootstrap() {
+        const KEY: &str = "sk-gw-desktop-test-key";
+        let redacted = redact_card(
+            ApprovalCard::Plan {
+                summary: Some(format!("use {KEY}")),
+                steps: vec![format!("run {KEY}")],
+            },
+            KEY,
+        );
+        let ApprovalCard::Plan { summary, steps } = redacted else {
+            panic!("redaction preserves the plan card");
+        };
+        assert_eq!(summary.as_deref(), Some("use [REDACTED]"));
+        assert_eq!(steps, vec!["run [REDACTED]"]);
+
+        let root = tempfile::tempdir().unwrap();
+        let state = DesktopState::with_settings(gateway_settings("http://127.0.0.1:9".into()));
+        state
+            .sessions()
+            .set_workspace_root(Some(root.path().to_path_buf()));
+        let id = state.sessions().new_session().unwrap();
+        let live = state.sessions().inner.lock().unwrap().sessions[&id]
+            .plan_store
+            .clone();
+        {
+            let mut plan = selora_ai::plan::lock(&live);
+            plan.phase = selora_ai::PlanPhase::Planning;
+            plan.plan = Some(selora_ai::PlanDraft {
+                summary: Some(KEY.into()),
+                steps: vec![KEY.into()],
+            });
+        }
+        let session = state
+            .bootstrap()
+            .chat
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == id)
+            .unwrap();
+        let plan = session.plan.expect("plan hydrates");
+        assert_eq!(plan.summary.as_deref(), Some("[REDACTED]"));
+        assert_eq!(plan.steps, vec!["[REDACTED]"]);
     }
 
     #[test]

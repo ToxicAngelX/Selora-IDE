@@ -83,7 +83,6 @@ fireEvent.click(otherRow!);
     expect(getByText('No sessions yet')).toBeTruthy();
     expect(queryByRole('button', { name: /Current session/ })).toBeNull();
   });
-});
   it('lists durable sessions under a truthful Resume session group', () => {
     const resumable: ResumableAgentSession[] = [
       {

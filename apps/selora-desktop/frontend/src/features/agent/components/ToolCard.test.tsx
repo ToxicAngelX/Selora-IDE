@@ -17,6 +17,23 @@ const makePendingTool = (overrides: Partial<AgentToolCall> = {}): AgentToolCall 
 });
 
 describe('ToolCard Component', () => {
+  it('renders one plan decision surface when old and new payloads both arrive', () => {
+    const revise = vi.spyOn(agentStore, 'resolvePlan').mockResolvedValue(true);
+    const deny = vi.spyOn(agentStore, 'handleApprovalDecision').mockImplementation(() => {});
+    const tool: WorkflowToolCall = {
+      ...makePendingTool({ toolName: 'exit_plan_mode' }),
+      plan: { summary: 'Review', steps: ['Inspect'] },
+      decisionPrompt: { kind: 'plan', summary: 'Review', steps: [{ title: 'Inspect' }] },
+    };
+    const { getByRole, queryAllByRole } = render(<ToolCard tool={tool} />);
+    expect(queryAllByRole('button', { name: 'Approve plan' })).toHaveLength(1);
+    fireEvent.click(getByRole('button', { name: 'Approve plan' }));
+    expect(revise).toHaveBeenCalledTimes(1);
+    expect(deny).not.toHaveBeenCalled();
+    fireEvent.click(getByRole('button', { name: 'Deny plan' }));
+    expect(deny).toHaveBeenCalledTimes(1);
+    expect(deny).toHaveBeenCalledWith('appr-pending', 'deny');
+  });
   beforeEach(() => {
     Object.defineProperty(navigator, 'clipboard', {
       value: { writeText: vi.fn().mockResolvedValue(undefined) },

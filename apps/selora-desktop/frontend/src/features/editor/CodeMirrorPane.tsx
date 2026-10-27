@@ -56,7 +56,6 @@ import {
 } from '../../bridge/bridge';
 import { getAppSnapshot, subscribeApp } from '../../app/app-store';
 import { keybindMatches, parseKeybind } from '../keymap/keybind';
-import { createSeloraTheme } from './cm-theme';
 import { createSeloraTheme, currentTheme } from './cm-theme';
 import {
   currentEditorContext,
@@ -543,7 +542,6 @@ export function CodeMirrorPane({
         ...defaultKeymap,
         indentWithTab,
       ]),
-      cmTheme,
       editorPreferencesCompartment.current.of(
         editorPreferencesExtension(settingsRef.current),
       ),

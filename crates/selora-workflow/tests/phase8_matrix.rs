@@ -663,6 +663,7 @@ fn phase8_step8_journal_lands_in_the_gitignored_workspace_path() {
         MockHost::new(),
         sink,
         RunOptions {
+            acknowledge_partial_effects: false,
             workspace_root: workspace.path().to_path_buf(),
             run_id: run_id.clone(),
             resume: false,

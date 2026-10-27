@@ -97,6 +97,7 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
     getBootstrapStateMock.mockResolvedValue(
       makeBootstrap({
         settings: {
+          ...makeBootstrap().settings,
           reduced_motion: true,
           theme: 'light',
           keybind_command_palette: 'Ctrl+Shift+P',
@@ -121,6 +122,7 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
         type: 'bootstrap_state',
         payload: makeBootstrap({
           settings: {
+            ...makeBootstrap().settings,
             reduced_motion: false,
             theme: 'light',
             keybind_command_palette: 'Ctrl+Shift+P',

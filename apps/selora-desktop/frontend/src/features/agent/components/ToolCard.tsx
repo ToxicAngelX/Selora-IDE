@@ -28,7 +28,6 @@ import { agentStore, type WorkflowToolCall } from '../agent-store';
 import { WorkflowCard } from './WorkflowCard';
 import { AgentQuestionCard } from './AgentQuestionCard';
 import { AgentPlanCard } from './AgentPlanCard';
-import { PlanCard, type PlanDecision } from './PlanCard';
 
 export type ToolCardProps = {
   /** A workflow card carries the §18.1 confirmation payload on the call. */
@@ -217,18 +216,15 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
 
   // Phase 9a: a structured question / plan is the body of the same parked
   // card. It stays expanded after the decision so the answer remains visible.
-  const decisionPrompt = tool.decisionPrompt;
+   const decisionPrompt = tool.decisionPrompt ?? (tool.plan ? {
+     kind: 'plan' as const,
+     summary: tool.plan.summary ?? undefined,
+     steps: tool.plan.steps.map((title) => ({ title })),
+   } : undefined);
   const showDecisionPrompt = Boolean(decisionPrompt);
   // Phase 9b: an `exit_plan_mode` card owns the body with its steps and the
   // Approve/Revise pair. It stays visible after the decision, like the
   // workflow grant, so the transcript records what was approved.
-  const plan = tool.plan;
-  const planCard = Boolean(plan) && tool.toolName === 'exit_plan_mode';
-  const planDecision: PlanDecision | null = isApproval
-    ? null
-    : tool.status === 'approved' || tool.status === 'completed'
-      ? 'approve'
-      : 'revise';
 
   // Live timer for running tools
   useEffect(() => {
@@ -251,7 +247,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
   // never through a global listener: only keystrokes routed to this card — and
   // not owned by a form/button/contentEditable descendant — may decide.
   const handleCardKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!isApproval || !tool.approvalId || tool.decisionPrompt) return;
+    if (!isApproval || !tool.approvalId || showDecisionPrompt) return;
 
     // Modified keystrokes belong to global shortcuts (Ctrl+Enter, Cmd+K, ...).
     if (e.ctrlKey || e.altKey || e.metaKey) return;
@@ -266,7 +262,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
     } else if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      agentStore.handleApprovalDecision(tool.approvalId, planCard ? 'revise' : 'deny');
+      agentStore.handleApprovalDecision(tool.approvalId, 'deny');
     }
   };
 
@@ -451,31 +447,17 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                 prompt={decisionPrompt}
                 submitting={tool.decisionSubmitting}
                 error={tool.decisionError}
-                resolution={tool.resolution}
+                resolution={tool.resolution ?? (isApproval ? undefined : {
+                  kind: 'plan', decision: tool.status === 'denied' ? 'request_changes' : 'approve',
+                  feedback: tool.status === 'denied' ? 'Plan denied' : undefined,
+                })}
                 onDecide={(decision, feedback) =>
                   void agentStore.resolvePlan(tool.approvalId!, decision, feedback)
                 }
+                onDeny={isApproval ? () => agentStore.handleApprovalDecision(tool.approvalId!, 'deny') : undefined}
               />
             </div>
           ) : null}
-          {/* A plan card owns the body: the steps and the Approve/Revise
-              pair. Approving flips the session to execution; nothing writes
-              until each diff card is approved separately. */}
-          {planCard && plan && (
-            <div className="tool-approval-gate" data-testid="tool-plan-grant">
-              <PlanCard
-                summary={plan.summary}
-                steps={plan.steps}
-                approvalId={tool.approvalId}
-                decision={planDecision}
-                onDecision={(decision) => {
-                  if (tool.approvalId) {
-                    agentStore.handleApprovalDecision(tool.approvalId, decision);
-                  }
-                }}
-              />
-            </div>
-          )}
 
           {/* A workflow grant owns the body: script, command set, cap, and the
               Approve/Deny pair the session routes through the existing

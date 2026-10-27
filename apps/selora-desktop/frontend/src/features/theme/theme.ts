@@ -14,7 +14,6 @@ export const DEFAULT_THEME: ThemeValue = 'selora-dark';
 export const THEME_OPTIONS: ReadonlyArray<{ value: ThemeValue; label: string }> = [
   { value: 'selora-dark', label: 'Selora Cosmic Dark' },
   { value: 'dark', label: 'Dark (alias)' },
-  { value: 'space-black', label: 'True Black (OLED)' },
   { value: 'light', label: 'Selora Moonlight (Light)' },
 ];
 

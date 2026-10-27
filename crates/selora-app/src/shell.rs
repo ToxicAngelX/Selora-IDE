@@ -3465,7 +3465,7 @@ mod tests {
                     content: "fix the build".into(),
                     error: None,
                 },
-                SessionEntry::Card(SessionCard {
+                SessionEntry::Card(Box::new(SessionCard {
                     id: "call_1".into(),
                     name: "edit_file".into(),
                     arguments: r#"{"path":"main.rs"}"#.into(),
@@ -3484,7 +3484,7 @@ mod tests {
                     }),
                     decided: None,
                     expanded: false,
-                }),
+                })),
                 SessionEntry::Summary(AgentSummary {
                     iterations: 1,
                     tools_used: 1,

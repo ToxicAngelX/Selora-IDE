@@ -20,7 +20,6 @@
 
 pub mod plan;
 pub mod router;
-pub mod todo;
 pub mod session;
 pub mod subagent;
 pub mod tools;
@@ -72,9 +71,11 @@ pub type ApprovalId = Uuid;
 /// non-allowlisted bash for the rest of this turn only — never persisted
 /// across turns or sessions. `Deny` continues the loop with a
 /// "user denied this action" tool result; `Stop` aborts the turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentDecision {
     Approve,
+    /// A structured answer is model input, never an effect grant.
+    Answer(String),
     ApproveAllThisTurn,
     Deny,
     /// Phase 9b: reject the *shape* of a proposed plan while keeping the

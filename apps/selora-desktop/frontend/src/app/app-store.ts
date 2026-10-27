@@ -292,6 +292,10 @@ function applyEvent(event: EventEnvelope, gen: number): void {
 
 function reduceEvent(event: EventEnvelope): void {
   const payload = event.payload;
+  if (['chat_delta', 'chat_completed', 'chat_failed', 'tool_call_started', 'tool_result',
+    'approval_needed', 'agent_state_changed', 'agent_turn_done', 'plan_state_changed', 'todos_changed'].includes(payload.type) &&
+    'payload' in payload && 'session_id' in payload.payload &&
+    agentStore.routeSessionEvent(payload.payload, () => reduceEvent(event))) return;
   switch (payload.type) {
     case 'bootstrap_state': {
       // Z4 — a workspace opened: the id, buffers and tree all move at once.

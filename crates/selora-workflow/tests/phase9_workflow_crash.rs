@@ -145,6 +145,7 @@ fn workspace(label: &str) -> PathBuf {
 
 fn options(root: &Path, run: &RunId, resume: bool) -> RunOptions {
     RunOptions {
+        acknowledge_partial_effects: false,
         workspace_root: root.to_path_buf(),
         run_id: run.clone(),
         resume,

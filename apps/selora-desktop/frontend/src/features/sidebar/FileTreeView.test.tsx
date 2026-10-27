@@ -49,6 +49,7 @@ vi.mock('../editor/editor-store', () => ({
 }));
 
 import { FileTreeView } from './FileTreeView';
+import { consumeFileTreeReveal, requestFileTreeReveal } from './file-tree-reveal';
 
 const tree: FileTreeNode = {
   path: 'workspace',
@@ -93,6 +94,7 @@ function readyState(fileRoot: FileTreeNode | null) {
 describe('FileTreeView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    consumeFileTreeReveal();
     harness.pickFolder.mockResolvedValue(null);
     harness.openFolderAt.mockResolvedValue(undefined);
     harness.refreshTree.mockResolvedValue(undefined);
@@ -190,6 +192,17 @@ describe('FileTreeView', () => {
         expect.objectContaining({ core_instance_id: 'core-1', workspace_id: 'ws-1' }),
       ),
     );
+  });
+
+  it('reveals a collapsed file requested by another surface', async () => {
+    render(<FileTreeView bootstrap={readyState(tree).bootstrap} />);
+    expect(screen.queryByText('App.tsx')).toBeNull();
+
+    requestFileTreeReveal('src/App.tsx');
+
+    await waitFor(() => expect(screen.getByText('App.tsx')).toBeTruthy());
+    const row = screen.getByText('App.tsx').closest('[role="treeitem"]');
+    expect(row?.getAttribute('aria-selected')).toBe('true');
   });
 });
 

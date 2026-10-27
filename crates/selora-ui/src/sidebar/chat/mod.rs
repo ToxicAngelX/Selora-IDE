@@ -246,7 +246,7 @@ pub enum SessionEntry {
         content: String,
         error: Option<String>,
     },
-    Card(SessionCard),
+    Card(Box<SessionCard>),
     Summary(AgentSummary),
 }
 
@@ -305,15 +305,15 @@ fn session_entry_of(entry: &TimelineEntry) -> SessionEntry {
             content: message.content.clone(),
             error: message.error.clone(),
         },
-        TimelineEntry::Card(card) => SessionEntry::Card(SessionCard {
+        TimelineEntry::Card(card) => SessionEntry::Card(Box::new(SessionCard {
             id: card.call.id.clone(),
             name: card.call.name.clone(),
             arguments: card.call.arguments.clone(),
             approval: card.approval.clone(),
             result: card.result.clone(),
-            decided: card.decided,
+            decided: card.decided.clone(),
             expanded: card.expanded,
-        }),
+        })),
         TimelineEntry::Summary(summary) => SessionEntry::Summary(summary.clone()),
     }
 }
@@ -336,6 +336,7 @@ fn timeline_entry_of(entry: SessionEntry) -> TimelineEntry {
             finished_at: None,
         }),
         SessionEntry::Card(card) => {
+            let card = *card;
             let mut restored = agent_cards::ToolCard::new(ToolCall {
                 id: card.id,
                 name: card.name,

@@ -182,6 +182,16 @@ pub fn partial_effects(root: &Path, run_id: &RunId) -> Result<PartialEffects, Wo
     let spec = load_workflow_spec(root, run_id)?;
     let verified = load_verified(root, run_id).map_err(persistence_error)?;
     let scan = scan_journal(&verified.loaded.entries, &spec)?;
+    if !crate::effects::tool_effects_path(root, run_id).is_file()
+        && scan
+            .calls
+            .values()
+            .any(|call| call.start.step.kind == StepKind::Ask)
+    {
+        return Err(WorkflowError::ToolEffectLedger {
+            message: "tool effect ledger is missing for a run with agent asks".into(),
+        });
+    }
     let records = crate::effects::load_tool_effects(root, run_id)?;
     Ok(scan.partial_effects(&records))
 }
@@ -546,6 +556,19 @@ impl Durable {
         options: &RunOptions,
         host: &dyn Host,
     ) -> Result<Self, WorkflowError> {
+        let dir = checked_run_dir(&options.workspace_root, &options.run_id, !options.resume)
+            .map_err(persistence_error)?;
+        let path = dir.join(SPEC_FILE);
+        check_file(&path).map_err(persistence_error)?;
+        let lock_path = dir.join("run.lock");
+        check_file(&lock_path).map_err(persistence_error)?;
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(persistence_error)?;
+        lock.try_lock().map_err(persistence_error)?;
         // Fail closed before any host call: a resume may replay tools whose
         // earlier effects already landed. The ledger is the durable evidence.
         if options.resume {
@@ -569,19 +592,6 @@ impl Durable {
                 "host usage counter must be finite and non-negative",
             ));
         }
-        let dir = checked_run_dir(&options.workspace_root, &options.run_id, !options.resume)
-            .map_err(persistence_error)?;
-        let path = dir.join(SPEC_FILE);
-        check_file(&path).map_err(persistence_error)?;
-        let lock_path = dir.join("run.lock");
-        check_file(&lock_path).map_err(persistence_error)?;
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .map_err(persistence_error)?;
-        lock.try_lock().map_err(persistence_error)?;
         if options.resume {
             if load_workflow_spec(&options.workspace_root, &options.run_id)? != *spec {
                 return Err(persistence_error(
@@ -598,6 +608,10 @@ impl Durable {
             file.write_all(&serde_json::to_vec(spec).map_err(persistence_error)?)
                 .and_then(|()| file.sync_all())
                 .map_err(persistence_error)?;
+            crate::effects::ToolEffectLedger::open_for_run(
+                &options.workspace_root,
+                &options.run_id,
+            )?;
         }
         let loaded = Journal::load(&options.workspace_root, options.run_id.clone())
             .map_err(persistence_error)?;

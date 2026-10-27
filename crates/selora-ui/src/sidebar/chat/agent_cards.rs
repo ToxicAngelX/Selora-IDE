@@ -752,7 +752,7 @@ fn paint_diff_card(
             vec2(width, BUTTON_HEIGHT),
         );
         if let Some(decision) = paint_decision_row(ui, row, card, fade, &mut outcome) {
-            card.decided = Some(decision);
+            card.decided = Some(decision.clone());
             outcome.decision = Some(decision);
         }
     }
@@ -828,7 +828,7 @@ fn paint_delete_card(
             vec2(width, BUTTON_HEIGHT),
         );
         if let Some(decision) = paint_decision_row(ui, row, card, fade, &mut outcome) {
-            card.decided = Some(decision);
+            card.decided = Some(decision.clone());
             outcome.decision = Some(decision);
         }
     }
@@ -967,7 +967,7 @@ fn paint_bash_card(
             vec2(width, BUTTON_HEIGHT),
         );
         if let Some(decision) = paint_decision_row(ui, row, card, fade, &mut outcome) {
-            card.decided = Some(decision);
+            card.decided = Some(decision.clone());
             outcome.decision = Some(decision);
         }
     } else if stop_row {

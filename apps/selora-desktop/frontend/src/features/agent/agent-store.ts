@@ -24,9 +24,7 @@ import {
   agentDecision,
   fetchModels,
   newSession as requestNewSessionCommand,
-  retryMessage as retryMessageCommand,
   listAgentSessions,
-  newSession as bridgeNewSession,
   retryMessage as bridgeRetryMessage,
   runWorkflow,
   sendAgent,
@@ -35,7 +33,6 @@ import {
   stopChat,
   switchSession as switchSessionCommand,
   type AgentDecisionResolution,
-  switchSession as bridgeSwitchSession,
   type AgentMode,
   type AgentStateChangedPayload,
   type AgentTurnDonePayload,
@@ -199,17 +196,16 @@ let state: AgentState = {
   sessions: INITIAL_SESSIONS,
   activeSessionId: '',
   resumableSessions: [],
-  activeSessionId: DEFAULT_SESSION_ID,
   messages: [],
   transcripts: {},
   todosBySession: {},
   todos: INITIAL_TODOS,
   planPhase: 'executing',
   plan: null,
-  subagents: INITIAL_SUBAGENTS,
+  subagents: [],
   unreadSubagentCount: 0,
   revealedSubagentId: null,
-  artifacts: INITIAL_ARTIFACTS,
+  artifacts: [],
   inFlight: false,
   thinkingState: 'breathing',
   permissionMode: DEFAULT_PERMISSION_MODE,
@@ -435,20 +431,23 @@ export type WorkflowToolCall = AgentToolCall & {
 };
 
 /** Map the bridge's snake_case todo items onto the dock's `AgentTodo`. */
-export function todosFromSnapshot(items: TodoItem[] | undefined): AgentTodo[] {
+export function todosFromSnapshot(items: Array<TodoItem | TodoDto> | undefined): AgentTodo[] {
   if (!items) return [];
   return items
-    .filter((item) => item && typeof item.title === 'string' && item.title.trim())
-    .map((item) => ({
-      id: item.id || `todo_${item.title}`,
-      title: item.title,
-      status:
-        item.status === 'completed'
-          ? 'completed'
-          : item.status === 'in_progress'
-            ? 'in_progress'
-            : 'pending',
-    }));
+    .flatMap((item) => {
+      const title = item.title ?? ('text' in item ? item.text : undefined) ?? '';
+      if (!title.trim()) return [];
+      return [{
+        id: item.id || `todo_${title}`,
+        text: title,
+        status:
+          item.status === 'completed'
+            ? 'completed' as const
+            : item.status === 'in_progress'
+              ? 'in_progress' as const
+              : 'pending' as const,
+      }];
+    });
 }
 
 /** Validate a plan payload before it drives the approval card. */
@@ -518,6 +517,29 @@ export function workflowApprovalFromArgs(
 // session-scoped ones, so only sessionEnvelopeContext() may add it.
 let context: EnvelopeContext | null = null;
 let activeRequestId: string | null = null;
+type SessionView = Pick<AgentState, 'messages' | 'todos' | 'plan' | 'planPhase' | 'inFlight' |
+  'thinkingState' | 'metrics' | 'promptQueue' | 'streamingActivityLevel'> & { requestId: string | null };
+const sessionViews = new Map<string, SessionView>();
+let routingSessionEvent = false;
+
+function selectSessionView(sessionId: string) {
+  const view = sessionViews.get(sessionId);
+  activeRequestId = view?.requestId ?? null;
+  state = {
+    ...state,
+    activeSessionId: sessionId,
+    messages: view?.messages ?? state.transcripts[sessionId] ?? [],
+    todos: view?.todos ?? state.todosBySession[sessionId] ?? [],
+    plan: view?.plan ?? null,
+    planPhase: view?.planPhase ?? 'executing',
+    inFlight: view?.inFlight ?? false,
+    thinkingState: view?.thinkingState ?? 'breathing',
+    metrics: view?.metrics ?? { totalTokens: 0, costUsd: 0, activeToolsCount: 0, approvedCount: 0, deniedCount: 0, latencyMs: 0 },
+    promptQueue: view?.promptQueue ?? [],
+    streamingActivityLevel: view?.streamingActivityLevel ?? 0,
+    permissionMode: DEFAULT_PERMISSION_MODE,
+  };
+}
 
 /**
  * The request that raised each parked approval, keyed by `approval_id`.
@@ -680,6 +702,20 @@ function sessionEnvelopeContext(): EnvelopeContext | null {
 }
 
 function notify() {
+  if (state.activeSessionId) {
+    sessionViews.set(state.activeSessionId, {
+      messages: state.messages, todos: state.todos, plan: state.plan, planPhase: state.planPhase,
+      inFlight: state.inFlight, thinkingState: state.thinkingState, metrics: state.metrics,
+      promptQueue: state.promptQueue, streamingActivityLevel: state.streamingActivityLevel,
+      requestId: activeRequestId,
+    });
+    state = {
+      ...state,
+      transcripts: { ...state.transcripts, [state.activeSessionId]: state.messages },
+      todosBySession: { ...state.todosBySession, [state.activeSessionId]: state.todos },
+    };
+  }
+  if (routingSessionEvent) return;
   for (const listener of listeners) {
     listener();
   }
@@ -700,11 +736,11 @@ function findApprovalCard(approvalId: string): AgentToolCall | undefined {
  */
 async function submitPromptDecision(
   approvalId: string,
-  decision: 'approve' | 'deny',
+  decision: 'approve' | 'answer' | 'deny' | 'revise',
   resolution: AgentDecisionResolution,
 ): Promise<boolean> {
   const card = findApprovalCard(approvalId);
-  if (!card?.decisionPrompt || card.status !== 'needs_approval') return false;
+  if ((!card?.decisionPrompt && !(card as WorkflowToolCall | undefined)?.plan) || card?.status !== 'needs_approval') return false;
   if (card.decisionSubmitting) return false;
   const requestId = pendingApprovalRequests.get(approvalId) ?? activeRequestId;
   const ctx = requestId ? sessionEnvelopeContext() : null;
@@ -722,7 +758,7 @@ async function submitPromptDecision(
     await agentDecision(requestId, approvalId, decision, ctx, resolution);
     pendingApprovalRequests.delete(approvalId);
     updateToolCallCard(approvalId, {
-      status: decision === 'deny' ? 'denied' : 'approved',
+      status: decision === 'approve' || decision === 'answer' ? 'approved' : 'denied',
       resolution,
       decisionSubmitting: false,
       decisionError: undefined,
@@ -738,6 +774,27 @@ async function submitPromptDecision(
 }
 
 export const agentStore = {
+  /** Apply a background turn's event to its own projection, not the selected tab. */
+  routeSessionEvent(payload: { session_id?: string | null; request_id?: string | null }, apply: () => void): boolean {
+    const sessionId = payload.session_id;
+    if (!sessionId || sessionId === state.activeSessionId) return false;
+    const selected = state.activeSessionId;
+    const permissionMode = state.permissionMode;
+    routingSessionEvent = true;
+    selectSessionView(sessionId);
+    if (!activeRequestId && payload.request_id && !terminalRequests.has(payload.request_id)) {
+      activeRequestId = payload.request_id;
+      state = { ...state, inFlight: true };
+    }
+    try { apply(); } finally {
+      notify();
+      selectSessionView(selected);
+      state = { ...state, permissionMode };
+      routingSessionEvent = false;
+      notify();
+    }
+    return true;
+  },
   subscribe(listener: Listener): () => void {
     listeners.add(listener);
     return () => listeners.delete(listener);
@@ -748,6 +805,14 @@ export const agentStore = {
   },
 
   hydrate(bootstrap: BootstrapState) {
+    const previousSessionId = state.activeSessionId;
+    if (context && (context.workspace_id !== bootstrap.workspace.id || context.core_instance_id !== bootstrap.core_instance_id)) {
+      sessionViews.clear();
+      pendingApprovalRequests.clear();
+      workflowConfirmations.clear();
+      completedSubagentIds.clear();
+      state = { ...state, transcripts: {}, todosBySession: {}, messages: [], subagents: [], artifacts: [] };
+    }
     // Workspace identity comes only from Rust. A null workspace means no
     // folder is open — the agent has nowhere to read or write, so we keep
     // `workspace` null and never synthesize one.
@@ -813,7 +878,6 @@ const activeSessionId =
       }),
     );
 
-    const messages: ChatMessage[] = [];
     for (const message of bootstrap.chat.messages) {
       if (!transcripts[message.session_id]) continue;
       if (message.role !== 'user' && message.role !== 'assistant') continue;
@@ -824,6 +888,18 @@ const activeSessionId =
         status: 'complete',
         timestamp: Date.now(),
       });
+    }
+    for (const session of sessions) {
+      const previous = state.transcripts[session.id] ?? [];
+      if (session.isRunning && previous.length > 0) {
+        transcripts[session.id] = previous;
+      } else {
+        for (const message of previous.filter((message) => message.toolCalls?.length)) {
+          const index = transcripts[session.id]!.findIndex((entry) => entry.id === message.id);
+          if (index >= 0) transcripts[session.id]![index] = { ...transcripts[session.id]![index]!, toolCalls: message.toolCalls };
+          else transcripts[session.id]!.push(message);
+        }
+      }
     }
 
     // Phase 9a additive seam: `ChatStateDto.todos` is authoritative once 9b
@@ -840,7 +916,10 @@ const activeSessionId =
     const activeSession = bootstrap.chat.sessions.find(
       (session) => session.session_id === activeSessionId,
     );
-    const hydratedTodos = todosFromSnapshot(activeSession?.todos);
+    for (const session of bootstrap.chat.sessions) {
+      if (session.todos !== undefined) todosBySession[session.session_id] = todosFromSnapshot(session.todos);
+    }
+    const hydratedTodos = todosBySession[activeSessionId] ?? [];
     const hydratedPlanPhase: PlanPhase = activeSession?.plan_phase ?? 'executing';
     const hydratedPlan = validPlanApproval(activeSession?.plan)
       ? activeSession.plan
@@ -848,16 +927,32 @@ const activeSessionId =
 
     // Keep request routing aligned with the turn Rust says is live.
     activeRequestId = bootstrap.chat.active_request_id ?? null;
+    for (const session of bootstrap.chat.sessions) {
+      const previous = sessionViews.get(session.session_id);
+      const isActive = session.session_id === activeSessionId;
+      sessionViews.set(session.session_id, {
+        messages: transcripts[session.session_id] ?? [],
+        todos: todosBySession[session.session_id] ?? [],
+        plan: validPlanApproval(session.plan) ? session.plan : null,
+        planPhase: session.plan_phase ?? 'executing',
+        inFlight: Boolean(previous?.inFlight || session.active || (isActive && activeRequestId)),
+        thinkingState: previous?.thinkingState ?? 'breathing',
+        metrics: previous?.metrics ?? { totalTokens: 0, costUsd: 0, activeToolsCount: 0, approvedCount: 0, deniedCount: 0, latencyMs: 0 },
+        promptQueue: previous?.promptQueue ?? [],
+        streamingActivityLevel: previous?.streamingActivityLevel ?? 0,
+        requestId: previous?.requestId ?? (isActive ? activeRequestId : null),
+      });
+    }
 
     // A pending approval survives the reload as a parked tool card so the
     // user can still decide it. Workflow summaries cannot authorize a run:
     // retain their identity, but wait for the full approval_needed payload.
     const previousConfirmations = new Map(workflowConfirmations);
     pendingApprovalRequests.clear();
-    workflowConfirmations.clear();
-    terminalRequests.clear();
-    const pending = bootstrap.chat.pending_approval;
-    if (pending) {
+    const parks = bootstrap.chat.pending_approvals?.length
+      ? bootstrap.chat.pending_approvals
+      : bootstrap.chat.pending_approval ? [bootstrap.chat.pending_approval] : [];
+    for (const pending of parks) {
       pendingApprovalRequests.set(pending.approval_id, pending.request_id);
       const previousCall = state.messages.flatMap((message) => message.toolCalls ?? [])
         .find((call) => call.approvalId === pending.approval_id) as WorkflowToolCall | undefined;
@@ -910,7 +1005,7 @@ const activeSessionId =
         const target = pendingMessages[lastAssistantIndex]!;
         pendingMessages[lastAssistantIndex] = {
           ...target,
-          toolCalls: [...(target.toolCalls ?? []), approvalCall],
+          toolCalls: [...(target.toolCalls ?? []).filter((call) => call.approvalId !== pending.approval_id), approvalCall],
         };
       } else {
         pendingMessages.push({
@@ -933,10 +1028,9 @@ const activeSessionId =
       transcripts,
       todosBySession,
       messages: transcripts[activeSessionId] ?? [],
-      todos: todosBySession[activeSessionId] ?? [],
       resumableSessions,
-      messages,
       activeSessionId,
+      permissionMode: activeSessionId === previousSessionId ? state.permissionMode : DEFAULT_PERMISSION_MODE,
       todos: hydratedTodos,
       planPhase: hydratedPlanPhase,
       plan: hydratedPlan,
@@ -944,6 +1038,11 @@ const activeSessionId =
       sessionBusy: false,
       sessionError: null,
     };
+    const previousView = sessionViews.get(activeSessionId);
+    if (previousView && state.inFlight) {
+      state = { ...state, thinkingState: previousView.thinkingState, metrics: previousView.metrics,
+        streamingActivityLevel: previousView.streamingActivityLevel, promptQueue: previousView.promptQueue };
+    }
     notify();
   },
 
@@ -967,6 +1066,7 @@ const activeSessionId =
   },
 
   reset() {
+    sessionViews.clear();
     context = null;
     activeRequestId = null;
     pendingApprovalRequests.clear();
@@ -983,7 +1083,7 @@ const activeSessionId =
       todos: [],
       planPhase: 'executing',
       plan: null,
-      subagents: INITIAL_SUBAGENTS,
+      subagents: [],
       unreadSubagentCount: 0,
       revealedSubagentId: null,
       inFlight: false,
@@ -1006,7 +1106,8 @@ const activeSessionId =
    * emits the bootstrap snapshot this store hydrates from — no local
    * placeholder row is ever fabricated.
    */
-  async createSession(): Promise<boolean> {
+  async createSession(_title?: string): Promise<boolean> {
+    state = { ...state, permissionMode: DEFAULT_PERMISSION_MODE };
     if (!context) {
       toastStore.pushLocal('warning', 'Open a folder and connect before starting a session.');
       return false;
@@ -1040,7 +1141,7 @@ const activeSessionId =
     if (!target || target.role !== 'user') return false;
     if (!context || !state.activeSessionId) return false;
     try {
-      await retryMessageCommand(state.activeSessionId, messageId, {
+      await bridgeRetryMessage(state.activeSessionId, messageId, {
         ...context,
         session_id: state.activeSessionId,
       });
@@ -1110,6 +1211,7 @@ const activeSessionId =
     notify();
     try {
       await requestNewSessionCommand(ctx);
+      state = { ...state, permissionMode: DEFAULT_PERMISSION_MODE };
       return true;
     } catch (error) {
       state = { ...state, sessionError: sessionCommandError('create', error) };
@@ -1126,12 +1228,7 @@ const activeSessionId =
    */
   selectSessionLocally(sessionId: string) {
     if (state.activeSessionId === sessionId) return;
-    state = {
-      ...state,
-      activeSessionId: sessionId,
-      messages: state.transcripts[sessionId] ?? [],
-      todos: state.todosBySession[sessionId] ?? [],
-    };
+    selectSessionView(sessionId);
     notify();
   },
 
@@ -1142,7 +1239,8 @@ const activeSessionId =
    */
   async requestSwitchSession(sessionId: string): Promise<boolean> {
     if (sessionId === state.activeSessionId) return true;
-    if (!state.sessions.some((session) => session.id === sessionId)) {
+    if (!state.sessions.some((session) => session.id === sessionId) &&
+        !state.resumableSessions.some((session) => session.id === sessionId)) {
       state = {
         ...state,
         sessionError: 'That session is not in the backend session list.',
@@ -1164,6 +1262,7 @@ const activeSessionId =
     notify();
     try {
       await switchSessionCommand(sessionId, ctx);
+      selectSessionView(sessionId);
       state = {
         ...state,
         activeSessionId: sessionId,
@@ -1200,7 +1299,7 @@ const activeSessionId =
     notify();
   },
 
-  /** Drop a locally-known session tab (fork helpers/tests). */
+  /**
    * Phase 9e: one accepted background completion. Returns false when this
    * child id was already handled (dedupe) or when the payload claims success
    * without a result. A failed child stays failed: it is never painted as a
@@ -1245,19 +1344,19 @@ const activeSessionId =
    * A notification click: select the parent session and reveal the child's
    * result under it. Marking read keeps the badge truthful.
    */
-  revealSubagent(sessionId: string, childId: string) {
+  async revealSubagent(sessionId: string, childId: string): Promise<boolean> {
+    if (sessionId && sessionId !== state.activeSessionId && !await this.requestSwitchSession(sessionId)) return false;
     const subagents = state.subagents.map((subagent) =>
       subagent.id === childId ? { ...subagent, unread: false } : subagent,
     );
     state = {
       ...state,
-      activeSessionId: sessionId || state.activeSessionId,
       subagents,
       unreadSubagentCount: countUnreadSubagents(subagents),
       revealedSubagentId: childId,
-      messages: sessionId && sessionId !== state.activeSessionId ? [] : state.messages,
     };
     notify();
+    return true;
   },
 
   /** Mark one child's result read without changing the selected session. */
@@ -1280,6 +1379,7 @@ const activeSessionId =
   },
 
   deleteSession(sessionId: string) {
+    sessionViews.delete(sessionId);
     const remaining = state.sessions.filter((s) => s.id !== sessionId);
     const nextActive = remaining[0]?.id || '';
     const { [sessionId]: _removedTranscript, ...transcripts } = state.transcripts;
@@ -1299,26 +1399,13 @@ const activeSessionId =
   /** Phase 9d — open a durable session restored by Rust. */
   resumeSession(sessionId: string): boolean {
     if (!state.resumableSessions.some((session) => session.id === sessionId)) return false;
-    this.switchSession(sessionId);
-    const ctx = sessionEnvelopeContext();
-    if (ctx) {
-      void bridgeSwitchSession(sessionId, ctx).catch((err: unknown) => {
-        console.error('Failed to restore agent session:', err);
-      });
-    }
+    void this.requestSwitchSession(sessionId);
     return true;
   },
 
   /** Phase 9d — new session (Rust owns the id and the empty on-disk store). */
-  newDurableSession(title = 'New Agent Session'): string {
-    const localId = this.createSession(title);
-    const ctx = sessionEnvelopeContext();
-    if (ctx) {
-      void bridgeNewSession(ctx).catch((err: unknown) => {
-        console.error('Failed to create agent session:', err);
-      });
-    }
-    return localId;
+  newDurableSession(title = 'New Agent Session'): Promise<boolean> {
+    return this.createSession(title);
   },
 
   /** Phase 9d — refresh the resume picker from disk. */
@@ -1452,17 +1539,7 @@ const activeSessionId =
 
 // The backend owns the transcript; these are the live render rows only.
     // Todos are NOT seeded from the prompt — `manage_todo` is the only writer.
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            status: 'working' as const,
-            activeStep: isSteer
-              ? `Steering: ${trimmed.slice(0, 40)}`
-              : `Planning: ${trimmed.slice(0, 45)}`,
-          }
-        : sub
-    );
+    const updatedSubagents = state.subagents;
 
     state = {
       ...state,
@@ -1944,16 +2021,8 @@ const activeSessionId =
     // a tool's arguments and never advanced by another tool's start.
     const updatedTodos = state.todos;
 
-    // 2. Update subagents active step
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            status: 'working' as const,
-            activeStep: `${payload.tool_name}: ${argsSummary.slice(0, 45)}`,
-          }
-        : sub
-    );
+    // The roster is backend-reported. A tool start never fabricates a child.
+    const updatedSubagents = state.subagents;
 
     const toolCall: WorkflowToolCall = {
       id: payload.call_id,
@@ -2128,11 +2197,7 @@ const activeSessionId =
   },
 
   handleTodosChanged(payload: TodosChangedPayload) {
-    if (payload.session_id && state.activeSessionId && payload.session_id !== state.activeSessionId) {
-      return;
-    }
-    state = { ...state, todos: todosFromSnapshot(payload.todos) };
-    notify();
+    this.applySessionTodos(payload);
   },
 
   handleAgentStateChanged(payload: AgentStateChangedPayload) {
@@ -2253,7 +2318,7 @@ const activeSessionId =
       });
       return Promise.resolve(false);
     }
-    return submitPromptDecision(approvalId, 'approve', {
+    return submitPromptDecision(approvalId, 'answer', {
       kind: 'question',
       ...(ownsOption ? { option_id: optionId! } : {}),
       ...(text ? { text } : {}),
@@ -2272,7 +2337,7 @@ const activeSessionId =
   ): Promise<boolean> {
     const card = findApprovalCard(approvalId);
     const prompt = card?.decisionPrompt;
-    if (!prompt || prompt.kind !== 'plan') return Promise.resolve(false);
+    if (prompt?.kind !== 'plan' && !(card as WorkflowToolCall | undefined)?.plan) return Promise.resolve(false);
     const note = feedback.trim();
     if (decision === 'request_changes' && !note) {
       updateToolCallCard(approvalId, {
@@ -2282,7 +2347,7 @@ const activeSessionId =
     }
     return submitPromptDecision(
       approvalId,
-      decision === 'approve' ? 'approve' : 'deny',
+      decision === 'approve' ? 'approve' : 'revise',
       {
         kind: 'plan',
         decision,

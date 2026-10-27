@@ -17,31 +17,33 @@ describe('PlanCard', () => {
   it('renders every step in order with the approval prompt', () => {
     const { getByTestId, getByText, container } = render(<PlanCard {...props} decision={null} />);
 
-    expect(getByTestId('plan-card')).toBeTruthy();
-    expect(getByText('Plan approval')).toBeTruthy();
-    expect(getByText('Needs your approval')).toBeTruthy();
+    expect(container.querySelectorAll('.agent-plan-card')).toHaveLength(1);
+    expect(getByText('Plan review')).toBeTruthy();
     expect(getByText('Make the change')).toBeTruthy();
 
-    const steps = Array.from(container.querySelectorAll('.plan-card-step-text')).map(
+    const steps = Array.from(container.querySelectorAll('.agent-plan-step-title')).map(
       (node) => node.textContent,
     );
     expect(steps).toEqual(['Inspect the router', 'Write the plan', 'Verify the gates']);
     expect(getByText('Approve plan')).toBeTruthy();
-    expect(getByText('Revise')).toBeTruthy();
+    expect(getByText('Request changes')).toBeTruthy();
+    expect(getByText('Deny plan')).toBeTruthy();
     // No blanket approval: a plan is a shape, not a write grant.
     expect(container.textContent).not.toContain('Approve All');
   });
 
   it('answers Approve and Revise through the decision callback', () => {
     const onDecision = vi.fn();
-    const { getByTestId, unmount } = render(
+    const { getByText, getByLabelText, unmount } = render(
       <PlanCard {...props} decision={null} onDecision={onDecision} />,
     );
 
-    fireEvent.click(getByTestId('plan-approve'));
+    fireEvent.click(getByText('Approve plan'));
     expect(onDecision).toHaveBeenLastCalledWith('approve');
 
-    fireEvent.click(getByTestId('plan-revise'));
+    fireEvent.click(getByText('Request changes'));
+    fireEvent.change(getByLabelText('What should change?'), { target: { value: 'Keep scope small' } });
+    fireEvent.click(getByText('Send changes'));
     expect(onDecision).toHaveBeenLastCalledWith('revise');
     expect(onDecision).toHaveBeenCalledTimes(2);
     unmount();
@@ -52,10 +54,10 @@ describe('PlanCard', () => {
       <PlanCard {...props} decision="approve" />,
     );
     expect(queryByTestId('plan-approve')).toBeNull();
-    expect(getByText('Approved')).toBeTruthy();
+    expect(getByText('Plan approved')).toBeTruthy();
 
     rerender(<PlanCard {...props} decision="revise" />);
     expect(queryByTestId('plan-approve')).toBeNull();
-    expect(getByText('Revision requested')).toBeTruthy();
+    expect(getByText('Changes requested: Revision requested')).toBeTruthy();
   });
 });

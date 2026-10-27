@@ -246,12 +246,26 @@ pub enum AgentModeDto {
 #[serde(rename_all = "snake_case")]
 pub enum DecisionDto {
     Approve,
+    Answer,
     Deny,
     ApproveAllThisTurn,
     /// Phase 9b: request a revised plan. A plan card answers with this; the
     /// session stays in plan mode and the model proposes again.
     Revise,
     Stop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentDecisionResolutionDto {
+    Question {
+        option_id: Option<String>,
+        text: Option<String>,
+    },
+    Plan {
+        decision: String,
+        feedback: Option<String>,
+    },
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchQueryDto {
@@ -491,6 +505,8 @@ pub enum FrontendCommand {
         request_id: RequestId,
         approval_id: ApprovalId,
         decision: DecisionDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<AgentDecisionResolutionDto>,
     },
     RetryMessage {
         session_id: SessionId,
@@ -682,6 +698,7 @@ pub struct PlanApprovalDto {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TodoDto {
     pub id: String,
+    #[serde(alias = "text")]
     pub title: String,
     #[serde(default)]
     pub status: TodoStatusDto,
@@ -755,6 +772,9 @@ pub struct ChatStateDto {
     pub active_request_id: Option<RequestId>,
     pub active_turn_id: Option<TurnId>,
     pub pending_approval: Option<ApprovalDto>,
+    /// Every session's park; the singular field remains the selected session projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<ApprovalDto>,
     /// Phase 9 session slice: the active session's authoritative todo list.
     /// Additive and serde-defaulted, so a pre-Phase-9 bootstrap loads with no
     /// todos rather than failing. Per-session copies ride [`SessionDto`].
@@ -1783,14 +1803,6 @@ pub enum FrontendEvent {
     Error(ProtocolErrorDto),
 }
 
-/// The `manage_todo` write announcement. Carries the whole stored list so a
-/// concurrent switch cannot make the frontend apply another session's todos.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SessionTodosDto {
-    pub session_id: SessionId,
-    pub todos: Vec<TodoDto>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequestEnvelope<T> {
     pub protocol_version: u32,
@@ -1988,6 +2000,7 @@ mod tests {
             active_model_id: None,
             connection: ConnectionStatus::Disconnected,
             chat: ChatStateDto {
+                pending_approvals: Vec::new(),
                 sessions: vec![SessionDto {
                     session_id: sid("session-1"),
                     title: "Welcome".into(),
@@ -2190,19 +2203,7 @@ mod tests {
             serde_json::to_string(&FrontendCommand::RefreshTree).unwrap(),
             r#"{"type":"refresh_tree"}"#
         );
-        let reveal = serde_json::to_string(&FrontendCommand::RevealInExplorer {
-            path: WorkspacePath::new("src/main.rs").unwrap(),
-        })
-        .unwrap();
-        assert_eq!(
-            reveal,
-            r#"{"type":"reveal_in_explorer","payload":{"path":"src/main.rs"}}"#
-        );
-        let parsed: FrontendCommand = serde_json::from_str(&reveal).unwrap();
-        assert!(matches!(
-            parsed,
-            FrontendCommand::RevealInExplorer { path } if path.as_str() == "src/main.rs"
-        ));
+
         assert_eq!(
             serde_json::to_string(&FrontendCommand::CloseFolder).unwrap(),
             r#"{"type":"close_folder"}"#
@@ -2245,6 +2246,23 @@ mod tests {
             serde_json::from_str(r#"{"type":"search","payload":{"query":{"query":"fn main","case_sensitive":false,"whole_word":false,"use_regex":false}}}"#)
                 .unwrap();
         assert!(matches!(parsed, FrontendCommand::Search { .. }));
+    }
+
+    #[test]
+    fn reveal_in_explorer_wire_shape_round_trips() {
+        let reveal = serde_json::to_string(&FrontendCommand::RevealInExplorer {
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            reveal,
+            r#"{"type":"reveal_in_explorer","payload":{"path":"src/main.rs"}}"#
+        );
+        let parsed: FrontendCommand = serde_json::from_str(&reveal).unwrap();
+        assert!(matches!(
+            parsed,
+            FrontendCommand::RevealInExplorer { path } if path.as_str() == "src/main.rs"
+        ));
     }
 
     #[test]
@@ -2546,6 +2564,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&FrontendCommand::AgentDecision {
+                resolution: None,
                 request_id: rid("request-1"),
                 approval_id: aid("approval-1"),
                 decision: DecisionDto::ApproveAllThisTurn,
@@ -2757,7 +2776,7 @@ mod tests {
         let with_todos = ChatStateDto {
             todos: vec![TodoDto {
                 id: "t1".into(),
-                text: "build".into(),
+                title: "build".into(),
                 status: TodoStatusDto::InProgress,
             }],
             ..chat.clone()
@@ -2793,12 +2812,12 @@ mod tests {
         );
 
         // The todo event rides the additive enum spelling.
-        let event = FrontendEvent::SessionTodosChanged(SessionTodosDto {
+        let event = FrontendEvent::TodosChanged(TodosDto {
             session_id: sid("session-1"),
             todos: with_todos.todos.clone(),
         });
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"session_todos_changed""#), "{json}");
+        assert!(json.contains(r#""type":"todos_changed""#), "{json}");
         assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
 

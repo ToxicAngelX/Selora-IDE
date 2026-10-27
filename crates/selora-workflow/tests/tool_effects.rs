@@ -20,6 +20,28 @@ use serde_json::{json, Value};
 
 struct Workspace(PathBuf);
 
+#[test]
+fn an_early_opened_ledger_rereads_sequence_before_its_first_write() {
+    let root = Workspace::new();
+    let id = RunId::from("reread-sequence");
+    let first = ToolEffectLedger::open_for_run(root.path(), &id).unwrap();
+    let stale = ToolEffectLedger::open_for_run(root.path(), &id).unwrap();
+    let effect = first
+        .record_started(None, "one", "write_file", json!({}))
+        .unwrap();
+    first
+        .record_finished(&effect, "one", "write_file", true)
+        .unwrap();
+    stale
+        .record_started(None, "two", "bash", json!({}))
+        .unwrap();
+    let records = selora_workflow::load_tool_effects(root.path(), &id).unwrap();
+    assert_eq!(
+        records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+}
+
 impl Workspace {
     fn new() -> Self {
         let base = std::env::var_os("LOCALAPPDATA")
@@ -259,6 +281,28 @@ fn crash_leaves_a_started_record_without_finished() {
     assert_eq!(partial.unfinished_effects, 1);
     assert_eq!(partial.unfinished_ask_effects, 0);
     assert_eq!(partial.unattributed_effects, 0);
+}
+
+#[test]
+fn deleting_a_ledger_cannot_turn_partial_effects_into_safe_resume() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = crash_after_started(&workspace, &id, false);
+    fs::remove_file(workspace.effects(&id)).unwrap();
+    assert!(matches!(
+        partial_effects(workspace.path(), &id),
+        Err(WorkflowError::ToolEffectLedger { .. })
+    ));
+    let host = Arc::new(EffectHost::default());
+    let before = fs::read(workspace.journal(&id)).unwrap();
+    let (result, events) = execute(&workspace, &id, &spec, host.clone(), true, true, true);
+    assert!(matches!(
+        result,
+        Err(WorkflowError::ToolEffectLedger { .. })
+    ));
+    assert_eq!(host.asks.load(Ordering::SeqCst), 0);
+    assert!(events.is_empty());
+    assert_eq!(before, fs::read(workspace.journal(&id)).unwrap());
 }
 
 #[test]

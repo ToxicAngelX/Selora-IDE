@@ -239,7 +239,7 @@ describe('Agent workbench question card', () => {
       expect(bridgeMocks.agentDecision).toHaveBeenCalledWith(
         'req-q',
         'appr-q',
-        'approve',
+        'answer',
         expect.objectContaining({ session_id: 'sess-a' }),
         { kind: 'question', option_id: 'opt-main', text: 'keep the header' },
       ),
@@ -275,7 +275,7 @@ describe('Agent workbench question card', () => {
     expect(bridgeMocks.agentDecision).toHaveBeenCalledWith(
       'req-q',
       'appr-q',
-      'approve',
+      'answer',
       expect.anything(),
       { kind: 'question', text: 'Render the plan inline' },
     );
@@ -309,7 +309,7 @@ describe('Agent workbench plan card', () => {
     expect(getByText('Plan approved')).toBeTruthy();
   });
 
-  it('requests changes with a real denial + feedback payload', async () => {
+  it('requests changes with a typed revision + feedback payload', async () => {
     hydrate(
       baseChat({
         active_request_id: 'req-p',
@@ -331,7 +331,7 @@ describe('Agent workbench plan card', () => {
       expect(bridgeMocks.agentDecision).toHaveBeenCalledWith(
         'req-p',
         'appr-p',
-        'deny',
+        'revise',
         expect.anything(),
         {
           kind: 'plan',

@@ -161,6 +161,8 @@ describe('contrast (WCAG AA)', () => {
     ['--warn', '--ink-canvas', 3],
     ['--err', '--ink-canvas', 3],
     ['--info', '--ink-canvas', 3],
+    ['--c-7dd3fc', '--ink-canvas', 4.5],
+    ['--c-7dd3fc', '--ink-low', 4.5],
   ];
 
   for (const [theme, palette] of [
@@ -177,6 +179,20 @@ describe('contrast (WCAG AA)', () => {
 });
 
 describe('theme implementation', () => {
+  it('keeps every stylesheet block balanced after integration', () => {
+    for (const file of styleFiles) {
+      const css = file.text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '');
+      let depth = 0;
+      let minimum = 0;
+      for (const char of css) {
+        if (char === '{') depth += 1;
+        if (char === '}') depth -= 1;
+        minimum = Math.min(minimum, depth);
+      }
+      expect(minimum, file.path).toBeGreaterThanOrEqual(0);
+      expect(depth, file.path).toBe(0);
+    }
+  });
   it('has no hardcoded colors in component stylesheets', () => {
     const literal = /#[0-9a-f]{3,8}\b|rgba?\(|\bhsla?\(/i;
     for (const file of styleFiles) {

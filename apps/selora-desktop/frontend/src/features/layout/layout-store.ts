@@ -253,6 +253,11 @@ export const layoutStore = {
    */
   applyLayoutEvent(layout: Layout): void {
     state = { ...state, layout, pending: null };
+    // The authoritative payload can carry a stale oversized size (persisted on a
+    // wider window) and the ResizeObserver won't refire for a dock re-widening,
+    // so re-clamp against the measured workbench box here.
+    layoutStore.reclampToWorkbench();
+    // reclamp only notifies on a change; the event itself must always notify.
     notify();
   },
 

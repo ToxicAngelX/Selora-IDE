@@ -1,6 +1,6 @@
 // Selora IDE — Phase Z3/9a AgentDock Component Tests
 import { beforeEach, describe, it, expect } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
+import { render, fireEvent, act } from '@testing-library/react';
 import React from 'react';
 import { AgentDock } from '../../layout/AgentDock';
 import { agentStore } from './agent-store';
@@ -56,13 +56,13 @@ it('switches between Chat and Plan tabs to reveal the todo spine', () => {
     act(() => {
       agentStore.handleSubagentCompleted({
         child_id: 'child-dock-1',
-        parent_session_id: 'sess-dock-parent',
+        parent_session_id: 'sess-a',
         policy: 'full',
         ok: true,
         final_message: 'the child found the bug',
         artifacts: [{ kind: 'diff', path: 'src/main.rs' }],
       });
-      agentStore.revealSubagent('sess-dock-parent', 'child-dock-1');
+      void agentStore.revealSubagent('sess-a', 'child-dock-1');
     });
 
     const { getByTestId, getByText } = render(<AgentDock />);
@@ -72,4 +72,3 @@ it('switches between Chat and Plan tabs to reveal the todo spine', () => {
     expect(getByText('Plan Execution')).toBeTruthy();
   });
 });
-

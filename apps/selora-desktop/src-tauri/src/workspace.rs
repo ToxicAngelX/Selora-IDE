@@ -587,13 +587,26 @@ impl Workspace {
         &self,
         id: &selora_protocol::BufferId,
     ) -> WsResult<BufferSnapshotDto> {
-        let (key, path, abs_path) = {
+        self.reload_buffer_with_reader(id, Self::read_editor_text)
+    }
+
+    fn reload_buffer_with_reader(
+        &self,
+        id: &selora_protocol::BufferId,
+        read: impl FnOnce(&Path, &str) -> WsResult<String>,
+    ) -> WsResult<BufferSnapshotDto> {
+        let (key, path, abs_path, version) = {
             let buffers = self.buffers_lock();
             let (key, state) = buffers
                 .iter()
                 .find(|(_, state)| &state.id == id)
                 .ok_or_else(|| unknown_buffer_error(id))?;
-            (key.clone(), state.path.clone(), state.abs_path.clone())
+            (
+                key.clone(),
+                state.path.clone(),
+                state.abs_path.clone(),
+                state.version,
+            )
         };
         {
             let conflicts = self.conflicts_lock();
@@ -605,7 +618,7 @@ impl Workspace {
             }
         }
 
-        let text = Self::read_editor_text(&abs_path, path.as_str())?;
+        let text = read(&abs_path, path.as_str())?;
         let mut buffers = self.buffers_lock();
         let mut conflicts = self.conflicts_lock();
         // Keep wins if the two decisions race: never discard text after the
@@ -619,6 +632,12 @@ impl Workspace {
         let state = buffers
             .get_mut(&key)
             .ok_or_else(|| unknown_buffer_error(id))?;
+        if state.version != version {
+            return Err(WorkspaceError::new(
+                "stale_buffer_version",
+                "The buffer changed while disk text was loading. Review the conflict again.",
+            ));
+        }
         // Keep the conflict until the disk read succeeds; a failed read leaves
         // the banner up so the user can retry or keep the local edits.
         let next_version = state
@@ -635,12 +654,16 @@ impl Workspace {
 
     /// Keep the local edits for a conflicting buffer and clear the marker.
     pub fn keep_buffer_edits(&self, id: &selora_protocol::BufferId) -> WsResult<BufferSnapshotDto> {
-        let buffers = self.buffers_lock();
-        let (key, path) = buffers
-            .iter()
-            .find(|(_, state)| &state.id == id)
-            .map(|(key, state)| (key.clone(), state.path.clone()))
-            .ok_or_else(|| unknown_buffer_error(id))?;
+        let (key, path, absolute) = {
+            let buffers = self.buffers_lock();
+            buffers
+                .iter()
+                .find(|(_, state)| &state.id == id)
+                .map(|(key, state)| (key.clone(), state.path.clone(), state.abs_path.clone()))
+                .ok_or_else(|| unknown_buffer_error(id))?
+        };
+        let disk_text = Self::read_editor_text(&absolute, path.as_str())?;
+        let mut buffers = self.buffers_lock();
         let mut conflicts = self.conflicts_lock();
         if conflicts.remove(&key).is_none() {
             return Err(WorkspaceError::new(
@@ -648,10 +671,11 @@ impl Workspace {
                 format!("'{}' has no external change to keep", path.as_str()),
             ));
         }
-        buffers
-            .get(&key)
-            .map(BufferState::snapshot)
-            .ok_or_else(|| unknown_buffer_error(id))
+        let state = buffers
+            .get_mut(&key)
+            .ok_or_else(|| unknown_buffer_error(id))?;
+        state.saved_text = disk_text;
+        Ok(state.snapshot())
     }
 
     /// This buffer's external-change marker, if any (test/diagnostic seam).
@@ -2080,6 +2104,49 @@ mod tests {
                 .code,
             "no_buffer_conflict"
         );
+        assert!(
+            workspace.refresh_clean_buffers().conflicts.is_empty(),
+            "the acknowledged disk text must not raise the same conflict again"
+        );
+        fs::write(
+            fixture.root.join("README.md"),
+            "# Another external change\n",
+        )
+        .unwrap();
+        assert_eq!(workspace.refresh_clean_buffers().conflicts.len(), 1);
+    }
+
+    #[test]
+    fn reload_never_discards_an_edit_made_while_the_disk_read_is_in_flight() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let buffer = workspace.open_file("README.md").unwrap();
+        workspace
+            .apply_change(
+                &buffer.buffer_id,
+                1,
+                &[change(position(0, 0), position(0, 9), "# Local")],
+            )
+            .unwrap();
+        fs::write(fixture.root.join("README.md"), "# External\n").unwrap();
+        workspace.refresh_clean_buffers();
+        let error = workspace
+            .reload_buffer_with_reader(&buffer.buffer_id, |path, relative| {
+                let text = Workspace::read_editor_text(path, relative)?;
+                workspace.apply_change(
+                    &buffer.buffer_id,
+                    2,
+                    &[change(position(0, 0), position(0, 7), "# New local")],
+                )?;
+                Ok(text)
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "stale_buffer_version");
+        assert_eq!(
+            workspace.buffer(&buffer.buffer_id).unwrap().text,
+            "# New local\n"
+        );
+        assert!(workspace.conflict_for(&buffer.buffer_id).is_some());
     }
 
     #[test]

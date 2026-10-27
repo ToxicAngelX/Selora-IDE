@@ -210,7 +210,7 @@ describe('NotificationCenter', () => {
   });
 
   it('opens and selects the parent session when a subagent completion is clicked', () => {
-    const reveal = vi.spyOn(agentStore, 'revealSubagent').mockImplementation(() => {});
+    const reveal = vi.spyOn(agentStore, 'revealSubagent').mockResolvedValue(true);
     act(() => {
       toastStore.pushSubagentCompletion(3001, {
         childId: 'child-notification-1',

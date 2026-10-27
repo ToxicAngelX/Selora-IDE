@@ -17,9 +17,10 @@ function isAbsolute(path: string): boolean {
 /** Join the workspace root and a relative buffer path. */
 export function absolutePathFor(root: string | null, path: string): string {
   const target = normalized(path);
-  if (isAbsolute(target)) return target;
+  if (isAbsolute(target)) return usesBackslashes() ? target.replace(/\//g, '\\') : target;
   if (!root) return target;
-  return `${normalized(root)}/${target}`;
+  const joined = `${normalized(root)}/${target}`;
+  return usesBackslashes() ? joined.replace(/\//g, '\\') : joined;
 }
 
 /** Workspace-relative path in the platform's separator style. */

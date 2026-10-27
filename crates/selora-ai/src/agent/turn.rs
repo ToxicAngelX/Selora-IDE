@@ -895,7 +895,10 @@ where
                         &mut chat,
                         &model.id,
                         &conversation,
-                        &open_todos,
+                        &tools
+                            .plan_snapshot()
+                            .map(|snapshot| snapshot.todos)
+                            .unwrap_or_else(|| open_todos.clone()),
                         config.keep_last,
                         0,
                     )
@@ -1112,7 +1115,10 @@ where
                             Parked::Decided(AgentDecision::Approve) => turn.approved += 1,
                             Parked::Decided(AgentDecision::ApproveAllThisTurn) => {
                                 turn.approved += 1;
-                                turn.approve_all = true;
+                                if !matches!(call.name.as_str(), "exit_plan_mode" | "run_workflow")
+                                {
+                                    turn.approve_all = true;
+                                }
                             }
                             Parked::Decided(AgentDecision::Deny) => {
                                 turn.denied += 1;
@@ -1121,6 +1127,9 @@ where
                             // Phase 9b: Revise is a plan-card-only answer.
                             // It keeps the session planning (nothing was
                             // flipped) and tells the model to resubmit.
+                            Parked::Decided(AgentDecision::Answer(answer)) => {
+                                result = Some(ToolResult::success(&call.id, answer));
+                            }
                             Parked::Decided(AgentDecision::Revise) => {
                                 turn.denied += 1;
                                 result = Some(if call.name == "exit_plan_mode" {
@@ -2359,7 +2368,7 @@ mod tests {
         )));
 
         decision_tx
-            .send((approval_id, decision))
+            .send((approval_id, decision.clone()))
             .expect("answer workflow card");
         let report = tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -2569,6 +2578,43 @@ mod tests {
             runner_state.lock().expect("state lock").approved_runs,
             vec!["call_plan".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_structured_answer_is_model_input_not_a_tool_execution_grant() {
+        let (chat, _) = ScriptedChat::new(vec![
+            tool_round(&[("question-1", "question", "{}")], "", 0.0),
+            answer_round("Understood.", 0.0),
+        ]);
+        let (runner, state) = MockRunner::new(vec![(
+            "question-1",
+            MockTool::Card {
+                card: ApprovalCard::Command {
+                    command: "choose".into(),
+                },
+                approved: ToolResult::success("question-1", "must not execute"),
+            },
+        )]);
+        let (events, receiver) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(receiver);
+        let (decisions, decision_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_agent_turn(
+            TurnInput::new(model(), conversation()),
+            chat,
+            runner,
+            events,
+            decision_rx,
+        ));
+        let id = recorder.wait_for_approval().await;
+        decisions
+            .send((id, AgentDecision::Answer("Use src/main.rs".into())))
+            .unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert!(state.lock().unwrap().approved_runs.is_empty());
+        assert!(report.conversation.iter().any(
+            |message| message.role == crate::Role::Tool && message.content == "Use src/main.rs"
+        ));
     }
 
     // -----------------------------------------------------------------------

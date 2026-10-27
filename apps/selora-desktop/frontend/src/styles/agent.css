@@ -395,6 +395,14 @@
   gap: var(--space-2);
 }
 
+/* Auto-apply armed badge: never wrap or compress — wrapped badge overflows
+   the header row and collides with the session title and view tabs. */
+.agent-auto-apply-badge,
+.composer-auto-apply-armed {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .agent-view-tab {
   padding: 2px var(--space-2);
   background: transparent;
@@ -2045,8 +2053,8 @@
   flex-direction: column;
   gap: 8px;
   padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: var(--ink-low);
+  border: 1px solid var(--hairline-faint);
   border-radius: 6px;
 }
 
@@ -2060,7 +2068,7 @@
 .plan-card-title {
   font-size: 12px;
   font-weight: 600;
-  color: var(--fg-strong, #e4e4e7);
+  color: var(--fg-default);
 }
 
 .plan-card-status {
@@ -2070,20 +2078,20 @@
 }
 
 .plan-card-status.is-pending {
-  background: #f59e0b;
-  color: #1c1917;
+  background: var(--warn);
+  color: var(--ink-canvas);
   font-weight: 600;
 }
 
 .plan-card-status.is-decided {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--fg-muted, #a1a1aa);
+  background: var(--ink-hi);
+  color: var(--fg-muted);
 }
 
 .plan-card-summary {
   margin: 0;
   font-size: 11.5px;
-  color: var(--fg-muted, #a1a1aa);
+  color: var(--fg-muted);
 }
 
 .plan-card-steps {
@@ -2100,7 +2108,7 @@
   align-items: flex-start;
   gap: 8px;
   font-size: 12px;
-  color: var(--fg-normal, #d4d4d8);
+  color: var(--fg-default);
 }
 
 .plan-card-step-num {
@@ -2108,8 +2116,8 @@
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--fg-muted, #a1a1aa);
+  background: var(--ink-hi);
+  color: var(--fg-muted);
   font-size: 10.5px;
   display: inline-flex;
   align-items: center;
@@ -2126,7 +2134,7 @@
   margin: 0;
   font-size: 10.5px;
   line-height: 1.4;
-  color: var(--fg-faint, #71717a);
+  color: var(--fg-faint);
 }
 
 .approval-banner {
@@ -4803,6 +4811,7 @@
   .header-right-group {
     gap: var(--space-1);
   }
+}
 /* --- Phase 9e: background subagent result (notification click) --------- */
 .agent-subagent-result {
   margin: 0 12px 8px;

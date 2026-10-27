@@ -143,6 +143,16 @@ describe('workspace_layout_changed application (ARCHITECTURE §2.4)', () => {
     layoutStore.applyLayoutEvent(makeLayout({ primary_sidebar_width_px: 360 }));
     expect(getLayoutSnapshot().layout?.primary_sidebar_width_px).toBe(360);
   });
+
+  it('re-clamps an oversized authoritative payload against the measured workbench box', () => {
+    hydrate();
+    // The event may carry a size persisted on a wider window and the
+    // ResizeObserver won't refire for a dock re-widening, so the store must
+    // clamp on application: 904 - 48 - 6 - 400 = 450 on this narrow box.
+    layoutStore.setWorkbenchBox({ width: 904, height: 900, activityBarWidth: 48 });
+    layoutStore.applyLayoutEvent(makeLayout({ primary_sidebar_width_px: 480 }));
+    expect(getLayoutSnapshot().layout?.primary_sidebar_width_px).toBe(450);
+  });
 });
 
 describe('resize command cadence (ARCHITECTURE §3.1)', () => {

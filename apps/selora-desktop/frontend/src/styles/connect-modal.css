@@ -797,6 +797,24 @@
   border-color: var(--fg-default);
 }
 
+/* Small windows: let footer/banner rows wrap and effort cards reflow so the
+   660px modal keeps fitting inside narrow viewports without clipping. */
+.connect-modal-footer {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.connect-status-banner {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Scoped to the settings tab so this survives the duplicated rule blocks
+   below: wins on specificity instead of source order. */
+.connect-settings-tab .connect-effort-grid {
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+}
+
 /* Tabs Navigation */
 .connect-tabs-nav {
   display: flex;

@@ -1044,6 +1044,8 @@ struct WorkflowStream<R: tauri::Runtime> {
     /// first thing to start the workspace's bridge. Shared with the shell so
     /// a settings override is never silently dropped on the workflow path.
     lsp_paths: selora_lsp::LspServerPaths,
+    lsp_epoch: Arc<AtomicU64>,
+    started_lsp_epoch: u64,
     max_cost_usd: f64,
     name: String,
     started: AtomicBool,
@@ -1104,6 +1106,18 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
     /// applies, and one warning toast naming files the refresh could not read.
     /// Dirty local text is never replaced here.
     fn publish_refresh(&self, outcome: crate::workspace::BufferRefreshOutcome) {
+        let same_workspace = {
+            let workspace = self
+                .workspace
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.root() == self.workspace_root)
+        };
+        if !same_workspace {
+            return;
+        }
         for snapshot in outcome.updated {
             self.sync_lsp_reload(&snapshot.path, &snapshot.text);
             self.record(FrontendEvent::BufferSnapshot(snapshot));
@@ -1148,10 +1162,18 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
     fn with_lsp(&self, action: impl FnOnce(&LspBridge)) {
         let log: Arc<EventLog> = Arc::clone(&self.log);
         let app = self.app.clone();
+        let epoch = self.lsp_epoch.clone();
+        let started = self.started_lsp_epoch;
         let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
+            if epoch.load(Ordering::SeqCst) != started {
+                return;
+            }
             log.record(&app, event, None);
         });
         let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+        if self.lsp_epoch.load(Ordering::SeqCst) != started {
+            return;
+        }
         if guard.is_none() {
             *guard = Some(LspBridge::start_with_paths(
                 self.workspace_root.clone(),
@@ -2375,12 +2397,14 @@ impl DesktopState {
                 request_id: command_request,
                 approval_id,
                 decision,
+                resolution,
             } => {
-                self.sessions.agent_decision(
+                self.sessions.agent_decision_with_resolution(
                     &command_request,
                     &approval_id,
                     decision,
                     envelope.session_id,
+                    resolution,
                 )?;
                 Ok(CommandResultDto::Ack(self.command_ack()))
             }
@@ -2415,26 +2439,6 @@ impl DesktopState {
             }
             // Phase 9d — durable sessions. Every arm publishes a bootstrap
             // so the rail/transcript follow without a reload.
-            FrontendCommand::SwitchSession { session_id } => {
-                self.sessions.switch_session(&session_id)?;
-                let snapshot = self.bootstrap();
-                self.record_event(
-                    app,
-                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
-                    Some(request_id),
-                );
-                Ok(snapshot)
-            }
-            FrontendCommand::NewSession => {
-                self.sessions.new_session()?;
-                let snapshot = self.bootstrap();
-                self.record_event(
-                    app,
-                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
-                    Some(request_id),
-                );
-                Ok(snapshot)
-            }
             FrontendCommand::ListAgentSessions => {
                 let snapshot = self.bootstrap();
                 self.record_event(
@@ -2442,27 +2446,14 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::SetAgentAutoApprove {
                 session_id,
                 enabled,
             } => {
                 self.sessions.set_auto_approve(&session_id, enabled)?;
-                Ok(self.bootstrap())
-            }
-            FrontendCommand::RetryMessage {
-                session_id,
-                message_id,
-            } => {
-                self.sessions.retry_message(
-                    self.event_log(),
-                    app.clone(),
-                    request_id,
-                    session_id,
-                    message_id,
-                )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::ToggleSurface { surface } => {
                 // Ã‚Â§2.2: the region a surface acts on is determined in Rust,
@@ -3016,6 +3007,8 @@ impl DesktopState {
         let workspace_id = workspace_id_for(&root);
         let run_id = Arc::new(Mutex::new(Some(durable_run_id.to_string())));
         let stream = Arc::new(WorkflowStream {
+            lsp_epoch: self.lsp_epoch.clone(),
+            started_lsp_epoch: self.lsp_epoch.load(Ordering::SeqCst),
             log: self.event_log(),
             app: app.clone(),
             request_id: request_id.clone(),
@@ -3223,25 +3216,33 @@ impl DesktopState {
             message: "No pending workflow approval matches that id.".into(),
             retryable: false,
         })?;
-        let decision = match decision {
-            DecisionDto::Approve => selora_ai::AgentDecision::Approve,
-            DecisionDto::Deny => selora_ai::AgentDecision::Deny,
-            DecisionDto::ApproveAllThisTurn => {
-                return Err(ProtocolErrorDto {
-                    code: "workflow_blanket_approval_rejected".into(),
-                    message: "Approve each workflow side effect separately.".into(),
+        let decision =
+            match decision {
+                DecisionDto::Answer => return Err(ProtocolErrorDto {
+                    code: "invalid_workflow_decision".into(),
+                    message:
+                        "Workflow effects require an explicit approval or denial, not an answer."
+                            .into(),
                     retryable: false,
-                })
-            }
-            DecisionDto::Stop => unreachable!("handled before approval lookup"),
-            DecisionDto::Revise => {
-                return Err(ProtocolErrorDto {
-                    code: "workflow_approval_not_revisable".into(),
-                    message: "Workflow approvals cannot be revised.".into(),
-                    retryable: false,
-                })
-            }
-        };
+                }),
+                DecisionDto::Approve => selora_ai::AgentDecision::Approve,
+                DecisionDto::Deny => selora_ai::AgentDecision::Deny,
+                DecisionDto::ApproveAllThisTurn => {
+                    return Err(ProtocolErrorDto {
+                        code: "workflow_blanket_approval_rejected".into(),
+                        message: "Approve each workflow side effect separately.".into(),
+                        retryable: false,
+                    })
+                }
+                DecisionDto::Stop => unreachable!("handled before approval lookup"),
+                DecisionDto::Revise => {
+                    return Err(ProtocolErrorDto {
+                        code: "workflow_approval_not_revisable".into(),
+                        message: "Workflow approvals cannot be revised.".into(),
+                        retryable: false,
+                    })
+                }
+            };
         decide(id, decision).map_err(|error| ProtocolErrorDto {
             code: "workflow_approval_not_found".into(),
             message: error.to_string(),

@@ -405,7 +405,7 @@ mod tests {
                     content: "fix the build".into(),
                     error: None,
                 },
-                SessionEntry::Card(card),
+                SessionEntry::Card(Box::new(card)),
                 SessionEntry::Summary(AgentSummary {
                     iterations: 2,
                     tools_used: 1,

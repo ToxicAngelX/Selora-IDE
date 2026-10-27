@@ -991,10 +991,14 @@ pub fn compacted_conversation(
     {
         carried.remove(0);
     }
-    let mut conversation = Vec::with_capacity(carried.len() + 1);
-    conversation.push(ChatMessage::system(system));
-    conversation.extend(carried);
-    conversation
+    let mut compacted: Vec<ChatMessage> = conversation
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .cloned()
+        .collect();
+    compacted.push(ChatMessage::system(system));
+    compacted.extend(carried);
+    compacted
 }
 
 /// Run one summarize round through the existing chat backend.
@@ -1268,16 +1272,29 @@ mod tests {
         store
             .set_parks(
                 &mut state,
-                vec![ParkedCard::Approval {
-                    approval_id: "a1".into(),
-                    tool_name: "bash".into(),
-                    card: ApprovalCard::Command {
-                        command: format!("echo {KEY}"),
+                vec![
+                    ParkedCard::Approval {
+                        approval_id: "a1".into(),
+                        tool_name: "bash".into(),
+                        card: ApprovalCard::Command {
+                            command: format!("echo {KEY}"),
+                        },
+                        request_id: None,
+                        turn_id: None,
+                        created_at: 0,
                     },
-                    request_id: None,
-                    turn_id: None,
-                    created_at: 0,
-                }],
+                    ParkedCard::Approval {
+                        approval_id: "plan".into(),
+                        tool_name: "exit_plan_mode".into(),
+                        card: ApprovalCard::Plan {
+                            summary: Some(format!("summary {KEY}")),
+                            steps: vec![format!("step {KEY}")],
+                        },
+                        request_id: None,
+                        turn_id: None,
+                        created_at: 0,
+                    },
+                ],
             )
             .expect("park");
 
@@ -1309,6 +1326,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // Compaction
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn compaction_keeps_original_system_instructions_and_paired_recent_tools() {
+        let original = ChatMessage::system("Never alter generated files. Keep the project policy.");
+        let conversation = vec![
+            original.clone(),
+            ChatMessage::user("old"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("latest"),
+        ];
+        let compacted = compacted_conversation("summary", &[], &conversation, 1);
+        assert_eq!(compacted[0], original);
+        assert!(compacted[1].content.contains("summary"));
+        assert_eq!(compacted.last().unwrap().content, "latest");
+    }
 
     struct ScriptedChat {
         deltas: Vec<String>,

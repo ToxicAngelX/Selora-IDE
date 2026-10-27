@@ -84,7 +84,6 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(Array.from(theme.options).map((option) => option.value)).toEqual([
       'selora-dark',
       'dark',
-      'space-black',
       'light',
     ]);
     // The fixture stores "dark"; the select reports it instead of rewriting it.

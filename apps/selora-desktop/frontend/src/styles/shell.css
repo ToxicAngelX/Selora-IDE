@@ -2305,7 +2305,7 @@
   border: 0;
 }
 
-/* --- 11. Narrow-window collapse (titlebar + statusbar) --------------------- */
+/* --- 15. Narrow-window collapse (titlebar + statusbar) --------------------- */
 /* Collapse order at 32px title bar: search kbd/text shrink then icon-only,
    session badge and git pill hide, title truncates, menus compress. Bell +
    window controls stay visible at every width. */
@@ -2429,9 +2429,9 @@
 
 /* --- Phase 9e: completed-background badge + toast action --------------- */
 .activity-badge.is-success {
-  background: var(--ok, #10b981);
+  background: var(--ok);
   color: var(--ink-canvas);
-  box-shadow: 0 0 6px rgba(16, 185, 129, 0.55);
+  box-shadow: 0 0 6px var(--glow-green);
 }
 
 .toast-open {

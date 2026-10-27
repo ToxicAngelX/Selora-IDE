@@ -22,7 +22,8 @@ function root(): HTMLElement {
 describe('theme resolution', () => {
   it('accepts exactly the values Rust persists', () => {
     expect([...THEME_VALUES]).toEqual(['selora-dark', 'dark', 'space-black', 'light']);
-    expect(THEME_OPTIONS.map((option) => option.value)).toEqual([...THEME_VALUES]);
+    expect(THEME_OPTIONS.map((option) => option.value)).toEqual(['selora-dark', 'dark', 'light']);
+    expect(THEME_OPTIONS.some((option) => /OLED/.test(option.label))).toBe(false);
     for (const value of THEME_VALUES) expect(isThemeValue(value)).toBe(true);
     expect(isThemeValue('not-a-theme')).toBe(false);
   });

@@ -283,6 +283,8 @@ pub enum SpawnError {
     EmptyMission,
     #[error("no tokio runtime is running for background subagent work")]
     NoRuntime,
+    #[error("the parent turn has been cancelled")]
+    Cancelled,
 }
 
 /// The `wait` answer. A timeout is not an error: it tells the parent the
@@ -355,12 +357,15 @@ struct ChildRecord {
     request: SpawnRequest,
     state: ChildState,
     result: Option<SubagentCompletion>,
+    generation: u64,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Default)]
 struct RuntimeState {
     children: BTreeMap<ChildId, ChildRecord>,
     cancelled_parents: BTreeSet<String>,
+    generations: BTreeMap<String, u64>,
 }
 
 struct RuntimeInner {
@@ -396,6 +401,17 @@ impl std::fmt::Debug for SubagentRuntime {
 }
 
 impl SubagentRuntime {
+    /// Start a new turn without reviving children cancelled by an earlier turn.
+    pub fn begin_turn(&self, parent_session: &str) {
+        let mut state = self.inner.state.lock().expect("subagent state lock");
+        *state
+            .generations
+            .entry(parent_session.to_owned())
+            .or_default() += 1;
+        state.cancelled_parents.remove(parent_session);
+        self.bump(&state);
+    }
+
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
         let (changed, _) = watch::channel(0);
@@ -424,6 +440,9 @@ impl SubagentRuntime {
             return Err(SpawnError::EmptyMission);
         }
         let mut state = self.inner.state.lock().expect("subagent state lock");
+        if state.cancelled_parents.contains(&request.parent_session) {
+            return Err(SpawnError::Cancelled);
+        }
         if state.children.contains_key(&request.child_id) {
             return Err(SpawnError::Duplicate(request.child_id));
         }
@@ -432,12 +451,15 @@ impl SubagentRuntime {
             parent_session: request.parent_session.clone(),
             policy: request.policy,
         };
+        let generation = *state.generations.get(&request.parent_session).unwrap_or(&0);
         state.children.insert(
             request.child_id.clone(),
             ChildRecord {
                 request,
                 state: ChildState::Running,
                 result: None,
+                generation,
+                task: None,
             },
         );
         self.bump(&state);
@@ -469,10 +491,23 @@ impl SubagentRuntime {
         };
         let runtime = self.clone();
         let child_id = handle.child_id.clone();
-        tokio_handle.spawn(async move {
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let task = tokio_handle.spawn(async move {
+            if ready.await.is_err() {
+                return;
+            }
             let outcome = work.await;
             runtime.complete(&child_id, outcome);
         });
+        let mut state = self.inner.state.lock().expect("subagent state lock");
+        if let Some(record) = state.children.get_mut(&handle.child_id) {
+            if record.state == ChildState::Cancelled {
+                task.abort();
+            } else if !record.state.terminal() {
+                record.task = Some(task.abort_handle());
+                let _ = start.send(());
+            }
+        }
         Ok(handle)
     }
 
@@ -496,7 +531,9 @@ impl SubagentRuntime {
         else {
             return CompletionDisposition::Unknown;
         };
-        let parent_cancelled = state.cancelled_parents.contains(&parent_session);
+        let parent_cancelled = state.cancelled_parents.contains(&parent_session)
+            && state.children[child_id].generation
+                == *state.generations.get(&parent_session).unwrap_or(&0);
         let record = state
             .children
             .get_mut(child_id)
@@ -522,6 +559,7 @@ impl SubagentRuntime {
             ChildState::Failed
         };
         record.result = Some(completion.clone());
+        record.task = None;
         self.bump(&state);
         drop(state);
         let _ = self.inner.events.send(SubagentEvent::Completed(completion));
@@ -545,6 +583,9 @@ impl SubagentRuntime {
         }
         record.state = ChildState::Cancelled;
         record.result = None;
+        if let Some(task) = record.task.take() {
+            task.abort();
+        }
         self.bump(&state);
         true
     }
@@ -553,11 +594,18 @@ impl SubagentRuntime {
     pub fn cancel_parent(&self, parent_session: &str) -> usize {
         let mut state = self.inner.state.lock().expect("subagent state lock");
         state.cancelled_parents.insert(parent_session.to_owned());
+        let generation = *state.generations.get(parent_session).unwrap_or(&0);
         let mut cancelled = 0;
         for record in state.children.values_mut() {
-            if record.request.parent_session == parent_session && !record.state.terminal() {
+            if record.request.parent_session == parent_session
+                && record.generation == generation
+                && !record.state.terminal()
+            {
                 record.state = ChildState::Cancelled;
                 record.result = None;
+                if let Some(task) = record.task.take() {
+                    task.abort();
+                }
                 cancelled += 1;
             }
         }
@@ -597,15 +645,33 @@ impl SubagentRuntime {
             .and_then(|record| record.result.clone())
     }
 
+    /// Wait for one child's terminal state, including cancellation, without retaining a broadcast task.
+    pub async fn wait_for_child(&self, child_id: &str) -> Option<SubagentCompletion> {
+        let mut changed = self.inner.changed.subscribe();
+        loop {
+            {
+                let state = self.inner.state.lock().expect("subagent state lock");
+                let record = state.children.get(child_id)?;
+                if record.state.terminal() {
+                    return record.result.clone();
+                }
+            }
+            if changed.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
     /// Every completed/failed result for a parent, in registration order.
     pub fn results_for_parent(&self, parent_session: &str) -> Vec<SubagentCompletion> {
-        self.inner
-            .state
-            .lock()
-            .expect("subagent state lock")
+        let state = self.inner.state.lock().expect("subagent state lock");
+        let generation = *state.generations.get(parent_session).unwrap_or(&0);
+        state
             .children
             .values()
-            .filter(|record| record.request.parent_session == parent_session)
+            .filter(|record| {
+                record.request.parent_session == parent_session && record.generation == generation
+            })
             .filter_map(|record| record.result.clone())
             .collect()
     }
@@ -646,6 +712,14 @@ impl SubagentRuntime {
         timeout: Duration,
         cancel: Option<&CancelToken>,
     ) -> Result<WaitOutcome, WaitError> {
+        let generation = *self
+            .inner
+            .state
+            .lock()
+            .expect("subagent state lock")
+            .generations
+            .get(parent_session)
+            .unwrap_or(&0);
         let requested = child_ids.map(|ids| {
             let mut seen = BTreeSet::new();
             ids.into_iter()
@@ -658,21 +732,34 @@ impl SubagentRuntime {
         let ids = match &requested {
             Some(ids) => {
                 let state = self.inner.state.lock().expect("subagent state lock");
-                let unknown: Vec<String> =
-                    ids.iter()
-                        .filter(|id| {
-                            state.children.get(*id).is_none_or(|record| {
-                                record.request.parent_session != parent_session
-                            })
+                let unknown: Vec<String> = ids
+                    .iter()
+                    .filter(|id| {
+                        state.children.get(*id).is_none_or(|record| {
+                            record.request.parent_session != parent_session
+                                || record.generation != generation
                         })
-                        .cloned()
-                        .collect();
+                    })
+                    .cloned()
+                    .collect();
                 if !unknown.is_empty() {
                     return Err(WaitError::UnknownIds(unknown.join(", ")));
                 }
                 ids.clone()
             }
-            None => self.child_ids(parent_session),
+            None => self
+                .inner
+                .state
+                .lock()
+                .expect("subagent state lock")
+                .children
+                .values()
+                .filter(|record| {
+                    record.request.parent_session == parent_session
+                        && record.generation == generation
+                })
+                .map(|record| record.request.child_id.clone())
+                .collect(),
         };
 
         let bounded = timeout.min(MAX_WAIT_TIMEOUT);
@@ -682,7 +769,9 @@ impl SubagentRuntime {
         loop {
             {
                 let state = self.inner.state.lock().expect("subagent state lock");
-                if state.cancelled_parents.contains(parent_session) {
+                if state.cancelled_parents.contains(parent_session)
+                    || *state.generations.get(parent_session).unwrap_or(&0) != generation
+                {
                     return Err(WaitError::Cancelled);
                 }
                 let explicit = requested.is_some();
@@ -895,6 +984,60 @@ mod tests {
 
     fn request(parent: &str, child: &str) -> SpawnRequest {
         SpawnRequest::new(parent, child, SubagentPolicy::ReadOnly, "review")
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_turn_scoped_and_wait_ignores_old_children() {
+        let runtime = SubagentRuntime::new();
+        runtime.begin_turn("session");
+        runtime
+            .register(request("session", "cancelled-child"))
+            .unwrap();
+        runtime.cancel_parent("session");
+        runtime.begin_turn("session");
+        assert!(!runtime.is_parent_cancelled("session"));
+        assert!(!runtime.complete("cancelled-child", ChildOutcome::success("late")));
+        runtime.register(request("session", "new-child")).unwrap();
+        assert!(runtime.complete("new-child", ChildOutcome::success("current")));
+        let WaitOutcome::Completed { results } =
+            runtime.wait("session", None, Duration::ZERO).await.unwrap()
+        else {
+            panic!("current turn has finished");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].child_id, "new-child");
+        runtime.begin_turn("session");
+        runtime
+            .register(request("session", "previous-running"))
+            .unwrap();
+        runtime.begin_turn("session");
+        assert!(
+            matches!(runtime.wait("session", None, Duration::ZERO).await,
+            Ok(WaitOutcome::Completed { results }) if results.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_parent_drops_background_work() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let runtime = SubagentRuntime::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropFlag(dropped.clone());
+        runtime
+            .spawn_background(request("session", "pending"), async move {
+                let _probe = probe;
+                std::future::pending().await
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        runtime.cancel_parent("session");
+        tokio::task::yield_now().await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -22,9 +22,6 @@ const bridgeMocks = vi.hoisted(() => {
       requestId: nextRequestId('req-workflow'),
       promise: Promise.resolve(),
     })),
-    newSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
-    switchSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
-    retryMessage: vi.fn((..._args: unknown[]) => Promise.resolve()),
     fetchModels: vi.fn((..._args: unknown[]) => Promise.resolve([])),
   };
 });
@@ -1264,8 +1261,8 @@ describe('agentStore', () => {
     expect(state.planPhase).toBe('planning');
     expect(state.plan?.steps).toEqual(['Inspect', 'Write']);
     expect(state.todos).toEqual([
-      { id: 'todo-1', title: 'Inspect', status: 'completed' },
-      { id: 'todo-2', title: 'Write', status: 'in_progress' },
+      { id: 'todo-1', text: 'Inspect', status: 'completed' },
+      { id: 'todo-2', text: 'Write', status: 'in_progress' },
     ]);
   });
 
@@ -1285,7 +1282,7 @@ describe('agentStore', () => {
       todos: [{ id: 'todo-1', title: 'Audit', status: 'pending' }],
     });
     expect(agentStore.getSnapshot().todos).toEqual([
-      { id: 'todo-1', title: 'Audit', status: 'pending' },
+      { id: 'todo-1', text: 'Audit', status: 'pending' },
     ]);
 
     // A payload for another session is ignored.
@@ -1341,6 +1338,38 @@ describe('agentStore', () => {
 });
 
 describe('Phase 9e background subagent completions', () => {
+  it('preserves live transcripts, tool cards, and independent approvals across tab switches', async () => {
+    const bootstrap = makeAgentBootstrap('session-a');
+    bootstrap.chat.sessions.push({ session_id: 'session-a', title: 'A', message_ids: [], active: false });
+    bootstrap.chat.sessions.push({ session_id: 'session-b', title: 'B', message_ids: [], active: false });
+    agentStore.hydrate(bootstrap);
+    agentStore.sendUserMessage('first turn');
+    const requestA = latestAgentRequestId();
+    const approvalA = { request_id: requestA, session_id: 'session-a', turn_id: 'turn-a', approval_id: 'approval-a', tool_name: 'write_file', path_or_command: 'a.txt', diff_or_input: '+a' };
+    agentStore.handleApprovalNeeded(approvalA);
+    const original = agentStore.getSnapshot().messages;
+    expect(agentStore.getSnapshot().transcripts['session-a']).toEqual(original);
+    await agentStore.requestSwitchSession('session-b');
+    expect(agentStore.getSnapshot().messages).toEqual([]);
+    agentStore.sendUserMessage('second turn');
+    const requestB = latestAgentRequestId();
+    agentStore.handleApprovalNeeded({ ...approvalA, request_id: requestB, session_id: 'session-b', approval_id: 'approval-b', turn_id: 'turn-b' });
+    agentStore.routeSessionEvent(approvalA, () => agentStore.handleChatDelta({
+      request_id: requestA, session_id: 'session-a', text: 'still running',
+    }));
+    expect(agentStore.getSnapshot().activeSessionId).toBe('session-b');
+    expect(agentStore.getSnapshot().transcripts['session-a']?.some((message) => message.content.includes('still running'))).toBe(true);
+    await agentStore.requestSwitchSession('session-a');
+    expect(agentStore.getSnapshot().messages.some((message) => message.content.includes('still running'))).toBe(true);
+    expect(agentStore.getSnapshot().messages.flatMap((message) => message.toolCalls ?? [])
+      .filter((call) => call.approvalId === 'approval-a')).toHaveLength(1);
+    agentStore.handleApprovalDecision('approval-a', 'deny');
+    expect(bridgeMocks.agentDecision).toHaveBeenLastCalledWith(requestA, 'approval-a', 'deny', expect.objectContaining({ session_id: 'session-a' }));
+    await agentStore.requestSwitchSession('session-b');
+    agentStore.handleApprovalDecision('approval-b', 'deny');
+    expect(bridgeMocks.agentDecision).toHaveBeenLastCalledWith(requestB, 'approval-b', 'deny', expect.objectContaining({ session_id: 'session-b' }));
+  });
+
   it('handles a completion once and never claims a failed child as success', () => {
     resetAndHydrate('sess-subagent');
     const ok = agentStore.handleSubagentCompleted({
@@ -1384,13 +1413,15 @@ describe('Phase 9e background subagent completions', () => {
     expect(snapshot.unreadSubagentCount).toBe(2);
   });
 
-  it('reveals the child result under its parent session and clears the badge', () => {
+  it('reveals the child result under its parent session and clears the badge', async () => {
     resetAndHydrate('sess-parent');
     for (const subagent of agentStore.getSnapshot().subagents) {
       agentStore.markSubagentRead(subagent.id);
     }
     const parent = agentStore.getSnapshot().activeSessionId;
-    agentStore.createSession('Other');
+    const bootstrap = makeAgentBootstrap('sess-other');
+    bootstrap.chat.sessions.push({ session_id: parent, title: 'Parent', message_ids: [], active: false });
+    agentStore.hydrate(bootstrap);
     agentStore.handleSubagentCompleted({
       child_id: 'child-reveal-1',
       parent_session_id: parent,
@@ -1400,7 +1431,8 @@ describe('Phase 9e background subagent completions', () => {
     });
     expect(agentStore.getSnapshot().activeSessionId).not.toBe(parent);
 
-    agentStore.revealSubagent(parent, 'child-reveal-1');
+    await agentStore.revealSubagent(parent, 'child-reveal-1');
+    expect(bridgeMocks.switchSession).toHaveBeenLastCalledWith(parent, expect.anything());
 
     const snapshot = agentStore.getSnapshot();
     expect(snapshot.activeSessionId).toBe(parent);

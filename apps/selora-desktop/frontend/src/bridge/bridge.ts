@@ -123,7 +123,7 @@ export type SessionDto = {
   active: boolean;
   plan_phase?: PlanPhase;
   plan?: PlanApproval;
-  todos?: TodoItem[];
+  todos?: TodoDto[];
 };
 export type ChatSession = SessionDto;
 export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
@@ -132,6 +132,8 @@ export type PlanPhase = 'planning' | 'executing';
 export type PlanApproval = { summary?: string | null; steps: string[] };
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 export type TodoItem = { id: string; title: string; status: TodoStatus };
+export type TodoDto = { id: string; title?: string; text?: string; status: TodoStatus; session_id?: Id; assigned_subagent?: string };
+export type ChatTodoDto = TodoDto;
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
@@ -165,7 +167,8 @@ export type BootstrapState = {
     active_session_id: Id | null;
     active_request_id: Id | null;
     active_turn_id: Id | null;
-    pending_approval: Approval | null;
+  pending_approval: Approval | null;
+  pending_approvals?: Approval[];
 /** Phase 9a additive authoritative todos (see `ChatTodoDto`). */
     todos?: ChatTodoDto[];
   };
@@ -234,7 +237,7 @@ export type ApiKeyStatus = {
   active_model_id: string | null;
 };
 
-export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'revise' | 'stop';
+export type Decision = 'approve' | 'answer' | 'deny' | 'approve_all_this_turn' | 'revise' | 'stop';
 export type AgentMode = 'execute' | 'explore' | 'auto';
 export type AgentPhase = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
 

@@ -8,10 +8,11 @@
 // real protocol event. New/select go through the real NewSession /
 // SwitchSession commands; a rejected command shows its message and creates
 // nothing locally.
-import React, { useState, useSyncExternalStore } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { ChevronDown, Code2, Columns, ShieldCheck, Square } from '../components/icons';
 import { agentStore, getComposerGate } from '../features/agent/agent-store';
 import { AgentSessionTabs } from '../features/agent/components/AgentSessionTabs';
+import { AgentSessionRail } from '../features/agent/components/AgentSessionRail';
 import { AgentTodoSpine } from '../features/agent/components/AgentTodoSpine';
 import { AgentExecutionFeed } from '../features/agent/components/AgentExecutionFeed';
 import { AgentPlanSpine } from '../features/agent/components/AgentPlanSpine';
@@ -46,6 +47,7 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
   const [activeTab, setActiveTab] = useState<'feed' | 'plan'>('feed');
   const [showFloatingPlan, setShowFloatingPlan] = useState(false);
   const [infeedPlanExpanded, setInfeedPlanExpanded] = useState(false);
+  const [showSessionRail, setShowSessionRail] = useState(false);
 
   const activeSession =
     state.sessions.find((session) => session.id === state.activeSessionId) ?? null;
@@ -250,33 +252,13 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
         </section>
       ) : null}
 
-      {/* 2. Main Workbench Body */}
-      <div className="agent-workbench-body">
-        {/* Optional Collapsible Session Drawer Overlay */}
-        {showSessionRail && (
-          <div
-            ref={sessionDrawerRef}
-            id="agent-session-drawer"
-            className="agent-session-drawer-overlay"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="agent-session-drawer-title"
-            tabIndex={-1}
-          >
-            <h2 id="agent-session-drawer-title" className="visually-hidden">Agent sessions</h2>
-            <AgentSessionRail
-              sessions={state.sessions}
-              activeSessionId={state.activeSessionId}
-              resumableSessions={state.resumableSessions}
-              onClose={closeSessionRail}
-            />
-            <div
-              className="agent-session-drawer-backdrop"
-              onClick={closeSessionRail}
-              aria-hidden="true"
-            />
-          </div>
-        )}
+      {/* Durable sessions share the same backend switch route as the tabs. */}
+      {state.resumableSessions.length > 0 && (
+        <button type="button" className="agent-decision-secondary" aria-expanded={showSessionRail}
+          onClick={() => setShowSessionRail(!showSessionRail)}>Resume sessions</button>
+      )}
+      {showSessionRail && <AgentSessionRail sessions={state.sessions} activeSessionId={state.activeSessionId}
+        resumableSessions={state.resumableSessions} onClose={() => setShowSessionRail(false)} />}
 
       {/* 3. Workbench body */}
       <div

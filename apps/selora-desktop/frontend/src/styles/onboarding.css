@@ -501,3 +501,40 @@
 :root[data-reduced-motion="true"] .onboarding-brand-satellite {
   animation: none;
 }
+
+/* --- Small windows --------------------------------------------------------- */
+/* Short viewport: drop the forced hero/body min-heights and let the two
+   dialog columns scroll instead of clipping their content. */
+@media (max-height: 620px) {
+  .onboarding-visual,
+  .onboarding-content {
+    overflow-y: auto;
+  }
+
+  .onboarding-hero-fx,
+  .onboarding-hero-fallback,
+  .onboarding-hero-card {
+    min-height: 0;
+  }
+
+  .onboarding-body {
+    min-height: 0;
+  }
+
+  .onboarding-dots {
+    padding: var(--space-3) 0 var(--space-2);
+  }
+}
+
+/* Very narrow viewport: stack the two dialog columns and scroll the dialog. */
+@media (max-width: 560px) {
+  .onboarding-dialog {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+
+  .onboarding-visual {
+    border-right: none;
+    border-bottom: var(--border-hairline);
+  }
+}

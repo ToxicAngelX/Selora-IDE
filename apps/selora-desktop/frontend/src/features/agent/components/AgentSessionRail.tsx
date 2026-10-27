@@ -55,6 +55,15 @@ void agentStore.requestNewSession().then((ok) => {
         </p>
       ) : null}
 
+      {sessions.length === 0 && <p className="agent-session-rail-empty">No sessions yet</p>}
+      <div className="session-list">
+        {sessions.map((session) => {
+          const isActive = session.id === activeSessionId;
+          const activateSession = () => {
+            void agentStore.requestSwitchSession(session.id).then((ok) => {
+              if (ok) onClose?.();
+            });
+          };
           return (
             <button
               key={session.id}
@@ -82,9 +91,8 @@ void agentStore.requestNewSession().then((ok) => {
                     {session.branchName}
                   </span>
                 )}
-                <span className="session-tokens">
-                  {(session.tokenCount / 1000).toFixed(1)}k tokens
-                </span>
+                <span className="session-id">{session.id}</span>
+                {session.isRunning && <span className="session-running-tag">Running</span>}
               </div>
             </button>
           );

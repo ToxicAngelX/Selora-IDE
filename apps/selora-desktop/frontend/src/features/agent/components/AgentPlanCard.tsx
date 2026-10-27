@@ -15,6 +15,7 @@ export type AgentPlanCardProps = {
   error?: string | null;
   resolution?: AgentDecisionResolution;
   onDecide: (decision: 'approve' | 'request_changes', feedback?: string) => void;
+  onDeny?: () => void;
 };
 
 export const AgentPlanCard: React.FC<AgentPlanCardProps> = ({
@@ -23,6 +24,7 @@ export const AgentPlanCard: React.FC<AgentPlanCardProps> = ({
   error,
   resolution,
   onDecide,
+  onDeny,
 }) => {
   const feedbackId = useId();
   const [requestingChanges, setRequestingChanges] = useState(false);
@@ -109,6 +111,7 @@ export const AgentPlanCard: React.FC<AgentPlanCardProps> = ({
       ) : null}
 
       <div className="agent-decision-actions">
+        {onDeny && <button type="button" className="agent-decision-danger" disabled={submitting} onClick={onDeny}>Deny plan</button>}
         {requestingChanges ? (
           <>
             <button

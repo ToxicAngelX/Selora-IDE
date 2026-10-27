@@ -333,9 +333,15 @@ impl ToolRunner for WorkflowTools {
                         )
                     });
                 }
-                // No ledger configured: legacy hosts (and most tests) keep the
-                // existing behavior. Production always passes a ledger.
-                None => None,
+                // No durable evidence means no side effect, including legacy hosts.
+                None => {
+                    return Box::pin(async move {
+                        ToolResult::error(
+                            call.id,
+                            "tool effect ledger unavailable; side effect refused",
+                        )
+                    })
+                }
             }
         } else {
             None
@@ -902,7 +908,10 @@ mod tests {
         let (handler, cards) = cards();
         let host = WorkflowHost::new(
             root.path().to_owned(),
-            script.config().with_approval_handler(handler),
+            script
+                .config()
+                .with_approval_handler(handler)
+                .with_tool_effect_ledger(root.path().join("tool-effects.jsonl"), "test-approve"),
         );
         let result = ask(&host, "writer");
         let (id, _) = cards.recv_timeout(WAIT).expect("card");
@@ -919,6 +928,27 @@ mod tests {
         );
         assert!(host.decide(id, AgentDecision::Deny).is_err());
         assert_usage(&host, 2);
+    }
+
+    #[test]
+    fn missing_ledger_refuses_an_explicitly_approved_write() {
+        let root = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![write("write-no-ledger", "never.txt"), answer("{}")]);
+        let (handler, cards) = cards();
+        let host = WorkflowHost::new(
+            root.path().to_owned(),
+            script.config().with_approval_handler(handler),
+        );
+        let result = ask(&host, "writer");
+        let (id, _) = cards.recv_timeout(WAIT).unwrap();
+        host.decide(id, AgentDecision::Approve).unwrap();
+        result.recv_timeout(WAIT).unwrap().unwrap();
+        assert!(!root.path().join("never.txt").exists());
+        assert!(script.seen()[1]
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool
+                && message.content.contains("ledger unavailable")));
     }
 
     #[test]
@@ -982,7 +1012,10 @@ mod tests {
         });
         let host = WorkflowHost::new(
             root.path().to_owned(),
-            script.config().with_approval_handler(handler),
+            script
+                .config()
+                .with_approval_handler(handler)
+                .with_tool_effect_ledger(root.path().join("tool-effects.jsonl"), "test-sync"),
         );
         *reference.lock().expect("reference") = Arc::downgrade(&host);
         host.ask("writer", None, "write")
@@ -1007,7 +1040,10 @@ mod tests {
         let (handler, cards) = cards();
         let host = WorkflowHost::new(
             root.path().to_owned(),
-            script.config().with_approval_handler(handler),
+            script
+                .config()
+                .with_approval_handler(handler)
+                .with_tool_effect_ledger(root.path().join("tool-effects.jsonl"), "test-all"),
         );
         let a = ask(&host, "a");
         let (a_id, _) = cards.recv_timeout(WAIT).expect("a card");
@@ -1415,7 +1451,8 @@ mod tests {
                     max_turn_secs: 10,
                     ..TurnCaps::spec_defaults(200_000)
                 })
-                .with_approval_handler(handler),
+                .with_approval_handler(handler)
+                .with_tool_effect_ledger(root.path().join("tool-effects.jsonl"), "test-cancel"),
         );
         let result = ask(&host, "runner");
         let (id, card) = cards

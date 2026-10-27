@@ -18,6 +18,7 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { requirePersistedKey, requireCleanRuntime } from './gates.mjs';
 
 const PORT = Number(process.env.CDP_PORT || 9333);
 const ARTIFACTS = process.env.WALKTHROUGH_ARTIFACTS || '';
@@ -38,6 +39,7 @@ await mkdir(ARTIFACTS, { recursive: true });
 const startedAt = new Date();
 const steps = [];
 const consoleLines = [];
+const runtimeErrors = [];
 const exceptions = [];
 const screenshots = [];
 const findings = [];
@@ -449,6 +451,7 @@ async function writeResult(payload) {
     screenshots,
     console: consoleLines,
     exceptions,
+    runtime_errors: runtimeErrors,
     error: payload.error ?? null,
     diagnostics: payload.diagnostics ?? null,
     bootstrap: payload.bootstrap ?? null,
@@ -495,6 +498,7 @@ async function main() {
         .map((arg) => arg.value ?? arg.description ?? arg.preview?.description ?? arg.type)
         .join(' ');
       const line = `console.${params.type}: ${text}`;
+      if (params.type === 'error' || params.type === 'assert') runtimeErrors.push(line);
       consoleLines.push(line);
       log(line);
     } else if (method === 'Runtime.exceptionThrown') {
@@ -508,6 +512,7 @@ async function main() {
       const entry = params.entry ?? {};
       if (entry.level === 'error') {
         const line = `log.error: ${entry.text} (${entry.url || ''}:${entry.lineNumber ?? ''})`;
+        runtimeErrors.push(line);
         consoleLines.push(line);
         log(line);
       }
@@ -544,6 +549,12 @@ async function main() {
   });
 
   await screenshot('00-launch.png');
+
+  await step('persisted-key', 'A persisted Credential Manager key is available', async () => {
+    const status = await evaluate(`window.__TAURI_INTERNALS__.invoke('get_api_key_status')`);
+    requirePersistedKey(status);
+    return 'persisted key present (key value never read or logged)';
+  });
 
   await step('onboarding', 'First-run overlay is dismissed through its own control', async () => {
     const present = await evaluate(
@@ -942,11 +953,9 @@ async function main() {
     return `composer mounted; send=${gate.send_label} disabled=${gate.send_disabled}; title=${short(gate.send_title, 80)}; blocked=${short(gate.blocked_text, 120)}`;
   });
 
-  await step('runtime-errors', 'No renderer exception occurred during the walkthrough', async () => {
-    if (exceptions.length > 0) {
-      throw new Error(`${exceptions.length} renderer exception(s): ${short(exceptions[0].description, 300)}`);
-    }
-    return 'no Runtime.exceptionThrown events';
+  await step('runtime-errors', 'No renderer exception, console error, or browser log error occurred', async () => {
+    requireCleanRuntime(exceptions, runtimeErrors);
+    return 'no renderer, console, or browser log errors';
   });
 
   const finalBootstrap = await getBootstrap();
