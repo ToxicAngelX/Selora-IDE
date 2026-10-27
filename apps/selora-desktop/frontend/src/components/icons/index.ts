@@ -45,6 +45,7 @@ import {
   DirectSend as IconsaxDirectSend,
   Clock as IconsaxClock,
   Timer1 as IconsaxTimer,
+  Archive,
   type IconProps as IconsaxIconProps,
 } from 'iconsax-react';
 
@@ -165,4 +166,6 @@ export const Clock: FC<IconProps> = IconsaxClock;
 export const ClockIcon: FC<IconProps> = IconsaxClock;
 export const Timer: FC<IconProps> = IconsaxTimer;
 export const TimerIcon: FC<IconProps> = IconsaxTimer;
+
+export const ArchiveIcon: FC<IconProps> = Archive;
 
