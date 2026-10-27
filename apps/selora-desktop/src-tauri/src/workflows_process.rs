@@ -42,15 +42,31 @@
 //! Selora process already sits in a restrictive Job Object that rejects nested
 //! jobs; that case gets its own message instead of a generic one.
 //!
-//! # Remaining limits
+//! After the run the caller kills the job and reads its membership back
+//! ([`WorldProcess::audit`]): a job that still lists a process fails the run
+//! instead of reporting success with debris.
 //!
-//! * A process that another broker creates on the child's behalf is not a
-//!   `CreateProcess` descendant of the child at all: a `ShellExecuteEx` launch
-//!   can be started by the shell service, which is outside this job, so it can
-//!   escape. Ordinary `CreateProcess`/`Start-Process -NoNewWindow` descendants
-//!   are contained because job membership is inherited.
-//! * A job that cannot be created or assigned stops the command instead of
-//!   running it uncontained.
+//! # What the job does not cover
+//!
+//! A process created by an out-of-process Windows broker is not a
+//! `CreateProcess` descendant of the child, is never a job member, and cannot
+//! be seen by the job audit. This is reproduced by the `wmi` test below: the
+//! WMI service creates the process outside the job and it survives the job
+//! kill. The same shape applies to Task Scheduler and Explorer. Two limits
+//! remain, stated exactly:
+//!
+//! * `workflow_broker::refusal` refuses the known broker launch forms in the
+//!   confirmed command text before PowerShell is spawned, so those commands do
+//!   not run at all. That scan is a policy, not a security boundary: it does
+//!   not inspect `world.run` arguments (data), so a confirmed interpreter
+//!   (`powershell`, `pwsh`, `cmd`) can carry broker code as an argument, and
+//!   obfuscated PowerShell can spell a broker token differently. Such a
+//!   process still escapes.
+//! * `Start-Process` without `-NoNewWindow` uses `ShellExecuteEx`. For an
+//!   executable that path is still a `CreateProcess` descendant and stays in
+//!   the job (test-covered); a document association handled by a shell broker
+//!   may not be. Use `-NoNewWindow` or a direct executable command when the
+//!   distinction matters.
 
 use selora_workflow::HostError;
 
@@ -60,10 +76,24 @@ pub use windows::WorldProcess;
 #[cfg(not(windows))]
 pub use fallback::WorldProcess;
 
+/// One read-back of the Job Object's membership after a run.
+///
+/// `active` is the process id list Windows still reports as assigned to the
+/// job. `total_created` is the job's lifetime process count. A stopped tree
+/// must leave `active` empty; [`crate::workflows_host`] fails the run when it
+/// does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobAudit {
+    /// Process ids still assigned to the job.
+    pub active: Vec<u32>,
+    /// Every process that was ever assigned to the job.
+    pub total_created: u32,
+}
+
 /// A non-Windows host cannot provide a Job Object, so `world.run` is refused.
 #[cfg(not(windows))]
 mod fallback {
-    use super::HostError;
+    use super::{HostError, JobAudit};
     use std::{ffi::OsString, fs::File, path::Path};
 
     /// Placeholder that keeps `world.run` fail-closed on every other host.
@@ -102,6 +132,13 @@ mod fallback {
             Ok(())
         }
 
+        /// Always fails: this host never spawned a job.
+        pub fn audit(&self) -> Result<JobAudit, HostError> {
+            Err(HostError::new(
+                "`world.run` process containment needs a Windows Job Object",
+            ))
+        }
+
         pub fn kill_and_reap(&mut self) {}
     }
 }
@@ -112,7 +149,7 @@ mod windows {
     //! whose handle and pointer preconditions are established by the owning
     //! struct or by the enclosing spawn step.
 
-    use super::HostError;
+    use super::{HostError, JobAudit};
     use std::{
         ffi::{OsStr, OsString},
         fs::File,
@@ -135,9 +172,11 @@ mod windows {
         },
         System::{
             JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+                JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Pipes::CreatePipe,
             Threading::{
@@ -239,6 +278,20 @@ mod windows {
         /// joins. Calling it on an empty job succeeds.
         pub fn terminate_job(&self) -> Result<(), HostError> {
             self.job.terminate()
+        }
+
+        /// Read the job's current membership back.
+        ///
+        /// Call after [`Self::terminate_job`]. `active` must be empty before
+        /// the run can be reported as successful; a non-empty list means at
+        /// least one process the job owns is still alive.
+        ///
+        /// This sees job members only. A process a Windows broker created
+        /// outside the job is not a member and cannot appear here; that is the
+        /// documented residual, and why the host also refuses known broker
+        /// launch forms before spawning.
+        pub fn audit(&self) -> Result<JobAudit, HostError> {
+            self.job.audit()
         }
 
         /// Kill and reap the direct child as the belt-and-braces fallback.
@@ -545,6 +598,91 @@ mod windows {
                 ));
             }
             Ok(())
+        }
+
+        /// Query the job's lifetime process count and its current pid list.
+        fn audit(&self) -> Result<JobAudit, HostError> {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                // SAFETY: the struct is a plain C struct of integers; all-zero
+                // bits is a valid value that the call overwrites.
+                unsafe { std::mem::zeroed() };
+            let mut returned = 0u32;
+            // SAFETY: `self.0` is a live job handle; `accounting` is a live,
+            // correctly sized out-parameter for the basic accounting class.
+            if unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    ptr::from_mut(&mut accounting).cast(),
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    &mut returned,
+                )
+            } == 0
+            {
+                return Err(job_error(
+                    "cannot read the `world.run` Job Object accounting",
+                    io::Error::last_os_error(),
+                ));
+            }
+
+            // `NumberOfAssignedProcesses` can exceed the buffer, in which case
+            // the call succeeds with a truncated list. Grow to the reported
+            // size until the list is complete.
+            let mut capacity = 64usize;
+            loop {
+                let header = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+                let extra = capacity.saturating_sub(1) * std::mem::size_of::<usize>();
+                let bytes = header + extra;
+                // `ProcessIdList` is a one-element array; a `usize` buffer keeps
+                // the allocation pointer-aligned for the pid array.
+                let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+                let list = storage
+                    .as_mut_ptr()
+                    .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+                let mut returned = 0u32;
+                // SAFETY: `self.0` is a live job handle; `list` points at
+                // `bytes` writable bytes of aligned storage; the class matches
+                // the struct and `returned` is a live out-parameter.
+                if unsafe {
+                    QueryInformationJobObject(
+                        self.0,
+                        JobObjectBasicProcessIdList,
+                        list.cast(),
+                        bytes as u32,
+                        &mut returned,
+                    )
+                } == 0
+                {
+                    return Err(job_error(
+                        "cannot read the `world.run` Job Object process list",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: the successful call initialized the header and at
+                // most `capacity` pid entries inside `storage`.
+                let (assigned, listed) = unsafe {
+                    (
+                        (*list).NumberOfAssignedProcesses as usize,
+                        (*list).NumberOfProcessIdsInList as usize,
+                    )
+                };
+                if assigned > capacity {
+                    capacity = assigned;
+                    continue;
+                }
+                // SAFETY: `listed` is at most the requested `capacity`, and the
+                // entries follow the struct header inside `storage`.
+                let active = unsafe {
+                    std::slice::from_raw_parts((*list).ProcessIdList.as_ptr(), listed)
+                        .iter()
+                        .map(|pid| *pid as u32)
+                        .collect()
+                };
+                return Ok(JobAudit {
+                    active,
+                    total_created: accounting.TotalProcesses,
+                });
+            }
         }
     }
 
@@ -911,6 +1049,9 @@ mod tests {
         sync::Mutex,
         time::{Duration, Instant},
     };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
 
     fn powershell() -> &'static str {
         if Command::new("pwsh")
@@ -972,6 +1113,41 @@ mod tests {
         }
     }
 
+    /// Non-panicking variant for the broker probe: WMI may be disabled on a
+    /// host, in which case there is no broker attempt to reproduce.
+    fn wait_for_pid_file_opt(path: &Path) -> Option<u32> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return Some(pid);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Terminate a process the job does not own, for broker-test cleanup.
+    fn terminate_outside_process(pid: u32) {
+        // SAFETY: `OpenProcess` takes a plain access mask and process id; the
+        // returned handle is checked and closed. `TerminateProcess` takes the
+        // live handle and a plain exit code.
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+
     fn process_alive(pid: u32) -> bool {
         let output = Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
@@ -1001,6 +1177,33 @@ mod tests {
              '-NonInteractive','-Command','Start-Sleep -Seconds 120' -NoNewWindow -PassThru; \
              Set-Content -LiteralPath {} -Value $grand.Id; {tail}",
             ps_literal(Path::new(powershell())),
+            ps_literal(pid_file)
+        )
+    }
+
+    /// The same grandchild through `Start-Process`'s default `ShellExecuteEx`
+    /// path (no `-NoNewWindow`). For an executable, Windows still creates it
+    /// as a `CreateProcess` descendant, so it must stay in the job.
+    fn shell_execute_grandchild_script(pid_file: &Path) -> String {
+        format!(
+            "$grand = Start-Process -FilePath {} -ArgumentList '-NoProfile',\
+             '-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; \
+             Set-Content -LiteralPath {} -Value $grand.Id; Start-Sleep -Seconds 120",
+            ps_literal(Path::new(powershell())),
+            ps_literal(pid_file)
+        )
+    }
+
+    /// A grandchild created by the WMI service (`WmiPrvSE.exe`), not by the
+    /// child. This is the broker escape: the process is outside the job, so
+    /// neither the job kill nor the job audit can reach it.
+    fn wmi_broker_script(pid_file: &Path) -> String {
+        format!(
+            "$cmd = '{} -NoProfile -Command \"Start-Sleep -Seconds 120\"'; \
+             $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \
+             -Arguments @{{CommandLine=$cmd}}; \
+             Set-Content -LiteralPath {} -Value $r.ProcessId; Start-Sleep -Seconds 120",
+            powershell(),
             ps_literal(pid_file)
         )
     }
@@ -1050,6 +1253,127 @@ mod tests {
                 "attempt {attempt}: grandchild {grandchild} survived the job termination"
             );
         }
+    }
+
+    #[test]
+    fn start_process_shell_execute_grandchild_is_in_the_job_and_dies_with_it() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pid_file = workspace.path().join("shell-execute.pid");
+        let script = shell_execute_grandchild_script(&pid_file);
+        let mut child = WorldProcess::spawn(
+            powershell(),
+            &args(&script),
+            workspace.path(),
+            &environment(),
+        )
+        .expect("suspended spawn and assignment succeed");
+        let grandchild = wait_for_pid_file(&pid_file);
+        assert!(
+            child.job_contains(grandchild),
+            "grandchild {grandchild} spawned through Start-Process/ShellExecuteEx is not in the job"
+        );
+        child.terminate_job().expect("job terminates");
+        child.kill_and_reap();
+        assert!(
+            wait_until_gone(grandchild),
+            "grandchild {grandchild} survived the job termination"
+        );
+    }
+
+    #[test]
+    fn job_audit_lists_members_and_is_empty_after_the_kill() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pid_file = workspace.path().join("audit.pid");
+        let script = grandchild_first_script(&pid_file, "Start-Sleep -Seconds 120");
+        let mut child = WorldProcess::spawn(
+            powershell(),
+            &args(&script),
+            workspace.path(),
+            &environment(),
+        )
+        .expect("suspended spawn and assignment succeed");
+        let grandchild = wait_for_pid_file(&pid_file);
+        let direct = child.pid();
+
+        let audit = child.audit().expect("job membership is readable");
+        assert!(
+            audit.active.contains(&direct),
+            "audit {audit:?} lost the direct child {direct}"
+        );
+        assert!(
+            audit.active.contains(&grandchild),
+            "audit {audit:?} lost the contained grandchild {grandchild}"
+        );
+        assert!(
+            audit.total_created >= 2,
+            "audit {audit:?} did not count the created processes"
+        );
+
+        child.terminate_job().expect("job terminates");
+        child.kill_and_reap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let audit = child
+                .audit()
+                .expect("job membership is readable after the kill");
+            if audit.active.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the job still lists {:?} after termination",
+                audit.active
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wait_until_gone(grandchild),
+            "grandchild {grandchild} survived the job termination"
+        );
+    }
+
+    #[test]
+    fn broker_created_process_escapes_the_job_and_the_audit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pid_file = workspace.path().join("wmi-broker.pid");
+        let script = wmi_broker_script(&pid_file);
+        let mut child = WorldProcess::spawn(
+            powershell(),
+            &args(&script),
+            workspace.path(),
+            &environment(),
+        )
+        .expect("suspended spawn and assignment succeed");
+        let Some(escaped) = wait_for_pid_file_opt(&pid_file) else {
+            eprintln!("WMI process creation is unavailable on this host; broker probe skipped");
+            child.terminate_job().expect("job terminates");
+            child.kill_and_reap();
+            return;
+        };
+
+        assert!(
+            !child.job_contains(escaped),
+            "WMI-created process {escaped} unexpectedly joined the job; the probe no longer \
+             reproduces the broker escape"
+        );
+        let audit = child.audit().expect("job membership is readable");
+        assert!(
+            !audit.active.contains(&escaped),
+            "the job audit claimed the out-of-job WMI process {escaped}: {audit:?}"
+        );
+
+        child.terminate_job().expect("job terminates");
+        child.kill_and_reap();
+        assert!(
+            process_alive(escaped),
+            "the broker-created process {escaped} was expected to survive the job kill (the \
+             documented escape)"
+        );
+        terminate_outside_process(escaped);
+        assert!(
+            wait_until_gone(escaped),
+            "the test could not clean up the escaped WMI process {escaped}"
+        );
     }
 
     #[test]

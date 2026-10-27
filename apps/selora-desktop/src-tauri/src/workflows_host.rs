@@ -68,10 +68,15 @@
 //!   including `Start-Process`/`Start-Job` descendants, and a descendant
 //!   holding the inherited capture pipes can no longer delay the reader joins.
 //!   A spawn whose job creation, assignment or resume fails is terminated
-//!   without ever being resumed. The residual escape is a process another
-//!   broker creates on the child's behalf (for example a `ShellExecuteEx`
-//!   launch started by the shell service), which is not a `CreateProcess`
-//!   descendant; see that module.
+//!   without ever being resumed. After the kill, `world.run` reads the job's
+//!   membership back and fails the run if a process is still listed. The
+//!   residual escape is a process another broker creates on the child's behalf
+//!   (for example a WMI `Win32_Process.Create`, Task Scheduler or
+//!   `ShellExecuteEx` launch started by the shell service), which is not a
+//!   `CreateProcess` descendant and never a job member. Known broker launch
+//!   forms in the confirmed command text are refused before PowerShell is
+//!   spawned (`workflow_broker`); a confirmed interpreter can still carry
+//!   broker code in an argument. See that module for the exact limit.
 //! * The legacy `with_chat` synchronous fake is cooperative only around the
 //!   closure. Real turns cancel HTTP, parked approvals and running tools promptly.
 //! * `git.log` and any `git.*` call with a `base` use the `git` CLI, because
@@ -1010,6 +1015,12 @@ impl WorkflowHost {
         if cmd.trim().is_empty() {
             return Err(HostError::new("`world.run` needs a command"));
         }
+        // Refuse known broker launch forms before PowerShell exists. A WMI,
+        // Task Scheduler or Explorer broker creates the process outside this
+        // job, where the post-exit audit cannot see or kill it.
+        if let Some(refusal) = crate::workflow_broker::refusal(cmd) {
+            return Err(HostError::new(refusal));
+        }
 
         let program = powershell_program();
         // PowerShell reparses arguments after `-Command` as code. Keep the
@@ -1086,6 +1097,19 @@ impl WorkflowHost {
         // capture joins, so a grandchild holding the inherited pipes cannot
         // block the run. The job handle stays open until both readers are done.
         let containment = child.terminate_job().err();
+        // Membership is read back after the kill. A non-empty job is a
+        // containment failure, not a successful command with debris.
+        let audit = if containment.is_none() {
+            audit_quiet_job(&child)
+        } else {
+            None
+        };
+        let containment = containment.or(audit);
+        if containment.is_some() {
+            // The audit (or the kill) failed. Reap the direct child so the
+            // capture readers cannot block on its handles.
+            child.kill_and_reap();
+        }
         let stdout = join_capture(stdout_reader).unwrap_or_default();
         let stderr = join_capture(stderr_reader).unwrap_or_default();
         if let Some(error) = containment {
@@ -1427,14 +1451,44 @@ fn cancelled_error() -> HostError {
 }
 
 /// Stop a `world.run` tree: terminate the Job Object first (authoritative),
-/// then kill and reap the direct child as a fallback.
+/// then kill and reap the direct child as a fallback, then read the job's
+/// membership back.
 ///
 /// Returns the job's failure, if any, so the caller can still report a typed
 /// containment error next to the timeout/cancel/wait failure it already has.
+/// A job that still lists a process after the kill is a containment failure:
+/// the caller reports it and the run fails.
 fn stop_process_tree(child: &mut WorldProcess) -> Option<HostError> {
     let containment = child.terminate_job().err();
     child.kill_and_reap();
-    containment
+    containment.or_else(|| audit_quiet_job(child))
+}
+
+/// Wait (bounded) for the stopped job to become empty, then report any member
+/// that is still listed.
+///
+/// `TerminateJobObject` returns before every process object has necessarily
+/// left the job, so a short poll avoids a false failure after a clean kill.
+/// The bound is deliberately small: a process that is still a member after it
+/// is a real leftover, and the caller must fail closed rather than continue.
+fn audit_quiet_job(child: &WorldProcess) -> Option<HostError> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.audit() {
+            Ok(audit) if audit.active.is_empty() => return None,
+            Ok(audit) if Instant::now() >= deadline => {
+                return Some(HostError::new(format!(
+                    "`world.run` Job Object still holds {} process(es) after the run ({:?}); \
+                     descendant processes could survive, so the run failed",
+                    audit.active.len(),
+                    audit.active
+                )));
+            }
+            Ok(_) => {}
+            Err(error) => return Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Append a containment failure to the primary `world.run` failure.
@@ -2192,6 +2246,58 @@ mod tests {
             "the combined cap was exceeded: {} + {} bytes",
             output.stdout.len(),
             output.stderr.len()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn world_run_refuses_broker_process_launch_before_spawning() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = WorkflowHost::new(workspace.path().to_path_buf(), config());
+        let sentinel = workspace.path().join("broker-ran.txt");
+        let script = format!(
+            "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \
+             -Arguments @{{CommandLine='cmd /c echo ran > {}'}}; \
+             Set-Content -LiteralPath {} -Value $r.ProcessId",
+            ps_literal(&sentinel),
+            ps_literal(&workspace.path().join("broker.pid"))
+        );
+        let error = host
+            .world_run(&script, &[], Some(30_000))
+            .expect_err("broker launch is refused");
+        assert!(
+            error.message.contains("refused")
+                && error.message.contains("broker")
+                && error.message.contains("Nothing was run"),
+            "the refusal must name the broker escape and the fail-closed policy: {error}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the refused command reached the WMI broker and ran"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn world_run_start_process_shell_execute_descendant_is_still_contained() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = WorkflowHost::new(workspace.path().to_path_buf(), config());
+        let pid_file = workspace.path().join("shell-execute-success.pid");
+        let script = format!(
+            "$grand = Start-Process -FilePath {} -ArgumentList '-NoProfile',\
+             '-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; \
+             Set-Content -LiteralPath {} -Value $grand.Id; exit 0",
+            ps_literal(Path::new(powershell_program())),
+            ps_literal(&pid_file)
+        );
+        let output = host
+            .world_run(&script, &[], Some(30_000))
+            .expect("powershell runs");
+        assert_eq!(output.exit_code, 0, "stderr: {}", output.stderr);
+        let pid = wait_for_grandchild_pid(&pid_file);
+        assert!(
+            wait_until_gone(pid),
+            "Start-Process/ShellExecuteEx grandchild {pid} survived a successful `world.run`"
         );
     }
 
