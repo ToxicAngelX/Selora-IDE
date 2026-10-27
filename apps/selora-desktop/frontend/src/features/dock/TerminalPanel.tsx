@@ -11,7 +11,7 @@ export function TerminalPanel() {
         <div className="terminal-tabs">
           <span className="terminal-placeholder-label">
             <Icon name="terminal" size={12} />
-            <span>Terminal placeholder</span>
+            <span>Terminal</span>
           </span>
         </div>
         <div className="dock-toolbar-right">

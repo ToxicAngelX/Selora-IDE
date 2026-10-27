@@ -143,8 +143,17 @@ describe('SettingsPanelView persistence wiring', () => {
     ]) {
       const value = screen.getByLabelText(label);
       expect(value.textContent).toBe('—');
-      expect(value.getAttribute('title')).toContain('no backend settings field');
+      // These fields persist in settings.json; only the settings wire omits them.
+      expect(value.getAttribute('title')).toContain('stored in settings.json');
+      expect(value.getAttribute('title')).toContain('does not expose it');
     }
+
+    // Format on save is not a settings.json field at all, so it must not
+    // borrow the "stored but unexposed" explanation.
+    const formatOnSave = screen.getByLabelText('Format on save value');
+    expect(formatOnSave.textContent).toBe('—');
+    expect(formatOnSave.getAttribute('title')).toContain('no backend settings field');
+    expect(formatOnSave.getAttribute('title')).not.toContain('stored in settings.json');
 
     expect(screen.queryByText('13.5')).toBeNull();
     expect(screen.queryByText('2 spaces')).toBeNull();
