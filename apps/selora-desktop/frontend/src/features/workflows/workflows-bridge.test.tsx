@@ -245,6 +245,39 @@ describe('toWorkflowStoreEvent', () => {
     ).toMatchObject({ artifact_id: null });
   });
 
+  it('maps an additive report phase and artifact phase without inventing one when absent', () => {
+    expect(
+      map({
+        type: 'workflow_report',
+        payload: {
+          run_id: 'run_1',
+          report: { id: 'report_2', item: 'Scoped finding.', phase: 'Scan' },
+        },
+      }),
+    ).toMatchObject({ phase: 'Scan' });
+    expect(
+      map({
+        type: 'workflow_artifact',
+        payload: {
+          run_id: 'run_1',
+          artifact: {
+            id: 'artifact_md',
+            title: 'Summary',
+            kind: 'markdown',
+            body: '## Findings',
+            phase: 'Review',
+          },
+        },
+      }),
+    ).toMatchObject({ phase: 'Review' });
+    expect(
+      map({
+        type: 'workflow_report',
+        payload: { run_id: 'run_1', report: { id: 'report_3', item: 'No phase.', phase: '' } },
+      }),
+    ).toMatchObject({ phase: null });
+  });
+
   it('maps workflow_artifact markdown bodies to content and file bodies to paths', () => {
     expect(map(ARTIFACT)).toEqual({
       kind: 'artifact',

@@ -58,7 +58,8 @@ use serde::{Deserialize, Serialize};
 
 pub use budget::Budget;
 pub use persisted::{
-    incomplete_asks, load_workflow_spec, run_workflow_persisted, IncompleteAsk, RunOptions,
+    incomplete_asks, load_workflow_spec, run_workflow_persisted, ArtifactRecord, IncompleteAsk,
+    ReportItemRecord, RunOptions, StepFinishRecord, StepStartRecord,
 };
 pub use sandbox::{
     prepare, Confirmation, Limits, DEFAULT_MAX_COST_USD, MAX_SCRIPT_BYTES, MAX_STEPS,

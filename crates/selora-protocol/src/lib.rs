@@ -973,24 +973,27 @@ pub struct WorkflowPersistedRunDto {
     /// Why resume is unavailable, or the terminal journal's error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Phase names from the run's terminal journal report, in first-marker
-    /// order. Empty when the journal does not carry a terminal report.
+    /// Phase names from the run's `phase_started` records, in first-marker
+    /// order. Empty when the journal does not carry them.
     #[serde(default)]
     pub phases: Vec<String>,
-    /// Steps from the run's terminal journal report.
+    /// Steps reconstructed from `engine_step_started`/`engine_step_finished`
+    /// records, with the phase recorded for each step.
     #[serde(default)]
     pub steps: Vec<WorkflowStepDto>,
-    /// Report items reconstructed from the journal's `engine_step_started`
-    /// inputs for successful report steps.
+    /// Report items reconstructed from `engine_report_item` records, keyed by
+    /// their run-wide ordinal. A journal that predates those records falls
+    /// back to the successful report steps' inputs.
     #[serde(default)]
     pub reports: Vec<WorkflowReportDto>,
-    /// Artifacts from the run's terminal journal report.
+    /// Artifacts reconstructed from `engine_artifact` records (or the terminal
+    /// report on an older journal), with their full content.
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifactDto>,
-    /// Receipt tokens recorded by the terminal report.
+    /// Receipt tokens: the terminal report's total, or the step records' sum.
     #[serde(default = "default_tokens")]
     pub tokens: u64,
-    /// Spend recorded by the terminal report.
+    /// Spend: the terminal report's total, or the step records' sum.
     #[serde(default = "default_cost_usd")]
     pub cost_usd: f64,
 }
@@ -1204,6 +1207,10 @@ pub struct WorkflowReportDto {
     pub item: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
+    /// The phase marker in effect when the item was reported, when known.
+    /// Additive: old payloads omit it and loaders may leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// One artifact produced by a run (`kind` is the producer's spelling, e.g.
@@ -1217,6 +1224,9 @@ pub struct WorkflowArtifactDto {
     pub kind: String,
     #[serde(default)]
     pub body: String,
+    /// The phase marker in effect when the artifact was produced, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// The ARCHITECTURE §18.1 workflow-level cost cap default ($5).
@@ -2576,6 +2586,7 @@ mod tests {
                     id: "report-1".into(),
                     item: "confirmed finding".into(),
                     artifact_id: Some("artifact-1".into()),
+                    phase: None,
                 },
             }),
             r#"{"type":"workflow_report","payload":{"run_id":"run-1","report":{"id":"report-1","item":"confirmed finding","artifact_id":"artifact-1"}}}"#,
@@ -2588,6 +2599,7 @@ mod tests {
                     title: "Review".into(),
                     kind: "markdown".into(),
                     body: "# Review".into(),
+                    phase: None,
                 },
             }),
             r##"{"type":"workflow_artifact","payload":{"run_id":"run-1","artifact":{"id":"artifact-1","title":"Review","kind":"markdown","body":"# Review"}}}"##,

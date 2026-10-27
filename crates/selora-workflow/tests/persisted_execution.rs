@@ -990,3 +990,142 @@ fn symlinked_metadata_run_and_files_never_escape_workspace() {
         }
     }
 }
+
+#[test]
+fn journal_records_every_step_phase_report_and_artifact_content() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = prepare(
+        "history",
+        r##"
+        report("before any phase");
+        phase("scan");
+        const first = files.read("a");
+        report("inside scan", "note");
+        artifact.markdown("note", "artifact body");
+        phase("fix");
+        files.read("b");
+        report({fixed: true});
+        phase("verify");
+        report("after phases");
+    "##,
+        5.0,
+    )
+    .unwrap()
+    .spec();
+    let (result, _) = execute(&workspace, &id, &spec, Arc::new(TestHost::default()), false);
+    result.unwrap();
+
+    let loaded = Journal::load(workspace.path(), id).unwrap();
+    assert!(loaded.corrupt.is_empty(), "{:?}", loaded.corrupt);
+
+    // Every step start/finish carries the phase in effect at that moment.
+    let starts: Vec<_> = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_step_started")
+        .collect();
+    assert_eq!(starts.len(), 10, "every facade call is a step");
+    assert!(starts[0].payload.get("phase").is_none(), "no phase yet");
+    assert!(
+        starts[1].payload.get("phase").is_none(),
+        "a phase step starts before its own marker"
+    );
+    assert_eq!(starts[2].payload["phase"], "scan");
+    assert_eq!(starts[3].payload["phase"], "scan");
+    assert_eq!(starts[4].payload["phase"], "scan");
+    assert_eq!(
+        starts[5].payload["phase"], "scan",
+        "the fix step starts in scan"
+    );
+    assert_eq!(starts[6].payload["phase"], "fix");
+    assert_eq!(starts[9].payload["phase"], "verify");
+    let phase_step = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_step_finished")
+        .find(|entry| {
+            entry.payload["step"]["kind"] == "phase" && entry.payload["step"]["detail"] == "fix"
+        })
+        .expect("the fix phase step finished");
+    assert_eq!(
+        phase_step.payload["phase"], "fix",
+        "a phase step finishes inside the phase it opened"
+    );
+
+    // Report items are explicit records with their live ordinal and phase.
+    let reports: Vec<_> = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_report_item")
+        .collect();
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports[0].payload["index"], 1);
+    assert_eq!(reports[0].payload["item"], "before any phase");
+    assert!(reports[0].payload.get("phase").is_none());
+    assert_eq!(reports[1].payload["index"], 2);
+    assert_eq!(reports[1].payload["phase"], "scan");
+    assert_eq!(reports[1].payload["artifact_id"], "note");
+    assert_eq!(reports[2].payload["phase"], "fix");
+    assert_eq!(reports[2].payload["item"], json!({"fixed": true}));
+    assert_eq!(reports[3].payload["phase"], "verify");
+
+    // Artifact content and an absent title are durable even without the
+    // terminal report's copy.
+    let artifacts: Vec<_> = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_artifact")
+        .collect();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].payload["artifact"]["id"], "note");
+    assert!(artifacts[0].payload["artifact"]["title"].is_null());
+    assert_eq!(
+        artifacts[0].payload["artifact"]["content"]["kind"],
+        "markdown"
+    );
+    assert_eq!(
+        artifacts[0].payload["artifact"]["content"]["body"],
+        "artifact body"
+    );
+    assert_eq!(artifacts[0].payload["phase"], "scan");
+}
+
+#[test]
+fn a_failed_report_step_is_never_journaled_as_reported() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = prepare(
+        "failed report",
+        r#"
+        phase("scan");
+        report("kept");
+        report("x".repeat(40000));
+    "#,
+        5.0,
+    )
+    .unwrap()
+    .spec();
+    let (result, events) = execute(&workspace, &id, &spec, Arc::new(TestHost::default()), false);
+    assert!(result.is_err(), "the oversized item aborts the run");
+    assert_eq!(terminal(&events).status, RunStatus::Failed);
+
+    let loaded = Journal::load(workspace.path(), id).unwrap();
+    let reports: Vec<_> = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_report_item")
+        .collect();
+    assert_eq!(reports.len(), 1, "only the item that reached the host");
+    assert_eq!(reports[0].payload["index"], 1);
+    assert_eq!(reports[0].payload["item"], "kept");
+    let failed = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "engine_step_finished")
+        .find(|entry| {
+            entry.payload["step"]["kind"] == "report" && entry.payload["step"]["status"] == "failed"
+        })
+        .expect("the oversized report step failed");
+    assert_eq!(failed.payload["phase"], "scan");
+}

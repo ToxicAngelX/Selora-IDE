@@ -15,6 +15,13 @@
 //! Path checks reject existing symlinks/reparse points. As with ordinary
 //! workspace IO, callers must exclude concurrent hostile filesystem mutation;
 //! portable safe Rust path APIs cannot eliminate check/open races.
+//!
+//! Record vocabulary (all additive; older journals stay readable):
+//! `engine_run_started`, `engine_step_started` (with the phase in effect),
+//! `engine_step_finished` (with the phase in effect at completion),
+//! `engine_report_item` (one per `report` that reached the host, carrying its
+//! run-wide ordinal), `engine_artifact` (full markdown/file content),
+//! `engine_run_finished`, and `phase_started`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -133,24 +140,74 @@ pub fn run_workflow_persisted(
     crate::sandbox::run_durable(spec, host, sink, options.run_id, durable)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct CallStart {
-    step: WorkflowStep,
-    inputs: Value,
+/// One `engine_step_started` record.
+///
+/// `phase` is the phase marker in effect when the step started. It is additive:
+/// journals written before it existed deserialize with `None`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepStartRecord {
+    /// The step identity and its initial (running) state.
+    pub step: WorkflowStep,
+    /// The call's normalized inputs, used to prove replay identity.
+    pub inputs: Value,
+    /// The current phase name, when the script declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct CallFinish {
-    step: WorkflowStep,
-    value: Value,
-    cost_usd: f64,
-    tokens: u64,
+/// One `engine_step_finished` record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepFinishRecord {
+    /// The completed step identity.
+    pub step: WorkflowStep,
+    /// The step's value (`null` when it produced none).
+    pub value: Value,
+    /// Receipt cost for this step.
+    pub cost_usd: f64,
+    /// Receipt tokens for this step.
+    pub tokens: u64,
+    /// A successful ask's checkpoint, when the host supports one.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_agent_state"
     )]
-    agent_state: Option<Value>,
+    pub agent_state: Option<Value>,
+    /// The current phase name when the step finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+/// One `engine_report_item` record: a `report(item, artifactId?)` that
+/// actually reached the host. A report step that failed before the host call
+/// leaves no record, so history can never claim it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReportItemRecord {
+    /// The report step's identity.
+    pub step_id: u64,
+    /// The phase in effect when the item was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The 1-based report ordinal across the run (the live `report-N` id).
+    pub index: u64,
+    /// The reported JSON item, verbatim.
+    pub item: Value,
+    /// Optional artifact the item belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+}
+
+/// One `engine_artifact` record: an artifact with its full content, written
+/// even when the terminal run report is missing or the step value is `null`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    /// The artifact step's identity.
+    pub step_id: u64,
+    /// The phase in effect when the artifact was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The artifact id, title and markdown/file content.
+    pub artifact: crate::Artifact,
 }
 
 // Preserve an explicitly supplied JSON null so the host can reject malformed
@@ -162,8 +219,8 @@ fn deserialize_agent_state<'de, D: serde::Deserializer<'de>>(
 }
 
 struct SavedCall {
-    start: CallStart,
-    finish: Option<CallFinish>,
+    start: StepStartRecord,
+    finish: Option<StepFinishRecord>,
 }
 
 /// What a durable journal proves once every record has been validated.
@@ -200,7 +257,7 @@ fn scan_journal(
         }
         match entry.kind.as_str() {
             "engine_step_started" => {
-                let start: CallStart =
+                let start: StepStartRecord =
                     serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
                 if let Some(saved) = scan.calls.get(&start.step.index) {
                     if saved.start.inputs != start.inputs || saved.start.step != start.step {
@@ -220,7 +277,7 @@ fn scan_journal(
                 }
             }
             "engine_step_finished" => {
-                let finish: CallFinish =
+                let finish: StepFinishRecord =
                     serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
                 if !finish.cost_usd.is_finite() || finish.cost_usd < 0.0 {
                     return Err(persistence_error("invalid usage delta"));
@@ -281,6 +338,14 @@ fn scan_journal(
                     ));
                 }
                 scan.confirmed = true;
+            }
+            "engine_report_item" => {
+                let _: ReportItemRecord =
+                    serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
+            }
+            "engine_artifact" => {
+                let _: ArtifactRecord =
+                    serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
             }
             "phase_started" => {}
             _ => {
@@ -474,14 +539,35 @@ impl Durable {
         &mut self,
         step: &WorkflowStep,
         inputs: Value,
+        phase: Option<String>,
     ) -> Result<(), WorkflowError> {
-        let start = CallStart {
+        let start = StepStartRecord {
             step: step.clone(),
             inputs,
+            phase,
         };
         self.append(
             "engine_step_started",
             serde_json::to_value(&start).map_err(persistence_error)?,
+        )
+    }
+
+    /// Append one report item that reached the host. Called only after the
+    /// host accepted it, so the journal never claims a report that did not
+    /// happen.
+    pub(crate) fn report_item(&mut self, record: &ReportItemRecord) -> Result<(), WorkflowError> {
+        self.append(
+            "engine_report_item",
+            serde_json::to_value(record).map_err(persistence_error)?,
+        )
+    }
+
+    /// Append one artifact with its full content. Called only after the host
+    /// accepted it.
+    pub(crate) fn artifact(&mut self, record: &ArtifactRecord) -> Result<(), WorkflowError> {
+        self.append(
+            "engine_artifact",
+            serde_json::to_value(record).map_err(persistence_error)?,
         )
     }
 
@@ -502,6 +588,7 @@ impl Durable {
         step: &WorkflowStep,
         value: Option<Value>,
         agent_state: Option<Value>,
+        phase: Option<String>,
         host: &dyn Host,
     ) -> Result<(), WorkflowError> {
         let cost = host.cost_usd();
@@ -511,12 +598,13 @@ impl Durable {
                 "host usage counters must be finite and monotonic",
             ));
         }
-        let finish = CallFinish {
+        let finish = StepFinishRecord {
             step: step.clone(),
             value: value.unwrap_or(Value::Null),
             cost_usd: cost - self.host_cost,
             tokens: tokens - self.host_tokens,
             agent_state,
+            phase,
         };
         self.append(
             "engine_step_finished",

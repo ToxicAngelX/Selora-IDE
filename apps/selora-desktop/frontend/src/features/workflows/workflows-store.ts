@@ -162,8 +162,14 @@ export type PersistedWorkflowRun = {
     agent?: string;
     detail?: string;
   }>;
-  reports?: Array<{ id: string; item: string; artifact_id?: string }>;
-  artifacts?: Array<{ id: string; title: string; kind: string; body: string }>;
+  reports?: Array<{ id: string; item: string; artifact_id?: string; phase?: string | null }>;
+  artifacts?: Array<{
+    id: string;
+    title: string;
+    kind: string;
+    body: string;
+    phase?: string | null;
+  }>;
   tokens?: number;
   cost_usd?: number;
 };
@@ -656,7 +662,7 @@ export const workflowsStore: WorkflowsStore = {
         }));
         const reports: WorkflowReport[] = (run.reports ?? []).map((report) => ({
           id: report.id,
-          phase: null,
+          phase: report.phase && report.phase.trim() !== '' ? report.phase : null,
           text: report.item,
           artifact_id: report.artifact_id ?? null,
           at: null,
@@ -669,7 +675,7 @@ export const workflowsStore: WorkflowsStore = {
             title: artifact.title || null,
             content: markdown ? artifact.body : null,
             path: markdown ? null : artifact.body,
-            phase: null,
+            phase: artifact.phase && artifact.phase.trim() !== '' ? artifact.phase : null,
           };
         });
         const created = appendLog(
