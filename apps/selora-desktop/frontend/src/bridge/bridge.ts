@@ -505,6 +505,13 @@ function envelopeFor(payload: FrontendCommand, ctx: EnvelopeContext): RequestEnv
 export const getBootstrapState = (): Promise<BootstrapState> =>
   invoke('get_bootstrap_state', { protocolVersion: PROTOCOL_VERSION });
 
+/**
+ * One-shot boot-trace marker. The Rust side appends a timestamped line to
+ * `%TEMP%\selora_boot.log`; the performance harness uses it as the
+ * "bootstrap ready" boundary (window creation happens earlier).
+ */
+export const markFrontendReady = (): Promise<void> => invoke('frontend_ready');
+
 export const dispatchCommand = <T>(envelope: RequestEnvelope): Promise<T> =>
   invoke<T>('dispatch_command', { envelope });
 

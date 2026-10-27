@@ -14,7 +14,7 @@ import {
   Transaction,
   type ChangeSet,
   type Extension,
-  type Text,
+  Text,
 } from '@codemirror/state';
 import {
   EditorView,
@@ -53,6 +53,7 @@ import {
   type Diagnostic,
   type HoverResult,
   type TextChange,
+  type TextPosition,
 } from '../../bridge/bridge';
 import { getAppSnapshot, subscribeApp } from '../../app/app-store';
 import { createSeloraTheme } from './cm-theme';
@@ -87,9 +88,19 @@ export type CodeMirrorPaneProps = {
 };
 
 type LocalBufferState = {
-  text: string;
+  // Keep the immutable `Text`; stringifying the whole document on every
+  // keystroke was O(file size) even though the cache is only read when the
+  // user switches tabs.
+  text: Text;
   version: number;
 };
+
+/** Convert an absolute offset to the 0-based line/column protocol address. */
+function textPositionAt(doc: Text, offset: number): TextPosition {
+  const clamped = Math.max(0, Math.min(Math.trunc(offset), doc.length));
+  const line = doc.lineAt(clamped);
+  return { line: line.number - 1, utf16_column: clamped - line.from };
+}
 
 /** The local version for a buffer; falls back to the snapshot's version. */
 function localVersionOf(states: Map<string, LocalBufferState>, buffer: BufferSnapshot): number {
@@ -197,12 +208,13 @@ function buildHoverTooltip(
  * the newly inserted text, so the result is independent of the post-edit doc.
  */
 export function computeTextChanges(docBefore: Text, changes: ChangeSet): TextChange[] {
-  const before = docBefore.toString();
   const result: TextChange[] = [];
   changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
     result.push({
-      start: offsetToPosition(before, fromA),
-      end: offsetToPosition(before, toA),
+      // `Text.lineAt` is O(log lines); stringifying the document and scanning
+      // from offset 0 was O(file size) per keystroke.
+      start: textPositionAt(docBefore, fromA),
+      end: textPositionAt(docBefore, toA),
       replacement: inserted.toString(),
     });
   });
@@ -270,7 +282,13 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
     diagnosticsRef.current = getAppSnapshot().bootstrap?.diagnostics ?? EMPTY_DIAGNOSTICS;
     languageKeyRef.current = languageKeyFor(initialBuffer);
     localBuffersRef.current = new Map([
-      [initialBuffer.buffer_id, { text: initialBuffer.text, version: initialBuffer.version }],
+      [
+        initialBuffer.buffer_id,
+        {
+          text: Text.of(initialBuffer.text.split('\n')),
+          version: initialBuffer.version,
+        },
+      ],
     ]);
 
     const scheduleSelection = (): void => {
@@ -314,7 +332,7 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
             const baseVersion = localVersionOf(localBuffersRef.current, current);
             const nextVersion = baseVersion + 1;
             localBuffersRef.current.set(current.buffer_id, {
-              text: update.state.doc.toString(),
+              text: update.state.doc,
               version: nextVersion,
             });
             void applyEditorChange(current.buffer_id, baseVersion, changes, context).catch(() => {
@@ -602,15 +620,15 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
       // from the (older) protocol text.
       const nextBuffer: BufferSnapshot =
         cached && cached.version > buffer.version
-          ? { ...buffer, text: cached.text, version: cached.version }
+          ? { ...buffer, text: cached.text.toString(), version: cached.version }
           : buffer;
-      localBuffersRef.current.set(buffer.buffer_id, {
-        text: nextBuffer.text,
-        version: nextBuffer.version,
-      });
       suppressEditsRef.current = true;
       view.setState(createState(nextBuffer));
       suppressEditsRef.current = false;
+      localBuffersRef.current.set(buffer.buffer_id, {
+        text: view.state.doc,
+        version: nextBuffer.version,
+      });
       languageKeyRef.current = languageKeyFor(nextBuffer);
       configureLanguage(view, nextBuffer);
       return;
@@ -622,7 +640,7 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
     // are already in flight.
     if (buffer.version > (cached?.version ?? 0)) {
       localBuffersRef.current.set(buffer.buffer_id, {
-        text: buffer.text,
+        text: Text.of(buffer.text.split('\n')),
         version: buffer.version,
       });
       const viewText = view.state.doc.toString();
@@ -636,7 +654,7 @@ export function CodeMirrorPane({ buffer, onScroll, revealTarget = null }: CodeMi
       }
     } else if (!cached) {
       localBuffersRef.current.set(buffer.buffer_id, {
-        text: view.state.doc.toString(),
+        text: view.state.doc,
         version: buffer.version,
       });
     }

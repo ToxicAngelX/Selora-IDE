@@ -26,6 +26,7 @@ nav:
   - Agent Mode: agent-mode.md
   - Settings: settings.md
   - Keyboard shortcuts: keybinds.md
+  - Performance: PERFORMANCE.md
   - Troubleshooting: troubleshooting.md
 
 markdown_extensions:

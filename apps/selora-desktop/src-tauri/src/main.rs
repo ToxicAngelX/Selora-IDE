@@ -14,9 +14,21 @@ mod workspace;
 
 use tauri::Manager;
 
-fn log_boot(msg: &str) {
+pub(crate) fn log_boot(msg: &str) {
+    // Elapsed milliseconds since `main()` started: the perf harness reads this
+    // file to split process spawn from the Rust bootstrap stages (scripts/perf.ps1).
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed_ms = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
     let log_path = std::env::temp_dir().join("selora_boot.log");
-    let line = format!("[pid {}] {}\n", std::process::id(), msg);
+    let line = format!(
+        "[pid {}] [+{} ms] {}\n",
+        std::process::id(),
+        elapsed_ms,
+        msg
+    );
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -122,6 +134,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::dispatch_command,
+            commands::frontend_ready,
             commands::update_settings,
             commands::get_events_after,
             commands::connect_api_key,

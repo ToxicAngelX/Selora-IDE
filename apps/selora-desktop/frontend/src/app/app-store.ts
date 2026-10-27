@@ -11,6 +11,7 @@ import {
   getBootstrapState,
   getEventsAfter,
   listenProtocolEvent,
+  markFrontendReady,
   validateEvent,
   type BootstrapState,
   type BufferSnapshot,
@@ -83,6 +84,17 @@ let draining = false;
  * rebootstrap loop.
  */
 let replaying = false;
+/** One boot-trace mark per process; rebootstrap after a gap must not repeat it. */
+let readyMarked = false;
+
+function markReadyOnce(): void {
+  if (readyMarked) return;
+  readyMarked = true;
+  // Not part of the protocol: a missing marker (tests, older shell) is inert.
+  void Promise.resolve()
+    .then(markFrontendReady)
+    .catch(() => undefined);
+}
 
 function notify(): void {
   snapshot = {
@@ -248,6 +260,7 @@ async function runBootstrapFlow(): Promise<void> {
     //    they apply as they arrive.
     replaying = false;
     drainLive(gen);
+    if (gen === generation) markReadyOnce();
   } catch (cause) {
     if (gen !== generation) return;
     replaying = false;

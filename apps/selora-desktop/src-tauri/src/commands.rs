@@ -16,7 +16,7 @@ use selora_protocol::{
 /// commands clone the `DesktopState` (it is `Clone`, all fields are `Arc`s)
 /// and the `AppHandle` instead of borrowing the `tauri::State` across the
 /// await. A join failure becomes a typed, retryable protocol error; the wire
-/// return type of every command is unchanged.
+/// shape of the other commands is unchanged.
 async fn offload<T, F>(work: F) -> Result<T, ProtocolErrorDto>
 where
     F: FnOnce() -> Result<T, ProtocolErrorDto> + Send + 'static,
@@ -83,13 +83,29 @@ pub async fn dispatch_command(
     envelope: RequestEnvelope<FrontendCommand>,
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
-) -> Result<BootstrapState, ProtocolErrorDto> {
+) -> Result<Option<BootstrapState>, ProtocolErrorDto> {
     // §2.4: the app handle rides the command so accepted commands can emit
     // `WorkspaceLayoutChanged` through the existing `record_event` path.
     // `dispatch` is synchronous and does the command's whole body (tree walks,
     // libgit2, file I/O, the `rg` subprocess), so it runs on the blocking pool.
+    //
+    // The bridge ignores the return value of the two per-keystroke commands.
+    // They take the quiet path so the IPC body is a bare `null` instead of a
+    // full bootstrap snapshot (which clones every open buffer's text).
     let state = state.inner().clone();
-    offload(move || state.dispatch(&app, envelope)).await
+    let quiet = matches!(
+        &envelope.payload,
+        FrontendCommand::ApplyEditorChange { .. } | FrontendCommand::SetSelection { .. }
+    );
+    offload(move || {
+        if quiet {
+            state.dispatch_quiet(&app, envelope)?;
+            Ok(None)
+        } else {
+            state.dispatch(&app, envelope).map(Some)
+        }
+    })
+    .await
 }
 
 /// Persist a settings patch through the same validated path as the protocol
@@ -104,6 +120,15 @@ pub async fn update_settings(
     // (temp file + fsync + rename): disk work, so never on the IPC thread.
     let state = state.inner().clone();
     offload(move || state.apply_settings_update(&app, patch, None)).await
+}
+
+/// Boot-trace marker: the frontend calls this once its bootstrap + replay flow
+/// reaches `ready`. It writes one line to `%TEMP%\selora_boot.log`, so support
+/// logs and `scripts/perf.ps1` can separate process/window creation from the
+/// first usable shell without changing app state.
+#[tauri::command]
+pub fn frontend_ready() {
+    crate::log_boot("frontend bootstrap ready");
 }
 
 /// §3.4's replay command — the only Tauri command Z2 adds. Backed by the
