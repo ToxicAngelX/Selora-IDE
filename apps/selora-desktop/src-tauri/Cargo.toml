@@ -48,15 +48,19 @@ tauri-plugin-opener = "2"
 url.workspace = true
 
 # Phase 8 gap 1: `world.run` must kill grandchildren, not just the direct
-# PowerShell child, so `workflows_process.rs` owns a Job Object with
-# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. Only the Win32 modules that gate the job
-# calls and their struct types are enabled (JobObjects needs Security for
-# SECURITY_ATTRIBUTES and Threading for IO_COUNTERS).
+# PowerShell child. `workflows_process.rs` creates the process suspended and
+# assigns it to a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE before
+# resuming it. Only the Win32 modules that gate the spawn and job calls are
+# enabled: JobObjects for the job, Threading for CreateProcessW/ResumeThread
+# and the attribute list, Security for SECURITY_ATTRIBUTES, Storage_FileSystem
+# for the stdin NUL device, and Pipes for the capture pipes.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 
