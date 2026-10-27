@@ -197,6 +197,32 @@ fn persisted_workflow_runs(
         let status = raw_terminal.or_else(|| journal.resume_plan().run_status());
         let ambiguous_command = workflow_has_ambiguous_command(&journal);
         let completed = status == Some(selora_workflow::journal::RunStatus::Completed);
+        let (partial_effects, ledger_block) = if completed {
+            (false, None)
+        } else {
+            match selora_workflow::partial_effects(root, &id) {
+                Ok(partial) if !partial.is_empty() => (
+                    true,
+                    Some(
+                        "Earlier tool effects may already exist for this run. Resume needs an explicit acknowledgement."
+                            .to_owned(),
+                    ),
+                ),
+                Ok(_) => (false, None),
+                Err(selora_workflow::WorkflowError::ToolEffectLedger { message }) => (
+                    false,
+                    Some(format!(
+                        "The tool-effect ledger is damaged and cannot be verified: {message}"
+                    )),
+                ),
+                Err(error) => (
+                    false,
+                    Some(format!(
+                        "Partial tool effects cannot be ruled out: {error}"
+                    )),
+                ),
+            }
+        };
         let history = workflow_run_history(&journal);
         let (status, detail) = match status {
             Some(selora_workflow::journal::RunStatus::Completed) => {
@@ -237,11 +263,19 @@ fn persisted_workflow_runs(
             // A completed run is history, never a replay target. A budget trip
             // needs a new consent budget; an interrupted command may already
             // have side effects. Never offer any of them as a silent replay.
-            resumable: !completed && !ambiguous_command && !budget_tripped && !journal.is_damaged(),
+            resumable: !completed
+                && !ambiguous_command
+                && !budget_tripped
+                && !journal.is_damaged()
+                && !partial_effects
+                && ledger_block.is_none(),
+            partial_effects,
             detail: if ambiguous_command {
                 Some("An interrupted command has ambiguous side effects and cannot resume.".into())
             } else if journal.is_damaged() {
                 Some("The run journal is damaged and cannot resume safely.".into())
+            } else if let Some(block) = ledger_block {
+                Some(block)
             } else {
                 detail
             },
@@ -591,6 +625,8 @@ pub(crate) struct WorkflowHostSettings {
     pub(crate) model_metadata: Option<selora_ai::Model>,
     pub(crate) caps: selora_ai::TurnCaps,
     pub(crate) on_approval: crate::workflows_host::WorkflowApprovalHandler,
+    /// Durable run identity for the per-run tool-effect ledger.
+    pub(crate) durable_run_id: String,
 }
 
 /// Builds one host per run. Production is [`production_workflow_host`]; tests
@@ -601,15 +637,27 @@ pub(crate) type WorkflowHostFactory =
 /// The construction contract this slice expects from `workflows_host.rs`:
 /// `WorkflowHost::new(root, WorkflowHostConfig) -> Arc<WorkflowHost>`, plus
 /// `impl selora_workflow::Host for WorkflowHost` and `WorkflowHost::cancel`.
-/// `WorkflowHostConfig::new(base_url, api_key, model)` is the shell's entry
-/// point; every cap stays at the host's §18 defaults.
+/// `WorkflowHostConfig::new(base_url, api_key, model)` is the
+/// shell's entry point; every cap stays at the host's §18 defaults. The
+/// builder also attaches the per-run tool-effect ledger with
+/// `with_tool_effect_ledger(path, run_id)`.
 fn production_workflow_host(root: PathBuf, settings: WorkflowHostSettings) -> WorkflowHostBundle {
+    // Match the host's own root canonicalization so the ledger lands in the
+    // same run directory the engine writes its journal to.
+    let ledger_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let mut config = crate::workflows_host::WorkflowHostConfig::new(
         settings.base_url,
         settings.api_key,
         settings.model,
     )
     .with_turn_caps(settings.caps)
+    .with_tool_effect_ledger(
+        selora_workflow::tool_effects_path(
+            &ledger_root,
+            &selora_workflow::RunId::from(settings.durable_run_id.as_str()),
+        ),
+        settings.durable_run_id,
+    )
     .with_approval_handler(settings.on_approval);
     if let Some(model) = settings.model_metadata {
         config = config.with_model(model);
@@ -1045,6 +1093,34 @@ fn workflow_incomplete_asks_message(asks: &[selora_workflow::IncompleteAsk]) -> 
     )
 }
 
+/// The separate partial-effect refusal. Names what the durable ledger proved,
+/// then asks for the separate acknowledgement (never the ordinary Resume).
+fn workflow_partial_effects_message(partial: selora_workflow::PartialEffects) -> String {
+    let mut reasons = Vec::new();
+    if partial.unfinished_effects > 0 {
+        reasons.push(format!(
+            "{} tool call(s) started without a recorded finish",
+            partial.unfinished_effects
+        ));
+    }
+    if partial.unfinished_ask_effects > 0 {
+        reasons.push(format!(
+            "{} side effect(s) belong to an unfinished ask",
+            partial.unfinished_ask_effects
+        ));
+    }
+    if partial.unattributed_effects > 0 {
+        reasons.push(format!(
+            "{} side effect(s) cannot be attributed to a completed step",
+            partial.unattributed_effects
+        ));
+    }
+    format!(
+        "Resume would replay a run whose tools may already have applied effects ({}). Files or commands may already exist; resume does not undo them. Acknowledge partial effects to resume anyway.",
+        reasons.join("; ")
+    )
+}
+
 /// §18.1's confirmation contract, restated at the command boundary: the size
 /// cap and the syntax scan run through [`selora_workflow::prepare`], and every
 /// command the script actually runs must be in the set the user confirmed.
@@ -1118,9 +1194,12 @@ pub struct DesktopState {
 enum WorkflowLaunch {
     /// A newly confirmed run.
     New,
-    /// Replay an existing run; the flag is the user's explicit consent to
-    /// re-dispatch unfinished asks.
-    Resume { allow_incomplete_asks: bool },
+    /// Replay an existing run; the flags are the user's explicit consents:
+    /// re-dispatch unfinished asks, and replay effects that may already exist.
+    Resume {
+        allow_incomplete_asks: bool,
+        acknowledge_partial_effects: bool,
+    },
 }
 
 impl DesktopState {
@@ -1910,6 +1989,7 @@ impl DesktopState {
                 request_id,
                 run_id,
                 allow_incomplete_asks,
+                acknowledge_partial_effects,
             } => {
                 let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
                     code: "no_workspace".into(),
@@ -1942,13 +2022,43 @@ impl DesktopState {
                         retryable: false,
                     });
                 }
+                // Durable ledger evidence: an unfinished tool effect, or an
+                // effect owned by an ask the resume would dispatch again.
+                // This is a SEPARATE action from ordinary Resume; the flag
+                // defaults false. A corrupt ledger is a typed refusal.
+                let partial = match selora_workflow::partial_effects(&root, &run_id) {
+                    Ok(partial) => partial,
+                    Err(selora_workflow::WorkflowError::ToolEffectLedger { message }) => {
+                        return Err(ProtocolErrorDto {
+                            code: "workflow_effect_ledger_corrupt".into(),
+                            message: format!(
+                                "The tool-effect ledger cannot be verified, so resume is refused: {message}"
+                            ),
+                            retryable: false,
+                        });
+                    }
+                    Err(error) => return Err(workflow_persistence_error(error)),
+                };
+                if !partial.is_empty() && !acknowledge_partial_effects {
+                    return Err(ProtocolErrorDto {
+                        code: "workflow_partial_effects".into(),
+                        message: workflow_partial_effects_message(partial),
+                        retryable: false,
+                    });
+                }
                 // Fail closed before a worker or event exists: a resume that
                 // would dispatch an unfinished ask again may re-run tools whose
                 // earlier effects already landed. The user's explicit
-                // confirmation is the flag; never infer it.
-                let pending = selora_workflow::incomplete_asks(&root, &run_id)
-                    .map_err(workflow_persistence_error)?;
-                if !pending.is_empty() && !allow_incomplete_asks {
+                // confirmation is the flag; never infer it. A partial-effect
+                // acknowledgement names those same effects, so it covers the
+                // ask re-dispatch too.
+                let pending = if allow_incomplete_asks || acknowledge_partial_effects {
+                    Vec::new()
+                } else {
+                    selora_workflow::incomplete_asks(&root, &run_id)
+                        .map_err(workflow_persistence_error)?
+                };
+                if !pending.is_empty() {
                     return Err(ProtocolErrorDto {
                         code: "workflow_incomplete_asks".into(),
                         message: workflow_incomplete_asks_message(&pending),
@@ -1963,6 +2073,7 @@ impl DesktopState {
                     run_id,
                     WorkflowLaunch::Resume {
                         allow_incomplete_asks,
+                        acknowledge_partial_effects,
                     },
                 )?;
                 Ok(self.bootstrap())
@@ -2025,11 +2136,12 @@ impl DesktopState {
         durable_run_id: selora_workflow::RunId,
         launch: WorkflowLaunch,
     ) -> Result<(), ProtocolErrorDto> {
-        let (resume, allow_incomplete_asks) = match launch {
-            WorkflowLaunch::New => (false, false),
+        let (resume, allow_incomplete_asks, acknowledge_partial_effects) = match launch {
+            WorkflowLaunch::New => (false, false, false),
             WorkflowLaunch::Resume {
                 allow_incomplete_asks,
-            } => (true, allow_incomplete_asks),
+                acknowledge_partial_effects,
+            } => (true, allow_incomplete_asks, acknowledge_partial_effects),
         };
         let workspace_id = workspace_id_for(&root);
         let run_id = Arc::new(Mutex::new(Some(durable_run_id.to_string())));
@@ -2075,6 +2187,7 @@ impl DesktopState {
                 model_metadata,
                 caps,
                 on_approval: Arc::new(move |id, card| approval_stream.on_approval(id, card)),
+                durable_run_id: durable_run_id.to_string(),
             },
         );
         let token = Uuid::new_v4();
@@ -2130,8 +2243,10 @@ impl DesktopState {
                         resume,
                         // Only a user-confirmed resume passes `true`; a new
                         // run and an unconfirmed resume keep the fail-closed
-                        // default for unfinished asks.
+                        // default for unfinished asks. The partial-effect
+                        // acknowledgement is its own explicit action.
                         allow_incomplete_asks,
+                        acknowledge_partial_effects,
                     },
                 )
             }));
@@ -4191,6 +4306,7 @@ mod tests {
                         request_id: RequestId::new("wf-resume").expect("valid id"),
                         run_id: "run-1".into(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4505,6 +4621,7 @@ mod tests {
                     request_id: RequestId::new("wf-completed-resume").unwrap(),
                     run_id: summary.run_id.clone(),
                     allow_incomplete_asks: false,
+                    acknowledge_partial_effects: false,
                 },
             ),
         );
@@ -4566,6 +4683,7 @@ mod tests {
                         request_id: RequestId::new("wf-interrupted-resume").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4623,6 +4741,7 @@ mod tests {
                         request_id: RequestId::new("wf-ask-unconfirmed").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4671,6 +4790,7 @@ mod tests {
                         request_id: RequestId::new("wf-ask-confirmed").unwrap(),
                         run_id: saved.run_id,
                         allow_incomplete_asks: true,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4680,6 +4800,158 @@ mod tests {
         assert!(events.iter().any(|event| matches!(&event.payload,
             FrontendEvent::WorkflowFinished(done)
                 if done.request_id.as_str() == "wf-ask-confirmed")));
+    }
+
+    #[test]
+    fn p8_workflow_partial_effects_block_resume_until_acknowledged() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_failing_ask(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-effects",
+                        r#"agent("reviewer").ask("inspect src/lib.rs");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        assert_eq!(finished_count(&events), 1);
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.name == "review")
+            .expect("the failed run is listed");
+        let run_id = selora_workflow::RunId::from(saved.run_id.as_str());
+        // Durable evidence: a tool effect started for the unfinished ask and
+        // the process died before its finish line.
+        let ledger = selora_workflow::ToolEffectLedger::open_for_run(dir.path(), &run_id).unwrap();
+        ledger
+            .record_started(
+                Some(&selora_workflow::ToolEffectStep {
+                    step_id: "1".into(),
+                    agent: Some("reviewer".into()),
+                }),
+                "call-1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content_bytes": 12}),
+            )
+            .unwrap();
+        drop(ledger);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == run_id.as_str())
+            .expect("the partial-effect run is still listed");
+        assert!(
+            !saved.resumable,
+            "partial effects make the run non-resumable"
+        );
+        assert!(saved.partial_effects);
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Earlier tool effects")),
+            "the detail names the risk: {:?}",
+            saved.detail
+        );
+
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-unacked").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
+                    },
+                ),
+            )
+            .expect_err("ordinary Resume refuses partial effects");
+        assert_eq!(refused.code, "workflow_partial_effects");
+        assert!(!refused.retryable);
+        assert!(
+            refused.message.contains("may already have applied effects")
+                && refused.message.contains("does not undo"),
+            "the refusal states the effect risk: {}",
+            refused.message
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a refused resume starts no worker"
+        );
+        assert_eq!(finished_count(&state.events_after(0)), 1);
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-acked").unwrap(),
+                        run_id: saved.run_id,
+                        // The separate action: ack alone covers the ask
+                        // re-dispatch, because it names the same effects.
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: true,
+                    },
+                ),
+            )
+            .expect("the explicit partial-effect acknowledgement resumes");
+        let events = wait_for_finished_runs(&state, 2);
+        wait_for_no_active_runs(&state);
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.payload,
+                FrontendEvent::WorkflowFinished(done)
+                    if done.request_id.as_str() == "wf-effects-acked"))
+                .count()
+                == 1,
+            "the acknowledgement starts exactly once"
+        );
+
+        // Corrupt evidence is a typed refusal even for a further explicit
+        // acknowledgement: it can never be read as an empty ledger.
+        let path = selora_workflow::tool_effects_path(dir.path(), &run_id);
+        let mut bytes = std::fs::read(&path).expect("ledger");
+        bytes.extend_from_slice(b"not json\n");
+        std::fs::write(&path, bytes).expect("corrupt ledger");
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-corrupt").unwrap(),
+                        run_id: run_id.to_string(),
+                        allow_incomplete_asks: true,
+                        acknowledge_partial_effects: true,
+                    },
+                ),
+            )
+            .expect_err("corrupt ledger is never empty evidence");
+        assert_eq!(refused.code, "workflow_effect_ledger_corrupt");
+        assert!(!refused.retryable);
     }
 
     #[test]

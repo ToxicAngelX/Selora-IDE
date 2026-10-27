@@ -506,6 +506,12 @@ pub enum FrontendCommand {
         /// pre-flag payload resumes fail-closed.
         #[serde(default)]
         allow_incomplete_asks: bool,
+        /// Whether the user has accepted durable evidence that tool effects
+        /// may already exist for this run (an unfinished `started` record, or
+        /// an effect owned by an unfinished ask). This is a separate action
+        /// from ordinary Resume; false by default so old payloads refuse.
+        #[serde(default)]
+        acknowledge_partial_effects: bool,
     },
     WorkflowStop {
         request_id: RequestId,
@@ -899,8 +905,14 @@ pub struct WorkflowPersistedRunDto {
     pub name: String,
     pub status: WorkflowStatus,
     /// False when the journal proved the run ambiguous (an interrupted command)
-    /// and replay would be unsafe, or when the run already completed.
+    /// and replay would be unsafe, when the tool-effect ledger proves a partial
+    /// effect, or when the run already completed.
     pub resumable: bool,
+    /// True when durable ledger evidence says a side effect may already have
+    /// applied. Resume stays unavailable; a separate explicit
+    /// `acknowledge_partial_effects` action is required.
+    #[serde(default)]
+    pub partial_effects: bool,
     /// Why resume is unavailable, or the terminal journal's error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -2397,16 +2409,18 @@ mod tests {
                 request_id: rid("request-2"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: false,
+                acknowledge_partial_effects: false,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false,"acknowledge_partial_effects":false}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowResume {
                 request_id: rid("request-5"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: true,
+                acknowledge_partial_effects: true,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true,"acknowledge_partial_effects":true}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowStop {
@@ -2560,12 +2574,14 @@ mod tests {
         .unwrap();
         let FrontendCommand::WorkflowResume {
             allow_incomplete_asks,
+            acknowledge_partial_effects,
             ..
         } = legacy
         else {
             panic!("expected a resume command");
         };
         assert!(!allow_incomplete_asks);
+        assert!(!acknowledge_partial_effects);
 
         // A pre-history persisted run still loads: every additive field falls
         // to its empty/default value rather than failing the bootstrap.
@@ -2580,6 +2596,7 @@ mod tests {
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
+        assert!(!run.partial_effects);
     }
 
     #[test]

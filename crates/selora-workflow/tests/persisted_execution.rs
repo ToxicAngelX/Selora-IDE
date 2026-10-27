@@ -208,6 +208,7 @@ fn execute(
             // These tests exercise replay semantics; the fail-closed default
             // for unfinished asks is covered by `tests/resume_preflight.rs`.
             allow_incomplete_asks: resume,
+            acknowledge_partial_effects: false,
         },
     );
     let events = events.lock().unwrap().clone();
@@ -653,6 +654,7 @@ fn phase_only_cancellation_stops_persisted_and_original_api() {
                     run_id: RunId::new(),
                     resume: false,
                     allow_incomplete_asks: false,
+                    acknowledge_partial_effects: false,
                 },
             )
         } else {
@@ -817,6 +819,7 @@ fn completed_command_is_durable_before_js_receives_its_result() {
                 run_id: id.clone(),
                 resume: false,
                 allow_incomplete_asks: false,
+                acknowledge_partial_effects: false,
             },
         )
     }))
@@ -884,6 +887,7 @@ fn active_run_cannot_resume_concurrently() {
                     run_id: run_id.clone(),
                     resume: true,
                     allow_incomplete_asks: false,
+                    acknowledge_partial_effects: false,
                 },
             );
             assert!(result.is_err());
@@ -899,6 +903,7 @@ fn active_run_cannot_resume_concurrently() {
             run_id: id,
             resume: false,
             allow_incomplete_asks: false,
+            acknowledge_partial_effects: false,
         }
     )
     .is_ok());

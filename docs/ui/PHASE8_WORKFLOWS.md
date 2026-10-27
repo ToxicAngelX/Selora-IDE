@@ -302,6 +302,23 @@ The §10 table was written before the wave-2 agents landed. Current state:
 - Release EXE and an unsigned installer were built; see
   `docs/PHASE8_ACCEPTANCE.md`. Owner acceptance steps remain unrun.
 
+### 10e. Partial tool effects (P2 gap 2)
+
+- Every workflow ask's side-effecting tool (`write_file`, `edit_file`,
+  `delete_file`, `bash`) writes a per-run ledger at
+  `.selora/workflow-runs/{run_id}/tool-effects.jsonl`: `started` before the
+  tool executes, `finished` after it returns. Both records carry the same
+  `effect_id`; only the redacted argument summary (paths and byte counts) is
+  stored, never file bodies, command text, or secrets.
+- A crash leaves `started` without `finished`. Bootstrap then marks the run
+  `resumable=false` with `partial_effects=true`, and Resume returns
+  `workflow_partial_effects` before starting a worker. The panel shows a
+  separate acknowledgement action ("Acknowledge and resume anyway"); only that
+  click sets `acknowledge_partial_effects`.
+- Completed asks' paired effects do not block. A read-only unfinished ask keeps
+  ordinary Resume. A corrupt ledger is a typed refusal
+  (`workflow_effect_ledger_corrupt`), never treated as empty.
+
 ## 11. Acceptance checklist (ROADMAP Phase 8, "Acceptance tests")
 
 These are the roadmap's acceptance tests, verbatim. They are **owner-run**:

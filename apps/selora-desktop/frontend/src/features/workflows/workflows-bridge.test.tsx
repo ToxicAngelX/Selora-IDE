@@ -608,6 +608,7 @@ describe('workflows-bridge wiring', () => {
       'run_journal',
       { ...CONTEXT, session_id: null },
       false,
+      false,
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Resume anyway' }));
@@ -617,6 +618,7 @@ describe('workflows-bridge wiring', () => {
       'run_journal',
       { ...CONTEXT, session_id: null },
       true,
+      false,
     );
   });
 

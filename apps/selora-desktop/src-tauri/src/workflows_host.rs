@@ -29,6 +29,12 @@
 //!   require a turn-local approval; script confirmation grants never cross in.
 //! * `report` / `artifact.*` / `log` are stored on the host, per run, so the
 //!   shell can render them next to the engine's own event stream.
+//! * Side-effecting agent tools (`write_file`, `edit_file`, `delete_file`,
+//!   `bash`) append a flushed `started` record to the run's tool-effect ledger
+//!   before execution and a matching `finished` record after. Records carry the
+//!   durable step/ask identity and a redacted argument summary (paths and byte
+//!   counts only). A crash leaves `started` without `finished`, which the
+//!   resume preflight refuses until explicitly acknowledged.
 //!
 //! # Caps
 //!
@@ -189,6 +195,8 @@ pub struct WorkflowHostConfig {
     pub default_timeout_ms: u64,
     /// Test seam; `None` means the real streaming agent-turn path.
     pub chat: Option<ChatFn>,
+    /// Per-run tool-effect ledger: `(path, run id)`.
+    tool_effect_ledger: Option<(PathBuf, String)>,
     model_metadata: Option<Model>,
     turn_caps: Option<TurnCaps>,
     approval_handler: Option<WorkflowApprovalHandler>,
@@ -214,6 +222,7 @@ impl WorkflowHostConfig {
             max_items: MAX_ITEMS,
             default_timeout_ms: DEFAULT_WORLD_TIMEOUT_MS,
             chat: None,
+            tool_effect_ledger: None,
             model_metadata: None,
             turn_caps: None,
             approval_handler: None,
@@ -237,6 +246,19 @@ impl WorkflowHostConfig {
     #[must_use]
     pub fn with_approval_handler(mut self, handler: WorkflowApprovalHandler) -> Self {
         self.approval_handler = Some(handler);
+        self
+    }
+
+    /// Attach the per-run tool-effect ledger. The shell passes the durable run
+    /// id's `tool-effects.jsonl` path; side-effecting tools then write a
+    /// `started`/`finished` pair around every execution.
+    #[must_use]
+    pub fn with_tool_effect_ledger(
+        mut self,
+        path: impl Into<PathBuf>,
+        run_id: impl Into<String>,
+    ) -> Self {
+        self.tool_effect_ledger = Some((path.into(), run_id.into()));
         self
     }
 
@@ -309,7 +331,76 @@ impl fmt::Debug for WorkflowHostConfig {
             .field("max_items", &self.max_items)
             .field("default_timeout_ms", &self.default_timeout_ms)
             .field("chat", &self.chat.is_some())
+            .field("tool_effect_ledger", &self.tool_effect_ledger.is_some())
             .finish()
+    }
+}
+
+/// The per-run tool-effect ledger, with the step identity the engine reported
+/// before the current step's body ran.
+///
+/// The ledger is opened once per host. An open failure is kept as a string and
+/// fails every side-effecting tool closed: no tool runs without durable
+/// evidence.
+pub(super) struct EffectRecorder {
+    ledger: Result<Arc<selora_workflow::ToolEffectLedger>, Arc<str>>,
+    step: Mutex<Option<selora_workflow::ToolEffectStep>>,
+}
+
+impl EffectRecorder {
+    fn new(path: PathBuf, run_id: String) -> Self {
+        let ledger = selora_workflow::ToolEffectLedger::open_path(path, run_id)
+            .map(Arc::new)
+            .map_err(|error| Arc::<str>::from(error.to_string()));
+        Self {
+            ledger,
+            step: Mutex::new(None),
+        }
+    }
+
+    fn note_step(&self, step: &selora_workflow::WorkflowStep) {
+        let identity = selora_workflow::ToolEffectStep {
+            step_id: step.index.to_string(),
+            agent: step.agent.clone(),
+        };
+        *self
+            .step
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(identity);
+    }
+
+    /// Record `started` before the tool executes. Never run the tool on error.
+    fn started(&self, call: &selora_ai::ToolCall) -> Result<String, String> {
+        let ledger = self
+            .ledger
+            .as_ref()
+            .map_err(|error| format!("tool effect ledger unavailable: {error}"))?;
+        let step = self
+            .step
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        ledger
+            .record_started(
+                step.as_ref(),
+                &call.id,
+                &call.name,
+                selora_workflow::redacted_tool_arguments(&call.name, &arguments),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Record the outcome after the tool returns. An append failure means the
+    /// completion is unconfirmed, so it must surface as a tool error.
+    fn finished(&self, effect_id: &str, call_id: &str, tool: &str, ok: bool) -> Result<(), String> {
+        let ledger = self
+            .ledger
+            .as_ref()
+            .map_err(|error| format!("tool effect ledger unavailable: {error}"))?;
+        ledger
+            .record_finished(effect_id, call_id, tool, ok)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -324,6 +415,7 @@ pub struct WorkflowHost {
     config: WorkflowHostConfig,
     scheduler: Subagents<WorkflowAskExecutor>,
     live_turns: Mutex<LiveTurns>,
+    tool_effects: Option<Arc<EffectRecorder>>,
     cancelled: AtomicBool,
     conversations: Mutex<BTreeMap<String, Vec<ChatMessage>>>,
     reports: Mutex<Vec<ReportItem>>,
@@ -360,6 +452,10 @@ impl WorkflowHost {
         if let Some(model) = &config.model_metadata {
             caps.context_window = model.context_window;
         }
+        let tool_effects = config
+            .tool_effect_ledger
+            .clone()
+            .map(|(path, run_id)| Arc::new(EffectRecorder::new(path, run_id)));
         Arc::new_cyclic(|host| Self {
             root,
             root_display,
@@ -369,6 +465,7 @@ impl WorkflowHost {
                 SubagentConfig::new(config.max_concurrency),
             ),
             live_turns: Mutex::new(LiveTurns::default()),
+            tool_effects,
             config,
             cancelled: AtomicBool::new(false),
             conversations: Mutex::new(BTreeMap::new()),
@@ -704,6 +801,12 @@ impl WorkflowHost {
 }
 
 impl Host for WorkflowHost {
+    fn note_step_started(&self, step: &selora_workflow::WorkflowStep) {
+        if let Some(recorder) = &self.tool_effects {
+            recorder.note_step(step);
+        }
+    }
+
     fn snapshot_agent(&self, agent: &str) -> Result<Option<Value>, HostError> {
         self.conversation(agent)
             .map(|conversation| {

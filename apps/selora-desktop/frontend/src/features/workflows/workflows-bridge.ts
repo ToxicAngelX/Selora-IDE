@@ -226,7 +226,7 @@ export function installWorkflowHandlers(): void {
     return workflowDecision(requestId, approvalId, decision, ctx);
   });
 
-  workflowsStore.setResumeHandler((runId, allowIncompleteAsks) => {
+  workflowsStore.setResumeHandler((runId, allowIncompleteAsks, acknowledgePartialEffects) => {
     // A journal-recovered run has no live origin yet. The backend resolves the
     // run id only inside the currently open workspace, so binding here cannot
     // resume a same-id run from a different project.
@@ -240,6 +240,6 @@ export function installWorkflowHandlers(): void {
     )) {
       throw new Error('Switch back to the workspace that started this workflow.');
     }
-    return resumeWorkflow(runId, { ...ctx, session_id: null }, allowIncompleteAsks).promise;
+    return resumeWorkflow(runId, { ...ctx, session_id: null }, allowIncompleteAsks, acknowledgePartialEffects).promise;
   });
 }

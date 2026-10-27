@@ -2,13 +2,17 @@
 //!
 //! Completed calls replay without host IO. An interrupted `world.run` is
 //! ambiguous and cannot resume: its effects may already have happened.
+//! A per-run tool-effect ledger (`.selora/workflow-runs/{run_id}/tool-effects.jsonl`)
+//! records `started`/`finished` pairs around side-effecting ask tools. A
+//! `started` without `finished`, or an effect owned by an unfinished ask, makes
+//! the run non-resumable until [`RunOptions::acknowledge_partial_effects`]
+//! accepts that effects may already exist. A corrupt ledger is a typed error,
+//! never empty evidence. [`partial_effects`] is the shell's preflight.
 //! Unfinished asks are dispatched again through the host with fresh approval
-//! slots. Tools inside those asks may have partially applied effects before
-//! interruption; renewed approval is not an exactly-once guarantee. Resume is
-//! therefore fail-closed: when any ask would be dispatched again and
-//! [`RunOptions::allow_incomplete_asks`] is false, the run is refused before
-//! the host is called or the journal is appended to. [`incomplete_asks`] is
-//! the shell's preflight for the confirmation that flag represents.
+//! slots. When any ask would be dispatched again and neither
+//! [`RunOptions::allow_incomplete_asks`] nor the partial-effect acknowledgement
+//! is set, the run is refused before the host is called or the journal is
+//! appended to. [`incomplete_asks`] is the shell's preflight for that flag.
 //! Recorded usage includes failed turns. A process crash before the host returns
 //! its receipt cannot recover that unreported charge from this journal.
 //!
@@ -25,6 +29,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::effects::{ToolEffectPhase, ToolEffectRecord};
 use crate::journal::{check_file, checked_run_dir, load_verified, Journal, JournalWriter};
 use crate::{
     EventSink, Host, RunId, RunStatus, StepKind, WorkflowError, WorkflowOutcome, WorkflowReport,
@@ -48,6 +53,16 @@ pub struct RunOptions {
     /// resume with [`WorkflowError::IncompleteAsks`] before any host call or
     /// journal append, because a re-dispatched ask is not exactly-once.
     pub allow_incomplete_asks: bool,
+    /// Accept that resume may replay tool effects the ledger proves may already
+    /// have applied: a `started` record without `finished`, or a side effect
+    /// owned by an ask the resume would dispatch again.
+    ///
+    /// Only consulted when `resume` is true. Default (`false`) refuses with
+    /// [`WorkflowError::PartialEffects`] before any host call or journal
+    /// append. Set this only from a separate, explicit user action that names
+    /// the existing-effect risk; it also accepts the unfinished-ask
+    /// re-dispatch, because that ask is the owner of those effects.
+    pub acknowledge_partial_effects: bool,
 }
 
 /// One ask step a resume would dispatch again.
@@ -106,15 +121,78 @@ pub fn incomplete_asks(root: &Path, run_id: &RunId) -> Result<Vec<IncompleteAsk>
     scan.unfinished_asks()
 }
 
+/// Durable evidence that a resume may replay already-applied tool effects.
+///
+/// Non-empty when the run's tool-effect ledger proves at least one of:
+///
+/// * a `started` side effect has no matching `finished` record (the crash
+///   window between the effect landing and its completion append);
+/// * a side effect is owned by an ask the resume would dispatch again (that
+///   ask's tools may run a second time);
+/// * a side effect cannot be attributed to any known step (fail closed, never
+///   guess it is safe).
+///
+/// Effects owned by completed asks are not reported, and a read-only unfinished
+/// ask produces no ledger records at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartialEffects {
+    /// `started` records with no matching `finished`.
+    pub unfinished_effects: usize,
+    /// Side effects owned by an ask the resume would dispatch again.
+    pub unfinished_ask_effects: usize,
+    /// Side effects whose step identity is unknown to the journal.
+    pub unattributed_effects: usize,
+}
+
+impl PartialEffects {
+    /// No durable partial-effect evidence.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.unfinished_effects == 0
+            && self.unfinished_ask_effects == 0
+            && self.unattributed_effects == 0
+    }
+
+    /// Distinct side effects that make a silent resume unsafe.
+    #[must_use]
+    pub fn risk_count(&self) -> usize {
+        self.unfinished_effects + self.unfinished_ask_effects + self.unattributed_effects
+    }
+}
+
+/// Read the run's tool-effect ledger against its journal: the shell's
+/// partial-effect preflight.
+///
+/// A missing ledger is empty evidence. A corrupt ledger is a typed
+/// [`WorkflowError::ToolEffectLedger`] error, never an empty success. It also
+/// runs the same strict spec/journal validation as a resume, so it cannot
+/// answer for a run the engine would refuse.
+///
+/// # Errors
+/// Invalid run id, untrusted path, missing or malformed spec, damaged journal,
+/// or a corrupt/foreign ledger.
+pub fn partial_effects(root: &Path, run_id: &RunId) -> Result<PartialEffects, WorkflowError> {
+    let spec = load_workflow_spec(root, run_id)?;
+    let verified = load_verified(root, run_id).map_err(persistence_error)?;
+    let scan = scan_journal(&verified.loaded.entries, &spec)?;
+    let records = crate::effects::load_tool_effects(root, run_id)?;
+    Ok(scan.partial_effects(&records))
+}
+
 /// Execute a confirmed workflow with durable, deterministic replay. Blocking.
 ///
 /// Completed runs cannot be resumed. Failed or stopped runs can resume, except
-/// when an interrupted command has an ambiguous side effect. Unfinished asks
-/// are new host dispatches and require fresh approval slots; their tools may
-/// already have partially applied effects before interruption. A resume that
-/// would dispatch one again is refused with [`WorkflowError::IncompleteAsks`]
-/// unless [`RunOptions::allow_incomplete_asks`] is true, and the refusal
-/// happens before any host call or journal append.
+/// when an interrupted command has an ambiguous side effect. The tool-effect
+/// ledger is consulted first: an unfinished `started` record, or an effect
+/// owned by an unfinished ask, is refused with
+/// [`WorkflowError::PartialEffects`] unless
+/// [`RunOptions::acknowledge_partial_effects`] is true. A corrupt ledger is
+/// [`WorkflowError::ToolEffectLedger`]. Unfinished asks are new host dispatches
+/// and require fresh approval slots; a resume that would dispatch one again is
+/// refused with [`WorkflowError::IncompleteAsks`] unless
+/// [`RunOptions::allow_incomplete_asks`] (or the partial-effect
+/// acknowledgement) is true. Every refusal happens before any host call or
+/// journal append.
 ///
 /// # Errors
 /// Returns workflow errors or persistence errors before any unjournaled effect.
@@ -325,6 +403,62 @@ impl JournalScan {
         }
         Ok(asks)
     }
+
+    /// Classify the ledger against this journal's proven step identities.
+    fn partial_effects(&self, records: &[ToolEffectRecord]) -> PartialEffects {
+        use std::collections::BTreeSet;
+
+        let unfinished_asks: BTreeSet<u64> = self
+            .calls
+            .values()
+            .filter(|saved| {
+                saved.start.step.kind == StepKind::Ask
+                    && !saved
+                        .finish
+                        .as_ref()
+                        .is_some_and(|finish| finish.step.status == crate::StepStatus::Ok)
+            })
+            .map(|saved| saved.start.step.index)
+            .collect();
+        let mut finished: BTreeSet<&str> = BTreeSet::new();
+        for record in records {
+            if record.phase == ToolEffectPhase::Finished {
+                finished.insert(record.effect_id.as_str());
+            }
+        }
+        let mut unfinished_effects = BTreeSet::new();
+        let mut unfinished_ask_effects = BTreeSet::new();
+        let mut unattributed_effects = BTreeSet::new();
+        for record in records {
+            if record.phase != ToolEffectPhase::Started {
+                continue;
+            }
+            if !finished.contains(record.effect_id.as_str()) {
+                unfinished_effects.insert(record.effect_id.as_str());
+                continue;
+            }
+            let known = record.step.as_ref().and_then(|step| {
+                step.step_id
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|index| self.calls.contains_key(index))
+            });
+            match known {
+                Some(index) if unfinished_asks.contains(&index) => {
+                    unfinished_ask_effects.insert(record.effect_id.as_str());
+                }
+                Some(_) => {}
+                None => {
+                    unattributed_effects.insert(record.effect_id.as_str());
+                }
+            }
+        }
+        PartialEffects {
+            unfinished_effects: unfinished_effects.len(),
+            unfinished_ask_effects: unfinished_ask_effects.len(),
+            unattributed_effects: unattributed_effects.len(),
+        }
+    }
 }
 
 pub(crate) struct Durable {
@@ -343,14 +477,22 @@ impl Durable {
         options: &RunOptions,
         host: &dyn Host,
     ) -> Result<Self, WorkflowError> {
-        // Fail closed before any host call: a resume that would ask again may
-        // re-run tools whose earlier effects already landed.
-        if options.resume && !options.allow_incomplete_asks {
-            let pending = incomplete_asks(&options.workspace_root, &options.run_id)?;
-            if !pending.is_empty() {
-                return Err(WorkflowError::IncompleteAsks {
-                    count: pending.len(),
+        // Fail closed before any host call: a resume may replay tools whose
+        // earlier effects already landed. The ledger is the durable evidence.
+        if options.resume {
+            let partial = partial_effects(&options.workspace_root, &options.run_id)?;
+            if !partial.is_empty() && !options.acknowledge_partial_effects {
+                return Err(WorkflowError::PartialEffects {
+                    effects: partial.risk_count(),
                 });
+            }
+            if !options.allow_incomplete_asks && !options.acknowledge_partial_effects {
+                let pending = incomplete_asks(&options.workspace_root, &options.run_id)?;
+                if !pending.is_empty() {
+                    return Err(WorkflowError::IncompleteAsks {
+                        count: pending.len(),
+                    });
+                }
             }
         }
         if !host.cost_usd().is_finite() || host.cost_usd() < 0.0 {
