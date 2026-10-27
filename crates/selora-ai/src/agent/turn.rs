@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::router::{self, ToolContext, ToolOutcome};
-use super::{AgentDecision, ApprovalCard, ApprovalId};
+use super::{plan, AgentDecision, ApprovalCard, ApprovalId};
 use crate::chat_types::{ToolCall, ToolCallAccumulator, ToolResult, ToolSpec};
 use crate::types::{compute_cost_usd, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, Model};
 
@@ -96,6 +96,42 @@ impl TurnCaps {
     }
 }
 
+/// When and how the turn compacts its conversation (ARCHITECTURE §19.5).
+///
+/// Opt-in: `TurnInput::new` leaves compaction off so a turn's request count
+/// stays caller-controlled. The desktop enables it with the §19.5 threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    /// Fraction of the context budget that triggers the summarize round.
+    pub threshold: f64,
+    /// Messages carried after the summary.
+    pub keep_last: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            threshold: super::session::COMPACTION_THRESHOLD,
+            keep_last: super::session::COMPACTION_KEEP_LAST,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// True when `estimated_tokens` has reached this config's threshold.
+    pub fn should_compact(&self, estimated_tokens: u64, budget_tokens: u64) -> bool {
+        if budget_tokens == 0 {
+            return false;
+        }
+        let threshold = if self.threshold.is_finite() {
+            self.threshold.clamp(0.0, 1.0)
+        } else {
+            super::session::COMPACTION_THRESHOLD
+        };
+        (estimated_tokens as f64) >= (budget_tokens as f64 * threshold)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // End states and events
 // ---------------------------------------------------------------------------
@@ -122,6 +158,14 @@ pub enum TurnEnd {
     /// The user pressed Stop (§17.4): any running bash child was killed,
     /// the stream cancelled.
     StoppedByUser,
+    /// The ~80% summarize round failed. The typed error is also emitted as
+    /// [`AgentEvent::CompactionFailed`]; the partial summary is retained so
+    /// the caller surfaces it instead of silently truncating history.
+    CompactionFailed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_summary: Option<String>,
+    },
     /// The stream or a tool failed; the message is the surfaced error.
     Failed(String),
 }
@@ -148,6 +192,9 @@ impl TurnEnd {
                 "agent turn stopped: conversation (~{estimated_tokens} tokens) exceeds the context budget ({budget_tokens} tokens)"
             ),
             TurnEnd::StoppedByUser => "agent turn stopped by user".to_owned(),
+            TurnEnd::CompactionFailed { message, .. } => {
+                format!("agent turn stopped: context compaction failed ({message})")
+            }
             TurnEnd::Failed(message) => format!("agent turn failed: {message}"),
         }
     }
@@ -182,9 +229,24 @@ pub enum AgentEvent {
         approval_id: ApprovalId,
         card: ApprovalCard,
     },
+    /// The context-compaction summarize round failed. Typed for the shell:
+    /// `SummaryFailed` carries the partial summary (never silently dropped).
+    CompactionFailed(super::session::CompactionError),
+    /// One summarize round completed; the caller records the cursor (the
+    /// full transcript on disk is untouched).
+    Compacted(super::session::CompactionCursor),
     /// The turn ended: the summary, the reason, the (partial) answer, and
     /// the grown conversation.
     TurnDone(AgentTurnReport),
+    /// Phase 9b: the session's plan phase or proposed plan changed (set by
+    /// `enter_plan_mode`, or by approving `exit_plan_mode`). Additive: a
+    /// pre-9b consumer can ignore it.
+    PlanChanged {
+        phase: plan::PlanPhase,
+        plan: Option<plan::PlanDraft>,
+    },
+    /// Phase 9b: the session's stored todo list changed. Additive.
+    TodosChanged(Vec<plan::TodoItem>),
 }
 
 /// The turn's result: what [`AgentSummary`] counts, how it ended, the
@@ -347,6 +409,13 @@ pub trait ToolRunner: Send {
     /// timeouts). Must be callable while a `run`/`run_approved` future is
     /// still in flight.
     fn abort(&mut self);
+    /// Phase 9b: the session's plan/todo snapshot, when this runner owns
+    /// one. The loop turns changes into [`AgentEvent::PlanChanged`] /
+    /// [`AgentEvent::TodosChanged`]; a runner without session state (the
+    /// test doubles) returns `None` and no such events are emitted.
+    fn plan_snapshot(&self) -> Option<plan::PlanSnapshot> {
+        None
+    }
 }
 
 /// Production tool backend: 5b's router. A thin adapter — the single
@@ -387,6 +456,10 @@ impl ToolRunner for RouterToolRunner {
         // resolves.
         self.ctx.abort.kill();
     }
+
+    fn plan_snapshot(&self) -> Option<plan::PlanSnapshot> {
+        Some(plan::snapshot(&self.ctx.plan))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +484,11 @@ pub struct TurnInput {
     /// This is a property of the caller's session mode, never persisted by
     /// the engine.
     pub auto_approve_writes: bool,
+    /// Opt-in context compaction (§19.5). `None` keeps the request sequence
+    /// caller-controlled (tests, short turns).
+    pub compaction: Option<CompactionConfig>,
+    /// Open todos carried into the compacted summary.
+    pub open_todos: Vec<super::session::TodoItem>,
 }
 
 impl TurnInput {
@@ -426,6 +504,8 @@ impl TurnInput {
             temperature: None,
             reasoning_effort: None,
             auto_approve_writes: false,
+            compaction: None,
+            open_todos: Vec::new(),
         }
     }
 
@@ -446,6 +526,18 @@ impl TurnInput {
     /// Bash and workflows keep their approval gates.
     pub fn with_auto_approve_writes(mut self, on: bool) -> Self {
         self.auto_approve_writes = on;
+        self
+    }
+
+    /// Opt in to §19.5 context compaction at the configured threshold.
+    pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = Some(config);
+        self
+    }
+
+    /// The session's open todos, carried into the compacted summary.
+    pub fn with_open_todos(mut self, todos: Vec<super::session::TodoItem>) -> Self {
+        self.open_todos = todos;
         self
     }
 
@@ -474,7 +566,7 @@ impl TurnInput {
 /// Chars/4 token estimate over the conversation (the same fallback the
 /// client's receipts use, RISKS.md §3) — coarse, but it keeps the
 /// context cap honest without shipping a tokenizer.
-fn estimate_conversation_tokens(conversation: &[ChatMessage]) -> u64 {
+pub(crate) fn estimate_conversation_tokens(conversation: &[ChatMessage]) -> u64 {
     conversation
         .iter()
         .map(|message| {
@@ -713,6 +805,40 @@ fn emit(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) -> bool {
     events.send(event).is_ok()
 }
 
+/// Phase 9b: after each tool, compare the runner's session snapshot with
+/// the last one and emit the additive plan/todo events. Todo events are
+/// separate so the plan spine can update without re-rendering the plan
+/// card (and vice versa).
+fn emit_plan_changes(
+    tools: &dyn ToolRunner,
+    last: &mut Option<plan::PlanSnapshot>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let Some(snapshot) = tools.plan_snapshot() else {
+        return;
+    };
+    let (phase_changed, todos_changed) = match last.as_ref() {
+        None => (true, true),
+        Some(previous) => (
+            previous.phase != snapshot.phase || previous.plan != snapshot.plan,
+            previous.todos != snapshot.todos,
+        ),
+    };
+    if phase_changed {
+        let _ = emit(
+            events,
+            AgentEvent::PlanChanged {
+                phase: snapshot.phase,
+                plan: snapshot.plan.clone(),
+            },
+        );
+    }
+    if todos_changed {
+        let _ = emit(events, AgentEvent::TodosChanged(snapshot.todos.clone()));
+    }
+    *last = Some(snapshot);
+}
+
 // ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
@@ -738,6 +864,9 @@ where
     let caps = input.caps.clone();
     let model = input.model.clone();
     let auto_approve_writes = input.auto_approve_writes;
+    let compaction = input.compaction.clone();
+    let open_todos = input.open_todos.clone();
+    let mut compaction_attempted = false;
     let deadline = if caps.max_turn_secs == 0 {
         None
     } else {
@@ -747,13 +876,54 @@ where
     let mut turn = AgentTurn::new();
     let mut conversation = input.conversation.clone();
     let mut final_message = String::new();
+    let mut plan_state = tools.plan_snapshot();
     let end: Option<TurnEnd>;
     let mut ui_gone = false;
 
     'turn: loop {
         // --- the caps, checked before every round ------------------------
         if let Some(budget) = caps.context_budget_tokens() {
-            let estimated = estimate_conversation_tokens(&conversation);
+            let mut estimated = estimate_conversation_tokens(&conversation);
+            // §19.5: at ~80% of the budget, run one summarize round
+            // through this same chat backend and continue with the
+            // summary + open todos + last N messages. One attempt per
+            // turn; a failure is typed and preserves the partial summary.
+            if let Some(config) = compaction.as_ref() {
+                if !compaction_attempted && config.should_compact(estimated, budget) {
+                    compaction_attempted = true;
+                    match super::session::compact_conversation(
+                        &mut chat,
+                        &model.id,
+                        &conversation,
+                        &open_todos,
+                        config.keep_last,
+                        0,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            conversation = outcome.conversation;
+                            estimated = estimate_conversation_tokens(&conversation);
+                            let _ = emit(&events, AgentEvent::Compacted(outcome.cursor));
+                        }
+                        Err(error) => {
+                            let _ = emit(&events, AgentEvent::CompactionFailed(error.clone()));
+                            let partial_summary = match &error {
+                                super::session::CompactionError::SummaryFailed {
+                                    partial_summary,
+                                    ..
+                                } => partial_summary.clone(),
+                                _ => None,
+                            };
+                            end = Some(TurnEnd::CompactionFailed {
+                                message: error.to_string(),
+                                partial_summary,
+                            });
+                            break 'turn;
+                        }
+                    }
+                }
+            }
             if estimated > budget {
                 end = Some(TurnEnd::ContextOverflow {
                     estimated_tokens: estimated,
@@ -894,18 +1064,23 @@ where
                     // Session full-access auto-applies file writes, edits,
                     // and deletes. A bash command still cards: the flag
                     // never inspects the command line.
-                    // A workflow card is never pre-approved: the shell starts the run from
-                    // the card's explicit Approve, so an earlier `Approve all this
-                    // turn` must not silently skip the confirmation.
-                    let workflow_card =
-                        matches!(&card, crate::agent::ApprovalCard::Workflow { .. });
+                    // A workflow or plan card is never pre-approved: the shell starts the
+                    // run / flips the session from the card's explicit Approve, so
+                    // an earlier `Approve all this turn` must not silently skip the
+                    // confirmation.
+                    let explicit_card = matches!(
+                        &card,
+                        crate::agent::ApprovalCard::Workflow { .. }
+                            | crate::agent::ApprovalCard::Plan { .. }
+                    );
                     let auto_write = auto_approve_writes
                         && !matches!(
                             &card,
                             crate::agent::ApprovalCard::Command { .. }
                                 | crate::agent::ApprovalCard::Workflow { .. }
+                                | crate::agent::ApprovalCard::Plan { .. }
                         );
-                    if (turn.approve_all && !workflow_card) || auto_write {
+                    if (turn.approve_all && !explicit_card) || auto_write {
                         // §17.4: ApproveAllThisTurn pre-approves the rest
                         // of this turn's write/bash cards; full access
                         // pre-approves the file side effects for the session.
@@ -942,6 +1117,17 @@ where
                             Parked::Decided(AgentDecision::Deny) => {
                                 turn.denied += 1;
                                 result = Some(router::denied_result(&call));
+                            }
+                            // Phase 9b: Revise is a plan-card-only answer.
+                            // It keeps the session planning (nothing was
+                            // flipped) and tells the model to resubmit.
+                            Parked::Decided(AgentDecision::Revise) => {
+                                turn.denied += 1;
+                                result = Some(if call.name == "exit_plan_mode" {
+                                    router::revise_plan_result(&call)
+                                } else {
+                                    router::denied_result(&call)
+                                });
                             }
                             // Defensive: park never returns Stop here (it
                             // is handled before the id match) — but if it
@@ -988,6 +1174,7 @@ where
             turn.tools_used += 1;
             conversation.push(ChatMessage::tool_result(call.id, result.content.clone()));
             let _ = emit(&events, AgentEvent::ToolResult(result));
+            emit_plan_changes(&tools, &mut plan_state, &events);
         }
         // The batch finished: loop with the grown conversation.
     }
@@ -1168,6 +1355,7 @@ mod tests {
             events,
             receipt: round_receipt,
             delay: None,
+            error: None,
         }
     }
 
@@ -1178,6 +1366,7 @@ mod tests {
             events: vec![text_delta(text), ChatEvent::Done(round_receipt.clone())],
             receipt: round_receipt,
             delay: None,
+            error: None,
         }
     }
 
@@ -1185,10 +1374,25 @@ mod tests {
     // The mock gateway (ChatStream)
     // -----------------------------------------------------------------------
 
+    /// A round that streams `text` then fails (the compaction summarize
+    /// failure path).
+    fn error_round(text: &str) -> ScriptedRound {
+        let round_receipt = receipt(0.0, 10, 5);
+        ScriptedRound {
+            events: vec![text_delta(text)],
+            receipt: round_receipt,
+            delay: None,
+            error: Some(SeloraError::Net("gateway down".into())),
+        }
+    }
+
     struct ScriptedRound {
         events: Vec<ChatEvent>,
         receipt: ChatReceipt,
         delay: Option<Duration>,
+        /// When set, the round streams `events` then fails (the compaction
+        /// failure path: a partial summary must not be dropped).
+        error: Option<SeloraError>,
     }
 
     /// The mock gateway: one [`ScriptedRound`] per request, every request
@@ -1230,7 +1434,10 @@ mod tests {
                 for event in round.events {
                     let _ = events.send(event);
                 }
-                Ok(round.receipt)
+                match round.error {
+                    Some(error) => Err(error),
+                    None => Ok(round.receipt),
+                }
             })
         }
     }
@@ -1634,6 +1841,7 @@ mod tests {
                 ],
                 receipt: receipt(0.01, 100, 50),
                 delay: None,
+                error: None,
             });
         }
         let (chat, requests) = ScriptedChat::new(rounds);
@@ -1851,6 +2059,56 @@ mod tests {
         assert_eq!(
             count(&events, |event| matches!(event, AgentEvent::ToolResult(_))),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_approve_writes_never_pre_approves_bash() {
+        // Session full access pre-approves the file side effects only. A
+        // non-allowlisted command still parks; denying it never runs it.
+        let rounds = vec![
+            tool_round(
+                &[("call_bash", "bash", r#"{"command":"cargo test"}"#)],
+                "",
+                0.01,
+            ),
+            answer_round("The command was denied.", 0.01),
+        ];
+        let (chat, _requests) = ScriptedChat::new(rounds);
+        let (runner, state) = MockRunner::new(vec![(
+            "call_bash".to_owned(),
+            MockTool::Card {
+                card: ApprovalCard::Command {
+                    command: "cargo test".into(),
+                },
+                approved: ToolResult {
+                    id: "call_bash".to_owned(),
+                    ok: true,
+                    content: "ran".into(),
+                },
+            },
+        )]);
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
+        let input = TurnInput::new(model(), conversation())
+            .with_manifest(manifest())
+            .with_auto_approve_writes(true);
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
+
+        let approval_id = recorder.wait_for_approval().await;
+        decision_tx
+            .send((approval_id, AgentDecision::Deny))
+            .expect("deny the command");
+        let report = task.await.expect("turn task joins");
+
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert_eq!(report.summary.denied, 1);
+        assert_eq!(report.summary.approved, 0);
+        assert!(
+            state.lock().expect("runner").approved_runs.is_empty(),
+            "the denied command never ran"
         );
     }
 
@@ -2160,6 +2418,159 @@ mod tests {
         assert_workflow_approval_gate(false, false, AgentDecision::Deny).await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn approve_all_this_turn_still_parks_the_plan_card() {
+        // A write first (pre-approved by the shortcut), then a plan card:
+        // the plan is an explicit decision, never skipped by `Approve all`
+        // or session full access.
+        let plan_card = ApprovalCard::Plan {
+            summary: Some("Do it".into()),
+            steps: vec!["Inspect".into(), "Write".into()],
+        };
+        let (chat, _requests) = ScriptedChat::new(vec![
+            tool_round(
+                &[(
+                    "call_write",
+                    "write_file",
+                    r#"{"path":"a.rs","content":"x"}"#,
+                )],
+                "Writing.",
+                0.01,
+            ),
+            tool_round(
+                &[(
+                    "call_plan",
+                    "exit_plan_mode",
+                    r#"{"plan":["Inspect","Write"]}"#,
+                )],
+                "Proposing.",
+                0.01,
+            ),
+            answer_round("Revised.", 0.01),
+        ]);
+        let (runner, runner_state) = MockRunner::new(vec![
+            (
+                "call_write",
+                MockTool::Card {
+                    card: diff_card("a.rs"),
+                    approved: ToolResult {
+                        id: "call_write".into(),
+                        ok: true,
+                        content: "written".into(),
+                    },
+                },
+            ),
+            (
+                "call_plan",
+                MockTool::Card {
+                    card: plan_card.clone(),
+                    approved: ToolResult {
+                        id: "call_plan".into(),
+                        ok: true,
+                        content: "approved".into(),
+                    },
+                },
+            ),
+        ]);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
+        let input = TurnInput::new(model(), conversation());
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
+
+        // Pre-approve the write with `Approve all this turn`.
+        let write_id = tokio::time::timeout(Duration::from_secs(1), recorder.wait_for_approval())
+            .await
+            .expect("the write cards first");
+        decision_tx
+            .send((write_id, AgentDecision::ApproveAllThisTurn))
+            .expect("approve all this turn");
+
+        let id = tokio::time::timeout(Duration::from_secs(1), recorder.wait_for_approval())
+            .await
+            .expect("the plan must park despite approve-all");
+        assert_eq!(
+            recorder.seen.last(),
+            Some(&AgentEvent::ApprovalNeeded {
+                approval_id: id,
+                card: plan_card,
+            })
+        );
+        assert!(
+            !task.is_finished(),
+            "the plan card waits for its own explicit decision"
+        );
+        decision_tx
+            .send((id, AgentDecision::Revise))
+            .expect("revise the plan");
+        let report = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("revise unpark the turn")
+            .expect("turn joins");
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert_eq!(report.summary.denied, 1);
+        assert_eq!(
+            runner_state.lock().expect("state lock").approved_runs,
+            vec!["call_write".to_owned()],
+            "the write was pre-approved; the plan never was"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_mode_still_parks_the_plan_card() {
+        let plan_card = ApprovalCard::Plan {
+            summary: None,
+            steps: vec!["Inspect".into()],
+        };
+        let (chat, _requests) = ScriptedChat::new(vec![
+            tool_round(
+                &[("call_plan", "exit_plan_mode", r#"{"plan":["Inspect"]}"#)],
+                "Proposing.",
+                0.01,
+            ),
+            answer_round("Approved.", 0.01),
+        ]);
+        let (runner, runner_state) = MockRunner::new(vec![(
+            "call_plan",
+            MockTool::Card {
+                card: plan_card.clone(),
+                approved: ToolResult {
+                    id: "call_plan".into(),
+                    ok: true,
+                    content: "approved".into(),
+                },
+            },
+        )]);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
+        let input = TurnInput::new(model(), conversation()).with_auto_approve_writes(true);
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
+
+        let id = tokio::time::timeout(Duration::from_secs(1), recorder.wait_for_approval())
+            .await
+            .expect("auto mode must not skip the plan card");
+        assert_eq!(
+            recorder.seen.last(),
+            Some(&AgentEvent::ApprovalNeeded {
+                approval_id: id,
+                card: plan_card,
+            })
+        );
+        decision_tx
+            .send((id, AgentDecision::Approve))
+            .expect("approve the plan");
+        let report = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the decision unparks the turn")
+            .expect("turn joins");
+        assert_eq!(report.end, TurnEnd::Completed);
+        assert_eq!(
+            runner_state.lock().expect("state lock").approved_runs,
+            vec!["call_plan".to_owned()]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The cost cap
     // -----------------------------------------------------------------------
@@ -2242,6 +2653,7 @@ mod tests {
             events: vec![text_delta("partial "), text_delta("answer")],
             receipt: receipt(0.10, 100, 50),
             delay: Some(Duration::from_secs(5)),
+            error: None,
         };
         let (chat, requests) = ScriptedChat::new(vec![round]);
         let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
@@ -2307,6 +2719,104 @@ mod tests {
             requests.lock().expect("requests lock").len(),
             0,
             "no request was made"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_compaction_runs_one_summary_round_and_carries_state_forward() {
+        let mut conversation = vec![ChatMessage::user("x".repeat(3000))];
+        conversation.push(ChatMessage::assistant("older answer"));
+        conversation.push(ChatMessage::user("recent question"));
+        conversation.push(ChatMessage::assistant("recent answer"));
+        let (chat, requests) = ScriptedChat::new(vec![
+            answer_round("summary of the work so far", 0.0),
+            answer_round("all done", 0.01),
+        ]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
+        let caps = TurnCaps {
+            context_window: 1_000,
+            ..caps()
+        };
+        let input = TurnInput::new(model(), conversation)
+            .with_caps(caps)
+            .with_manifest(manifest())
+            .with_compaction(CompactionConfig {
+                threshold: 0.8,
+                keep_last: 2,
+            })
+            .with_open_todos(vec![crate::agent::session::TodoItem {
+                id: "t1".into(),
+                title: "keep this todo".into(),
+                status: crate::agent::session::TodoStatus::InProgress,
+            }]);
+        let (report, mut rx) = run_turn(chat, runner, input).await;
+
+        assert_eq!(report.end, TurnEnd::Completed);
+        let events = drain_remaining(&mut rx);
+        assert_eq!(
+            count(&events, |event| matches!(event, AgentEvent::Compacted(_))),
+            1,
+            "the cursor event is emitted once"
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2, "one summarize round, then the answer");
+        assert!(requests[0].tools.is_none(), "the summary is tool-free");
+        let carried = &requests[1].messages;
+        assert!(carried[0].content.contains("summary of the work so far"));
+        assert!(carried[0].content.contains("keep this todo"));
+        assert_eq!(carried.len(), 3, "summary + keep_last 2");
+        assert_eq!(carried[1].content, "recent question");
+        assert_eq!(carried[2].content, "recent answer");
+    }
+
+    #[tokio::test]
+    async fn context_compaction_failure_is_typed_and_keeps_the_partial_summary() {
+        let mut conversation = vec![ChatMessage::user("x".repeat(3000))];
+        conversation.push(ChatMessage::user("recent question"));
+        conversation.push(ChatMessage::assistant("recent answer"));
+        let (chat, requests) = ScriptedChat::new(vec![error_round("partial summary")]);
+        let (runner, _state) = MockRunner::new(Vec::<(&str, MockTool)>::new());
+        let caps = TurnCaps {
+            context_window: 1_000,
+            ..caps()
+        };
+        let input = TurnInput::new(model(), conversation)
+            .with_caps(caps)
+            .with_manifest(manifest())
+            .with_compaction(CompactionConfig {
+                threshold: 0.8,
+                keep_last: 2,
+            });
+        let (report, mut rx) = run_turn(chat, runner, input).await;
+
+        match &report.end {
+            TurnEnd::CompactionFailed {
+                message,
+                partial_summary,
+            } => {
+                assert!(message.contains("gateway down"));
+                assert_eq!(partial_summary.as_deref(), Some("partial summary"));
+            }
+            other => panic!("expected a typed compaction failure, got {other:?}"),
+        }
+        assert!(!report.summary.completed);
+        let events = drain_remaining(&mut rx);
+        assert_eq!(
+            count(&events, |event| matches!(
+                event,
+                AgentEvent::CompactionFailed(
+                    crate::agent::session::CompactionError::SummaryFailed {
+                        partial_summary: Some(_),
+                        ..
+                    }
+                )
+            )),
+            1
+        );
+        assert_eq!(
+            requests.lock().expect("requests").len(),
+            1,
+            "the failed summary is not retried silently"
         );
     }
 
@@ -2460,6 +2970,127 @@ mod tests {
         // goes sticky.
         runner.abort();
         assert!(abort_handle.is_killed(), "the turn's bash handle is killed");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn turn_emits_plan_and_todo_events_and_gates_writes_until_approval() {
+        // Round 1: enter plan mode + a write in the same batch — the write
+        // must be refused structurally, before any card or disk touch.
+        // Round 2: propose a plan; the user approves it.
+        // Round 3: the same write now cards, and is approved.
+        // Round 4: the final answer.
+        let root = unique_temp_root("plan-turn");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let (chat, _requests) = ScriptedChat::new(vec![
+            tool_round(
+                &[
+                    ("call_enter", "enter_plan_mode", "{}"),
+                    (
+                        "call_blocked",
+                        "write_file",
+                        r#"{"path":"blocked.txt","content":"nope"}"#,
+                    ),
+                ],
+                "Planning first.",
+                0.01,
+            ),
+            tool_round(
+                &[(
+                    "call_exit",
+                    "exit_plan_mode",
+                    r#"{"summary":"Make the file","plan":["Inspect","Write","Verify"]}"#,
+                )],
+                "Here is the plan.",
+                0.01,
+            ),
+            tool_round(
+                &[(
+                    "call_write",
+                    "write_file",
+                    r#"{"path":"made.txt","content":"approved"}"#,
+                )],
+                "Executing.",
+                0.01,
+            ),
+            answer_round("Done.", 0.01),
+        ]);
+
+        let store = plan::new_store();
+        let ctx =
+            ToolContext::new(&root, router::AgentToolSettings::default()).with_plan(store.clone());
+        let runner = RouterToolRunner::new(ctx);
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let mut recorder = Recorder::new(events_rx);
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel::<TurnDecision>();
+        let input = TurnInput::new(model(), conversation()).with_manifest(manifest());
+        let task = tokio::spawn(run_agent_turn(input, chat, runner, events_tx, decision_rx));
+
+        // The only two cards in this turn are the plan and the write; the
+        // blocked write never cards.
+        let plan_card = recorder.wait_for_approval().await;
+        decision_tx
+            .send((plan_card, AgentDecision::Approve))
+            .expect("approve the plan");
+        let write_card = recorder.wait_for_approval().await;
+        decision_tx
+            .send((write_card, AgentDecision::Approve))
+            .expect("approve the write");
+
+        let report = task.await.expect("turn task joins");
+        assert_eq!(report.end, TurnEnd::Completed);
+        let seen = recorder.seen;
+
+        // The structural rejection is model-visible, not a phantom success.
+        let blocked = seen
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult(result) if result.id == "call_blocked" => Some(result),
+                _ => None,
+            })
+            .expect("the blocked write has a tool result");
+        assert!(!blocked.ok);
+        assert!(blocked.content.contains("approve the plan first"));
+        assert!(!root.join("blocked.txt").exists());
+
+        // Plan/todo events are additive and carry real stored state.
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AgentEvent::PlanChanged {
+                    phase: plan::PlanPhase::Planning,
+                    ..
+                }
+            )),
+            "entering plan mode must emit a plan phase event"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AgentEvent::PlanChanged {
+                    phase: plan::PlanPhase::Executing,
+                    plan: Some(plan),
+                } if plan.steps.len() == 3
+            )),
+            "approving the plan must emit the execution phase with the plan"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AgentEvent::TodosChanged(todos) if todos.len() == 3
+            )),
+            "an approved plan must seed the live todos"
+        );
+
+        // The approved write executed for real, and the session store
+        // agrees about the phase.
+        assert_eq!(
+            std::fs::read_to_string(root.join("made.txt")).expect("written file"),
+            "approved"
+        );
+        assert_eq!(plan::snapshot(&store).phase, plan::PlanPhase::Executing);
 
         let _ = std::fs::remove_dir_all(root);
     }

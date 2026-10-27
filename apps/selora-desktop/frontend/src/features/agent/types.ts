@@ -122,7 +122,12 @@ export type AgentTodo = {
   assignedSubagent?: string;
 };
 
-export type SubagentStatus = 'working' | 'idle' | 'done';
+export type SubagentStatus = 'working' | 'idle' | 'done' | 'failed';
+
+export type SubagentArtifact = {
+  kind: string;
+  path: string;
+};
 
 export type SubagentInfo = {
   id: string;
@@ -130,6 +135,16 @@ export type SubagentInfo = {
   model: string;
   status: SubagentStatus;
   activeStep?: string;
+  /** Phase 9e: the session whose transcript groups this child's result. */
+  parentSessionId?: string;
+  policy?: 'read_only' | 'full';
+  /** The child's final answer (empty for a failed child). */
+  result?: string;
+  /** The honest failure text; only set when status is `failed`. */
+  error?: string;
+  artifacts?: SubagentArtifact[];
+  /** True until the user opens the parent session/result. */
+  unread?: boolean;
 };
 
 export type ArtifactKind = 'doc' | 'code' | 'diff' | 'diagram';
@@ -155,6 +170,21 @@ export type AgentSession = {
   isCompacted?: boolean;
   /** True while the backend reports an active request for this session. */
   isRunning?: boolean;
+};
+
+/**
+ * Phase 9d — a durable session found under `.selora/agent-sessions/{id}/`.
+ * Only ever populated from the Rust bootstrap; the UI never invents one.
+ */
+export type ResumableAgentSession = {
+  id: string;
+  title: string;
+  updatedAt: number;
+  model?: string;
+  mode: string;
+  pending?: { kind: string; summary: string };
+  compacted: boolean;
+  messageCount: number;
 };
 
 export type AgentMetrics = {

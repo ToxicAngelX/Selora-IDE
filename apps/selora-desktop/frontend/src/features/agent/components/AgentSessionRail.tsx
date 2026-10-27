@@ -7,21 +7,26 @@
 // `SessionDto` does not report them (never show a made-up 0.0k).
 import React, { useSyncExternalStore } from 'react';
 import { Plus } from '../../../components/icons';
-import type { AgentSession } from '../types';
+import type { AgentSession, ResumableAgentSession } from '../types';
 import { agentStore } from '../agent-store';
 
 export type AgentSessionRailProps = {
   sessions: AgentSession[];
   activeSessionId: string;
+  /** Phase 9d: durable sessions from Rust not yet open in this process. */
+  resumableSessions?: ResumableAgentSession[];
   onClose?: () => void;
 };
 
 export const AgentSessionRail: React.FC<AgentSessionRailProps> = ({
   sessions,
   activeSessionId,
+  resumableSessions = [],
   onClose,
 }) => {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.getSnapshot);
+  const closedIds = new Set(sessions.map((session) => session.id));
+  const resumable = resumableSessions.filter((session) => !closedIds.has(session.id));
   return (
     <aside className="agent-session-rail" aria-label="Agent Session History">
       <div className="session-rail-header">
@@ -50,42 +55,78 @@ void agentStore.requestNewSession().then((ok) => {
         </p>
       ) : null}
 
-      {sessions.length === 0 ? (
-        <p className="agent-session-rail-empty">No sessions yet</p>
-      ) : (
-        <div className="session-list">
-          {sessions.map((session) => {
-            const isActive = session.id === activeSessionId;
-            const activateSession = () => {
-              void agentStore.requestSwitchSession(session.id).then((ok) => {
-                if (ok) onClose?.();
-              });
-            };
+          return (
+            <button
+              key={session.id}
+              type="button"
+              className={`session-item ${isActive ? 'is-active' : ''}`}
+              onClick={activateSession}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  activateSession();
+                }
+              }}
+              aria-current={isActive ? 'true' : undefined}
+              style={{ textAlign: 'left' }}
+            >
+              <div className="session-item-row">
+                <span className="session-indicator" />
+                <span className="session-title" title={session.title}>
+                  {session.title}
+                </span>
+              </div>
+              <div className="session-item-meta">
+                {session.branchName && (
+                  <span className="session-branch-tag">
+                    {session.branchName}
+                  </span>
+                )}
+                <span className="session-tokens">
+                  {(session.tokenCount / 1000).toFixed(1)}k tokens
+                </span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
 
+      {resumable.length > 0 && (
+        <div className="session-list" role="group" aria-label="Resume session">
+          <div className="session-rail-subtitle">Resume session</div>
+          {resumable.map((session) => {
+            const resume = () => {
+              agentStore.resumeSession(session.id);
+              onClose?.();
+            };
             return (
               <button
                 key={session.id}
                 type="button"
-                className={`session-item ${isActive ? 'is-active' : ''}`}
-                onClick={activateSession}
+                className="session-item session-item-resumable"
+                onClick={resume}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    activateSession();
+                    resume();
                   }
                 }}
-                aria-current={isActive ? 'true' : undefined}
-                title={session.title}
+                title={session.pending ? session.pending.summary : session.title}
               >
                 <div className="session-item-row">
                   <span className="session-indicator" />
                   <span className="session-title">{session.title}</span>
                 </div>
                 <div className="session-item-meta">
-                  <span className="session-id">{session.id}</span>
-                  {session.isRunning ? (
-                    <span className="session-running-tag">Running</span>
-                  ) : null}
+                  <span className="session-tokens">
+                    {session.messageCount} messages · {session.mode}
+                  </span>
+                  {session.pending && (
+                    <span className="session-pending-badge">{session.pending.kind}</span>
+                  )}
+                  {session.compacted && (
+                    <span className="session-compacted-badge">compacted</span>
+                  )}
                 </div>
               </button>
             );

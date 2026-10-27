@@ -354,9 +354,39 @@ function reduceEvent(event: EventEnvelope): void {
     case 'agent_turn_done':
       agentStore.handleAgentTurnDone(payload.payload);
       return;
-    case 'session_todos_changed':
-      agentStore.applySessionTodos(payload.payload);
+case 'plan_state_changed':
+      agentStore.handlePlanStateChanged(payload.payload);
       return;
+    case 'todos_changed':
+      agentStore.handleTodosChanged(payload.payload);
+      return;
+    case 'agent_compaction_failed': {
+      const failure = payload.payload;
+      const partial = failure.partial_summary
+        ? ` A partial summary (${failure.partial_summary.length} chars) was kept.`
+        : '';
+      toastStore.pushProtocol(event.sequence, {
+        severity: 'error',
+        message: `Context compaction failed: ${failure.message}.${partial}`,
+      });
+      return;
+    }
+    case 'subagent_completed': {
+      // Phase 9e: the toast/badge is emitted only for the first accepted
+      // delivery of this child id. A failed child is a warning, never a
+      // success; a cancelled child never reaches this arm at all.
+      const completion = payload.payload;
+      if (!agentStore.handleSubagentCompleted(completion)) return;
+      toastStore.pushSubagentCompletion(event.sequence, {
+        childId: completion.child_id,
+        sessionId: completion.parent_session_id,
+        ok: completion.ok,
+        message: completion.ok
+          ? `Subagent finished: ${completion.final_message || completion.child_id}`
+          : `Subagent failed: ${completion.error ?? completion.child_id}`,
+      });
+      return;
+    }
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;

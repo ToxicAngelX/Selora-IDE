@@ -42,18 +42,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use selora_ai::{
-    AgentSummary, AgentTurnState, ApprovalCard, ChatEvent, ChatMessage, ChatReceipt, ChatRequest,
-    Model, RouterToolRunner, TodoItem, TodoSink, TodoStatus, ToolContext, ToolSpec, TurnCaps,
-    TurnInput,
+    AgentSessionMode, AgentSessionState, AgentSessionStore, AgentSummary, AgentTurnState,
+    ApprovalCard, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, CompactionConfig,
+    CompactionError, Model, ParkedCard, PlanState, RouterToolRunner, TodoItem, ToolContext,
+    ToolSpec, TranscriptEntry, TurnCaps, TurnInput,
 };
 use selora_core::SeloraError;
 use selora_protocol::{
-    validate_and_consume_approval, AgentModeDto, AgentPhase, AgentStateDto, AgentTurnDoneDto,
-    ApprovalDto, ApprovalId, ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto,
-    ChatRequestDto, ChatStateDto, ConnectionStatus, DecisionDto, FrontendEvent, MessageDto,
-    MessageId, MessageRole, ModelDto, ModelsDto, ProtocolErrorDto, RequestId, SeloraStatusDto,
-    SessionDto, SessionId, SessionTodosDto, TodoDto, TodoStatusDto, ToolCallStartedDto,
-    ToolResultDto, TurnId, WorkflowApprovalDto,
+    validate_and_consume_approval, AgentCompactionFailedDto, AgentModeDto, AgentParkSummaryDto,
+    AgentPhase, AgentSessionSummaryDto, AgentStateDto, AgentTurnDoneDto, ApprovalDto, ApprovalId,
+    ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto, ChatRequestDto, ChatStateDto,
+    ConnectionStatus, DecisionDto, FrontendEvent, MessageDto, MessageId, MessageRole, ModelDto,
+    ModelsDto, PlanApprovalDto, PlanPhaseDto, PlanStateDto, ProtocolErrorDto, RequestId,
+    SeloraStatusDto, SessionDto, SessionId, SubagentArtifactDto, SubagentCompletedDto,
+    SubagentPolicyDto, TodoDto, TodoStatusDto, TodosDto, ToolCallStartedDto, ToolResultDto, TurnId,
+    WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -61,15 +64,19 @@ use uuid::Uuid;
 use crate::state::EventLog;
 
 /// The read-only half of the §17.1 manifest — `explore` mode arms exactly
-/// these (the model cannot request a side effect).
-const EXPLORE_TOOLS: [&str; 7] = [
+/// these (the model cannot request a side effect). Phase 9b's todo tools
+/// are session state, not workspace writes, so they stay available.
+const EXPLORE_TOOLS: [&str; 10] = [
     "read_file",
     "list_dir",
     "fuzzy_find",
     "search_files",
     "web_search",
     "web_fetch",
+    "todo_read",
+    "todo_write",
     "manage_todo",
+    "wait",
 ];
 
 /// Transcript bound (the egui panel's 100-entry cap, R3) on the web shell's
@@ -181,6 +188,12 @@ struct StoredMessage {
     /// same content through the same path exactly once. Assistant messages
     /// carry `None`.
     retry: Option<RetrySpec>,
+    /// Assistant-side tool calls (restored sessions keep the pairing).
+    tool_calls: Option<Vec<selora_ai::ToolCall>>,
+    /// The call a tool-result message answers.
+    tool_call_id: Option<String>,
+    ok: bool,
+    timestamp: u64,
 }
 
 /// The dispatch path a user message took. Capability fields are copied from
@@ -216,11 +229,64 @@ struct ChatSession {
     /// The turn's parked approval (§17.4) — `None` while none is pending.
     /// Consumed exactly once by a matching `AgentDecision`.
     pending_approval: Option<ApprovalDto>,
-    /// The session's authoritative todo list, written only by the
-    /// `manage_todo` tool through [`SessionTodoSink`].
-    todos: Vec<TodoItem>,
-    /// Monotonic recency stamp (bootstrap's recency order).
+    /// Phase 9b: session-scoped plan mode + todos. Shared with the turn's
+    /// `ToolContext`, so tool writes land here and the bootstrap hydrates
+    /// them after a reload.
+    plan_store: selora_ai::PlanStore,
+    /// The parked card itself (needed to persist/restore the resume view).
+    pending_card: Option<ApprovalCard>,
+    pending_tool_name: Option<String>,
+    /// The restored park's underlying card (resume renders it; a decision
+    /// expires without reaching any turn).
+    restored_park: bool,
+    /// Monotonic recency stamp (bootstrap's `active_session_id` = the most
+    /// recently touched session).
     last_activity: u64,
+    // ---- Phase 9d: durable session fields -----------------------------
+    created_at: u64,
+    updated_at: u64,
+    model: Option<String>,
+    mode: AgentModeDto,
+    todos: Vec<TodoItem>,
+    plan: PlanState,
+    /// Session full access. Deliberately never written to disk (the store
+    /// has no field for it) and reset on switch/new/restart.
+    auto_approve: bool,
+    /// How many `messages` entries have already been appended to the
+    /// transcript. Tool-call/tool-result records are appended live and are
+    /// not part of this count.
+    durable_entries: usize,
+    /// `true` for an agent session (persisted under `.selora/agent-sessions`).
+    /// Plain chat sessions stay in memory.
+    durable: bool,
+    /// The last successful compaction cursor (full transcript stays on disk).
+    compaction: selora_ai::CompactionCursor,
+}
+
+impl ChatSession {
+    fn new(title: String, now: u64) -> Self {
+        Self {
+            title,
+            messages: Vec::new(),
+            active_request: None,
+            pending_approval: None,
+            pending_card: None,
+            pending_tool_name: None,
+            restored_park: false,
+            last_activity: now,
+            created_at: now,
+            updated_at: now,
+            model: None,
+            mode: AgentModeDto::Execute,
+            todos: Vec::new(),
+            plan_store: selora_ai::new_store(),
+            plan: PlanState::default(),
+            auto_approve: false,
+            durable_entries: 0,
+            durable: false,
+            compaction: selora_ai::CompactionCursor::default(),
+        }
+    }
 }
 
 struct EngineInner {
@@ -243,6 +309,11 @@ struct EngineInner {
 pub(crate) struct SessionEngine {
     inner: Mutex<EngineInner>,
     config: EngineConfig,
+    /// Phase 9e: the session-scoped background subagent runtime. It
+    /// outlives individual turns, so a child started by one turn can finish
+    /// while the user edits in another. The `wait` tool reads it through
+    /// `ToolContext`.
+    subagents: selora_ai::SubagentRuntime,
     /// The agent tools' root. The Z3 shell has no folder picker (that lands
     /// in Z4 with the workbench), so `SELORA_WORKSPACE_ROOT` is the one way
     /// to point the tools at a real tree today; without it `SendAgent`
@@ -287,11 +358,344 @@ impl SessionEngine {
             }),
             config,
             workspace_root: Mutex::new(None),
+            subagents: selora_ai::SubagentRuntime::new(),
         }
     }
 
     pub(crate) fn set_workspace_root(&self, root: Option<PathBuf>) {
         *self.workspace_root.lock().expect("workspace root lock") = root;
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 9d — durable sessions
+    // -----------------------------------------------------------------
+
+    /// The store rooted at the live workspace. No workspace means no agent
+    /// session can exist (the same rule as `SendAgent`).
+    fn store(&self) -> Option<AgentSessionStore> {
+        let root = self
+            .workspace_root
+            .lock()
+            .expect("workspace root lock")
+            .clone()?;
+        let store = AgentSessionStore::new(root);
+        match self.config.key_source.get().ok().flatten() {
+            Some(key) => Some(store.with_redaction_key(key)),
+            None => Some(store),
+        }
+    }
+
+    /// The resume picker's list (read-only; newest first).
+    pub(crate) fn agent_sessions(&self) -> Vec<AgentSessionSummaryDto> {
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
+        store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|summary| {
+                Some(AgentSessionSummaryDto {
+                    session_id: SessionId::new(summary.session_id).ok()?,
+                    title: summary.title,
+                    updated_at: summary.updated_at,
+                    model: summary.model,
+                    mode: summary.mode.as_str().to_owned(),
+                    pending: summary.pending.map(|pending| AgentParkSummaryDto {
+                        kind: pending.kind,
+                        summary: pending.summary,
+                    }),
+                    compacted: summary.compacted,
+                    message_count: summary.message_count,
+                })
+            })
+            .collect()
+    }
+
+    /// Persist one session's new messages, metadata, and todos.
+    ///
+    /// Appends are incremental (one fsynced record per new message); the
+    /// state/todos files are atomic replacements. A failed append leaves the
+    /// durable counter unchanged so the next flush retries it.
+    fn flush_session(&self, session_id: &SessionId) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let (start, entries, state, todos) = {
+            let inner = self.inner.lock().expect("engine lock");
+            let Some(session) = inner.sessions.get(session_id) else {
+                return;
+            };
+            if !session.durable {
+                return;
+            }
+            let start = session.durable_entries.min(session.messages.len());
+            let entries: Vec<TranscriptEntry> = session.messages[start..]
+                .iter()
+                .map(message_entry)
+                .collect();
+            (
+                start,
+                entries,
+                session_state(session_id, session),
+                session.todos.clone(),
+            )
+        };
+        let mut appended = 0usize;
+        for entry in &entries {
+            if store.append(session_id.as_str(), entry).is_err() {
+                break;
+            }
+            appended += 1;
+        }
+        let _ = store.save_state(&state);
+        let _ = store.save_todos(session_id.as_str(), &todos);
+        if appended > 0 {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                let end = (start + appended).min(session.messages.len());
+                session.durable_entries = end;
+            }
+        }
+    }
+
+    /// Append a live tool-call batch to the transcript (not part of the
+    /// in-memory message tail).
+    fn record_tool_calls(&self, session_id: &SessionId, calls: Vec<selora_ai::ToolCall>) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let _ = store.append(
+            session_id.as_str(),
+            &TranscriptEntry::ToolCalls {
+                id: Uuid::new_v4().to_string(),
+                timestamp: selora_ai::now_millis(),
+                calls,
+            },
+        );
+    }
+
+    /// Append one tool result to the transcript.
+    fn record_tool_result(&self, session_id: &SessionId, result: &selora_ai::ToolResult) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let _ = store.append(
+            session_id.as_str(),
+            &TranscriptEntry::Tool {
+                id: Uuid::new_v4().to_string(),
+                timestamp: selora_ai::now_millis(),
+                call_id: result.id.clone(),
+                ok: result.ok,
+                content: result.content.clone(),
+            },
+        );
+    }
+
+    /// Record a successful compaction cursor. The transcript is not rewritten.
+    fn record_compaction(&self, session_id: &SessionId, cursor: selora_ai::CompactionCursor) {
+        {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                session.compaction = cursor;
+                session.updated_at = selora_ai::now_millis();
+            }
+        }
+        self.flush_session(session_id);
+    }
+
+    /// Switch the dock to a session, restoring it from disk when it is not in
+    /// memory. Every session's auto-approve flag is cleared first: trust never
+    /// transfers across a switch.
+    pub(crate) fn switch_session(&self, session_id: &SessionId) -> Result<(), ProtocolErrorDto> {
+        let mut inner = self.inner.lock().expect("engine lock");
+        if inner
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.active_request.is_some())
+        {
+            return Err(ProtocolErrorDto {
+                code: "session_busy".into(),
+                message: "A request is already running for this session — stop it first.".into(),
+                retryable: false,
+            });
+        }
+        if !inner.sessions.contains_key(session_id) {
+            let loaded = self.load_session_from_disk(session_id)?;
+            inner.sessions.insert(session_id.clone(), loaded);
+        }
+        inner.activity_counter += 1;
+        let activity = inner.activity_counter;
+        for session in inner.sessions.values_mut() {
+            session.auto_approve = false;
+        }
+        if let Some(session) = inner.sessions.get_mut(session_id) {
+            session.last_activity = activity;
+        }
+        inner.active_session = Some(session_id.clone());
+        Ok(())
+    }
+
+    /// Create a fresh session and make it active. Its auto-approve flag is
+    /// off by construction.
+    pub(crate) fn new_session(&self) -> Result<SessionId, ProtocolErrorDto> {
+        let store = self.store().ok_or_else(no_workspace)?;
+        let session_id =
+            SessionId::new(format!("sess-{}", Uuid::new_v4())).expect("uuid session id is valid");
+        let title = "New Agent Session".to_owned();
+        let now = selora_ai::now_millis();
+        let state = store
+            .create(
+                session_id.as_str(),
+                &title,
+                self.active_model_id().as_deref(),
+                selora_ai::AgentSessionMode::Execute,
+            )
+            .map_err(|error| session_persistence_error(&error))?;
+        let mut session = ChatSession::new(title, now);
+        session.mode = AgentModeDto::Execute;
+        session.model = state.model;
+        session.durable = true;
+        let mut inner = self.inner.lock().expect("engine lock");
+        inner.activity_counter += 1;
+        session.last_activity = inner.activity_counter;
+        for open in inner.sessions.values_mut() {
+            open.auto_approve = false;
+        }
+        inner.sessions.insert(session_id.clone(), session);
+        inner.active_session = Some(session_id.clone());
+        Ok(session_id)
+    }
+
+    /// Arm/disarm session full access. The flag is session memory only.
+    pub(crate) fn set_auto_approve(
+        &self,
+        session_id: &SessionId,
+        enabled: bool,
+    ) -> Result<(), ProtocolErrorDto> {
+        let mut inner = self.inner.lock().expect("engine lock");
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return Err(ProtocolErrorDto {
+                code: "session_not_found".into(),
+                message: "That agent session is not open.".into(),
+                retryable: false,
+            });
+        };
+        session.auto_approve = enabled;
+        Ok(())
+    }
+
+    /// Mirror the live plan/todo store into the durable session record after
+    /// a plan or todo event. Phase 9b's events are the only writer of these
+    /// fields, so this is where a reload's plan spine is captured.
+    fn sync_plan_store(&self, session_id: &SessionId) {
+        let plan_store = {
+            let inner = self.inner.lock().expect("engine lock");
+            match inner.sessions.get(session_id) {
+                Some(session) => session.plan_store.clone(),
+                None => return,
+            }
+        };
+        let snapshot = selora_ai::plan::snapshot(&plan_store);
+        {
+            let mut inner = self.inner.lock().expect("engine lock");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            session.todos = snapshot.todos.clone();
+            session.plan = plan_state_from_live(&snapshot);
+            session.updated_at = selora_ai::now_millis();
+        }
+        self.flush_session(session_id);
+    }
+
+    /// Restore one session from disk into the in-memory shape.
+    fn load_session_from_disk(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ChatSession, ProtocolErrorDto> {
+        let store = self.store().ok_or_else(no_workspace)?;
+        let loaded = store
+            .load(session_id.as_str())
+            .map_err(|error| session_persistence_error(&error))?
+            .ok_or_else(|| ProtocolErrorDto {
+                code: "session_not_found".into(),
+                message: "That agent session does not exist on disk.".into(),
+                retryable: false,
+            })?;
+        let now = selora_ai::now_millis();
+        let mut session = ChatSession::new(loaded.state.title.clone(), now);
+        session.created_at = loaded.state.created_at;
+        session.updated_at = loaded.state.updated_at;
+        session.durable = true;
+        session.model = loaded.state.model.clone();
+        session.mode = mode_from_disk(loaded.state.mode);
+        session.todos = loaded.todos.clone();
+        session.plan = loaded.state.plan.clone();
+        // Phase 9b's live store hydrates from the durable record: the
+        // resume picker must reopen the same plan phase, draft and todos.
+        {
+            let mut live = selora_ai::plan::lock(&session.plan_store);
+            live.phase = if session.plan.status == selora_ai::PlanStatus::Proposed {
+                selora_ai::PlanPhase::Planning
+            } else {
+                selora_ai::PlanPhase::Executing
+            };
+            live.plan = session.plan.plan.as_deref().and_then(plan_draft_from_disk);
+            live.todos = session.todos.clone();
+        }
+        session.compaction = loaded.state.compaction;
+        session.messages = loaded
+            .conversation()
+            .into_iter()
+            .map(|message| stored_message(&message, now))
+            .collect();
+        session.durable_entries = session.messages.len();
+        // A restored park is shown once. It has no live request, so any
+        // decision expires instead of executing (see `agent_decision`).
+        if let Some(park) = loaded.state.parks.first() {
+            match park {
+                ParkedCard::Approval {
+                    approval_id,
+                    tool_name,
+                    card,
+                    request_id,
+                    turn_id,
+                    ..
+                } => {
+                    if let Ok(approval_id) = ApprovalId::new(approval_id.clone()) {
+                        let request_id = request_id
+                            .as_deref()
+                            .and_then(|id| RequestId::new(id).ok())
+                            .unwrap_or_else(|| {
+                                RequestId::new(format!("restored-{}", approval_id.as_str()))
+                                    .expect("restored request id")
+                            });
+                        let turn_id = turn_id
+                            .as_deref()
+                            .and_then(|id| TurnId::new(id).ok())
+                            .unwrap_or_else(|| {
+                                TurnId::new(format!("restored-{}", approval_id.as_str()))
+                                    .expect("restored turn id")
+                            });
+                        session.pending_approval = Some(ApprovalDto {
+                            approval_id: approval_id.clone(),
+                            request_id,
+                            turn_id,
+                            session_id: session_id.clone(),
+                            summary: park.summary(),
+                            can_approve_all_this_turn: false,
+                            plan: approval_plan(card),
+                        });
+                        session.pending_card = Some(card.clone());
+                        session.pending_tool_name = Some(tool_name.clone());
+                        session.restored_park = true;
+                    }
+                }
+                ParkedCard::Question { .. } => {}
+            }
+        }
+        Ok(session)
     }
 
     pub(crate) fn base_url(&self) -> String {
@@ -350,11 +754,13 @@ impl SessionEngine {
         let mut active_request_id = None;
         let mut active_turn_id = None;
         let mut pending_approval = None;
-        // Recency order (most recent last). While a turn is live, its
-        // session wins: the frontend can only route one stream at a time.
+        let mut pending_approvals: Vec<(SessionId, ApprovalDto)> = Vec::new();
+        // Recency order (most recent last): `active_session_id` picks the
+        // most recently touched session that is still running a request.
         let mut ordered: Vec<(&SessionId, &ChatSession)> = inner.sessions.iter().collect();
         ordered.sort_by_key(|(_, session)| session.last_activity);
         for (session_id, session) in ordered {
+            let plan = selora_ai::plan::snapshot(&session.plan_store);
             sessions.push(SessionDto {
                 session_id: session_id.clone(),
                 title: session.title.clone(),
@@ -364,7 +770,9 @@ impl SessionEngine {
                     .map(|message| message.message_id.clone())
                     .collect(),
                 active: session.active_request.is_some(),
-                todos: session.todos.iter().map(todo_dto).collect(),
+                plan_phase: plan_phase_dto(plan.phase),
+                plan: plan.plan.as_ref().map(plan_approval_dto),
+                todos: plan.todos.iter().map(todo_dto).collect(),
             });
             for message in &session.messages {
                 messages.push(MessageDto {
@@ -381,15 +789,27 @@ impl SessionEngine {
                     active_turn_id = Some(active.turn_id().clone());
                 }
             }
-            if session.pending_approval.is_some() && pending_approval.is_none() {
-                pending_approval = session.pending_approval.clone();
+            if let Some(approval) = &session.pending_approval {
+                pending_approvals.push((session_id.clone(), approval.clone()));
             }
         }
-        let todos = active_session_id
-            .as_ref()
-            .and_then(|id| inner.sessions.get(id))
-            .map(|session| session.todos.iter().map(todo_dto).collect())
-            .unwrap_or_default();
+        if active_session_id.is_none() {
+            active_session_id = inner.active_session.clone();
+        }
+        // Prefer the active session's park; otherwise the first in recency
+        // order (the pre-9d behaviour).
+        if let Some(active) = &active_session_id {
+            pending_approval = pending_approvals
+                .iter()
+                .find(|(session, _)| session == active)
+                .map(|(_, approval)| approval.clone());
+        }
+        if pending_approval.is_none() {
+            pending_approval = pending_approvals
+                .into_iter()
+                .next()
+                .map(|(_, approval)| approval);
+        }
         ChatStateDto {
             sessions,
             messages,
@@ -692,10 +1112,28 @@ impl SessionEngine {
             &payload.prompt,
             Some(spec),
         )?;
+        // Mode and model are durable session facts. Full access is not: the
+        // flag lives only in this `ChatSession` and is reset on switch/new.
+        session.model = Some(model.id.clone());
+        session.mode = persist_mode(payload.mode);
+        session.auto_approve = matches!(payload.mode, AgentModeDto::Auto);
+        session.durable = true;
+        session.updated_at = selora_ai::now_millis();
+        if session.restored_park {
+            // A new turn supersedes a restored park: it can never execute.
+            session.pending_approval = None;
+            session.pending_card = None;
+            session.pending_tool_name = None;
+            session.restored_park = false;
+        }
+        let auto_approve = session.auto_approve;
+        let open_todos = session.todos.clone();
         let sys_prompt = system_prompt(&payload, &root);
         let mut conversation: Vec<ChatMessage> = vec![ChatMessage::system(sys_prompt)];
         conversation.extend(conversation_tail(session));
+        let plan_store = session.plan_store.clone();
         drop(inner);
+        self.flush_session(&payload.session_id);
 
         // The turn: 5c's loop over 5a's client and 5b's router, rooted and
         // capped exactly like the egui shell's `spawn_agent` (§17.6).
@@ -708,7 +1146,9 @@ impl SessionEngine {
         let mut input = TurnInput::new(model.clone(), conversation)
             .with_caps(caps)
             .with_manifest(manifest_for(payload.mode))
-            .with_auto_approve_writes(matches!(payload.mode, AgentModeDto::Auto));
+            .with_auto_approve_writes(auto_approve)
+            .with_compaction(CompactionConfig::default())
+            .with_open_todos(open_todos);
         if let Some(temp) = payload.temperature {
             input = input.with_temperature(temp);
         }
@@ -716,14 +1156,11 @@ impl SessionEngine {
             input = input.with_reasoning_effort(effort.clone());
         }
         let tool_settings = agent_tool_settings(&self.config.agent, self.brave_key());
-        let tools = RouterToolRunner::new(ToolContext::new(root, tool_settings).with_todo_sink(
-            Arc::new(SessionTodoSink {
-                engine: Arc::downgrade(self),
-                session_id: payload.session_id.clone(),
-                log: Arc::clone(&log),
-                app: app.clone(),
-            }),
-        ));
+        let tools = RouterToolRunner::new(
+            ToolContext::new(root, tool_settings)
+                .with_plan(plan_store)
+                .with_subagents(self.subagents.clone(), payload.session_id.as_str()),
+        );
         let chat = selora_ai::ClientChatStream::new(selora_ai::SeloraClient::new(
             &self.base_url(),
             &api_key,
@@ -760,6 +1197,47 @@ impl SessionEngine {
         Ok(())
     }
 
+    /// Phase 9e: start one background child and emit its single typed
+    /// completion event. The runtime outlives the parent turn; the relay
+    /// only maps the one accepted result onto `selora://event`. A cancelled
+    /// child emits nothing, and a late result is discarded by the runtime.
+    ///
+    /// The host-facing spawn tool (Phase 9c) calls this seam; keeping the
+    /// relay here means every consumer gets the same event contract.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_background_subagent<R: tauri::Runtime, F>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        request: selora_ai::SpawnRequest,
+        work: F,
+    ) -> Result<selora_ai::SubagentHandle, selora_ai::SpawnError>
+    where
+        F: std::future::Future<Output = selora_ai::ChildOutcome> + Send + 'static,
+    {
+        let mut events = self.subagents.subscribe();
+        let child_id = request.child_id.clone();
+        let handle = self.subagents.spawn_background(request, work)?;
+        tauri::async_runtime::spawn(async move {
+            while let Ok(selora_ai::SubagentEvent::Completed(completion)) = events.recv().await {
+                if completion.child_id != child_id {
+                    continue;
+                }
+                let Ok(parent) = SessionId::new(completion.parent_session.clone()) else {
+                    return;
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::SubagentCompleted(subagent_completed_dto(completion)),
+                    None,
+                    parent,
+                );
+                return;
+            }
+        });
+        Ok(handle)
+    }
+
     // -----------------------------------------------------------------
     // StopChat / AgentDecision
     // -----------------------------------------------------------------
@@ -784,7 +1262,10 @@ impl SessionEngine {
                     let _ = cancel.send(true);
                 }
                 ActiveRequest::Agent { decisions, .. } => {
+                    // Phase 9e: stopping the parent stops its children. The
+                    // runtime drops any result that arrives afterwards.
                     let _ = decisions.send((Uuid::nil(), selora_ai::AgentDecision::Stop));
+                    self.subagents.cancel_parent(active.session_id().as_str());
                 }
             }
         }
@@ -832,6 +1313,32 @@ impl SessionEngine {
             .expect("found by pending approval")
             .turn_id
             .clone();
+        // A restored park has no live turn. Consume it exactly once and tell
+        // the caller it expired — never execute the restored action.
+        if session.restored_park {
+            let matches = session
+                .pending_approval
+                .as_ref()
+                .is_some_and(|approval| &approval.approval_id == approval_id);
+            if !matches {
+                return Err(ProtocolErrorDto {
+                    code: "approval_mismatch".into(),
+                    message: "The decision does not match the restored approval.".into(),
+                    retryable: false,
+                });
+            }
+            session.pending_approval = None;
+            session.pending_card = None;
+            session.pending_tool_name = None;
+            let sid = session_id.clone();
+            drop(inner);
+            self.flush_session(&sid);
+            return Err(ProtocolErrorDto {
+                code: "park_expired".into(),
+                message: "This approval was restored from disk and has already expired. Ask again to start a new turn.".into(),
+                retryable: false,
+            });
+        }
         // The single-use gate: a mismatch leaves the card parked — only the
         // matching decision consumes it.
         validate_and_consume_approval(
@@ -847,6 +1354,8 @@ impl SessionEngine {
             message: "The decision does not match the pending approval.".into(),
             retryable: false,
         })?;
+        session.pending_card = None;
+        session.pending_tool_name = None;
         // The loop keys decisions by its own uuid approval id; a decision
         // that survived the gate names a uuid by construction.
         let Ok(loop_id) = Uuid::parse_str(approval_id.as_str()) else {
@@ -862,8 +1371,11 @@ impl SessionEngine {
             ..
         }) = inner.active.get(request_id)
         else {
+            let sid = session_id.clone();
+            drop(inner);
+            self.flush_session(&sid);
             return Err(ProtocolErrorDto {
-                code: "approval_not_pending".into(),
+                code: "approval_expired".into(),
                 message: "The turn this approval belongs to has ended.".into(),
                 retryable: false,
             });
@@ -871,13 +1383,106 @@ impl SessionEngine {
         if envelope_session.is_some_and(|session| session != *owner) {
             return Err(stale_session());
         }
-        decisions
+        let result = decisions
             .send((loop_id, map_decision(decision)))
             .map_err(|_| ProtocolErrorDto {
-                code: "approval_not_pending".into(),
+                code: "approval_expired".into(),
                 message: "The turn this approval belongs to has ended.".into(),
                 retryable: false,
-            })
+            });
+        drop(inner);
+        self.flush_session(&session_id);
+        result
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 9d — RetryMessage
+    // -----------------------------------------------------------------
+
+    /// Rewind the session to just before `message_id` and re-send that user
+    /// message as a new turn. The rewritten transcript drops the abandoned
+    /// branch; the full history of *other* sessions is untouched.
+    pub(crate) fn retry_message<R: tauri::Runtime>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        request_id: RequestId,
+        session_id: SessionId,
+        message_id: MessageId,
+    ) -> Result<(), ProtocolErrorDto> {
+        let store = self.store().ok_or_else(no_workspace)?;
+        let (prompt, model, mode, entries) = {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if inner
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| session.active_request.is_some())
+            {
+                return Err(ProtocolErrorDto {
+                    code: "session_busy".into(),
+                    message: "A request is already running for this session — stop it first."
+                        .into(),
+                    retryable: false,
+                });
+            }
+            if !inner.sessions.contains_key(&session_id) {
+                let restored = self.load_session_from_disk(&session_id)?;
+                inner.sessions.insert(session_id.clone(), restored);
+            }
+            let session = inner.sessions.get_mut(&session_id).expect("inserted above");
+            let index = session
+                .messages
+                .iter()
+                .position(|message| message.message_id == message_id)
+                .ok_or_else(|| ProtocolErrorDto {
+                    code: "message_not_found".into(),
+                    message: "That message is not in this session.".into(),
+                    retryable: false,
+                })?;
+            if session.messages[index].role != MessageRole::User {
+                return Err(ProtocolErrorDto {
+                    code: "retry_requires_user_message".into(),
+                    message: "Only a user message can be retried.".into(),
+                    retryable: false,
+                });
+            }
+            let prompt = session.messages[index].text.clone();
+            let entries: Vec<TranscriptEntry> = session.messages[..index]
+                .iter()
+                .map(message_entry)
+                .collect();
+            session.messages.truncate(index);
+            session.durable_entries = index;
+            session.pending_approval = None;
+            session.pending_card = None;
+            session.pending_tool_name = None;
+            session.restored_park = false;
+            session.updated_at = selora_ai::now_millis();
+            let model = session.model.clone();
+            let mode = session.mode;
+            inner.active_session = Some(session_id.clone());
+            (prompt, model, mode, entries)
+        };
+        store
+            .rewrite_transcript(session_id.as_str(), &entries)
+            .map_err(|error| session_persistence_error(&error))?;
+        self.flush_session(&session_id);
+        self.send_agent(
+            log,
+            app,
+            Some(session_id.clone()),
+            request_id,
+            selora_protocol::AgentRequestDto {
+                session_id: session_id.clone(),
+                prompt,
+                model_id: model,
+                mode,
+                reasoning_effort: None,
+                system_instructions: None,
+                temperature: None,
+                editor_context: None,
+            },
+        )
     }
 
     // -----------------------------------------------------------------
@@ -957,16 +1562,20 @@ impl SessionEngine {
         session_id: &SessionId,
         assistant: Option<(MessageId, String)>,
     ) {
-        let mut inner = self.inner.lock().expect("engine lock");
-        inner.active.remove(request_id);
-        if let Some(session) = inner.sessions.get_mut(session_id) {
-            if session.active_request.as_ref() == Some(request_id) {
-                session.active_request = None;
-            }
-            if let Some((message_id, text)) = assistant {
-                push_message(session, message_id, MessageRole::Assistant, text, None);
+        {
+            let mut inner = self.inner.lock().expect("engine lock");
+            inner.active.remove(request_id);
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                if session.active_request.as_ref() == Some(request_id) {
+                    session.active_request = None;
+                }
+                if let Some((message_id, text)) = assistant {
+                    push_message(session, message_id, MessageRole::Assistant, text);
+                }
+                session.updated_at = selora_ai::now_millis();
             }
         }
+        self.flush_session(session_id);
     }
 
     /// The relay's terminal for an agent turn: same teardown, plus clearing
@@ -977,27 +1586,47 @@ impl SessionEngine {
         session_id: &SessionId,
         assistant: Option<(MessageId, String)>,
     ) {
-        let mut inner = self.inner.lock().expect("engine lock");
-        inner.active.remove(request_id);
-        if let Some(session) = inner.sessions.get_mut(session_id) {
-            if session.active_request.as_ref() == Some(request_id) {
-                session.active_request = None;
-            }
-            session.pending_approval = None;
-            if let Some((message_id, text)) = assistant {
-                push_message(session, message_id, MessageRole::Assistant, text, None);
+        {
+            let mut inner = self.inner.lock().expect("engine lock");
+            inner.active.remove(request_id);
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                if session.active_request.as_ref() == Some(request_id) {
+                    session.active_request = None;
+                }
+                session.pending_approval = None;
+                session.pending_card = None;
+                session.pending_tool_name = None;
+                session.restored_park = false;
+                if let Some((message_id, text)) = assistant {
+                    push_message(session, message_id, MessageRole::Assistant, text);
+                }
+                session.updated_at = selora_ai::now_millis();
             }
         }
+        self.flush_session(session_id);
     }
 
     /// Park the turn's approval card (the single-use slot). The relay calls
     /// this *before* emitting `ApprovalNeeded`, so a decision can never race
     /// the announcement.
-    fn set_pending_approval(&self, session_id: &SessionId, approval: ApprovalDto) {
-        let mut inner = self.inner.lock().expect("engine lock");
-        if let Some(session) = inner.sessions.get_mut(session_id) {
-            session.pending_approval = Some(approval);
+    fn set_pending_approval(
+        &self,
+        session_id: &SessionId,
+        approval: ApprovalDto,
+        card: ApprovalCard,
+        tool_name: String,
+    ) {
+        {
+            let mut inner = self.inner.lock().expect("engine lock");
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                session.pending_approval = Some(approval);
+                session.pending_card = Some(card);
+                session.pending_tool_name = Some(tool_name);
+                session.restored_park = false;
+                session.updated_at = selora_ai::now_millis();
+            }
         }
+        self.flush_session(session_id);
     }
 
     // -----------------------------------------------------------------
@@ -1412,6 +2041,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                 );
             }
             selora_ai::AgentEvent::ToolCallStarted(call) => {
+                engine.record_tool_calls(&session_id, vec![call.clone()]);
                 log.record_session(
                     &app,
                     FrontendEvent::ToolCallStarted(ToolCallStartedDto {
@@ -1428,6 +2058,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                 last_call = Some(call);
             }
             selora_ai::AgentEvent::ToolResult(result) => {
+                engine.record_tool_result(&session_id, &result);
                 log.record_session(
                     &app,
                     FrontendEvent::ToolResult(ToolResultDto {
@@ -1448,6 +2079,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                     .map(|call| call.name.clone())
                     .unwrap_or_else(|| fallback_tool_name(&card));
                 let (path_or_command, diff_or_input, workflow) = approval_body(&card);
+                let plan = approval_plan(&card);
                 // Park before announcing: the single-use slot exists before
                 // the frontend can possibly answer.
                 engine.set_pending_approval(
@@ -1459,8 +2091,11 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         turn_id: turn_id.clone(),
                         session_id: session_id.clone(),
                         summary: format!("{tool_name} {path_or_command}"),
-                        can_approve_all_this_turn: true,
+                        can_approve_all_this_turn: !matches!(&card, ApprovalCard::Plan { .. }),
+                        plan,
                     },
+                    card.clone(),
+                    tool_name.clone(),
                 );
                 log.record_session(
                     &app,
@@ -1474,6 +2109,56 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         path_or_command,
                         diff_or_input,
                         workflow,
+                        plan: approval_plan(&card),
+                    }),
+                    Some(request_id.clone()),
+                    session_id.clone(),
+                );
+            }
+            selora_ai::AgentEvent::PlanChanged { phase, plan } => {
+                engine.sync_plan_store(&session_id);
+                log.record_session(
+                    &app,
+                    FrontendEvent::PlanStateChanged(PlanStateDto {
+                        session_id: session_id.clone(),
+                        phase: plan_phase_dto(phase),
+                        plan: plan.as_ref().map(plan_approval_dto),
+                    }),
+                    Some(request_id.clone()),
+                    session_id.clone(),
+                );
+            }
+            selora_ai::AgentEvent::TodosChanged(todos) => {
+                engine.sync_plan_store(&session_id);
+                log.record_session(
+                    &app,
+                    FrontendEvent::TodosChanged(TodosDto {
+                        session_id: session_id.clone(),
+                        todos: todos.iter().map(todo_dto).collect(),
+                    }),
+                    Some(request_id.clone()),
+                    session_id.clone(),
+                );
+            }
+            selora_ai::AgentEvent::Compacted(cursor) => {
+                engine.record_compaction(&session_id, cursor);
+            }
+            selora_ai::AgentEvent::CompactionFailed(error) => {
+                let (message, partial_summary) = match &error {
+                    CompactionError::SummaryFailed {
+                        message,
+                        partial_summary,
+                    } => (message.clone(), partial_summary.clone()),
+                    other => (other.to_string(), None),
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::AgentCompactionFailed(AgentCompactionFailedDto {
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        message: redact(&message, &api_key),
+                        partial_summary: partial_summary.map(|summary| redact(&summary, &api_key)),
                     }),
                     Some(request_id.clone()),
                     session_id.clone(),
@@ -1651,13 +2336,14 @@ fn system_prompt(payload: &selora_protocol::AgentRequestDto, root: &Path) -> Str
         "You are Selora, an autonomous coding agent in Selora IDE.\n\
          Operating System: Windows. Shell: PowerShell.\n\
          Workspace Root: {}\n\
-         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, manage_todo.\n\
+         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
          Instructions:\n\
          1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
          2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
          3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
-         4. Break complex work into clear steps and maintain progress in your answer or with `manage_todo`.\n\
-         5. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}{}",
+         4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
+         5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
+         6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}{}",
         root.display(),
         approval_note,
         depth_instructions,
@@ -1704,26 +2390,14 @@ fn begin_turn<'a>(
     }
     inner.activity_counter += 1;
     let activity = inner.activity_counter;
+    let now = selora_ai::now_millis();
     let session = inner
         .sessions
         .entry(session_id.clone())
-        .or_insert_with(|| ChatSession {
-            // The auto-title: the first user message, first line, 32 chars
-            // (the egui panel's rule).
-            title: title_from(user_text),
-            messages: Vec::new(),
-            active_request: None,
-            pending_approval: None,
-            todos: Vec::new(),
-            last_activity: activity,
-        });
+        .or_insert_with(|| ChatSession::new(title_from(user_text), now));
     session.last_activity = activity;
     session.active_request = Some(request_id.clone());
-    // A session created by NewSession is still titled "New session" until its
-    // first user message; adopt the same auto-title rule then.
-    if session.messages.is_empty() && session.title == "New session" {
-        session.title = title_from(user_text);
-    }
+    session.updated_at = now;
     inner.active_session = Some(session_id.clone());
     let user_message_id = fresh_message_id();
     push_message(
@@ -1775,16 +2449,24 @@ fn push_message(
         role,
         text,
         retry,
+        tool_calls: None,
+        tool_call_id: None,
+        ok: true,
+        timestamp: selora_ai::now_millis(),
     });
     if session.messages.len() > MAX_SESSION_MESSAGES {
         let overflow = session.messages.len() - MAX_SESSION_MESSAGES;
         session.messages.drain(..overflow);
+        // The transcript keeps the full history; the in-memory tail is what
+        // the request needs. Never re-append a message that was already
+        // written.
+        session.durable_entries = session.durable_entries.saturating_sub(overflow);
     }
 }
 
-/// The trailing transcript as request messages: user/assistant text only
-/// (tool activity is live-event-only in Z3 — restoring cards is a later
-/// slice, the egui app's own open item).
+/// The trailing transcript as request messages. Tool-call/tool-result
+/// pairing is preserved for restored sessions (Z3's live-only behaviour
+/// would lose the model's own tool context on resume).
 fn conversation_tail(session: &ChatSession) -> Vec<ChatMessage> {
     session
         .messages
@@ -1792,10 +2474,20 @@ fn conversation_tail(session: &ChatSession) -> Vec<ChatMessage> {
         .rev()
         .take(REQUEST_HISTORY_MESSAGES)
         .rev()
-        .filter_map(|message| match message.role {
-            MessageRole::User => Some(ChatMessage::user(&message.text)),
-            MessageRole::Assistant => Some(ChatMessage::assistant(&message.text)),
-            MessageRole::Tool | MessageRole::System => None,
+        .map(|message| {
+            let mut chat = match message.role {
+                MessageRole::User => ChatMessage::user(&message.text),
+                MessageRole::Assistant => ChatMessage::assistant(&message.text),
+                MessageRole::Tool => ChatMessage::tool_result(
+                    message.tool_call_id.clone().unwrap_or_default(),
+                    &message.text,
+                ),
+                MessageRole::System => ChatMessage::system(&message.text),
+            };
+            if message.role == MessageRole::Assistant {
+                chat.tool_calls = message.tool_calls.clone();
+            }
+            chat
         })
         .collect()
 }
@@ -1807,6 +2499,145 @@ fn title_from(text: &str) -> String {
         .chars()
         .take(32)
         .collect()
+}
+
+/// Persisted mode: `Auto` is session trust, not a durable mode.
+fn persist_mode(mode: AgentModeDto) -> AgentModeDto {
+    match mode {
+        AgentModeDto::Auto => AgentModeDto::Execute,
+        other => other,
+    }
+}
+
+fn durable_mode(mode: AgentModeDto) -> AgentSessionMode {
+    match persist_mode(mode) {
+        AgentModeDto::Explore => AgentSessionMode::Explore,
+        _ => AgentSessionMode::Execute,
+    }
+}
+
+fn mode_from_disk(mode: AgentSessionMode) -> AgentModeDto {
+    match mode {
+        AgentSessionMode::Explore => AgentModeDto::Explore,
+        AgentSessionMode::Execute | AgentSessionMode::Plan => AgentModeDto::Execute,
+    }
+}
+
+/// One in-memory message as a durable transcript record.
+fn message_entry(message: &StoredMessage) -> TranscriptEntry {
+    let id = message.message_id.as_str().to_owned();
+    match message.role {
+        MessageRole::User => TranscriptEntry::User {
+            id,
+            timestamp: message.timestamp,
+            content: message.text.clone(),
+        },
+        MessageRole::Assistant | MessageRole::System => TranscriptEntry::Assistant {
+            id,
+            timestamp: message.timestamp,
+            content: message.text.clone(),
+            tool_calls: message.tool_calls.clone(),
+        },
+        MessageRole::Tool => TranscriptEntry::Tool {
+            id,
+            timestamp: message.timestamp,
+            call_id: message.tool_call_id.clone().unwrap_or_default(),
+            ok: message.ok,
+            content: message.text.clone(),
+        },
+    }
+}
+
+/// A restored transcript message in the in-memory shape.
+fn stored_message(message: &ChatMessage, timestamp: u64) -> StoredMessage {
+    StoredMessage {
+        message_id: fresh_message_id(),
+        role: match message.role {
+            selora_ai::Role::User => MessageRole::User,
+            selora_ai::Role::Assistant => MessageRole::Assistant,
+            selora_ai::Role::Tool => MessageRole::Tool,
+            selora_ai::Role::System => MessageRole::System,
+        },
+        text: message.content.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        ok: true,
+        timestamp,
+    }
+}
+
+/// The metadata half of a session write. The auto-approve flag is absent by
+/// construction.
+fn session_state(session_id: &SessionId, session: &ChatSession) -> AgentSessionState {
+    let parks = match (&session.pending_approval, &session.pending_card) {
+        (Some(approval), Some(card)) => vec![ParkedCard::Approval {
+            approval_id: approval.approval_id.as_str().to_owned(),
+            tool_name: session
+                .pending_tool_name
+                .clone()
+                .unwrap_or_else(|| fallback_tool_name(card)),
+            card: card.clone(),
+            request_id: Some(approval.request_id.as_str().to_owned()),
+            turn_id: Some(approval.turn_id.as_str().to_owned()),
+            created_at: selora_ai::now_millis(),
+        }],
+        _ => Vec::new(),
+    };
+    AgentSessionState {
+        schema: selora_ai::SESSION_SCHEMA,
+        session_id: session_id.as_str().to_owned(),
+        title: session.title.clone(),
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        model: session.model.clone(),
+        mode: durable_mode(session.mode),
+        plan: session.plan.clone(),
+        parks,
+        compaction: session.compaction,
+    }
+}
+
+/// Parse a durable plan body back into a draft. Phase 9b writes the draft
+/// as JSON; a record written by an earlier build holds free-form text and
+/// loads as a single step rather than being dropped.
+fn plan_draft_from_disk(raw: &str) -> Option<selora_ai::PlanDraft> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<selora_ai::PlanDraft>(raw) {
+        Ok(draft) if !draft.steps.is_empty() => Some(draft),
+        _ => Some(selora_ai::PlanDraft {
+            summary: None,
+            steps: vec![raw.to_owned()],
+        }),
+    }
+}
+
+/// The durable half of the live plan store: status, draft (as JSON, so the
+/// steps survive a round trip) and timestamp.
+fn plan_state_from_live(snapshot: &selora_ai::PlanSnapshot) -> selora_ai::PlanState {
+    let plan = snapshot
+        .plan
+        .as_ref()
+        .map(|draft| serde_json::to_string(draft).unwrap_or_else(|_| draft.steps.join("\n")));
+    let status = match (&snapshot.plan, snapshot.phase) {
+        (None, _) => selora_ai::PlanStatus::None,
+        (Some(_), selora_ai::PlanPhase::Planning) => selora_ai::PlanStatus::Proposed,
+        (Some(_), selora_ai::PlanPhase::Executing) => selora_ai::PlanStatus::Approved,
+    };
+    selora_ai::PlanState {
+        status,
+        plan,
+        updated_at: selora_ai::now_millis(),
+    }
+}
+
+fn session_persistence_error(error: &SeloraError) -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "session_persistence_failed".into(),
+        message: format!("Could not read or write the agent session: {error}"),
+        retryable: true,
+    }
 }
 
 fn fresh_turn_id() -> TurnId {
@@ -1830,43 +2661,13 @@ pub(crate) fn model_dto(model: &Model) -> ModelDto {
 }
 
 fn manifest_for(mode: AgentModeDto) -> Vec<ToolSpec> {
-    let mut manifest: Vec<ToolSpec> = match mode {
+    match mode {
         AgentModeDto::Execute | AgentModeDto::Auto => selora_ai::tool_manifest(),
         AgentModeDto::Explore => selora_ai::tool_manifest()
             .into_iter()
             .filter(|spec| EXPLORE_TOOLS.contains(&spec.name.as_str()))
             .collect(),
-    };
-    manifest.push(ToolSpec::new(
-        "manage_todo",
-        "Replace this session's authoritative todo list. Pass `todos` as a JSON array of \
-         objects: { id (unique, non-empty, ≤64 chars), text (non-empty, ≤500 chars), \
-         status ('pending' | 'in_progress' | 'completed') }. At most 50 items; an empty \
-         array clears the list. The result reports exactly what was stored.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "todos": {
-                    "type": "array",
-                    "maxItems": 50,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "text": { "type": "string" },
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"]
-                            }
-                        },
-                        "required": ["id", "text", "status"]
-                    }
-                }
-            },
-            "required": ["todos"]
-        }),
-    ));
-    manifest
+    }
 }
 
 fn map_state(state: &AgentTurnState) -> (AgentPhase, Option<String>) {
@@ -1904,6 +2705,51 @@ fn approval_body(card: &ApprovalCard) -> (String, Option<String>, Option<Workflo
                 max_cost_usd: *max_cost_usd,
             }),
         ),
+        ApprovalCard::Plan { summary, steps } => (
+            summary
+                .clone()
+                .unwrap_or_else(|| format!("plan with {} step(s)", steps.len())),
+            None,
+            None,
+        ),
+    }
+}
+
+/// The plan payload for the wire card (and the parked approval slot), when
+/// the card is a plan.
+fn approval_plan(card: &ApprovalCard) -> Option<PlanApprovalDto> {
+    match card {
+        ApprovalCard::Plan { summary, steps } => Some(PlanApprovalDto {
+            summary: summary.clone(),
+            steps: steps.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn plan_phase_dto(phase: selora_ai::PlanPhase) -> PlanPhaseDto {
+    match phase {
+        selora_ai::PlanPhase::Planning => PlanPhaseDto::Planning,
+        selora_ai::PlanPhase::Executing => PlanPhaseDto::Executing,
+    }
+}
+
+fn plan_approval_dto(plan: &selora_ai::PlanDraft) -> PlanApprovalDto {
+    PlanApprovalDto {
+        summary: plan.summary.clone(),
+        steps: plan.steps.clone(),
+    }
+}
+
+fn todo_dto(todo: &selora_ai::TodoItem) -> TodoDto {
+    TodoDto {
+        id: todo.id.clone(),
+        title: todo.title.clone(),
+        status: match todo.status {
+            selora_ai::TodoStatus::Pending => TodoStatusDto::Pending,
+            selora_ai::TodoStatus::InProgress => TodoStatusDto::InProgress,
+            selora_ai::TodoStatus::Completed => TodoStatusDto::Completed,
+        },
     }
 }
 
@@ -1913,6 +2759,32 @@ fn fallback_tool_name(card: &ApprovalCard) -> String {
         ApprovalCard::Delete { .. } => "delete_file".into(),
         ApprovalCard::Command { .. } => "bash".into(),
         ApprovalCard::Workflow { .. } => "run_workflow".into(),
+        ApprovalCard::Plan { .. } => "exit_plan_mode".into(),
+    }
+}
+
+/// Map the runtime's completion onto the wire DTO (one shape for every
+/// consumer; the frontend dedupes by `child_id`).
+fn subagent_completed_dto(completion: selora_ai::SubagentCompletion) -> SubagentCompletedDto {
+    SubagentCompletedDto {
+        child_id: completion.child_id,
+        parent_session_id: SessionId::new(completion.parent_session)
+            .expect("runtime parent sessions originate from a SessionId"),
+        policy: match completion.policy {
+            selora_ai::SubagentPolicy::ReadOnly => SubagentPolicyDto::ReadOnly,
+            selora_ai::SubagentPolicy::Full => SubagentPolicyDto::Full,
+        },
+        ok: completion.ok,
+        error: completion.error,
+        final_message: completion.final_message,
+        artifacts: completion
+            .artifacts
+            .into_iter()
+            .map(|artifact| SubagentArtifactDto {
+                kind: artifact.kind,
+                path: artifact.path,
+            })
+            .collect(),
     }
 }
 
@@ -1921,6 +2793,7 @@ fn map_decision(decision: DecisionDto) -> selora_ai::AgentDecision {
         DecisionDto::Approve => selora_ai::AgentDecision::Approve,
         DecisionDto::Deny => selora_ai::AgentDecision::Deny,
         DecisionDto::ApproveAllThisTurn => selora_ai::AgentDecision::ApproveAllThisTurn,
+        DecisionDto::Revise => selora_ai::AgentDecision::Revise,
         DecisionDto::Stop => selora_ai::AgentDecision::Stop,
     }
 }
@@ -2165,6 +3038,43 @@ mod tests {
         }
         body.push_str("data: [DONE]\n\n");
         body
+    }
+
+    /// One streaming round that calls tools: a content marker (the mock
+    /// gateway's body matcher), one fragment per call, then `tool_calls`.
+    fn tool_round_sse(calls: &[(&str, &str, &str)], marker: &str, cost: f64) -> String {
+        let mut chunks = vec![content_chunk(marker)];
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            chunks.push(fragment_chunk(index, id, name, arguments));
+        }
+        chunks.push(usage_chunk("tool_calls", 100, 50, cost));
+        sse(&chunks)
+    }
+
+    /// One streaming round that is the final answer.
+    fn answer_round_sse(text: &str, cost: f64) -> String {
+        sse(&[content_chunk(text), usage_chunk("stop", 100, 50, cost)])
+    }
+
+    /// Wait until a parked approval differs from `previous` (a decision
+    /// unparks the turn, which then parks again on the next card).
+    fn wait_for_new_approval(
+        state: &DesktopState,
+        previous: Option<&str>,
+    ) -> selora_protocol::ApprovalDto {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        loop {
+            if let Some(pending) = state.bootstrap().chat.pending_approval {
+                if previous != Some(pending.approval_id.as_str()) {
+                    return pending;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a new parked approval"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// A mock gateway: one SSE round per `(body marker, response)`, mounted
@@ -2818,6 +3728,225 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_mode_and_todos_ride_the_agent_stream_and_the_chat_snapshot() {
+        let app = mock_app_handle();
+        let root = temp_workspace("plan-hydrate");
+        let server = mock_gateway(
+            vec![
+                // Mounted most specific first: the next request is
+                // identified by the previous round's tool result / prompt.
+                (
+                    "Stored 2 todo(s)",
+                    answer_round_sse("Planning is ready.", 0.01),
+                ),
+                (
+                    "PLAN_HYDRATE_PROMPT",
+                    tool_round_sse(
+                        &[
+                            ("call_enter", "enter_plan_mode", "{}"),
+                            (
+                                "call_todo",
+                                "todo_write",
+                                r#"{"todos":[{"title":"Audit the router","status":"completed"},{"title":"Write the plan"}]}"#,
+                            ),
+                        ],
+                        "Reading the workspace first.",
+                        0.01,
+                    ),
+                ),
+            ],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_agent("plan-h1", "session-plan", "PLAN_HYDRATE_PROMPT"),
+                ),
+            )
+            .expect("send_agent accepted");
+
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+        // The live events are additive and carry the stored state.
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::PlanStateChanged(dto) if dto.phase == PlanPhaseDto::Planning
+        )));
+        let todos = find_payload(&events, |payload| match payload {
+            FrontendEvent::TodosChanged(dto) => Some(dto.todos.clone()),
+            _ => None,
+        });
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].title, "Audit the router");
+        assert_eq!(todos[0].status, TodoStatusDto::Completed);
+
+        // Hydration: the bootstrap snapshot is the source of truth after a
+        // reload — the session carries the phase and the same stored list.
+        let chat = state.bootstrap().chat;
+        let session = chat.sessions.first().expect("the session exists");
+        assert_eq!(session.plan_phase, PlanPhaseDto::Planning);
+        assert_eq!(session.todos.len(), 2);
+        assert_eq!(session.todos[1].title, "Write the plan");
+        assert_eq!(session.todos[1].status, TodoStatusDto::Pending);
+        assert!(session.plan.is_none(), "no plan was approved yet");
+        // The tool results are real: entering plan mode and storing todos
+        // succeeded, and the write tools were never called.
+        let final_state = state.bootstrap().chat;
+        assert!(final_state.pending_approval.is_none());
+
+        tauri::async_runtime::block_on(async {
+            server.verify().await;
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_card_revise_keeps_planning_then_approval_flips_and_writes_still_card() {
+        let app = mock_app_handle();
+        let root = temp_workspace("plan-revise-approve");
+        let plan_args = r#"{"summary":"Make the file","plan":["Inspect","Write","Verify"]}"#;
+        let server = mock_gateway(
+            vec![
+                ("wrote 8 bytes", answer_round_sse("Done.", 0.01)),
+                (
+                    "plan approved",
+                    tool_round_sse(
+                        &[(
+                            "call_write",
+                            "write_file",
+                            r#"{"path":"made.txt","content":"approved"}"#,
+                        )],
+                        "Executing the approved plan.",
+                        0.01,
+                    ),
+                ),
+                (
+                    "asked to revise the plan",
+                    tool_round_sse(
+                        &[("call_exit_2", "exit_plan_mode", plan_args)],
+                        "Revising the plan.",
+                        0.01,
+                    ),
+                ),
+                (
+                    "PLAN_FLOW_PROMPT",
+                    tool_round_sse(
+                        &[
+                            ("call_enter", "enter_plan_mode", "{}"),
+                            ("call_exit", "exit_plan_mode", plan_args),
+                        ],
+                        "Planning first.",
+                        0.01,
+                    ),
+                ),
+            ],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_agent("plan-a", "session-approve", "PLAN_FLOW_PROMPT"),
+                ),
+            )
+            .expect("send_agent accepted");
+
+        // First card: the plan, with its steps on the parked approval slot
+        // (so a reload can rebuild the same card).
+        let first = wait_for_new_approval(&state, None);
+        assert_eq!(first.summary, "exit_plan_mode Make the file");
+        let plan = first.plan.expect("the parked card carries the plan");
+        assert_eq!(plan.steps, ["Inspect", "Write", "Verify"]);
+        assert!(!first.can_approve_all_this_turn);
+
+        // Revise: the turn continues in plan mode and proposes again.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", first.approval_id.as_str(), DecisionDto::Revise),
+                ),
+            )
+            .expect("revise resolves the card");
+        let second = wait_for_new_approval(&state, Some(first.approval_id.as_str()));
+        assert_eq!(
+            plan_phase(&state, "session-approve"),
+            PlanPhaseDto::Planning
+        );
+
+        // Approve: execution, with the approved plan stored and its steps
+        // seeded as todos.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", second.approval_id.as_str(), DecisionDto::Approve),
+                ),
+            )
+            .expect("approve resolves the plan");
+        let third = wait_for_new_approval(&state, Some(second.approval_id.as_str()));
+        assert_eq!(third.summary, "write_file made.txt");
+        let session = state
+            .bootstrap()
+            .chat
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id.as_str() == "session-approve")
+            .expect("session");
+        assert_eq!(session.plan_phase, PlanPhaseDto::Executing);
+        assert_eq!(session.plan.expect("approved plan").steps.len(), 3);
+        assert_eq!(session.todos.len(), 3);
+        // The plan approval never wrote the file; its own card is the save.
+        assert!(!root.join("made.txt").exists());
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", third.approval_id.as_str(), DecisionDto::Approve),
+                ),
+            )
+            .expect("approve the write");
+
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("made.txt")).expect("written file"),
+            "approved"
+        );
+
+        tauri::async_runtime::block_on(async {
+            server.verify().await;
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn plan_phase(state: &DesktopState, session_id: &str) -> PlanPhaseDto {
+        state
+            .bootstrap()
+            .chat
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id.as_str() == session_id)
+            .expect("session")
+            .plan_phase
     }
 
     #[test]
@@ -3642,13 +4771,14 @@ mod tests {
             "You are Selora, an autonomous coding agent in Selora IDE.\n\
              Operating System: Windows. Shell: PowerShell.\n\
              Workspace Root: {}\n\
-             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, manage_todo.\n\
+             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
              Instructions:\n\
              1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
              2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
              3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
-             4. Break complex work into clear steps and maintain progress in your answer or with `manage_todo`.\n\
-             5. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}",
+             4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
+             5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
+             6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}",
             "C:/repo",
             "Writes, deletes, and non-allowlisted commands pause for the user's approval card; explain what you are doing while the card is pending.",
             "\nReasoning depth: Standard. Balanced reasoning with clear explanations and thorough verification.",
@@ -3685,5 +4815,450 @@ mod tests {
             prompt.contains("Active file (workspace-relative): apps/selora-desktop/src/main.rs")
         );
         assert!(prompt.contains("do not claim to have read a file you have not read in this turn"));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 9d — durable sessions, resume, retry, session trust
+    // ------------------------------------------------------------------
+
+    fn seed_session_store(root: &Path, session: &str) {
+        let store = selora_ai::AgentSessionStore::new(root);
+        let mut state = store
+            .create(
+                session,
+                "Persisted session",
+                Some("test-model"),
+                selora_ai::AgentSessionMode::Execute,
+            )
+            .expect("create session");
+        store
+            .append(
+                session,
+                &selora_ai::TranscriptEntry::User {
+                    id: "m1".into(),
+                    timestamp: 1,
+                    content: "first prompt".into(),
+                },
+            )
+            .expect("append user");
+        store
+            .append(
+                session,
+                &selora_ai::TranscriptEntry::Assistant {
+                    id: "m2".into(),
+                    timestamp: 2,
+                    content: "first answer".into(),
+                    tool_calls: None,
+                },
+            )
+            .expect("append assistant");
+        store
+            .append(
+                session,
+                &selora_ai::TranscriptEntry::User {
+                    id: "m3".into(),
+                    timestamp: 3,
+                    content: "second prompt".into(),
+                },
+            )
+            .expect("append user");
+        store
+            .append(
+                session,
+                &selora_ai::TranscriptEntry::Assistant {
+                    id: "m4".into(),
+                    timestamp: 4,
+                    content: "second answer old".into(),
+                    tool_calls: None,
+                },
+            )
+            .expect("append old second answer");
+        state.plan = selora_ai::PlanState {
+            status: selora_ai::PlanStatus::Proposed,
+            plan: Some("keep the plan".into()),
+            updated_at: 4,
+        };
+        state.parks = vec![selora_ai::ParkedCard::Approval {
+            approval_id: Uuid::nil().to_string(),
+            tool_name: "bash".into(),
+            card: ApprovalCard::Command {
+                command: "cargo test".into(),
+            },
+            request_id: Some("req-park".into()),
+            turn_id: Some("turn-park".into()),
+            created_at: 5,
+        }];
+        store.save_state(&state).expect("save state");
+        store
+            .save_todos(
+                session,
+                &[selora_ai::TodoItem {
+                    id: "t1".into(),
+                    title: "restore me".into(),
+                    status: selora_ai::TodoStatus::InProgress,
+                }],
+            )
+            .expect("save todos");
+    }
+
+    #[test]
+    fn switch_restores_a_session_and_its_park_expires_once() {
+        let root = temp_workspace("resume");
+        seed_session_store(&root, "sess-restore");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        let listed = state.sessions().agent_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Persisted session");
+        assert_eq!(listed[0].message_count, 4);
+        assert_eq!(listed[0].mode, "execute");
+        assert_eq!(listed[0].pending.as_ref().expect("park").kind, "approval");
+
+        // A fresh process has not restored anything yet.
+        let before = state.bootstrap().chat;
+        assert!(before.sessions.is_empty());
+        assert!(before.messages.is_empty());
+
+        state
+            .sessions()
+            .switch_session(&SessionId::new("sess-restore").expect("id"))
+            .expect("switch restores");
+        let chat = state.bootstrap().chat;
+        assert_eq!(chat.sessions.len(), 1);
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages[0].text, "first prompt");
+        assert_eq!(chat.messages[1].text, "first answer");
+        assert_eq!(chat.messages[2].text, "second prompt");
+        assert_eq!(chat.messages[3].text, "second answer old");
+        let park = chat.pending_approval.expect("the parked card is restored");
+        assert_eq!(park.request_id.as_str(), "req-park");
+
+        // A restored park is actionable exactly once and never executes.
+        let error = state
+            .sessions()
+            .agent_decision(
+                &RequestId::new("req-park").expect("id"),
+                &ApprovalId::new(Uuid::nil().to_string()).expect("id"),
+                DecisionDto::Approve,
+                None,
+            )
+            .expect_err("a restored park expires");
+        assert_eq!(error.code, "park_expired");
+        assert!(state.bootstrap().chat.pending_approval.is_none());
+        let error = state
+            .sessions()
+            .agent_decision(
+                &RequestId::new("req-park").expect("id"),
+                &ApprovalId::new(Uuid::nil().to_string()).expect("id"),
+                DecisionDto::Approve,
+                None,
+            )
+            .expect_err("the second decision has no card");
+        assert_eq!(error.code, "approval_not_pending");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn switch_restores_the_plan_phase_draft_and_todos() {
+        let root = temp_workspace("resume-plan");
+        seed_session_store(&root, "sess-plan");
+        let store = selora_ai::AgentSessionStore::new(&root);
+        let mut record = store
+            .load("sess-plan")
+            .expect("load")
+            .expect("the seeded session exists")
+            .state;
+        record.plan = selora_ai::PlanState {
+            status: selora_ai::PlanStatus::Proposed,
+            plan: Some(
+                serde_json::to_string(&selora_ai::PlanDraft {
+                    summary: Some("ship it".into()),
+                    steps: vec!["Read the router".into(), "Write the plan".into()],
+                })
+                .expect("draft json"),
+            ),
+            updated_at: 7,
+        };
+        store.save_state(&record).expect("save state");
+        store
+            .save_todos(
+                "sess-plan",
+                &[selora_ai::TodoItem {
+                    id: "t1".into(),
+                    title: "Read the router".into(),
+                    status: selora_ai::TodoStatus::Completed,
+                }],
+            )
+            .expect("save todos");
+
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = state.sessions();
+        engine.set_workspace_root(Some(root.clone()));
+        let session_id = SessionId::new("sess-plan").expect("id");
+        engine.switch_session(&session_id).expect("switch restores");
+
+        let chat = state.bootstrap().chat;
+        let session = chat.sessions.first().expect("the session exists");
+        assert_eq!(session.plan_phase, PlanPhaseDto::Planning);
+        assert_eq!(session.todos.len(), 1);
+        assert_eq!(session.todos[0].title, "Read the router");
+        assert_eq!(session.todos[0].status, TodoStatusDto::Completed);
+        let plan = session.plan.as_ref().expect("the draft hydrates");
+        assert_eq!(plan.steps, vec!["Read the router", "Write the plan"]);
+        assert_eq!(plan.summary.as_deref(), Some("ship it"));
+
+        // The router's structural gate sees the restored phase.
+        let planning = {
+            let inner = engine.inner.lock().expect("engine lock");
+            selora_ai::plan::is_planning(
+                &inner.sessions.get(&session_id).expect("session").plan_store,
+            )
+        };
+        assert!(planning, "a proposed plan reopens as planning");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_auto_approve_is_off_by_default_and_resets_on_switch_and_new() {
+        let root = temp_workspace("auto-scope");
+        seed_session_store(&root, "sess-a");
+        seed_session_store(&root, "sess-b");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let engine = state.sessions();
+        engine.set_workspace_root(Some(root.clone()));
+
+        let a = SessionId::new("sess-a").expect("id");
+        let b = SessionId::new("sess-b").expect("id");
+        engine.switch_session(&a).expect("switch a");
+        let flag = |session: &SessionId| {
+            engine
+                .inner
+                .lock()
+                .expect("engine")
+                .sessions
+                .get(session)
+                .expect("session")
+                .auto_approve
+        };
+        assert!(!flag(&a), "off by default");
+        engine.set_auto_approve(&a, true).expect("arm a");
+        assert!(flag(&a));
+
+        // Switching cannot inherit the flag, and it clears the source too.
+        engine.switch_session(&b).expect("switch b");
+        assert!(!flag(&a), "the source session is disarmed");
+        assert!(!flag(&b), "the target never inherits trust");
+
+        engine.set_auto_approve(&b, true).expect("arm b");
+        engine.new_session().expect("new session");
+        assert!(!flag(&b), "a new session resets trust");
+
+        // Restart: the flag has no on-disk representation, so a fresh engine
+        // restores the session with trust off.
+        let restarted = DesktopState::with_settings(selora_settings::Settings::default());
+        restarted.sessions().set_workspace_root(Some(root.clone()));
+        restarted
+            .sessions()
+            .switch_session(&a)
+            .expect("restore after restart");
+        assert!(
+            !restarted
+                .sessions()
+                .inner
+                .lock()
+                .expect("engine")
+                .sessions
+                .get(&a)
+                .expect("session")
+                .auto_approve
+        );
+        let name = ".selora/agent-sessions/sess-a/state.json";
+        let text = std::fs::read_to_string(root.join(name)).expect("state file");
+        assert!(!text.contains("auto_approve"), "{name} persisted trust");
+        assert!(
+            !text.contains("sk-gw-desktop-test-key"),
+            "{name} leaked the key"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_rewinds_the_durable_transcript_and_resends() {
+        let app = mock_app_handle();
+        let root = temp_workspace("retry");
+        seed_session_store(&root, "sess-retry");
+        let server = mock_gateway(
+            vec![(
+                "second prompt",
+                sse(&[
+                    content_chunk("second answer"),
+                    usage_chunk("stop", 10, 5, 0.001),
+                ]),
+            )],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+        let session = SessionId::new("sess-retry").expect("id");
+        state
+            .sessions()
+            .switch_session(&session)
+            .expect("restore before retry");
+
+        let chat = state.bootstrap().chat;
+        let retry_target = chat
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User && message.text == "second prompt")
+            .expect("the second user message")
+            .message_id
+            .clone();
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::RetryMessage {
+                        session_id: session.clone(),
+                        message_id: retry_target,
+                    },
+                ),
+            )
+            .expect("retry accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+
+        let store = selora_ai::AgentSessionStore::new(&root);
+        let transcript = store.load_transcript("sess-retry").expect("transcript");
+        let user_texts: Vec<&str> = transcript
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                selora_ai::TranscriptEntry::User { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["first prompt", "second prompt"],
+            "the abandoned branch is dropped and the retried message re-sent"
+        );
+        assert!(
+            transcript.entries.iter().any(|entry| matches!(
+                entry,
+                selora_ai::TranscriptEntry::Assistant { content, .. }
+                    if content == "first answer"
+            )),
+            "history before the retried message is kept"
+        );
+        assert!(
+            !transcript.entries.iter().any(|entry| matches!(
+                entry,
+                selora_ai::TranscriptEntry::Assistant { content, .. }
+                    if content == "second answer old"
+            )),
+            "the abandoned branch is gone from the durable transcript"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_state_on_disk_never_contains_the_api_key() {
+        let root = temp_workspace("no-key");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state.sessions().set_workspace_root(Some(root.clone()));
+        let session = state.sessions().new_session().expect("new session");
+        // The engine writes the state through its redacting store; even a
+        // title that echoed the key must not survive.
+        let engine = state.sessions();
+        {
+            let mut inner = engine.inner.lock().expect("engine");
+            if let Some(open) = inner.sessions.get_mut(&session) {
+                open.title = "sk-gw-desktop-test-key".into();
+            }
+        }
+        engine.record_compaction(
+            &session,
+            selora_ai::CompactionCursor {
+                compacted_at: 1,
+                ..Default::default()
+            },
+        );
+        let dir = root.join(".selora/agent-sessions").join(session.as_str());
+        let state_json = std::fs::read_to_string(dir.join("state.json")).expect("state");
+        assert!(!state_json.contains("sk-gw-desktop-test-key"));
+        assert!(state_json.contains("[REDACTED]"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn phase_9e_background_completion_emits_one_typed_event() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let app = mock_app_handle();
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            active_model: None,
+            agent: selora_settings::AgentSettings::default(),
+            key_source: ApiKeySource::Fixed(None),
+        }));
+
+        let spawn = tauri::async_runtime::block_on(async {
+            engine.spawn_background_subagent(
+                Arc::clone(&log),
+                app,
+                selora_ai::SpawnRequest::new(
+                    "session-1",
+                    "child-desktop-1",
+                    selora_ai::SubagentPolicy::ReadOnly,
+                    "review",
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    selora_ai::ChildOutcome::success("review complete")
+                },
+            )
+        });
+        spawn.expect("spawn");
+
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let events = loop {
+            let events = log.events_after(0);
+            if events
+                .iter()
+                .any(|event| matches!(event.payload, FrontendEvent::SubagentCompleted(_)))
+                || Instant::now() >= deadline
+            {
+                break events;
+            }
+            tauri::async_runtime::block_on(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            });
+        };
+
+        let completions: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                FrontendEvent::SubagentCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 1, "one event, never a duplicate");
+        let completion = &completions[0];
+        assert_eq!(completion.child_id, "child-desktop-1");
+        assert_eq!(
+            completion.parent_session_id,
+            SessionId::new("session-1").unwrap()
+        );
+        assert!(completion.ok);
+        assert_eq!(completion.final_message, "review complete");
     }
 }

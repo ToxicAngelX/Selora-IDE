@@ -13,6 +13,11 @@ const bridgeMocks = vi.hoisted(() => {
     sendChat: vi.fn((..._args: unknown[]) => ({ requestId: nextRequestId('req-chat'), promise: Promise.resolve() })),
     stopChat: vi.fn((..._args: unknown[]) => Promise.resolve()),
     agentDecision: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    switchSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    newSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    retryMessage: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    listAgentSessions: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    setAgentAutoApprove: vi.fn((..._args: unknown[]) => Promise.resolve()),
     runWorkflow: vi.fn((..._args: unknown[]) => ({
       requestId: nextRequestId('req-workflow'),
       promise: Promise.resolve(),
@@ -1235,5 +1240,173 @@ describe('agentStore', () => {
     expect(toAgentMode('full')).toBe('auto');
     expect(toAgentMode('ask_before_change')).toBe('execute');
     expect(toAgentMode('plan_only')).toBe('explore');
+  });
+
+  it('hydrates plan state and todos from the session snapshot', () => {
+    const bootstrap = makeAgentBootstrap('sess-plan');
+    bootstrap.chat.sessions = [
+      {
+        session_id: 'sess-plan',
+        title: 'Plan',
+        message_ids: [],
+        active: false,
+        plan_phase: 'planning',
+        plan: { summary: 'Make the change', steps: ['Inspect', 'Write'] },
+        todos: [
+          { id: 'todo-1', title: 'Inspect', status: 'completed' },
+          { id: 'todo-2', title: 'Write', status: 'in_progress' },
+        ],
+      },
+    ];
+    agentStore.hydrate(bootstrap);
+
+    const state = agentStore.getSnapshot();
+    expect(state.planPhase).toBe('planning');
+    expect(state.plan?.steps).toEqual(['Inspect', 'Write']);
+    expect(state.todos).toEqual([
+      { id: 'todo-1', title: 'Inspect', status: 'completed' },
+      { id: 'todo-2', title: 'Write', status: 'in_progress' },
+    ]);
+  });
+
+  it('applies live plan and todo events without inventing state', () => {
+    agentStore.hydrate(makeAgentBootstrap('sess-live'));
+    agentStore.handlePlanStateChanged({
+      session_id: 'sess-live',
+      phase: 'planning',
+      plan: undefined,
+    });
+    expect(agentStore.getSnapshot().planPhase).toBe('planning');
+    // An empty/malformed plan payload never becomes a card.
+    expect(agentStore.getSnapshot().plan).toBeNull();
+
+    agentStore.handleTodosChanged({
+      session_id: 'sess-live',
+      todos: [{ id: 'todo-1', title: 'Audit', status: 'pending' }],
+    });
+    expect(agentStore.getSnapshot().todos).toEqual([
+      { id: 'todo-1', title: 'Audit', status: 'pending' },
+    ]);
+
+    // A payload for another session is ignored.
+    agentStore.handleTodosChanged({
+      session_id: 'sess-other',
+      todos: [],
+    });
+    expect(agentStore.getSnapshot().todos).toHaveLength(1);
+
+    agentStore.handlePlanStateChanged({
+      session_id: 'sess-live',
+      phase: 'executing',
+      plan: { summary: 'Approved', steps: ['Audit'] },
+    });
+    expect(agentStore.getSnapshot().planPhase).toBe('executing');
+    expect(agentStore.getSnapshot().plan?.steps).toEqual(['Audit']);
+  });
+
+  it('renders a plan card and routes Approve/Revise through agentDecision', async () => {
+    bridgeMocks.agentDecision.mockClear();
+    agentStore.hydrate(makeAgentBootstrap('sess-plan-card'));
+    agentStore.sendUserMessage('plan the change');
+    const requestId = latestAgentRequestId();
+    const plan = { summary: 'Make the change', steps: ['Inspect', 'Write'] };
+    agentStore.handleApprovalNeeded({
+      request_id: requestId,
+      session_id: 'sess-plan-card',
+      turn_id: 'turn-plan',
+      approval_id: 'appr-plan',
+      tool_name: 'exit_plan_mode',
+      path_or_command: 'Make the change',
+      plan,
+    });
+
+    const card = agentStore.getSnapshot().messages.flatMap((message) => message.toolCalls ?? [])
+      .find((call) => call.approvalId === 'appr-plan') as WorkflowToolCall | undefined;
+    expect(card?.plan).toEqual(plan);
+    expect(card?.diff).toBeUndefined();
+
+    agentStore.handleApprovalDecision('appr-plan', 'revise');
+    expect(bridgeMocks.agentDecision).toHaveBeenLastCalledWith(
+      requestId,
+      'appr-plan',
+      'revise',
+      expect.anything(),
+    );
+    const decided = agentStore.getSnapshot().messages
+      .flatMap((message) => message.toolCalls ?? [])
+      .find((call) => call.approvalId === 'appr-plan');
+    expect(decided?.status).toBe('denied');
+    expect(decided?.resultSummary).toContain('Revision requested');
+  });
+});
+
+describe('Phase 9e background subagent completions', () => {
+  it('handles a completion once and never claims a failed child as success', () => {
+    resetAndHydrate('sess-subagent');
+    const ok = agentStore.handleSubagentCompleted({
+      child_id: 'child-ok-1',
+      parent_session_id: 'sess-subagent',
+      policy: 'read_only',
+      ok: true,
+      final_message: 'review complete',
+      artifacts: [{ kind: 'diff', path: 'src/lib.rs' }],
+    });
+    expect(ok).toBe(true);
+    expect(
+      agentStore.handleSubagentCompleted({
+        child_id: 'child-ok-1',
+        parent_session_id: 'sess-subagent',
+        policy: 'read_only',
+        ok: true,
+        final_message: 'review complete',
+      }),
+    ).toBe(false);
+
+    agentStore.handleSubagentCompleted({
+      child_id: 'child-failed-1',
+      parent_session_id: 'sess-subagent',
+      policy: 'read_only',
+      ok: false,
+      error: 'gateway said no',
+      final_message: '',
+    });
+
+    const snapshot = agentStore.getSnapshot();
+    expect(snapshot.subagents.filter((subagent) => subagent.id === 'child-ok-1')).toHaveLength(1);
+    const done = snapshot.subagents.find((subagent) => subagent.id === 'child-ok-1');
+    expect(done?.status).toBe('done');
+    expect(done?.result).toBe('review complete');
+    expect(done?.artifacts?.[0]?.path).toBe('src/lib.rs');
+    const failed = snapshot.subagents.find((subagent) => subagent.id === 'child-failed-1');
+    expect(failed?.status).toBe('failed');
+    expect(failed?.error).toBe('gateway said no');
+    expect(failed?.result).toBe('');
+    expect(snapshot.unreadSubagentCount).toBe(2);
+  });
+
+  it('reveals the child result under its parent session and clears the badge', () => {
+    resetAndHydrate('sess-parent');
+    for (const subagent of agentStore.getSnapshot().subagents) {
+      agentStore.markSubagentRead(subagent.id);
+    }
+    const parent = agentStore.getSnapshot().activeSessionId;
+    agentStore.createSession('Other');
+    agentStore.handleSubagentCompleted({
+      child_id: 'child-reveal-1',
+      parent_session_id: parent,
+      policy: 'full',
+      ok: true,
+      final_message: 'found it',
+    });
+    expect(agentStore.getSnapshot().activeSessionId).not.toBe(parent);
+
+    agentStore.revealSubagent(parent, 'child-reveal-1');
+
+    const snapshot = agentStore.getSnapshot();
+    expect(snapshot.activeSessionId).toBe(parent);
+    expect(snapshot.revealedSubagentId).toBe('child-reveal-1');
+    const child = snapshot.subagents.find((subagent) => subagent.id === 'child-reveal-1');
+    expect(child?.unread).toBe(false);
+    expect(snapshot.unreadSubagentCount).toBe(0);
   });
 });

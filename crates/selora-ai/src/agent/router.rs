@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 use crate::chat_types::{ToolCall, ToolResult, ToolSpec};
 
 use super::tools::{bash, fs, web};
-use super::ApprovalCard;
+use super::{plan, ApprovalCard};
 
 /// What the router produced for one tool call: a finished result, or a
 /// card the user must approve before execution proceeds.
@@ -147,15 +147,23 @@ pub struct ToolContext {
     pub settings: AgentToolSettings,
     /// The Stop button's kill switch for bash children (§17.3).
     pub abort: bash::BashAbortHandle,
-    /// The session's authoritative todo list (`manage_todo`). `None` means
-    /// no session store is attached; the tool then answers a typed error
-    /// instead of pretending it stored anything.
-    todo_sink: Option<std::sync::Arc<dyn super::todo::TodoSink>>,
+    /// Phase 9b: the session's plan/todo state. Shared with the desktop
+    /// session record, so turns survive and the chat snapshot hydrates it.
+    pub plan: plan::PlanStore,
+    /// Phase 9e: the session-owned background subagent runtime, when the
+    /// host has one. `wait` is a model-visible error without it (never a
+    /// silent no-op).
+    pub subagents: Option<crate::agent::subagent::SubagentRuntime>,
+    /// Phase 9e: the parent session `wait` scopes to. Required with
+    /// `subagents`.
+    pub parent_session: Option<String>,
 }
 
 impl ToolContext {
     /// Build a context: `root` is canonicalized (falling back to the path
-    /// as given when it does not exist — the tools will report that).
+    /// as given when it does not exist — the tools will report that). The
+    /// plan store starts in execution mode; `with_plan` attaches a real
+    /// session.
     pub fn new(root: impl Into<PathBuf>, settings: AgentToolSettings) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -163,20 +171,28 @@ impl ToolContext {
             root,
             settings,
             abort: bash::BashAbortHandle::default(),
-            todo_sink: None,
+            plan: plan::new_store(),
+            subagents: None,
+            parent_session: None,
         }
     }
 
-    /// Attach the session's todo store (Phase 9 session slice). The desktop
-    /// engine binds one per session; workflow subagents and unit tests leave
-    /// it unset.
-    pub fn with_todo_sink(mut self, sink: std::sync::Arc<dyn super::todo::TodoSink>) -> Self {
-        self.todo_sink = Some(sink);
+    /// Attach a session's shared plan/todo store (Phase 9b).
+    pub fn with_plan(mut self, plan: plan::PlanStore) -> Self {
+        self.plan = plan;
         self
     }
 
-    pub(crate) fn todo_sink(&self) -> Option<&std::sync::Arc<dyn super::todo::TodoSink>> {
-        self.todo_sink.as_ref()
+    /// Attach the session's background subagent runtime for the `wait`
+    /// tool. The runtime must outlive this turn (the session owns it).
+    pub fn with_subagents(
+        mut self,
+        runtime: crate::agent::subagent::SubagentRuntime,
+        parent_session: impl Into<String>,
+    ) -> Self {
+        self.subagents = Some(runtime);
+        self.parent_session = Some(parent_session.into());
+        self
     }
 }
 
@@ -348,6 +364,77 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
                 "required": ["name", "script", "commands"],
             }),
         ),
+        // -- Phase 9b / manifest v3: plan mode + real todos ----------------
+        ToolSpec::new(
+            "enter_plan_mode",
+            "Switch this session to plan mode before a non-trivial change. While \
+             planning, every write, delete, bash command, and workflow is \
+             structurally refused with a `plan mode is active` error; read, web, \
+             and todo tools still work. Explore, then propose the plan with \
+             `exit_plan_mode`.",
+            json_schema([], []),
+        ),
+        ToolSpec::new(
+            "exit_plan_mode",
+            "Propose a plan and ask the user to approve it. `plan` is the ordered \
+             step list (1-32 single-line steps); `summary` is optional context. \
+             The user sees an approval card with Approve and Revise. Approving \
+             flips the session to execution — writes still need their own diff \
+             cards. Denying or revising keeps the session in plan mode; revise \
+             the plan and call this tool again.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered plan steps (1-32 single-line strings)."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional one-paragraph summary of the plan (≤2000 bytes)."
+                    }
+                },
+                "required": ["plan"],
+            }),
+        ),
+        ToolSpec::new(
+            "todo_read",
+            "Read the session's stored todo list. Todos persist across turns and \
+             hydrate from the session snapshot.",
+            json_schema([], []),
+        ),
+        ToolSpec::new(
+            "todo_write",
+            "Replace the session's todo list with a validated list (≤64 items). \
+             Each item is { title, status? } with status one of `pending`, \
+             `in_progress`, `completed` (default `pending`). Returns the stored \
+             list; nothing is reported unless it was stored. Use this to keep \
+             live progress while executing.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["title"]
+                        },
+                        "description": "The complete replacement list (empty clears it)."
+                    }
+                },
+                "required": ["todos"],
+            }),
+        ),
+        // -- Phase 9e: background subagent completion wait ------------------
+        crate::agent::subagent::wait_tool_spec(),
     ]
 }
 
@@ -390,6 +477,13 @@ pub async fn execute_tool(ctx: &ToolContext, call: ToolCall) -> ToolOutcome {
 }
 
 async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String> {
+    // Phase 9b's structural gate. It sits before dispatch, so a planning
+    // session cannot reach a write/delete/bash/workflow implementation at
+    // all — allowlisted commands and pre-approvals included. Reads, web and
+    // todo tools are not side-effecting and still run.
+    if plan::is_planning(&ctx.plan) && plan::is_side_effecting_tool(&call.name) {
+        return Err(plan::plan_mode_rejection(&call.name));
+    }
     let args = parse_arguments(&call.name, &call.arguments)?;
 
     match call.name.as_str() {
@@ -515,39 +609,111 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
                 max_cost_usd: plan.max_cost_usd,
             }))
         }
-        "manage_todo" => {
-            let raw = args
-                .get("todos")
-                .ok_or_else(|| "`todos` is required".to_string())?;
-            let todos = super::todo::parse_todos(raw)
-                .map_err(|error| format!("manage_todo rejected the list: {error}"))?;
-            let Some(sink) = ctx.todo_sink() else {
-                return Ok(ToolOutcome::Ready(ToolResult::error(
-                    &call.id,
-                    "manage_todo has no session todo store attached; nothing was stored",
-                )));
+        "manage_todo" | "todo_write" => {
+            let todos = if call.name == "manage_todo" {
+                // The pre-9b alias. It shares storage semantics with
+                // todo_write; a JSON-string payload is accepted because the
+                // old schema declared `todos` as a string.
+                match args.get("todos") {
+                    Some(Value::String(raw)) => {
+                        let parsed: Value = serde_json::from_str(raw).map_err(|e| {
+                            format!(
+                                "`manage_todo` is an alias for `todo_write`: pass `todos` as an \
+                                 array of {{ title, status? }} objects (the string was not JSON: {e})"
+                            )
+                        })?;
+                        plan::parse_todo_value(&parsed)?
+                    }
+                    Some(value) => plan::parse_todo_value(value)?,
+                    None => {
+                        return Err(
+                            "`manage_todo` is an alias for `todo_write`: it requires `todos`"
+                                .to_owned(),
+                        )
+                    }
+                }
+            } else {
+                plan::parse_todos(&args)?
             };
-            if let Err(error) = sink.store(todos) {
-                return Ok(ToolOutcome::Ready(ToolResult::error(
-                    &call.id,
-                    format!("manage_todo could not store the list: {error}"),
-                )));
+            // Store first; the success body is rendered from the stored
+            // list, never from the model's argument text.
+            let mut session = plan::lock(&ctx.plan);
+            session.todos = todos;
+            let rendered = plan::render_todos(&session.todos);
+            let count = session.todos.len();
+            drop(session);
+            Ok(ToolOutcome::Ready(ToolResult::success(
+                &call.id,
+                format!("Stored {count} todo(s) for this session.\n{rendered}"),
+            )))
+        }
+        "todo_read" => {
+            let snapshot = plan::snapshot(&ctx.plan);
+            let phase = match snapshot.phase {
+                plan::PlanPhase::Planning => "planning",
+                plan::PlanPhase::Executing => "executing",
+            };
+            Ok(ToolOutcome::Ready(ToolResult::success(
+                &call.id,
+                format!(
+                    "Plan phase: {phase}.\n{}",
+                    plan::render_todos(&snapshot.todos)
+                ),
+            )))
+        }
+
+        // -- Phase 9b: plan mode. Entering is local session state (no
+        // side effect outside the session); leaving is a plan card ---------
+        "enter_plan_mode" => {
+            let mut session = plan::lock(&ctx.plan);
+            if session.phase != plan::PlanPhase::Planning {
+                session.phase = plan::PlanPhase::Planning;
+                session.plan = None;
             }
-            // Report the store's contents, not the model's input: a sink may
-            // normalize, and a failed load must not read as success.
-            match sink.load() {
-                Ok(stored) => Ok(ToolOutcome::Ready(ToolResult::success(
-                    &call.id,
-                    super::todo::stored_result(&stored),
-                ))),
-                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
-                    &call.id,
-                    format!("manage_todo stored the list but could not read it back: {error}"),
-                ))),
+            let todo_count = session.todos.len();
+            drop(session);
+            Ok(ToolOutcome::Ready(ToolResult::success(
+                &call.id,
+                format!(
+                    "Plan mode entered: writes, deletes, bash commands, and workflows are \
+                     blocked until the plan is approved. Reads and todo tools still work. \
+                     {todo_count} stored todo(s) were kept. Explore first, then call \
+                     exit_plan_mode with the ordered steps."
+                ),
+            )))
+        }
+        "exit_plan_mode" => {
+            if !plan::is_planning(&ctx.plan) {
+                return Err(
+                    "`exit_plan_mode` requires an active plan: call `enter_plan_mode` first"
+                        .to_owned(),
+                );
             }
+            let draft = plan::parse_plan(&args)?;
+            Ok(ToolOutcome::NeedsApproval(ApprovalCard::Plan {
+                summary: draft.summary,
+                steps: draft.steps,
+            }))
         }
 
         // -- §17.1: the manifest is closed --------------------------------
+        // -- Phase 9e: wait for background subagents (never spins) ----------
+        "wait" => match (&ctx.subagents, &ctx.parent_session) {
+            (Some(runtime), Some(parent)) => Ok(ToolOutcome::Ready(
+                crate::agent::subagent::wait_tool_result(
+                    runtime,
+                    parent,
+                    &call.id,
+                    &call.arguments,
+                )
+                .await,
+            )),
+            _ => Ok(ToolOutcome::Ready(ToolResult::error(
+                &call.id,
+                "wait: no subagent runtime is attached to this turn",
+            ))),
+        },
+
         unknown => Err(format!(
             "unknown tool `{unknown}` — the tool manifest (§17.1) is fixed"
         )),
@@ -574,6 +740,12 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
 /// else is an error result (read tools already ran, and a card was never
 /// built for them).
 pub async fn execute_approved(ctx: &ToolContext, call: ToolCall) -> ToolResult {
+    // Phase 9b: a stale or pre-plan approval cannot bypass plan mode. The
+    // gate runs before argument parsing for the same structural reason as
+    // `route`.
+    if plan::is_planning(&ctx.plan) && plan::is_side_effecting_tool(&call.name) {
+        return ToolResult::error(&call.id, plan::plan_mode_rejection(&call.name));
+    }
     let args = match parse_arguments(&call.name, &call.arguments) {
         Ok(args) => args,
         Err(message) => return ToolResult::error(&call.id, message),
@@ -631,6 +803,26 @@ pub async fn execute_approved(ctx: &ToolContext, call: ToolCall) -> ToolResult {
             Ok(plan) => workflow_confirmed_result(&call.id, &plan),
             Err(message) => ToolResult::error(&call.id, message),
         },
+        // Phase 9b: the only path that leaves plan mode. It runs after the
+        // user's Approve on the plan card; the re-validation means a stale
+        // card cannot smuggle a changed step list through.
+        "exit_plan_mode" => match plan::parse_plan(&args) {
+            Ok(draft) => {
+                let mut session = plan::lock(&ctx.plan);
+                if session.phase != plan::PlanPhase::Planning {
+                    return ToolResult::error(
+                        &call.id,
+                        "the plan is no longer active: the session already left plan mode",
+                    );
+                }
+                session.phase = plan::PlanPhase::Executing;
+                session.plan = Some(draft.clone());
+                plan::seed_todos_from_plan(&mut session, &draft);
+                drop(session);
+                plan_approved_result(&call.id, &draft)
+            }
+            Err(message) => ToolResult::error(&call.id, message),
+        },
         other => ToolResult::error(
             &call.id,
             format!("`{other}` is not a side-effecting tool — nothing to approve"),
@@ -665,6 +857,36 @@ pub fn workflow_confirmed_result(id: impl Into<String>, plan: &WorkflowPlan) -> 
 /// Deny and continues the loop.
 pub fn denied_result(call: &ToolCall) -> ToolResult {
     ToolResult::error(&call.id, "user denied this action")
+}
+
+/// The tool result for an approved plan card (Phase 9b). The session is
+/// now executing, but approval of the *plan* is not approval of any write:
+/// every write/delete/bash still builds its own card.
+pub fn plan_approved_result(id: impl Into<String>, plan: &plan::PlanDraft) -> ToolResult {
+    let summary = plan
+        .summary
+        .as_deref()
+        .map(|summary| format!(" ({summary})"))
+        .unwrap_or_default();
+    ToolResult::success(
+        id,
+        format!(
+            "plan approved{summary}: {} step(s). The session is now in execution mode. \
+             Write, delete, and bash tools are available again but each side effect still \
+             needs its own approval card. Keep the todo list current as you work.",
+            plan.steps.len()
+        ),
+    )
+}
+
+/// The tool result after the user chooses Revise on a plan card (Phase 9b).
+/// The session stays in plan mode; the model must propose a new plan.
+pub fn revise_plan_result(call: &ToolCall) -> ToolResult {
+    ToolResult::error(
+        &call.id,
+        "user asked to revise the plan: the session is still in plan mode. Adjust the \
+         steps and call exit_plan_mode again with the revised plan. No files were changed.",
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -856,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_section_17_1s_ten_tools_plus_manifest_v2s_run_workflow() {
+    fn manifest_is_section_17_1s_ten_tools_plus_manifest_v2_and_9e_wait() {
         let manifest = tool_manifest();
         let names: Vec<&str> = manifest.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -875,8 +1097,15 @@ mod tests {
                 // §18.4: manifest v2 is additive — the ten §17.1 tools and
                 // exactly one new entry.
                 "run_workflow",
+                // Phase 9b: manifest v3 adds plan mode and real todos.
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "todo_read",
+                "todo_write",
+                // Phase 9e: the background completion wait.
+                "wait",
             ],
-            "§17.1's closed set plus §18.4's additive run_workflow"
+            "§17.1's closed set plus manifest v2/v3's additive tools"
         );
         for spec in &manifest {
             assert!(
@@ -1365,6 +1594,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_tool_requires_a_runtime_and_returns_the_child_result() {
+        let root = temp_root("route-wait");
+        let missing = execute_tool(&ctx(&root), call("wait", "{}")).await;
+        match missing {
+            ToolOutcome::Ready(result) => {
+                assert!(!result.ok);
+                assert!(
+                    result.content.contains("no subagent runtime"),
+                    "{}",
+                    result.content
+                );
+            }
+            other => panic!("wait without a runtime must be a model-visible error, got {other:?}"),
+        }
+
+        let runtime = crate::agent::subagent::SubagentRuntime::new();
+        runtime
+            .register(crate::agent::subagent::SpawnRequest::new(
+                "session-1",
+                "child-1",
+                crate::agent::subagent::SubagentPolicy::ReadOnly,
+                "review",
+            ))
+            .expect("register");
+        runtime.complete(
+            "child-1",
+            crate::agent::subagent::ChildOutcome::success("finished"),
+        );
+        let parent = ToolContext::new(&root, AgentToolSettings::default())
+            .with_subagents(runtime, "session-1");
+        match execute_tool(&parent, call("wait", r#"{"child_ids":["child-1"]}"#)).await {
+            ToolOutcome::Ready(result) => {
+                assert!(result.ok, "{}", result.content);
+                let body: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                assert_eq!(body["status"], "completed");
+                assert_eq!(body["children"][0]["final_message"], "finished");
+            }
+            other => panic!("wait must resolve through the runtime, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_tool_is_a_model_visible_error() {
         let root = temp_root("route-unknown");
         let outcome = execute_tool(&ctx(&root), call("rm_rf_everything", "{}")).await;
@@ -1528,98 +1799,303 @@ mod tests {
         assert!(fs::resolve_rooted(&ctx.root, ".").is_ok());
     }
 
-    /// The session todo store, held in a mutex so the router test can inspect
-    /// exactly what the tool wrote.
-    #[derive(Default)]
-    struct MemoryTodos(std::sync::Mutex<Vec<super::super::todo::TodoItem>>);
+    // -----------------------------------------------------------------
+    // Phase 9b — plan mode, live todos, manifest v3
+    // -----------------------------------------------------------------
 
-    impl super::super::todo::TodoSink for MemoryTodos {
-        fn load(&self) -> Result<Vec<super::super::todo::TodoItem>, String> {
-            Ok(self.0.lock().expect("todo lock").clone())
-        }
-        fn store(&self, todos: Vec<super::super::todo::TodoItem>) -> Result<(), String> {
-            *self.0.lock().expect("todo lock") = todos;
-            Ok(())
+    /// A context whose session shares `plan` with the test.
+    fn ctx_with_plan(root: &Path, plan: &plan::PlanStore) -> ToolContext {
+        ToolContext::new(root, AgentToolSettings::default()).with_plan(plan.clone())
+    }
+
+    async fn enter_plan(ctx: &ToolContext) {
+        match execute_tool(ctx, call("enter_plan_mode", "{}")).await {
+            ToolOutcome::Ready(result) => assert!(result.ok, "{}", result.content),
+            other => panic!("enter_plan_mode must run without a card, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn manage_todo_stores_the_validated_list_and_reports_it() {
-        let root = temp_root("todo-store");
-        let store = std::sync::Arc::new(MemoryTodos::default());
-        let ctx =
-            ToolContext::new(&root, AgentToolSettings::default()).with_todo_sink(store.clone());
-        let result = execute_tool(
-            &ctx,
-            call(
-                "manage_todo",
-                r#"{"todos":[
-                    {"id":"t1","text":"read the router","status":"completed"},
-                    {"id":"t2","text":"store the todos","status":"in_progress"}
-                ]}"#,
-            ),
-        )
-        .await;
-        let ToolOutcome::Ready(result) = result else {
-            panic!("manage_todo is a read-type tool");
-        };
-        assert!(result.ok, "{}", result.content);
-        assert!(result.content.contains("Stored 2 todo(s):"));
-        assert!(result
-            .content
-            .contains("[in_progress] store the todos (id: t2)"));
-        let stored = store.0.lock().expect("todo lock").clone();
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].id, "t1");
-        assert_eq!(stored[1].status, super::super::todo::TodoStatus::InProgress);
-    }
+    async fn plan_mode_rejects_every_side_effect_before_disk_but_reads_work() {
+        let root = temp_root("plan-gate");
+        touch(&root, "f.txt", "alpha\n");
+        touch(&root, "src/main.rs", "fn main() {}\n");
+        let store = plan::new_store();
+        let ctx = ctx_with_plan(&root, &store);
+        enter_plan(&ctx).await;
+        assert_eq!(plan::snapshot(&store).phase, plan::PlanPhase::Planning);
 
-    #[tokio::test]
-    async fn manage_todo_rejects_malformed_input_without_storing() {
-        let root = temp_root("todo-reject");
-        let store = std::sync::Arc::new(MemoryTodos::default());
-        let ctx =
-            ToolContext::new(&root, AgentToolSettings::default()).with_todo_sink(store.clone());
-        for arguments in [
-            r#"{}"#,
-            r#"{"todos":"not json"}"#,
-            r#"{"todos":[{"id":"t1","text":"x","status":"doing"}]}"#,
-            r#"{"todos":[{"id":"t1","text":"x","status":"pending"},{"id":"t1","text":"y","status":"pending"}]}"#,
+        // Reads and todo tools still run while planning.
+        for (name, args) in [
+            ("read_file", r#"{"path":"f.txt"}"#),
+            ("list_dir", r#"{"path":"."}"#),
+            ("fuzzy_find", r#"{"query":"main"}"#),
+            ("search_files", r#"{"query":"fn main"}"#),
         ] {
-            let ToolOutcome::Ready(result) =
-                execute_tool(&ctx, call("manage_todo", arguments)).await
-            else {
-                panic!("a malformed list is an error result");
-            };
-            assert!(!result.ok, "accepted {arguments}");
-            assert!(
-                result.content.contains("manage_todo") || result.content.contains("todos"),
-                "{}",
-                result.content
-            );
+            match execute_tool(&ctx, call(name, args)).await {
+                ToolOutcome::Ready(result) => assert!(result.ok, "{name}: {}", result.content),
+                other => panic!("{name} must stay usable while planning, got {other:?}"),
+            }
         }
-        assert!(
-            store.0.lock().expect("todo lock").is_empty(),
-            "a rejected write stores nothing"
+        match execute_tool(&ctx, call("todo_write", r#"{"todos":[{"title":"Audit"}]}"#)).await {
+            ToolOutcome::Ready(result) => assert!(result.ok, "{}", result.content),
+            other => panic!("todo_write must work while planning, got {other:?}"),
+        }
+
+        // Every side-effecting tool is structurally refused — no card, no
+        // disk write, no bash child. This includes allowlisted bash.
+        let allowlisted = ToolContext::new(
+            &root,
+            AgentToolSettings {
+                auto_approve_commands: vec!["Write-Output".to_owned()],
+                ..AgentToolSettings::default()
+            },
+        )
+        .with_plan(store.clone());
+        for (name, args) in [
+            ("write_file", r#"{"path":"new.txt","content":"x"}"#),
+            (
+                "edit_file",
+                r#"{"path":"f.txt","old_str":"alpha","new_str":"beta"}"#,
+            ),
+            ("delete_file", r#"{"path":"f.txt"}"#),
+            ("bash", r#"{"command":"Write-Output side-effect"}"#),
+            ("bash", r#"{"command":"Remove-Item -Recurse ."}"#),
+            (
+                "run_workflow",
+                r#"{"name":"w","script":"log('x');","commands":[]}"#,
+            ),
+        ] {
+            let outcome = if name == "bash" {
+                execute_tool(&allowlisted, call(name, args)).await
+            } else {
+                execute_tool(&ctx, call(name, args)).await
+            };
+            match outcome {
+                ToolOutcome::Ready(result) => {
+                    assert!(!result.ok, "{name} must be refused: {}", result.content);
+                    assert!(
+                        result.content.contains("approve the plan first"),
+                        "{name}: {}",
+                        result.content
+                    );
+                }
+                other => panic!("{name} must not build a card during planning, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "alpha\n",
+            "no planning write/delete may reach disk"
+        );
+        assert!(!root.join("new.txt").exists());
+
+        // The approved path re-checks the gate: a pre-plan approval cannot
+        // execute a write while the session is still planning.
+        let stale = call("write_file", r#"{"path":"new.txt","content":"x"}"#);
+        let result = execute_approved(&ctx, stale).await;
+        assert!(!result.ok);
+        assert!(result.content.contains("approve the plan first"));
+        assert!(!root.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_cards_then_approval_flips_and_writes_card_again() {
+        let root = temp_root("plan-approve");
+        let store = plan::new_store();
+        let ctx = ctx_with_plan(&root, &store);
+        enter_plan(&ctx).await;
+
+        let exit = call(
+            "exit_plan_mode",
+            r#"{"summary":"Add the file","plan":["Read the tree","Write new.txt","Verify"]}"#,
+        );
+        match execute_tool(&ctx, exit.clone()).await {
+            ToolOutcome::NeedsApproval(ApprovalCard::Plan { summary, steps }) => {
+                assert_eq!(summary.as_deref(), Some("Add the file"));
+                assert_eq!(steps.len(), 3);
+            }
+            other => panic!("exit_plan_mode must build a plan card, got {other:?}"),
+        }
+        assert_eq!(
+            plan::snapshot(&store).phase,
+            plan::PlanPhase::Planning,
+            "a card is not an approval — the session stays planning"
+        );
+
+        // Approve: the session flips, the approved plan is stored, and its
+        // steps seed the (empty) todo list.
+        let approved = execute_approved(&ctx, exit).await;
+        assert!(approved.ok, "{}", approved.content);
+        assert!(approved.content.contains("execution mode"));
+        assert!(approved
+            .content
+            .contains("still needs its own approval card"));
+        let snapshot = plan::snapshot(&store);
+        assert_eq!(snapshot.phase, plan::PlanPhase::Executing);
+        assert_eq!(snapshot.plan.as_ref().unwrap().steps.len(), 3);
+        assert_eq!(snapshot.todos.len(), 3);
+
+        // A write after approval still cards (no new trust primitive) and
+        // then executes only through the approved path.
+        let write = call("write_file", r#"{"path":"new.txt","content":"ok\n"}"#);
+        match execute_tool(&ctx, write.clone()).await {
+            ToolOutcome::NeedsApproval(ApprovalCard::Diff { path, .. }) => {
+                assert_eq!(path, "new.txt")
+            }
+            other => panic!("an approved plan must not skip the diff card, got {other:?}"),
+        }
+        assert!(!root.join("new.txt").exists());
+        let result = execute_approved(&ctx, write).await;
+        assert!(result.ok, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "ok\n"
         );
     }
 
     #[tokio::test]
-    async fn manage_todo_without_a_session_store_errors() {
-        let root = temp_root("todo-no-store");
-        let ctx = ctx(&root);
-        let ToolOutcome::Ready(result) = execute_tool(
-            &ctx,
-            call(
-                "manage_todo",
-                r#"{"todos":[{"id":"t1","text":"x","status":"pending"}]}"#,
-            ),
-        )
-        .await
-        else {
-            panic!("no store is an error result");
+    async fn deny_or_revise_keeps_planning_and_nothing_runs() {
+        let root = temp_root("plan-revise");
+        let store = plan::new_store();
+        let ctx = ctx_with_plan(&root, &store);
+        enter_plan(&ctx).await;
+        let exit = call("exit_plan_mode", r#"{"plan":["One step"]}"#);
+
+        // Deny is handled by the loop as a normal denial; the router never
+        // flips the phase, so a following write stays blocked.
+        assert!(matches!(
+            execute_tool(&ctx, exit.clone()).await,
+            ToolOutcome::NeedsApproval(ApprovalCard::Plan { .. })
+        ));
+        let write = call("write_file", r#"{"path":"x.txt","content":"x"}"#);
+        let result = execute_tool(&ctx, write.clone()).await;
+        match result {
+            ToolOutcome::Ready(result) => assert!(!result.ok),
+            ToolOutcome::NeedsApproval(_) => panic!("planning must never card a write"),
+        }
+        assert!(!root.join("x.txt").exists());
+
+        // The revise result is model-visible and keeps the session planning.
+        let revised = revise_plan_result(&exit);
+        assert!(!revised.ok);
+        assert!(revised.content.contains("still in plan mode"));
+        assert_eq!(plan::snapshot(&store).phase, plan::PlanPhase::Planning);
+        assert!(!root.join("x.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn todos_round_trip_through_session_state_and_alias_uses_real_storage() {
+        let root = temp_root("todo-store");
+        let store = plan::new_store();
+        let ctx = ctx_with_plan(&root, &store);
+
+        // No fabrication: an empty session reports an empty list.
+        match execute_tool(&ctx, call("todo_read", "{}")).await {
+            ToolOutcome::Ready(result) => {
+                assert!(result.ok);
+                assert!(result.content.contains("No todos"), "{}", result.content);
+            }
+            other => panic!("todo_read must be a ready read, got {other:?}"),
+        }
+
+        let written = r#"{"todos":[{"title":"Read","status":"completed"},{"title":"Write","status":"in_progress"}]}"#;
+        match execute_tool(&ctx, call("todo_write", written)).await {
+            ToolOutcome::Ready(result) => {
+                assert!(result.ok);
+                assert!(result.content.contains("Stored 2 todo(s)"));
+                assert!(result.content.contains("[in_progress] Write"));
+            }
+            other => panic!("todo_write must be a ready write, got {other:?}"),
+        }
+        // The store is the source of truth (not the success text).
+        assert_eq!(plan::snapshot(&store).todos.len(), 2);
+
+        // todo_read returns the stored list after a *different* call —
+        // session-scoped, not turn-scoped.
+        match execute_tool(&ctx, call("todo_read", "{}")).await {
+            ToolOutcome::Ready(result) => {
+                assert!(result.content.contains("Read"), "{}", result.content);
+                assert!(result.content.contains("Write"), "{}", result.content);
+            }
+            other => panic!("todo_read must return the stored list, got {other:?}"),
+        }
+
+        // The legacy alias writes the same store; a JSON string is accepted
+        // because the old schema declared `todos` as a string.
+        let alias = serde_json::json!({
+            "todos": serde_json::json!([{ "title": "Alias step" }]).to_string()
+        });
+        match execute_tool(&ctx, call("manage_todo", &alias.to_string())).await {
+            ToolOutcome::Ready(result) => assert!(result.ok, "{}", result.content),
+            other => panic!("manage_todo is an alias, got {other:?}"),
+        }
+        let snapshot = plan::snapshot(&store);
+        assert_eq!(snapshot.todos.len(), 1);
+        assert_eq!(snapshot.todos[0].title, "Alias step");
+
+        // An empty array clears the stored list; success is still backed
+        // by storage.
+        match execute_tool(&ctx, call("todo_write", r#"{"todos":[]}"#)).await {
+            ToolOutcome::Ready(result) => assert!(result.ok),
+            other => panic!("clearing is a ready write, got {other:?}"),
+        }
+        assert!(plan::snapshot(&store).todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_and_todo_malformed_arguments_are_model_visible_errors() {
+        let root = temp_root("plan-args");
+        let store = plan::new_store();
+        let ctx = ctx_with_plan(&root, &store);
+        let cases = [
+            ("exit_plan_mode", "{}"),
+            ("exit_plan_mode", r#"{"plan":[]}"#),
+            ("exit_plan_mode", r#"{"plan":"not an array"}"#),
+            ("exit_plan_mode", r#"{"plan":[7]}"#),
+            // A valid plan outside plan mode is still refused: the tool
+            // cannot fabricate plan mode.
+            ("exit_plan_mode", r#"{"plan":["valid step"]}"#),
+            ("todo_write", "{}"),
+            ("todo_write", r#"{"todos":[{"title":""}]}"#),
+            ("todo_write", r#"{"todos":[{"title":"x","status":"done"}]}"#),
+            ("manage_todo", r#"{"todos":"not json"}"#),
+            ("manage_todo", "{}"),
+        ];
+        for (name, args) in cases {
+            match execute_tool(&ctx, call(name, args)).await {
+                ToolOutcome::Ready(result) => {
+                    assert!(!result.ok, "{name} `{args}` must error");
+                    assert_eq!(result.id, "call_1");
+                }
+                ToolOutcome::NeedsApproval(card) => {
+                    panic!("{name} `{args}` must not card, got {card:?}")
+                }
+            }
+        }
+        // Failed writes never mutate the session.
+        assert!(plan::snapshot(&store).todos.is_empty());
+        assert!(plan::snapshot(&store).plan.is_none());
+        assert_eq!(plan::snapshot(&store).phase, plan::PlanPhase::Executing);
+    }
+
+    #[test]
+    fn plan_card_serializes_for_parked_session_persistence() {
+        let card = ApprovalCard::Plan {
+            summary: Some("Do the thing".into()),
+            steps: vec!["First".into(), "Second".into()],
         };
-        assert!(!result.ok);
-        assert!(result.content.contains("no session todo store"));
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "Plan": {
+                    "summary": "Do the thing",
+                    "steps": ["First", "Second"],
+                }
+            })
+        );
+        let back: ApprovalCard = serde_json::from_value(json).unwrap();
+        assert_eq!(back, card);
     }
 }

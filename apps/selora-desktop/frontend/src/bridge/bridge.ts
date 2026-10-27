@@ -25,6 +25,8 @@ export type Approval = {
   can_approve_all_this_turn: boolean;
   /** Phase 9a additive: a parked question / plan survives a bootstrap replay. */
   decision_prompt?: AgentDecisionPrompt;
+  /** Phase 9b: present only when the parked card is a plan. */
+  plan?: PlanApproval | null;
 };
 export type Diagnostic = { path: string; line: number; column: number; severity: 'error' | 'warning' | 'info' | 'hint'; message: string };
 
@@ -114,23 +116,22 @@ export type EditorContextDto = {
 export type Model = { id: string; display_name: string; available: boolean };
 export type SearchQuery = { query: string; case_sensitive: boolean; whole_word: boolean; use_regex: boolean };
 export type SearchHit = { path: string; line: number; column: number; preview: string };
-export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean; todos?: TodoDto[] };
-export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
-/**
- * The authoritative `manage_todo` list (session-scoped). The backend sends
- * `text`; `title` is the Phase 9a spelling older payloads and local plans
- * carry, and `assigned_subagent` is additive.
- */
-export type TodoDto = {
-  id: string;
-  text?: string;
-  title?: string;
-  status: 'pending' | 'in_progress' | 'completed';
-  session_id?: Id;
-  assigned_subagent?: string;
+export type SessionDto = {
+  session_id: Id;
+  title: string;
+  message_ids: Id[];
+  active: boolean;
+  plan_phase?: PlanPhase;
+  plan?: PlanApproval;
+  todos?: TodoItem[];
 };
-/** Phase 9a alias for the same authoritative todo row. */
-export type ChatTodoDto = TodoDto;
+export type ChatSession = SessionDto;
+export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
+/** Phase 9b: the session's plan phase. `executing` is the pre-9b default. */
+export type PlanPhase = 'planning' | 'executing';
+export type PlanApproval = { summary?: string | null; steps: string[] };
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+export type TodoItem = { id: string; title: string; status: TodoStatus };
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
@@ -183,6 +184,21 @@ export type BootstrapState = {
   lsp_servers: LspServerState[];
   feature_flags: { agent: boolean; git: boolean; search: boolean; editor: boolean; later_slices: string[] };
   workflows?: WorkflowPersistedRun[];
+  /** Phase 9d: durable sessions for the resume picker (newest first). */
+  agent_sessions?: AgentSessionSummary[];
+};
+
+/** One durable agent session in the resume picker (`.selora/agent-sessions`). */
+export type AgentSessionSummary = {
+  session_id: Id;
+  title: string;
+  updated_at: number;
+  model?: string;
+  /** `execute` | `explore` | `plan`; `auto` is never persisted. */
+  mode: string;
+  pending?: { kind: string; summary: string };
+  compacted: boolean;
+  message_count: number;
 };
 
 export type WorkflowPersistedRun = {
@@ -218,7 +234,7 @@ export type ApiKeyStatus = {
   active_model_id: string | null;
 };
 
-export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'stop';
+export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'revise' | 'stop';
 export type AgentMode = 'execute' | 'explore' | 'auto';
 export type AgentPhase = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
 
@@ -310,6 +326,22 @@ export type ApprovalNeededPayload = {
   workflow?: WorkflowApproval;
   /** Phase 9a: structured question / plan review on the same park channel. */
   prompt?: AgentDecisionPrompt;
+  /**
+   * Phase 9b: the `exit_plan_mode` card — the ordered steps and optional
+   * summary. Present only on a plan card.
+   */
+  plan?: PlanApproval;
+};
+
+export type PlanStateChangedPayload = {
+  session_id: Id;
+  phase: PlanPhase;
+  plan?: PlanApproval | null;
+};
+
+export type TodosChangedPayload = {
+  session_id: Id;
+  todos: TodoItem[];
 };
 
 export type AgentStateChangedPayload = {
@@ -331,6 +363,35 @@ export type AgentTurnDonePayload = {
   denied: number;
   completed: boolean;
   end_message: string;
+};
+
+/** Phase 9d: the summarize round failed; the turn also ends with a typed
+ *  `CompactionFailed`. `partial_summary` is the text streamed before failure. */
+export type AgentCompactionFailedPayload = {
+  request_id: Id;
+  session_id: Id;
+  turn_id: Id;
+  message: string;
+  partial_summary?: string;
+};
+
+/**
+ * Phase 9e: one background child's accepted terminal result. `child_id` is
+ * the dedupe key; a cancelled child never produces this event. A failed
+ * child is `ok: false` with `error`, never a success.
+ */
+export type SubagentPolicy = 'read_only' | 'full';
+
+export type SubagentArtifact = { kind: string; path: string };
+
+export type SubagentCompletedPayload = {
+  child_id: string;
+  parent_session_id: Id;
+  policy: SubagentPolicy;
+  ok: boolean;
+  error?: string | null;
+  final_message: string;
+  artifacts?: SubagentArtifact[];
 };
 
 export type ChatCompletedPayload = {
@@ -462,6 +523,8 @@ export type FrontendCommand =
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
   | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
+  | { type: 'list_agent_sessions' }
+  | { type: 'set_agent_auto_approve'; payload: { session_id: Id; enabled: boolean } }
   | { type: 'open_folder_at'; payload: { root: string } }
   | { type: 'close_folder' }
   | { type: 'refresh_tree' }
@@ -518,6 +581,8 @@ export type FrontendEvent =
   | { type: 'approval_needed'; payload: ApprovalNeededPayload }
   | { type: 'agent_state_changed'; payload: AgentStateChangedPayload }
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
+  | { type: 'agent_compaction_failed'; payload: AgentCompactionFailedPayload }
+  | { type: 'subagent_completed'; payload: SubagentCompletedPayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'lsp_server_state_changed'; payload: LspServerState }
@@ -550,7 +615,8 @@ export type FrontendEvent =
   | { type: 'workflow_artifact'; payload: WorkflowArtifactPayload }
   | { type: 'workflow_approval_needed'; payload: WorkflowApprovalNeededPayload }
   | { type: 'workflow_finished'; payload: WorkflowFinishedPayload }
-  | { type: 'session_todos_changed'; payload: { session_id: Id; todos: TodoDto[] } }
+  | { type: 'plan_state_changed'; payload: PlanStateChangedPayload }
+  | { type: 'todos_changed'; payload: TodosChangedPayload }
   | { type: 'toast'; payload: { severity: ToastSeverity; message: string } }
   | { type: 'error'; payload: ProtocolError };
 
@@ -882,6 +948,22 @@ export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unkn
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);
 
+/** Phase 9d: refresh the resume picker (the bootstrap carries the list). */
+export const listAgentSessions = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'list_agent_sessions' }, ctx);
+
+/** Phase 9d: session full access. Never persisted; resets on switch/new. */
+export const setAgentAutoApprove = (
+  sessionId: Id,
+  enabled: boolean,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'set_agent_auto_approve', payload: { session_id: sessionId, enabled } },
+    ctx,
+  );
+
+/** Phase 9d: rewind a session before `messageId` and send that message again. */
 export const retryMessage = (
   sessionId: Id,
   messageId: Id,

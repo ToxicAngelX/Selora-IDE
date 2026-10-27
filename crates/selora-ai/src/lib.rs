@@ -22,12 +22,22 @@ mod types;
 mod updates;
 
 pub use agent::{
-    denied_result, execute_approved, execute_tool, parse_todos, run_agent_turn, spawn_agent_turn,
-    stored_result, tool_manifest, AgentDecision, AgentEvent, AgentSummary, AgentToolSettings,
-    AgentTurn, AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle,
-    ChatStream, ClientChatStream, RouterToolRunner, TodoItem, TodoSink, TodoStatus, ToolContext,
-    ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE, MAX_TODOS,
-    MAX_TODO_ID_CHARS, MAX_TODO_TEXT_CHARS,
+    bound_summary, compact_conversation, compacted_conversation, denied_result, execute_approved,
+    execute_tool, new_store, now_millis, plan, plan_approved_result, revise_plan_result,
+    run_agent_turn, should_compact, spawn_agent_turn, summary_request, tool_manifest,
+    transcript_conversation, wait_tool_result, wait_tool_spec, AgentDecision, AgentEvent,
+    AgentSessionMode, AgentSessionState, AgentSessionStore, AgentSessionSummary, AgentSummary,
+    AgentToolSettings, AgentTurn, AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId,
+    ArtifactRef, BashAbortHandle, CancelToken, ChatStream, ChildId, ChildOutcome, ChildState,
+    ClientChatStream, CompactionConfig, CompactionCursor, CompactionError, CompactionOutcome,
+    CompletionDisposition, LoadedAgentSession, ParkSummary, ParkedCard, PlanDraft, PlanPhase,
+    PlanSession, PlanSnapshot, PlanState, PlanStatus, PlanStore, RouterToolRunner, SpawnError,
+    SpawnRequest, SubagentCompletion, SubagentEvent, SubagentHandle, SubagentPolicy,
+    SubagentRuntime, TodoItem, TodoStatus, ToolContext, ToolOutcome, ToolRunner, TranscriptEntry,
+    TranscriptLoad, TurnCaps, TurnDecision, TurnEnd, TurnInput, WaitError, WaitOutcome,
+    AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD, DEFAULT_WAIT_TIMEOUT,
+    DENIED_MESSAGE, MAX_SUMMARY_CHARS, MAX_WAIT_TIMEOUT, SESSION_SCHEMA, STATE_FILE, TODOS_FILE,
+    TRANSCRIPT_FILE, WAIT_TOOL_NAME,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

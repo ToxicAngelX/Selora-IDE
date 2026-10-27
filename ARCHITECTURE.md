@@ -862,6 +862,37 @@ AgentTurnDone(ChatId, ChatReceipt, AgentSummary),  // iterations, tools used, co
 - No agent-initiated git operations beyond read-only git commands through `bash` (no agent commit/push).
 - No MCP/external tool servers — the manifest is fixed, defined by us, versioned with the app.
 
+### 17.9 Plan mode and live todos (manifest v3, Phase 9b)
+
+Manifest v3 is additive: `enter_plan_mode`, `exit_plan_mode(plan, summary?)`,
+`todo_read`, `todo_write(todos)` (the pre-9b `manage_todo` stays routable as an
+alias with the same storage semantics).
+
+- **Plan state is session-scoped.** A session starts in `executing`. While
+  `planning`, the router structurally refuses `write_file`, `edit_file`,
+  `delete_file`, `bash` (allowlisted or not) and `run_workflow` *before*
+  dispatch, returning a model-visible "approve the plan first" error.
+  `execute_approved` re-checks the same gate, so a stale pre-plan approval
+  cannot bypass it. Reads, web tools, and todo tools still run.
+- **The plan card is the only way out.** `exit_plan_mode` validates 1-32
+  single-line steps and builds `ApprovalCard::Plan`. Approve flips the
+  session to `executing`, stores the plan, and seeds its steps as pending
+  todos only when the session has no todos; Deny or Revise keeps planning
+  (Revise returns a "revise the plan" tool result). This adds no trust
+  primitive: after approval, every write/delete/bash still builds its own
+  card.
+- **Todos live in session state**, bounded (64 items, 500-byte single-line
+  titles) and validated at the router boundary. `todo_write` stores first
+  and renders the stored list; `todo_read` returns it. Nothing reports
+  success without storage.
+- **Wire additions** (protocol_version stays 1): `SessionDto` carries
+  `plan_phase` / `plan` / `todos` for bootstrap hydration;
+  `FrontendEvent::PlanStateChanged` and `TodosChanged` carry live updates;
+  `ApprovalNeededDto::plan` and the parked `ApprovalDto::plan` let a plan
+  card survive a reload; `DecisionDto::Revise` is the plan card's second
+  answer. The loop emits the two signals through the additive
+  `AgentEvent::PlanChanged` / `AgentEvent::TodosChanged`.
+
 ---
 
 ## 18. Workflows (Phase 8) — dynamic multi-agent orchestration
@@ -1003,6 +1034,18 @@ each ask runs under its own `TurnCaps`; receipts roll into the session's cost
 the way any turn's do. The runtime lives at
 `crates/selora-ai/src/agent/subagent.rs` (additive; Phase 8's engine consumes
 the same module).
+
+**Background completion contract (Phase 9e).** The runtime outlives the
+parent turn: its child task is not joined into the turn future. Exactly one
+accepted terminal result per child is stored and emitted as
+`subagent_completed` carrying `child_id`, `parent_session_id`, `policy`,
+`ok`, `error`, `final_message`, and artifact refs. Duplicate deliveries are
+dropped by child id; a cancelled child (or a result arriving after its
+parent was cancelled) emits nothing and is never resurrected. The parent
+waits with the manifest v3 `wait(child_ids?, timeout?)` tool: completed
+results, a truthful `status: "timeout"` with pending ids, or a model-visible
+unknown-id error. The wait is watch-channel based, bounded to 30s by default
+(300s max), and wakes immediately when the parent turn is cancelled.
 
 ### 19.4 Escalations and the generalized park channel
 

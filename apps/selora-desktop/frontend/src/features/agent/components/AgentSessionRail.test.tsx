@@ -4,7 +4,7 @@ import { fireEvent, render, waitFor } from '@testing-library/react';
 import React from 'react';
 import { AgentSessionRail } from './AgentSessionRail';
 import { agentStore } from '../agent-store';
-import type { AgentSession } from '../types';
+import type { AgentSession, ResumableAgentSession } from '../types';
 
 const sessions: AgentSession[] = [
   {
@@ -82,5 +82,37 @@ fireEvent.click(otherRow!);
     );
     expect(getByText('No sessions yet')).toBeTruthy();
     expect(queryByRole('button', { name: /Current session/ })).toBeNull();
+  });
+});
+  it('lists durable sessions under a truthful Resume session group', () => {
+    const resumable: ResumableAgentSession[] = [
+      {
+        id: 'sess-disk',
+        title: 'Yesterday work',
+        updatedAt: 10,
+        model: 'test-model',
+        mode: 'execute',
+        pending: { kind: 'approval', summary: 'bash cargo test' },
+        compacted: true,
+        messageCount: 12,
+      },
+    ];
+    const resumeSpy = vi.spyOn(agentStore, 'resumeSession').mockImplementation(() => true);
+    const { getByRole, getByText } = render(
+      <AgentSessionRail
+        sessions={sessions}
+        activeSessionId="sess-active"
+        resumableSessions={resumable}
+      />,
+    );
+
+    expect(getByRole('group', { name: 'Resume session' })).toBeTruthy();
+    expect(getByText('Yesterday work')).toBeTruthy();
+    expect(getByText('approval')).toBeTruthy();
+    expect(getByText('compacted')).toBeTruthy();
+
+    fireEvent.click(getByText('Yesterday work').closest('button')!);
+    expect(resumeSpy).toHaveBeenLastCalledWith('sess-disk');
+    resumeSpy.mockRestore();
   });
 });

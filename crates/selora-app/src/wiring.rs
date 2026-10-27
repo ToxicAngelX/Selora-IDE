@@ -802,6 +802,13 @@ pub fn spawn_agent(
                     AppMessage::ApprovalNeeded(turn_id, approval_id, card)
                 }
                 selora_ai::AgentEvent::State(_) => continue,
+                // Plan/todo events feed the web shell's dock; the egui
+                // shell has no plan spine, so it ignores them. Compaction
+                // events are likewise surfaced only by the desktop shell.
+                selora_ai::AgentEvent::PlanChanged { .. }
+                | selora_ai::AgentEvent::TodosChanged(_) => continue,
+                selora_ai::AgentEvent::Compacted(_) => continue,
+                selora_ai::AgentEvent::CompactionFailed(_) => continue,
                 selora_ai::AgentEvent::TurnDone(report) => {
                     done_seen = true;
                     AppMessage::AgentTurnDone(

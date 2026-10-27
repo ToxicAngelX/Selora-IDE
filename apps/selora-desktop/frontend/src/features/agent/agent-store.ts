@@ -14,6 +14,7 @@ import type {
   PermissionMode,
   QueuedPrompt,
   ReasoningEffort,
+  ResumableAgentSession,
   SubagentInfo,
   ThinkingState,
   TodoStatus,
@@ -24,12 +25,17 @@ import {
   fetchModels,
   newSession as requestNewSessionCommand,
   retryMessage as retryMessageCommand,
+  listAgentSessions,
+  newSession as bridgeNewSession,
+  retryMessage as bridgeRetryMessage,
   runWorkflow,
   sendAgent,
   sendChat,
+  setAgentAutoApprove,
   stopChat,
   switchSession as switchSessionCommand,
   type AgentDecisionResolution,
+  switchSession as bridgeSwitchSession,
   type AgentMode,
   type AgentStateChangedPayload,
   type AgentTurnDonePayload,
@@ -41,6 +47,12 @@ import {
   type EditorContextDto,
   type EnvelopeContext,
   type Model,
+  type PlanApproval,
+  type PlanPhase,
+  type PlanStateChangedPayload,
+  type SubagentCompletedPayload,
+  type TodoItem,
+  type TodosChangedPayload,
   type ToolCallStartedPayload,
   type ToolResultPayload,
   type TodoDto,
@@ -56,6 +68,8 @@ export type ModelSettings = {
 
 export type AgentState = {
   sessions: AgentSession[];
+  /** Phase 9d: durable sessions from Rust (the resume picker). */
+  resumableSessions: ResumableAgentSession[];
   activeSessionId: string;
   messages: ChatMessage[];
 /** Authoritative `manage_todo` list for the active session (backend-owned). */
@@ -66,9 +80,15 @@ export type AgentState = {
   transcripts: Record<string, ChatMessage[]>;
   todosBySession: Record<string, AgentTodo[]>;
   todos: AgentTodo[];
-  /** Live subagent roster. Empty until the backend reports one. */
+  /** Phase 9b: the session's plan phase (hydrated + live). */
+  planPhase: PlanPhase;
+  /** Phase 9b: the approved/proposed plan, when any. */
+  plan: PlanApproval | null;
   subagents: SubagentInfo[];
-  /** Artifacts the session produced; empty unless a real event adds one. */
+  /** Phase 9e: completion notifications not yet opened (activity badge). */
+  unreadSubagentCount: number;
+  /** Phase 9e: the child whose result the UI should reveal (click hook). */
+  revealedSubagentId: string | null;
   artifacts: ArtifactItem[];
   inFlight: boolean;
   thinkingState: ThinkingState;
@@ -173,12 +193,18 @@ const INITIAL_TODOS: AgentTodo[] = [];
 let state: AgentState = {
   sessions: INITIAL_SESSIONS,
   activeSessionId: '',
+  resumableSessions: [],
+  activeSessionId: DEFAULT_SESSION_ID,
   messages: [],
   transcripts: {},
   todosBySession: {},
   todos: INITIAL_TODOS,
-  subagents: [],
-  artifacts: [],
+  planPhase: 'executing',
+  plan: null,
+  subagents: INITIAL_SUBAGENTS,
+  unreadSubagentCount: 0,
+  revealedSubagentId: null,
+  artifacts: INITIAL_ARTIFACTS,
   inFlight: false,
   thinkingState: 'breathing',
   permissionMode: 'full',
@@ -380,6 +406,17 @@ function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unkno
 }
 
 /**
+ * Phase 9e: the dedupe ledger. A child id reaches this store once, ever;
+ * a replayed protocol event or a duplicate completion is ignored rather
+ * than producing a second toast/badge/result.
+ */
+const completedSubagentIds = new Set<string>();
+
+function countUnreadSubagents(subagents: SubagentInfo[]): number {
+  return subagents.reduce((count, subagent) => (subagent.unread ? count + 1 : count), 0);
+}
+
+/**
  * A `run_workflow` card also carries the §18.1 confirmation payload (script,
  * confirmed command set, cost cap) so the chat renders the same grant the
  * approval carries. `types.ts` is outside this slice's edit set, so the field
@@ -387,8 +424,58 @@ function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unkno
  */
 export type WorkflowToolCall = AgentToolCall & {
   workflow?: WorkflowApproval;
+  /** Phase 9b: the plan payload on an `exit_plan_mode` card. */
+  plan?: PlanApproval;
   approvalSubmitting?: boolean;
 };
+
+/** Map the bridge's snake_case todo items onto the dock's `AgentTodo`. */
+export function todosFromSnapshot(items: TodoItem[] | undefined): AgentTodo[] {
+  if (!items) return [];
+  return items
+    .filter((item) => item && typeof item.title === 'string' && item.title.trim())
+    .map((item) => ({
+      id: item.id || `todo_${item.title}`,
+      title: item.title,
+      status:
+        item.status === 'completed'
+          ? 'completed'
+          : item.status === 'in_progress'
+            ? 'in_progress'
+            : 'pending',
+    }));
+}
+
+/** Validate a plan payload before it drives the approval card. */
+export function validPlanApproval(
+  plan: PlanApproval | null | undefined,
+): plan is PlanApproval {
+  return Boolean(
+    plan &&
+      Array.isArray(plan.steps) &&
+      plan.steps.length > 0 &&
+      plan.steps.every((step) => typeof step === 'string' && step.trim()),
+  );
+}
+
+/**
+ * The plan payload from an `exit_plan_mode` call's arguments. The
+ * authoritative repeat rides `approval_needed`; this lets the running card
+ * render before that arrives, without inventing steps.
+ */
+export function planApprovalFromArgs(
+  args: Record<string, unknown> | undefined,
+): PlanApproval | undefined {
+  if (!args || !Array.isArray(args.plan)) return undefined;
+  const steps = args.plan.filter(
+    (step): step is string => typeof step === 'string' && Boolean(step.trim()),
+  );
+  if (steps.length === 0) return undefined;
+  return {
+    summary: typeof args.summary === 'string' ? args.summary : undefined,
+    steps,
+  };
+}
 
 /** §18.1's workflow-level cap default, mirroring `WorkflowApprovalDto`. */
 const DEFAULT_WORKFLOW_MAX_COST_USD = 5;
@@ -706,6 +793,22 @@ const activeSessionId =
     // show that session's messages, not the flattened union of every session.
     const transcripts: Record<string, ChatMessage[]> = {};
     for (const session of sessions) transcripts[session.id] = [];
+    // Durable sessions come from `.selora/agent-sessions` — a read-only
+    // projection Rust owns. Never synthesized locally.
+    const resumableSessions: ResumableAgentSession[] = (bootstrap.agent_sessions ?? []).map(
+      (session) => ({
+        id: session.session_id,
+        title: session.title,
+        updatedAt: session.updated_at,
+        ...(session.model ? { model: session.model } : {}),
+        mode: session.mode,
+        ...(session.pending ? { pending: session.pending } : {}),
+        compacted: session.compacted,
+        messageCount: session.message_count,
+      }),
+    );
+
+    const messages: ChatMessage[] = [];
     for (const message of bootstrap.chat.messages) {
       if (!transcripts[message.session_id]) continue;
       if (message.role !== 'user' && message.role !== 'assistant') continue;
@@ -727,6 +830,17 @@ const activeSessionId =
       (todosBySession[sessionId] ??= []).push(...parseSessionTodos([todo]));
     }
 
+    // Phase 9b: the active session's plan/todos hydrate the dock's spine
+    // from the Rust snapshot (session-scoped state, not a turn artifact).
+    const activeSession = bootstrap.chat.sessions.find(
+      (session) => session.session_id === activeSessionId,
+    );
+    const hydratedTodos = todosFromSnapshot(activeSession?.todos);
+    const hydratedPlanPhase: PlanPhase = activeSession?.plan_phase ?? 'executing';
+    const hydratedPlan = validPlanApproval(activeSession?.plan)
+      ? activeSession.plan
+      : null;
+
     // Keep request routing aligned with the turn Rust says is live.
     activeRequestId = bootstrap.chat.active_request_id ?? null;
 
@@ -745,6 +859,9 @@ const activeSessionId =
       const previousConfirmation = previousConfirmations.get(pending.approval_id);
       const isWorkflow = /^run_workflow(?:\s|$)/.test(pending.summary) ||
         previousCall?.toolName === 'run_workflow' || Boolean(previousCall?.workflow) || Boolean(previousConfirmation);
+      const isPlan = Boolean(pending.plan) || Boolean(previousCall?.plan) ||
+        /^exit_plan_mode(?:\s|$)/.test(pending.summary) ||
+        previousCall?.toolName === 'exit_plan_mode';
       if (isWorkflow) {
         const sameOrigin = previousConfirmation?.requestId === pending.request_id &&
           previousConfirmation.sessionId === pending.session_id &&
@@ -761,13 +878,16 @@ const activeSessionId =
         confirmation.workflow = null;
         workflowConfirmations.set(pending.approval_id, confirmation);
       }
-      const approvalCall: AgentToolCall = {
+      const approvalCall: WorkflowToolCall = {
         id: `call_appr_${pending.approval_id}`,
-        toolName: isWorkflow ? 'run_workflow' : 'operation',
+        toolName: isPlan ? 'exit_plan_mode' : isWorkflow ? 'run_workflow' : 'operation',
         argsSummary: pending.summary,
         status: 'needs_approval',
         approvalId: pending.approval_id,
         decisionPrompt: pending.decision_prompt,
+        plan: isPlan
+          ? (pending.plan ?? previousCall?.plan ?? undefined)
+          : undefined,
         resultSummary: isWorkflow
           ? 'Workflow confirmation is unavailable after refresh. Wait for the full approval_needed payload before deciding.'
           : undefined,
@@ -809,7 +929,12 @@ const activeSessionId =
       todosBySession,
       messages: transcripts[activeSessionId] ?? [],
       todos: todosBySession[activeSessionId] ?? [],
+      resumableSessions,
+      messages,
       activeSessionId,
+      todos: hydratedTodos,
+      planPhase: hydratedPlanPhase,
+      plan: hydratedPlan,
       inFlight: Boolean(bootstrap.chat.active_request_id),
       sessionBusy: false,
       sessionError: null,
@@ -842,6 +967,7 @@ const activeSessionId =
     pendingApprovalRequests.clear();
     workflowConfirmations.clear();
     terminalRequests.clear();
+    completedSubagentIds.clear();
     state = {
       ...state,
       sessions: [],
@@ -850,6 +976,11 @@ const activeSessionId =
       transcripts: {},
       todosBySession: {},
       todos: [],
+      planPhase: 'executing',
+      plan: null,
+      subagents: INITIAL_SUBAGENTS,
+      unreadSubagentCount: 0,
+      revealedSubagentId: null,
       inFlight: false,
       thinkingState: 'breathing',
       streamingActivityLevel: 0,
@@ -859,6 +990,7 @@ const activeSessionId =
       workspace: null,
       sessionBusy: false,
       sessionError: null,
+      resumableSessions: [],
     };
     notify();
   },
@@ -936,6 +1068,8 @@ const activeSessionId =
       transcripts: { ...state.transcripts, [newId]: [] },
       todosBySession: { ...state.todosBySession, [newId]: [] },
       todos: [],
+      planPhase: 'executing',
+      plan: null,
       inFlight: false,
       thinkingState: 'breathing',
       promptQueue: [],
@@ -1059,6 +1193,84 @@ const activeSessionId =
   },
 
   /** Drop a locally-known session tab (fork helpers/tests). */
+   * Phase 9e: one accepted background completion. Returns false when this
+   * child id was already handled (dedupe) or when the payload claims success
+   * without a result. A failed child stays failed: it is never painted as a
+   * completed result.
+   */
+  handleSubagentCompleted(payload: SubagentCompletedPayload): boolean {
+    if (completedSubagentIds.has(payload.child_id)) return false;
+    completedSubagentIds.add(payload.child_id);
+
+    const existing = state.subagents.find((subagent) => subagent.id === payload.child_id);
+    const ok = payload.ok === true;
+    const entry: SubagentInfo = {
+      id: payload.child_id,
+      name: existing?.name ?? `subagent-${payload.child_id}`,
+      model: existing?.model ?? 'Auto',
+      status: ok ? 'done' : 'failed',
+      parentSessionId: payload.parent_session_id,
+      policy: payload.policy,
+      result: ok ? payload.final_message : '',
+      error: ok ? undefined : payload.error ?? 'subagent failed without a message',
+      artifacts: payload.artifacts ?? [],
+      unread: true,
+      activeStep: ok
+        ? `Completed: ${payload.final_message || 'no output'}`
+        : `Failed: ${payload.error ?? 'unknown error'}`,
+    };
+    const subagents = existing
+      ? state.subagents.map((subagent) =>
+          subagent.id === payload.child_id ? { ...subagent, ...entry } : subagent,
+        )
+      : [...state.subagents, entry];
+    state = {
+      ...state,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+    };
+    notify();
+    return true;
+  },
+
+  /**
+   * A notification click: select the parent session and reveal the child's
+   * result under it. Marking read keeps the badge truthful.
+   */
+  revealSubagent(sessionId: string, childId: string) {
+    const subagents = state.subagents.map((subagent) =>
+      subagent.id === childId ? { ...subagent, unread: false } : subagent,
+    );
+    state = {
+      ...state,
+      activeSessionId: sessionId || state.activeSessionId,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+      revealedSubagentId: childId,
+      messages: sessionId && sessionId !== state.activeSessionId ? [] : state.messages,
+    };
+    notify();
+  },
+
+  /** Mark one child's result read without changing the selected session. */
+  markSubagentRead(childId: string) {
+    const subagents = state.subagents.map((subagent) =>
+      subagent.id === childId ? { ...subagent, unread: false } : subagent,
+    );
+    state = {
+      ...state,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+    };
+    notify();
+  },
+
+  clearSubagentReveal() {
+    if (state.revealedSubagentId === null) return;
+    state = { ...state, revealedSubagentId: null };
+    notify();
+  },
+
   deleteSession(sessionId: string) {
     const remaining = state.sessions.filter((s) => s.id !== sessionId);
     const nextActive = remaining[0]?.id || '';
@@ -1074,6 +1286,73 @@ const activeSessionId =
       todos: todosBySession[nextActive] ?? [],
     };
     notify();
+  },
+
+  /** Phase 9d — open a durable session restored by Rust. */
+  resumeSession(sessionId: string): boolean {
+    if (!state.resumableSessions.some((session) => session.id === sessionId)) return false;
+    this.switchSession(sessionId);
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void bridgeSwitchSession(sessionId, ctx).catch((err: unknown) => {
+        console.error('Failed to restore agent session:', err);
+      });
+    }
+    return true;
+  },
+
+  /** Phase 9d — new session (Rust owns the id and the empty on-disk store). */
+  newDurableSession(title = 'New Agent Session'): string {
+    const localId = this.createSession(title);
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void bridgeNewSession(ctx).catch((err: unknown) => {
+        console.error('Failed to create agent session:', err);
+      });
+    }
+    return localId;
+  },
+
+  /** Phase 9d — refresh the resume picker from disk. */
+  refreshResumableSessions(): void {
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void listAgentSessions(ctx).catch((err: unknown) => {
+        console.error('Failed to list agent sessions:', err);
+      });
+    }
+  },
+
+  /**
+   * Phase 9d — arm/disarm session full access. The flag is Rust session
+   * memory only: it never reaches disk and resets on switch/new/restart.
+   */
+  setSessionAutoApprove(enabled: boolean): void {
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void setAgentAutoApprove(state.activeSessionId, enabled, ctx).catch((err: unknown) => {
+        console.error('Failed to set session auto-approve:', err);
+      });
+    }
+  },
+
+  /** Phase 9d — retry a user message (Rust rewinds the durable transcript). */
+  retryFromMessage(messageId: string): boolean {
+    const ctx = sessionEnvelopeContext();
+    const index = state.messages.findIndex((message) => message.id === messageId);
+    if (!ctx || index < 0 || state.messages[index]?.role !== 'user') return false;
+    state = {
+      ...state,
+      messages: state.messages.slice(0, index),
+      inFlight: false,
+      thinkingState: 'breathing',
+      streamingActivityLevel: 0,
+    };
+    notify();
+    void bridgeRetryMessage(state.activeSessionId, messageId, ctx).catch((err: unknown) => {
+      console.error('Failed to retry message:', err);
+    });
+    return true;
   },
 
   setPermissionMode(mode: PermissionMode) {
@@ -1427,6 +1706,8 @@ const activeSessionId =
     const newMessages = [...state.messages];
     newMessages[lastMsgIndex] = updated;
 
+    // Todos are owned by the session store (`todos_changed`), never
+    // derived from assistant prose.
     state = {
       ...state,
       messages: newMessages,
@@ -1493,10 +1774,18 @@ const activeSessionId =
     notify();
   },
 
-  handleApprovalDecision(approvalId: string, decision: 'approve' | 'deny' | 'approve_all'): void | Promise<void> {
+  handleApprovalDecision(
+    approvalId: string,
+    decision: 'approve' | 'deny' | 'approve_all' | 'revise',
+  ): void | Promise<void> {
     const target = state.messages.flatMap((message) => message.toolCalls ?? [])
       .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
-    if (target?.toolName === 'run_workflow' || target?.workflow || workflowConfirmations.has(approvalId)) {
+    const planCard = Boolean(target?.plan) || target?.toolName === 'exit_plan_mode';
+    // A plan card only offers Approve/Revise: a blanket approval is a
+    // different grant and must never skip the plan decision.
+    if (planCard && decision === 'approve_all') return;
+    if (!planCard && (target?.toolName === 'run_workflow' || target?.workflow || workflowConfirmations.has(approvalId))) {
+      if (decision === 'revise') return;
       return submitWorkflowConfirmation(approvalId, decision);
     }
     // Route to the request that raised this approval, not whatever request
@@ -1520,10 +1809,14 @@ const activeSessionId =
     if (!lastMsg || !lastMsg.toolCalls) return;
 
     const updatedCalls = lastMsg.toolCalls.map((c) => {
-      if (c.approvalId === approvalId || (decision === 'approve_all' && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow)) {
+      const isPlan = c.approvalId === approvalId && (Boolean((c as WorkflowToolCall).plan) || c.toolName === 'exit_plan_mode');
+      if (c.approvalId === approvalId || (decision === 'approve_all' && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow && !(c as WorkflowToolCall).plan)) {
         return {
           ...c,
-          status: (decision === 'deny' ? 'denied' : 'approved') as AgentToolCall['status'],
+          status: (decision === 'deny' || decision === 'revise' ? 'denied' : 'approved') as AgentToolCall['status'],
+          resultSummary: isPlan && decision === 'revise'
+            ? 'Revision requested — the session stays in plan mode.'
+            : c.resultSummary,
         };
       }
       return c;
@@ -1536,7 +1829,7 @@ const activeSessionId =
     state = {
       ...state,
       messages: newMessages,
-      thinkingState: decision === 'deny' ? 'breathing' : 'solving',
+      thinkingState: decision === 'deny' || decision === 'revise' ? 'breathing' : 'solving',
     };
     notify();
   },
@@ -1632,19 +1925,16 @@ const activeSessionId =
       payload.tool_name === 'run_workflow'
         ? workflowApprovalFromArgs(parsedArgs)
         : undefined;
+    // Phase 9b: an `exit_plan_mode` call carries its steps before the card.
+    const plan =
+      payload.tool_name === 'exit_plan_mode'
+        ? planApprovalFromArgs(parsedArgs)
+        : undefined;
 
-// `session_todos_changed` is authoritative; a `manage_todo` tool start also
-    // carries the same list, so apply it as the optimistic live view. Every
-    // other tool leaves the list exactly as the session reported it — no
-    // inferred state.
-    let updatedTodos = state.todos;
-    if (payload.tool_name === 'manage_todo' || payload.tool_name === 'update_plan') {
-      const raw = parsedArgs ? (parsedArgs.todos ?? parsedArgs.tasks ?? parsedArgs.steps ?? parsedArgs) : payload.args_json;
-      const modelTodos = parseModelTodos(raw);
-      if (modelTodos && modelTodos.length > 0) {
-        updatedTodos = modelTodos;
-      }
-    }
+    // Phase 9b: todos are session state owned by Rust. The store is updated
+    // only by the authoritative `todos_changed` event — never inferred from
+    // a tool's arguments and never advanced by another tool's start.
+    const updatedTodos = state.todos;
 
     // 2. Update subagents active step
     const updatedSubagents = state.subagents.map((sub, i) =>
@@ -1660,11 +1950,14 @@ const activeSessionId =
     const toolCall: WorkflowToolCall = {
       id: payload.call_id,
       toolName: payload.tool_name,
-      argsSummary: workflow?.name ? workflow.name : argsSummary,
+      argsSummary: workflow?.name
+        ? workflow.name
+        : plan?.summary || (plan ? `${plan.steps.length}-step plan` : argsSummary),
       argsRaw: parsedArgs,
       status: 'running',
       // A workflow grant renders from this payload even before its approval.
       workflow,
+      plan,
       startedAt: Date.now(),
     };
 
@@ -1741,16 +2034,18 @@ const activeSessionId =
     // A workflow card is a grant, not a diff: the payload rides `workflow`
     // and its script is never counted as a diff hunk.
     const workflow = payload.workflow;
+    const plan = payload.plan;
     const diffHunks =
-      !workflow && payload.diff_or_input ? [payload.diff_or_input] : undefined;
+      !workflow && !plan && payload.diff_or_input ? [payload.diff_or_input] : undefined;
     const approvalCall: WorkflowToolCall = {
       id: `call_appr_${payload.approval_id}`,
       toolName: payload.tool_name,
-      argsSummary: payload.path_or_command,
+      argsSummary: plan?.summary || payload.path_or_command,
       status: 'needs_approval',
       approvalId: payload.approval_id,
       workflow,
       decisionPrompt: payload.prompt,
+      plan,
       resultSummary: undefined,
       diff: diffHunks
         ? {
@@ -1808,6 +2103,27 @@ const activeSessionId =
       messages: newMessages,
       thinkingState: 'breathing',
     };
+    notify();
+  },
+
+  handlePlanStateChanged(payload: PlanStateChangedPayload) {
+    if (payload.session_id && state.activeSessionId && payload.session_id !== state.activeSessionId) {
+      return;
+    }
+    const plan = validPlanApproval(payload.plan) ? payload.plan : null;
+    state = {
+      ...state,
+      planPhase: payload.phase ?? 'executing',
+      plan,
+    };
+    notify();
+  },
+
+  handleTodosChanged(payload: TodosChangedPayload) {
+    if (payload.session_id && state.activeSessionId && payload.session_id !== state.activeSessionId) {
+      return;
+    }
+    state = { ...state, todos: todosFromSnapshot(payload.todos) };
     notify();
   },
 

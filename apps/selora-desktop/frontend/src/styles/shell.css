@@ -2426,3 +2426,26 @@
     flex-shrink: 0;
   }
 }
+
+/* --- Phase 9e: completed-background badge + toast action --------------- */
+.activity-badge.is-success {
+  background: var(--ok, #10b981);
+  color: var(--ink-canvas);
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.55);
+}
+
+.toast-open {
+  align-self: flex-start;
+  border: 1px solid var(--hairline-active);
+  background: transparent;
+  color: var(--fg-default);
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.toast-open:hover,
+.toast-open:focus-visible {
+  background: var(--ink-hi);
+}

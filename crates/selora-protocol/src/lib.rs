@@ -248,6 +248,9 @@ pub enum DecisionDto {
     Approve,
     Deny,
     ApproveAllThisTurn,
+    /// Phase 9b: request a revised plan. A plan card answers with this; the
+    /// session stays in plan mode and the model proposes again.
+    Revise,
     Stop,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -497,6 +500,16 @@ pub enum FrontendCommand {
         session_id: SessionId,
     },
     NewSession,
+    /// Phase 9d: refresh the resume picker. The answer is a full bootstrap
+    /// whose `agent_sessions` is freshly scanned from disk.
+    ListAgentSessions,
+    /// Phase 9d: arm/disarm session full access. The flag lives only in the
+    /// engine's session memory: it is never written to disk and resets on
+    /// switch/new/restart.
+    SetAgentAutoApprove {
+        session_id: SessionId,
+        enabled: bool,
+    },
     Search {
         query: SearchQueryDto,
     },
@@ -629,28 +642,76 @@ pub struct SessionDto {
     pub title: String,
     pub message_ids: Vec<MessageId>,
     pub active: bool,
-    /// Phase 9 session slice: this session's authoritative todo list, written
-    /// only by the `manage_todo` tool. Additive: a pre-Phase-9 snapshot
-    /// deserializes as an empty list.
+    /// Phase 9b: the session's plan phase, hydrated into the dock's plan
+    /// spine. Defaulted so a pre-9b snapshot still loads (as executing).
+    #[serde(default)]
+    pub plan_phase: PlanPhaseDto,
+    /// Phase 9b: the approved/proposed plan, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
+    /// Phase 9b: the session's stored todos.
     #[serde(default)]
     pub todos: Vec<TodoDto>,
 }
-/// One authoritative session todo (`manage_todo`), in the order the tool
-/// stored it.
+
+// ---------------------------------------------------------------------------
+// Phase 9b — plan mode and live todos (ROADMAP Phase 9b). Additive to
+// protocol_version 1; every field has a serde default so pre-9b payloads
+// still load.
+// ---------------------------------------------------------------------------
+
+/// The session's plan phase. `executing` is the pre-9b behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPhaseDto {
+    Planning,
+    #[default]
+    Executing,
+}
+
+/// The plan card's payload: optional one-line context and the ordered steps.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanApprovalDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+/// One stored todo item.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TodoDto {
-    /// The tool-supplied stable id, unique within the session.
     pub id: String,
-    /// The task text, already validated and length-bounded by the tool.
-    pub text: String,
+    pub title: String,
+    #[serde(default)]
     pub status: TodoStatusDto,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatusDto {
+    #[default]
     Pending,
     InProgress,
     Completed,
+}
+
+/// `PlanStateChanged` — the session's phase or proposed/approved plan moved.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanStateDto {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub phase: PlanPhaseDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
+}
+
+/// `TodosChanged` — the session's stored list was replaced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodosDto {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageDto {
@@ -675,6 +736,10 @@ pub struct ApprovalDto {
     pub session_id: SessionId,
     pub summary: String,
     pub can_approve_all_this_turn: bool,
+    /// Phase 9b: the plan payload for a parked `exit_plan_mode` card, so a
+    /// reload can rebuild the same plan card. Absent on every other card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelDto {
@@ -695,6 +760,57 @@ pub struct ChatStateDto {
     /// todos rather than failing. Per-session copies ride [`SessionDto`].
     #[serde(default)]
     pub todos: Vec<TodoDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9d — durable agent sessions (ARCHITECTURE §19.1).
+//
+// The resume picker's data comes from `.selora/agent-sessions/{id}/`. It is a
+// read-only projection: a switch/resume restores the transcript, todos, plan,
+// model, mode and parked cards; the session auto-approve flag has no wire
+// field because it must never survive a process or a switch.
+// ---------------------------------------------------------------------------
+
+/// One durable session in the resume picker (newest first).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionSummaryDto {
+    pub session_id: SessionId,
+    pub title: String,
+    /// Wall-clock milliseconds since the Unix epoch (the store's unit).
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `execute` / `explore` / `plan`; `auto` is never persisted.
+    #[serde(default)]
+    pub mode: String,
+    /// The restored park, if any. It is shown once and never auto-executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<AgentParkSummaryDto>,
+    /// True once a compaction cursor was recorded (full transcript preserved).
+    #[serde(default)]
+    pub compacted: bool,
+    #[serde(default)]
+    pub message_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentParkSummaryDto {
+    /// `approval` or `question`.
+    pub kind: String,
+    pub summary: String,
+}
+
+/// The typed compaction failure. `partial_summary` is the text streamed before
+/// the summarize round failed — surfaced, never silently dropped.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentCompactionFailedDto {
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_summary: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1044,6 +1160,10 @@ pub struct BootstrapState {
     /// arrive as `workflow_*` events instead.
     #[serde(default)]
     pub workflows: Vec<WorkflowPersistedRunDto>,
+    /// Phase 9d: durable agent sessions found in the open workspace (the
+    /// resume picker). Read-only projection — switching loads the session.
+    #[serde(default)]
+    pub agent_sessions: Vec<AgentSessionSummaryDto>,
 }
 
 /// The reply shape of `dispatch_command` (P1 state slice).
@@ -1224,6 +1344,10 @@ pub struct ApprovalNeededDto {
     /// field absent) and every non-workflow card omits the key entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowApprovalDto>,
+    /// Phase 9b: the `exit_plan_mode` plan card — steps plus optional
+    /// summary. Additive/defaulted like `workflow`; absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanApprovalDto>,
 }
 /// The agent status line's phase (drives the dock's ThinkingOrb state).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1271,6 +1395,46 @@ pub struct AgentEventDto {
     pub turn_id: TurnId,
     pub approval: Option<ApprovalDto>,
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9e - background subagent completion (ARCHITECTURE 19.3).
+//
+// One event per accepted terminal result, keyed by `child_id` for frontend
+// dedupe. `parent_session_id` is explicit so a toast/badge can select the
+// right session after the spawning turn has ended. A cancelled child emits
+// no completion event at all; a failed child is `ok: false` with `error`.
+// ---------------------------------------------------------------------------
+
+/// The child's structural tool policy (19.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPolicyDto {
+    ReadOnly,
+    Full,
+}
+
+/// One artifact reference a child produced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubagentArtifactDto {
+    pub kind: String,
+    /// Workspace-relative path, or an engine-owned virtual artifact id.
+    pub path: String,
+}
+
+/// A background subagent's one terminal result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCompletedDto {
+    pub child_id: String,
+    #[serde(alias = "parent_session")]
+    pub parent_session_id: SessionId,
+    pub policy: SubagentPolicyDto,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub final_message: String,
+    #[serde(default, alias = "artifact_refs")]
+    pub artifacts: Vec<SubagentArtifactDto>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,6 +1738,12 @@ pub enum FrontendEvent {
     ApprovalNeeded(ApprovalNeededDto),
     AgentStateChanged(AgentStateDto),
     AgentTurnDone(AgentTurnDoneDto),
+    /// Phase 9d: the summarize round failed. The turn ends with a typed
+    /// `CompactionFailed` end too; this event carries the partial summary.
+    AgentCompactionFailed(AgentCompactionFailedDto),
+    /// Phase 9e: one background child reached a terminal result. Keyed by
+    /// `child_id`; never emitted for a cancelled child.
+    SubagentCompleted(SubagentCompletedDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     /// P1: one language server changed lifecycle (starting/ready/failed).
     /// `failed` carries a truthful, typed reason for the UI.
@@ -1606,10 +1776,10 @@ pub enum FrontendEvent {
     WorkflowArtifact(WorkflowArtifactEventDto),
     WorkflowApprovalNeeded(WorkflowApprovalNeededDto),
     WorkflowFinished(WorkflowFinishedDto),
-    // Phase 9 session slice: the `manage_todo` tool wrote a session's list.
-    // The full list is authoritative; the active session's copy is also in
-    // the next `ChatStateDto`. Additive (protocol_version stays 1).
-    SessionTodosChanged(SessionTodosDto),
+    // Phase 9b — plan mode and live todos. Additive; a pre-9b consumer
+    // ignores the arms it does not know.
+    PlanStateChanged(PlanStateDto),
+    TodosChanged(TodosDto),
     Error(ProtocolErrorDto),
 }
 
@@ -1823,6 +1993,8 @@ mod tests {
                     title: "Welcome".into(),
                     message_ids: vec![],
                     active: true,
+                    plan_phase: PlanPhaseDto::Executing,
+                    plan: None,
                     todos: vec![],
                 }],
                 messages: vec![],
@@ -1874,6 +2046,7 @@ mod tests {
                 later_slices: vec!["agent".into(), "lsp".into()],
             },
             workflows: vec![],
+            agent_sessions: vec![],
         }
     }
     #[test]
@@ -1920,6 +2093,60 @@ mod tests {
         assert!(patch.keybind_fuzzy_find.is_none());
         assert!(patch.keybind_toggle_chat.is_none());
         assert!(patch.keybind_save.is_none());
+    }
+    #[test]
+    fn phase9d_resume_picker_and_compaction_failure_round_trip() {
+        let summary = AgentSessionSummaryDto {
+            session_id: sid("sess-disk"),
+            title: "Yesterday".into(),
+            updated_at: 42,
+            model: Some("test-model".into()),
+            mode: "execute".into(),
+            pending: Some(AgentParkSummaryDto {
+                kind: "approval".into(),
+                summary: "bash cargo test".into(),
+            }),
+            compacted: true,
+            message_count: 12,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentSessionSummaryDto>(&json).unwrap(),
+            summary
+        );
+
+        // A pre-9d bootstrap (no agent_sessions key) still loads the picker as
+        // empty; the command/event spellings are stable.
+        let mut state = sample();
+        state.agent_sessions = vec![summary];
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("agent_sessions");
+        let back: BootstrapState = serde_json::from_value(value).unwrap();
+        assert!(back.agent_sessions.is_empty());
+
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::ListAgentSessions).unwrap(),
+            r#"{"type":"list_agent_sessions"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::SetAgentAutoApprove {
+                session_id: sid("sess-disk"),
+                enabled: true,
+            })
+            .unwrap(),
+            r#"{"type":"set_agent_auto_approve","payload":{"session_id":"sess-disk","enabled":true}}"#
+        );
+        let failure = AgentCompactionFailedDto {
+            request_id: rid("req-1"),
+            session_id: sid("sess-disk"),
+            turn_id: tid("turn-1"),
+            message: "gateway down".into(),
+            partial_summary: Some("half".into()),
+        };
+        let event = FrontendEvent::AgentCompactionFailed(failure.clone());
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "agent_compaction_failed");
+        assert_eq!(json["payload"]["partial_summary"], "half");
     }
     #[test]
     fn serde_rejects_invalid_ids_paths() {
@@ -2363,6 +2590,7 @@ mod tests {
                 path_or_command: "src/main.rs".into(),
                 diff_or_input: Some("+fn main() {}".into()),
                 workflow: None,
+                plan: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"src/main.rs","diff_or_input":"+fn main() {}"}}"#
@@ -2378,6 +2606,7 @@ mod tests {
                 path_or_command: "cargo test".into(),
                 diff_or_input: None,
                 workflow: None,
+                plan: None,
             }))
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
@@ -2399,6 +2628,7 @@ mod tests {
                 commands: vec!["cargo test".into(), "git status".into()],
                 max_cost_usd: 5.0,
             }),
+            plan: None,
         };
         let workflow_json =
             serde_json::to_string(&FrontendEvent::ApprovalNeeded(workflow_card.clone())).unwrap();
@@ -2463,6 +2693,29 @@ mod tests {
             .unwrap(),
             r#"{"type":"agent_turn_done","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","total_tokens":12400,"cost_usd":0.041,"num_tools":6,"approved":3,"denied":1,"completed":true,"end_message":"agent turn complete"}}"#
         );
+    }
+    #[test]
+    fn phase_9e_subagent_completion_wire_shape_is_stable() {
+        // One event carries the child, the parent, the policy, the honest
+        // ok/error pair, the final message and artifact refs.
+        let event = FrontendEvent::SubagentCompleted(SubagentCompletedDto {
+            child_id: "child-1".into(),
+            parent_session_id: sid("session-1"),
+            policy: SubagentPolicyDto::ReadOnly,
+            ok: false,
+            error: Some("gateway said no".into()),
+            final_message: String::new(),
+            artifacts: vec![SubagentArtifactDto {
+                kind: "diff".into(),
+                path: "src/lib.rs".into(),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"subagent_completed","payload":{"child_id":"child-1","parent_session_id":"session-1","policy":"read_only","ok":false,"error":"gateway said no","final_message":"","artifacts":[{"kind":"diff","path":"src/lib.rs"}]}}"#
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
     #[test]
     fn z3_serde_boundaries_reject_malformed_payloads() {
@@ -2659,6 +2912,7 @@ mod tests {
             session_id: sid("session"),
             summary: "write".into(),
             can_approve_all_this_turn: false,
+            plan: None,
         });
         assert_eq!(
             validate_and_consume_approval(
@@ -2956,6 +3210,80 @@ mod tests {
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
         assert!(!run.partial_effects);
+    }
+
+    #[test]
+    fn p9b_plan_and_todo_wire_is_additive_and_round_trips() {
+        // A plan approval card carries the steps where the user decides.
+        let card = ApprovalNeededDto {
+            request_id: rid("request-1"),
+            session_id: sid("session-1"),
+            turn_id: tid("turn-1"),
+            approval_id: ApprovalId::new("approval-1").unwrap(),
+            tool_name: "exit_plan_mode".into(),
+            path_or_command: "Make the change".into(),
+            diff_or_input: None,
+            workflow: None,
+            plan: Some(PlanApprovalDto {
+                summary: Some("Make the change".into()),
+                steps: vec!["Inspect".into(), "Write".into()],
+            }),
+        };
+        let json = serde_json::to_string(&FrontendEvent::ApprovalNeeded(card.clone())).unwrap();
+        assert!(json.contains("\"plan\""));
+        assert!(!json.contains("\"workflow\""));
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&json).unwrap(),
+            FrontendEvent::ApprovalNeeded(card)
+        );
+
+        // Pre-9b approval_needed JSON still loads with no plan.
+        let legacy: FrontendEvent = serde_json::from_str(
+            r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"write_file","path_or_command":"a.rs"}}"#,
+        )
+        .unwrap();
+        match legacy {
+            FrontendEvent::ApprovalNeeded(dto) => assert!(dto.plan.is_none()),
+            other => panic!("expected an approval card, got {other:?}"),
+        }
+
+        // The two live events and the revise decision round-trip.
+        let plan_state = FrontendEvent::PlanStateChanged(PlanStateDto {
+            session_id: sid("session-1"),
+            phase: PlanPhaseDto::Planning,
+            plan: None,
+        });
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&serde_json::to_string(&plan_state).unwrap())
+                .unwrap(),
+            plan_state
+        );
+        let todos = FrontendEvent::TodosChanged(TodosDto {
+            session_id: sid("session-1"),
+            todos: vec![TodoDto {
+                id: "todo-1".into(),
+                title: "Inspect".into(),
+                status: TodoStatusDto::InProgress,
+            }],
+        });
+        assert_eq!(
+            serde_json::from_str::<FrontendEvent>(&serde_json::to_string(&todos).unwrap()).unwrap(),
+            todos
+        );
+        assert_eq!(
+            serde_json::to_string(&DecisionDto::Revise).unwrap(),
+            "\"revise\""
+        );
+
+        // A pre-9b session snapshot hydrates as executing with no plan and
+        // no todos.
+        let session: SessionDto = serde_json::from_str(
+            r#"{"session_id":"session-1","title":"Old","message_ids":[],"active":false}"#,
+        )
+        .unwrap();
+        assert_eq!(session.plan_phase, PlanPhaseDto::Executing);
+        assert!(session.plan.is_none());
+        assert!(session.todos.is_empty());
     }
 
     #[test]

@@ -1191,6 +1191,9 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
             // Nested workflow tools are not armed by WorkflowHost. Do not
             // turn an unexpected nested grant into a generic write card.
             selora_ai::ApprovalCard::Workflow { .. } => return,
+            // Phase 9b plan cards belong to a chat session, not a workflow
+            // subagent; an unexpected one is never rendered as a write.
+            selora_ai::ApprovalCard::Plan { .. } => return,
         };
         self.record(FrontendEvent::WorkflowApprovalNeeded(
             WorkflowApprovalNeededDto {
@@ -2223,8 +2226,10 @@ impl DesktopState {
             .unwrap_or_default();
         // P1: the live bridge store, never a hard-coded empty vector.
         let (diagnostics, lsp_servers) = self.lsp_snapshot();
+        let agent_sessions = self.sessions.agent_sessions();
         BootstrapState {
             workflows,
+            agent_sessions,
             protocol_version: PROTOCOL_VERSION,
             core_instance_id: self.log.core_instance_id(),
             snapshot_sequence: self.log.snapshot_sequence(),
@@ -2296,6 +2301,10 @@ impl DesktopState {
                 | FrontendCommand::SendAgent { .. }
                 | FrontendCommand::AgentDecision { .. }
                 | FrontendCommand::RetryMessage { .. }
+                | FrontendCommand::SwitchSession { .. }
+                | FrontendCommand::NewSession
+                | FrontendCommand::ListAgentSessions
+                | FrontendCommand::SetAgentAutoApprove { .. }
         );
         // Ã‚Â§2.3: a command may name the workspace it was composed against Ã¢â‚¬â€
         // "no-workspace" before one is open, or the live id after. An
@@ -2403,6 +2412,57 @@ impl DesktopState {
                 // snapshot is how the frontend learns which stream to route.
                 self.publish_chat_bootstrap(app, Some(request_id));
                 Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            // Phase 9d — durable sessions. Every arm publishes a bootstrap
+            // so the rail/transcript follow without a reload.
+            FrontendCommand::SwitchSession { session_id } => {
+                self.sessions.switch_session(&session_id)?;
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::NewSession => {
+                self.sessions.new_session()?;
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::ListAgentSessions => {
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::SetAgentAutoApprove {
+                session_id,
+                enabled,
+            } => {
+                self.sessions.set_auto_approve(&session_id, enabled)?;
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::RetryMessage {
+                session_id,
+                message_id,
+            } => {
+                self.sessions.retry_message(
+                    self.event_log(),
+                    app.clone(),
+                    request_id,
+                    session_id,
+                    message_id,
+                )?;
+                Ok(self.bootstrap())
             }
             FrontendCommand::ToggleSurface { surface } => {
                 // Ã‚Â§2.2: the region a surface acts on is determined in Rust,
@@ -3174,6 +3234,13 @@ impl DesktopState {
                 })
             }
             DecisionDto::Stop => unreachable!("handled before approval lookup"),
+            DecisionDto::Revise => {
+                return Err(ProtocolErrorDto {
+                    code: "workflow_approval_not_revisable".into(),
+                    message: "Workflow approvals cannot be revised.".into(),
+                    retryable: false,
+                })
+            }
         };
         decide(id, decision).map_err(|error| ProtocolErrorDto {
             code: "workflow_approval_not_found".into(),

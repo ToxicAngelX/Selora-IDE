@@ -61,7 +61,7 @@ export type ActivityBarProps = {
 
 type BadgeInfo = {
   count?: number;
-  variant: 'error' | 'warn' | 'git' | 'pulse';
+  variant: 'error' | 'warn' | 'git' | 'success' | 'pulse';
   pulse?: boolean;
 };
 
@@ -190,6 +190,11 @@ export function ActivityBar({ viewMode, onSelectViewMode, bootstrap: initialBoot
       };
     }
     if (surface === 'agent') {
+      // Phase 9e: a finished background child outranks the running pulse -
+      // the user needs to see that a result is waiting.
+      if (agentState.unreadSubagentCount > 0) {
+        return { count: agentState.unreadSubagentCount, variant: 'success' };
+      }
       if (agentInFlight) {
         return { variant: 'pulse', pulse: true };
       }

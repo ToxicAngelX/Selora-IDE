@@ -18,27 +18,44 @@
 //! guard, and the approval split. 5c's loop controller and 5e's web
 //! implementations build on these seams.
 
+pub mod plan;
 pub mod router;
 pub mod todo;
+pub mod session;
+pub mod subagent;
 pub mod tools;
 pub mod turn;
 
 // Re-exports of the Phase 5 surfaces (5c/5d consume these): the router
 // (5b), the loop (5c), the bash abort handle. The shared types' shapes
 // are unchanged from the prep commit — these are additive.
-pub use router::{
-    denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
-    ToolOutcome,
+pub use plan::{
+    new_store, PlanDraft, PlanPhase, PlanSession, PlanSnapshot, PlanStore, TodoItem, TodoStatus,
 };
-pub use todo::{
-    parse_todos, stored_result, TodoItem, TodoSink, TodoStatus, MAX_TODOS, MAX_TODO_ID_CHARS,
-    MAX_TODO_TEXT_CHARS,
+pub use router::{
+    denied_result, execute_approved, execute_tool, plan_approved_result, revise_plan_result,
+    tool_manifest, AgentToolSettings, ToolContext, ToolOutcome,
+};
+pub use session::{
+    bound_summary, compact_conversation, compacted_conversation, now_millis, should_compact,
+    summary_request, transcript_conversation, AgentSessionMode, AgentSessionState,
+    AgentSessionStore, AgentSessionSummary, CompactionCursor, CompactionError, CompactionOutcome,
+    LoadedAgentSession, ParkSummary, ParkedCard, PlanState, PlanStatus, TranscriptEntry,
+    TranscriptLoad, AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD,
+    MAX_SUMMARY_CHARS, SESSION_SCHEMA, STATE_FILE, TODOS_FILE, TRANSCRIPT_FILE,
+};
+#[allow(unused_imports)]
+pub use subagent::{
+    wait_tool_result, wait_tool_spec, ArtifactRef, CancelToken, ChildId, ChildOutcome, ChildState,
+    CompletionDisposition, SpawnError, SpawnRequest, SubagentCompletion, SubagentEvent,
+    SubagentHandle, SubagentPolicy, SubagentRuntime, WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT,
+    MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{
     run_agent_turn, spawn_agent_turn, AgentEvent, AgentSummary, AgentTurn, AgentTurnReport,
-    AgentTurnState, ChatStream, ClientChatStream, RouterToolRunner, ToolRunner, TurnCaps,
-    TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
+    AgentTurnState, ChatStream, ClientChatStream, CompactionConfig, RouterToolRunner, ToolRunner,
+    TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
 };
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +77,10 @@ pub enum AgentDecision {
     Approve,
     ApproveAllThisTurn,
     Deny,
+    /// Phase 9b: reject the *shape* of a proposed plan while keeping the
+    /// session in plan mode. The model sees a "revise the plan" tool result
+    /// and calls `exit_plan_mode` again. Never a grant.
+    Revise,
     Stop,
 }
 
@@ -88,6 +109,17 @@ pub enum ApprovalCard {
     /// `bash` — the command about to run (auto-approved allowlisted
     /// commands never build a card).
     Command { command: String },
+    /// `exit_plan_mode` (Phase 9b): the plan approval card. Approving flips
+    /// the session to execution (writes still card) and seeds the step list
+    /// as todos when the session has none; Revise/Deny keeps planning.
+    Plan {
+        /// Optional one-line context the model supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// The ordered plan steps, validated and bounded by
+        /// [`plan::MAX_PLAN_STEPS`].
+        steps: Vec<String>,
+    },
     /// `run_workflow` (§18.1): the confirmation moment for a workflow
     /// script. Shows the full script body, the extracted `world.run`
     /// command set, and the workflow-level cost cap. Approving it starts

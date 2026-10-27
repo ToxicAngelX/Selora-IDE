@@ -6,6 +6,7 @@
 // dialog and return focus to the bell (DESIGN §7).
 import { useEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { toastStore, type NotificationEntry } from '../features/toasts/toast-store';
+import { agentStore } from '../features/agent/agent-store';
 import type { ToastSeverity } from '../bridge/bridge';
 
 export const OPEN_NOTIFICATIONS_EVENT = 'selora:open-notifications';
@@ -94,17 +95,35 @@ export function formatNotificationAge(at: number, now: number = Date.now()): str
   return `${Math.floor(hours / 24)}d`;
 }
 
-function NotificationRow({ entry, now }: { entry: NotificationEntry; now: number }) {
+function NotificationRow({
+  entry,
+  now,
+  onActivate,
+}: {
+  entry: NotificationEntry;
+  now: number;
+  onActivate: (entry: NotificationEntry) => void;
+}) {
   const age = formatNotificationAge(entry.at, now);
 
   return (
     <li className="notification-list-item">
       <button
         type="button"
-        className={`notification-item${entry.read ? '' : ' is-unread'}`}
-        onClick={() => toastStore.markRead(entry.id)}
-        title={entry.read ? SEVERITY_LABEL[entry.severity] : 'Mark as read'}
-        aria-label={`${entry.message}, ${age}${entry.read ? '' : ', unread'}`}
+        className={`notification-item${entry.read ? '' : ' is-unread'}${
+          entry.action ? ' has-action' : ''
+        }`}
+        onClick={() => onActivate(entry)}
+        title={
+          entry.action
+            ? `Open ${entry.read ? 'result' : 'and mark read'}`
+            : entry.read
+              ? SEVERITY_LABEL[entry.severity]
+              : 'Mark as read'
+        }
+        aria-label={`${entry.message}, ${age}${entry.read ? '' : ', unread'}${
+          entry.action ? ', open result' : ''
+        }`}
       >
         <span
           className={`notification-dot notification-dot-${entry.severity}`}
@@ -206,6 +225,14 @@ export function NotificationCenter() {
 
   const unreadLabel = state.unreadCount > 0 ? `${state.unreadCount} unread` : 'All read';
 
+  const activateEntry = (entry: NotificationEntry) => {
+    toastStore.markRead(entry.id);
+    if (entry.action?.kind === 'subagent') {
+      agentStore.revealSubagent(entry.action.sessionId, entry.action.childId);
+      setOpen(false);
+    }
+  };
+
   return (
     <div ref={rootRef} className="notification-center">
       <button
@@ -275,7 +302,7 @@ export function NotificationCenter() {
           ) : (
             <ul className="notification-list" aria-label="Notification history">
               {state.history.map((entry) => (
-                <NotificationRow key={`${entry.id}:${entry.at}`} entry={entry} now={now} />
+                <NotificationRow key={`${entry.id}:${entry.at}`} entry={entry} now={now} onActivate={activateEntry} />
               ))}
             </ul>
           )}

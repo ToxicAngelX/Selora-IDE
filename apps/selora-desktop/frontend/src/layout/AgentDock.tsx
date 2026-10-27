@@ -70,6 +70,13 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
       );
     }
   };
+  const revealedSubagent = state.revealedSubagentId
+    ? state.subagents.find((subagent) => subagent.id === state.revealedSubagentId)
+    : undefined;
+
+  useEffect(() => {
+    if (state.revealedSubagentId) setActiveTab('plan');
+  }, [state.revealedSubagentId]);
 
   const suggestions = SUGGESTIONS.filter((suggestion) => {
     if (suggestion === 'Explain this file') return editor.activeBuffer !== null;
@@ -208,6 +215,68 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
         onNew={() => void agentStore.requestNewSession()}
         onSelect={(sessionId) => void agentStore.requestSwitchSession(sessionId)}
       />
+      {/* Phase 9e: notification click reveals the child result here, under
+          the selected parent session. */}
+      {revealedSubagent ? (
+        <section className="agent-subagent-result" data-testid="subagent-result" aria-label="Subagent result">
+          <div className="agent-subagent-result-head">
+            <span className="agent-subagent-result-title">
+              {revealedSubagent.name}
+              <span className="agent-subagent-policy">{revealedSubagent.policy ?? 'read_only'}</span>
+            </span>
+            <button
+              type="button"
+              className="agent-subagent-result-close"
+              aria-label="Dismiss subagent result"
+              onClick={() => agentStore.clearSubagentReveal()}
+            >
+              Close
+            </button>
+          </div>
+          <p className="agent-subagent-result-body">
+            {revealedSubagent.status === 'failed'
+              ? revealedSubagent.error ?? 'Subagent failed without a message.'
+              : revealedSubagent.result || 'Subagent finished without a final message.'}
+          </p>
+          {revealedSubagent.artifacts && revealedSubagent.artifacts.length > 0 ? (
+            <ul className="agent-subagent-artifacts">
+              {revealedSubagent.artifacts.map((artifact) => (
+                <li key={`${artifact.kind}:${artifact.path}`}>
+                  <span>{artifact.kind}</span> {artifact.path}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
+
+      {/* 2. Main Workbench Body */}
+      <div className="agent-workbench-body">
+        {/* Optional Collapsible Session Drawer Overlay */}
+        {showSessionRail && (
+          <div
+            ref={sessionDrawerRef}
+            id="agent-session-drawer"
+            className="agent-session-drawer-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="agent-session-drawer-title"
+            tabIndex={-1}
+          >
+            <h2 id="agent-session-drawer-title" className="visually-hidden">Agent sessions</h2>
+            <AgentSessionRail
+              sessions={state.sessions}
+              activeSessionId={state.activeSessionId}
+              resumableSessions={state.resumableSessions}
+              onClose={closeSessionRail}
+            />
+            <div
+              className="agent-session-drawer-backdrop"
+              onClick={closeSessionRail}
+              aria-hidden="true"
+            />
+          </div>
+        )}
 
       {/* 3. Workbench body */}
       <div
