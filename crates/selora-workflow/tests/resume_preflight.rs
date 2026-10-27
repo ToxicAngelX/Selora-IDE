@@ -483,6 +483,7 @@ fn budget_exhausted_run_is_refused_before_any_effect() {
         Arc::clone(&first_host),
         false,
         false,
+        false,
     );
     assert!(matches!(result, Err(WorkflowError::BudgetExceeded { .. })));
     assert!(matches!(
@@ -501,6 +502,7 @@ fn budget_exhausted_run_is_refused_before_any_effect() {
         &spec,
         Arc::clone(&resume_host),
         true,
+        false,
         false,
     );
     assert!(

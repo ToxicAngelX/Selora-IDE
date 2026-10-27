@@ -137,7 +137,7 @@ struct RefreshCandidate {
 pub struct Workspace {
     root: PathBuf,
     buffers: Mutex<BTreeMap<String, BufferState>>,
-/// P2 gap 3: in-memory external-change markers, keyed by the buffer path.
+    /// P2 gap 3: in-memory external-change markers, keyed by the buffer path.
     /// Nothing here is persisted; a restart simply has no conflict.
     conflicts: Mutex<BTreeMap<String, BufferConflictDto>>,
     /// The buffer the user most recently opened or selected. Bootstrap
@@ -184,7 +184,7 @@ impl Workspace {
         Ok(Self {
             root,
             buffers: Mutex::new(BTreeMap::new()),
-conflicts: Mutex::new(BTreeMap::new()),
+            conflicts: Mutex::new(BTreeMap::new()),
             active: Mutex::new(None),
             git: Mutex::new(git),
         })

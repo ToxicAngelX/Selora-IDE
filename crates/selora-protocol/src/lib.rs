@@ -497,13 +497,6 @@ pub enum FrontendCommand {
         session_id: SessionId,
     },
     NewSession,
-    /// Phase 9 session slice: record the buffer the user is actually looking
-    /// at, so the next bootstrap reports it instead of the first buffer in
-    /// path order. Additive to protocol_version 1: older clients simply never
-    /// send it and keep the path-order fallback.
-    SetActiveBuffer {
-        buffer_id: BufferId,
-    },
     Search {
         query: SearchQueryDto,
     },
@@ -562,7 +555,7 @@ pub enum FrontendCommand {
         /// pre-flag payload resumes fail-closed.
         #[serde(default)]
         allow_incomplete_asks: bool,
-// No `max_cost_usd` here on purpose: resume replays the confirmed
+        // No `max_cost_usd` here on purpose: resume replays the confirmed
         // grant and never raises it. A run that exhausted its cap is refused
         // with `workflow_budget_exhausted`; continuing needs a new run and a
         // newly confirmed budget.

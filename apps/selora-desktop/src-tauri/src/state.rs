@@ -2,12 +2,11 @@ use selora_protocol::{
     clamp_region_size, ApprovalId, BootstrapState, BufferSnapshotDto, CommandAckDto,
     CommandResultDto, CoreInstanceId, DecisionDto, EventEnvelope, FileTreeDto, FrontendCommand,
     FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto, RegionId, RequestEnvelope,
-    RequestId, SessionId, SettingsPatchDto,
-    SettingsViewDto, SurfaceId, ToastDto, ToastSeverity, WorkflowApprovalNeededDto,
-    WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto,
-    WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto,
-    WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto, WorkspaceId,
-    PROTOCOL_VERSION,
+    RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId, ToastDto, ToastSeverity,
+    WorkflowApprovalNeededDto, WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto,
+    WorkflowPhaseDto, WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto,
+    WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto,
+    WorkspaceId, PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
@@ -434,7 +433,7 @@ fn persisted_workflow_runs(
         let ambiguous_command = workflow_has_ambiguous_command(&journal);
         let budget_tripped = status == Some(selora_workflow::journal::RunStatus::BudgetExceeded);
         let completed = status == Some(selora_workflow::journal::RunStatus::Completed);
-        let (partial_effects, ledger_block) = if completed {
+        let (partial_effects, ledger_block) = if completed || budget_tripped {
             (false, None)
         } else {
             match selora_workflow::partial_effects(root, &id) {
@@ -2160,7 +2159,7 @@ impl DesktopState {
         let (workspace_dto, buffers, active_buffer_id, file_tree, git) = match workspace.as_ref() {
             Some(open) => {
                 let buffers = open.buffers();
-// The workspace owns the active tab: it follows explicit
+                // The workspace owns the active tab: it follows explicit
                 // switches and the nearest-neighbour rule on close. The
                 // state-level preference is a second source for paths that
                 // set it directly, and path order is the last resort.
@@ -2504,7 +2503,7 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::RefreshTree => {
                 let tree = self.with_workspace(|workspace| workspace.tree())?;
@@ -2518,7 +2517,7 @@ impl DesktopState {
                     retryable: false,
                 })?;
                 reveal_in_file_explorer(&root.join(path.as_str()))?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::OpenFile { path } => {
                 let buffer = self.with_workspace(|workspace| workspace.open_file(path.as_str()))?;
@@ -2583,7 +2582,7 @@ impl DesktopState {
                         Some(request_id),
                     );
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::ReloadBufferFromDisk { buffer_id } => {
                 let buffer =
@@ -2607,7 +2606,7 @@ impl DesktopState {
                     ),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::KeepBufferEdits { buffer_id } => {
                 let buffer =
@@ -2622,7 +2621,7 @@ impl DesktopState {
                     ),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::ApplyEditorChange {
                 buffer_id,
@@ -2689,7 +2688,7 @@ impl DesktopState {
             }
             FrontendCommand::LspRestart { language } => {
                 self.restart_lsp(app, &language)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::Search { query } => {
                 let results = self.with_workspace(|workspace| workspace.search(&query))?;
@@ -6171,7 +6170,7 @@ mod tests {
                         request_id: RequestId::new("wf-budget-resume").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
-                    acknowledge_partial_effects: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -6255,7 +6254,7 @@ mod tests {
                         request_id: RequestId::new("wf-budget-raw-resume").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
-                    acknowledge_partial_effects: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -6451,7 +6450,7 @@ mod tests {
                         request_id: RequestId::new("wf-stopped-resume-again").unwrap(),
                         run_id: saved.run_id,
                         allow_incomplete_asks: false,
-                    acknowledge_partial_effects: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
