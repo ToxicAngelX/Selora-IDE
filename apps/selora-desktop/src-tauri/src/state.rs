@@ -58,7 +58,9 @@ fn reveal_in_file_explorer(path: &std::path::Path) -> Result<(), ProtocolErrorDt
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let target = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
         std::process::Command::new("xdg-open")
             .arg(target.unwrap_or(path))
             .spawn()
@@ -915,6 +917,10 @@ struct WorkflowStream<R: tauri::Runtime> {
     /// The language-server bridge slot. A clean reload sends the new full
     /// text and retracts stale diagnostics before the next request.
     lsp: Arc<Mutex<Option<LspBridge>>>,
+    /// The settings-fed LSP paths/args/enabled, used when this run is the
+    /// first thing to start the workspace's bridge. Shared with the shell so
+    /// a settings override is never silently dropped on the workflow path.
+    lsp_paths: selora_lsp::LspServerPaths,
     max_cost_usd: f64,
     name: String,
     started: AtomicBool,
@@ -1024,7 +1030,11 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
         });
         let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
         if guard.is_none() {
-            *guard = Some(LspBridge::start(self.workspace_root.clone(), emit));
+            *guard = Some(LspBridge::start_with_paths(
+                self.workspace_root.clone(),
+                emit,
+                self.lsp_paths.clone(),
+            ));
         }
         if let Some(bridge) = guard.as_ref() {
             action(bridge);
@@ -2524,6 +2534,7 @@ impl DesktopState {
             workspace_root: root.clone(),
             workspace: Arc::clone(&self.workspace),
             lsp: Arc::clone(&self.lsp),
+            lsp_paths: self.lsp_paths.clone(),
             max_cost_usd: spec.max_cost_usd,
             name: spec.name.clone(),
             started: AtomicBool::new(false),
