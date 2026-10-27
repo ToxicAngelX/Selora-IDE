@@ -5,6 +5,61 @@ All notable changes to Selora IDE are documented here. The format follows
 
 ## [Unreleased]
 
+<!-- FINALIZATION: keep these entries under Unreleased until the post-merge gate
+passes and a version/tag is chosen. Do not add test counts, artifact hashes, or
+dates from memory; record gate evidence in STATUS.md and RELEASE.md. Remove any
+Phase 9a bullet if the `selora-p3-window` branch is discarded instead of merged. -->
+
+### Added
+
+- Workflows (Phase 8): a scripted multi-agent engine with a hardened facade,
+  schema-validated `ask`, deterministic `world.run` gates, named-agent FIFO
+  scheduling, a per-run budget, and a durable JSONL journal under
+  `.selora/workflow-runs/`.
+- Workflows (Phase 8): the `run_workflow` tool, manifest v2, a confirmation
+  card showing the script body, command set, and cost cap, an approval route
+  that reuses Agent Mode's cards, run/stop/resume dispatch, and receipt/token
+  accounting.
+- Workflows (Phase 8): a live panel with the phase graph, step status, run log,
+  inline approvals, Stop, and completed-run history. Completed history,
+  explicit journal phases/reports/artifacts, and budget preflight on direct
+  resume are on the `integration` branch pending merge.
+- Workflows (Phase 8): `world.run` creates the child suspended and assigns it
+  to a Windows Job Object before execution, so the process tree is contained
+  on Stop, timeout, and cancel. `Resume anyway` is explicit and default-refused
+  for an unfinished ask.
+- Agent Workbench (Phase 9a, on `selora-p3-window` pending merge): a dedicated
+  Agent surface with truthful session tabs, a read-only todo spine, structured
+  question and plan cards, Chat/Plan views, and a composer mode row mapped to
+  session permission policies. Backend session routing lands with the session
+  slice, not in 9a alone.
+
+### Changed
+
+- Agent sessions (branch `selora-wt-session`, pending merge): new/switch/retry
+  become backend-authoritative, todos are stored per session and published as
+  `session_todos_changed`, the active buffer is recorded, and event sequence
+  assignment is serialized under one order guard.
+- Editor settings (branch `selora-wt-settings`, pending merge): editor
+  settings become real controls and dirty-tab close is protected.
+- LSP (branch `selora-wt-lsp`, pending merge): lifecycle isolation, `.cmd`
+  server resolution, and `rg`/fallback search parity.
+
+### Fixed
+
+- LSP documents are re-sent after a clean-buffer workflow reload; dirty buffers
+  are preserved with a toast instead of being overwritten.
+- A budget-exhausted workflow run is pre-refused on direct resume, not only by
+  the run listing.
+
+### Pending verification
+
+- Post-merge gate: **NOT RUN** - `TODO-VERIFY` in `STATUS.md`.
+- Phase 8 owner acceptance: **UNRUN** - `docs/PHASE8_ACCEPTANCE.md`.
+- Phase 9 acceptance: **UNRUN / partial** - `docs/PHASE9_ACCEPTANCE.md`.
+- Artifacts: unsigned, not built from the merged tree, no clean-VM install -
+  `RELEASE.md` section 11.
+
 ## [0.1.0] - 2026-10-26
 
 ### Added

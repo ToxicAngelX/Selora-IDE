@@ -1,70 +1,112 @@
-# Status - 2026-10-27
+# Status - 2026-10-27 (post-merge documentation skeleton)
 
-> Restart point. Read this, then `AGENT_ORCHESTRATION.md` section 10.
-> The pre-Tauri STATUS is archived as `STATUS_ARCHIVE_2026-10-09.md`; the
-> per-slice audit and its hardening addendum live in
-> `docs/ui/PHASE_Z_PARITY_REPORT.md`.
+> **NOT FINAL. FINALIZE AFTER MERGE.**
+> This restart point is a skeleton for the tree that exists after the Phase 8
+> follow-up, Phase 9a, and session branches are merged. Every value marked
+> `TODO-VERIFY` must be replaced from the final gate output. Do not copy an
+> earlier number or hash into a final record.
+>
+> Restart point. Read this, then `AGENT_ORCHESTRATION.md` section 10 and
+> `docs/POST_MERGE_FINALIZATION.md`. The pre-Tauri STATUS is archived as
+> `STATUS_ARCHIVE_2026-10-09.md`; the per-slice audit and its hardening
+> addendum live in `docs/ui/PHASE_Z_PARITY_REPORT.md`.
+
+## Merge state (fill at finalization)
+
+This worktree is the release lane `selora-lane-release`. It contains the
+release-prep, walkthrough, and documentation lanes merged on top of the
+feature tree. The feature branches in the table below are merged through
+`integration`; the remaining Phase 9 lanes are not merged here yet.
+
+| Branch | Scope | Merge state |
+|---|---|---|
+| `main` | Phase 8 waves 2-4 on the base tree | base |
+| `integration` | Phase 8 follow-ups: journal history, dirty-buffer conflict, budget resume preflight, LSP lifecycle, search parity | merged (ancestor of this lane); gate `TODO-VERIFY` |
+| `selora-p3-window` | Phase 9a Agent Workbench frontend | branch has commits; not merged in this lane |
+| `selora-wt-session` | Backend-authoritative sessions, todos, retry, event ordering | branch has commits; not merged in this lane |
+| `selora-wt-settings` | Real editor settings and dirty-close protection | branch has commits; not merged in this lane |
+| `selora-wt-lsp` | LSP lifecycle isolation and `rg`/fallback parity | merged (part of `integration`) |
+| `selora-p3-plan` | Phase 9b plan mode + todos + effects gating | branch has commits; not merged in this lane |
+| `selora-p3-subagent` | Phase 9c subagent runtime + escalations | branch has commits; not merged in this lane |
+| `selora-p3-sessions` | Phase 9d persistence, resume, compaction | branch has commits; not merged in this lane |
+| `selora-p3-background` | Phase 9e background runs + notifications | branch has commits; not merged in this lane |
 
 ## Last completed
 
-Phase Z7 hardening plus **Phase 8 waves 2–4**: execution, approvals, durable
+Phase Z7 hardening and **Phase 8 waves 2-4**: execution, approvals, durable
 replay, receipt accounting, process-tree containment, explicit unfinished-ask
-resume consent, live buffer refresh, completed-run history, and a release build
-plus installer. A first-run freeze was diagnosed and fixed: the onboarding
-WebGL effect hung WebView2, and duplicate launches raced for one WebView2
-profile. Brand surfaces are CSS-only and the app is single-instance. Automated
-work is green; Phase 8 acceptance waits on the owner’s real-key steps.
+resume consent, live buffer refresh, and a release build plus installer.
 
-Branch: **none** - this checkout has no `.git` directory, so nothing could be
-committed, branched, or diffed. All work is in the working tree only.
-Integrated: 2026-10-27 (working tree, no VCS)
-Automated baseline: **green** (numbers below). Manual acceptance is unrun.
+Post-merge additions expected from the branches above: completed-run history,
+explicit journal phases/reports/artifacts, budget preflight on direct resume,
+dirty-buffer conflict handling, LSP lifecycle fixes, real editor settings,
+backend-authoritative sessions/todos/retry, and the Phase 9a Agent Workbench
+frontend.
 
-## Last completed gate (wave 4, end of session)
+Automated work was recorded as green **before** the post-merge tree existed.
+That result does not describe the merged tree. Re-run the full gate and record
+the result here.
+
+## Last completed gate (POST-MERGE: NOT RUN)
 
 | Gate | Result |
 |---|---|
-| `cargo fmt --all -- --check` | clean |
-| `cargo clippy --workspace --all-targets -- -D warnings` | clean, exit 0 |
-| `cargo test --workspace --no-fail-fast` | **1121 passed, 0 failed** (4 ignored), 29 suites |
-| `npm run typecheck` | clean, exit 0 |
-| `npm test` | **466 passed, 0 failed**, 51 files |
-| `npm run build` | green |
-| `cargo deny check` | **advisories ok, bans ok, licenses ok, sources ok** |
-| `scripts/phase8-acceptance.ps1` | **13 passed, 0 failed, 2 skipped**; exit 0 |
+| `cargo fmt --all -- --check` | `TODO-VERIFY` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | `TODO-VERIFY` |
+| `cargo test --workspace --no-fail-fast` | `TODO-VERIFY` (passed / failed / ignored / suites) |
+| `npm run typecheck` | `TODO-VERIFY` |
+| `npm test` | `TODO-VERIFY` (passed / failed / files) |
+| `npm run build` | `TODO-VERIFY` |
+| `cargo deny check` | `TODO-VERIFY` |
+| `scripts/phase8-acceptance.ps1` | `TODO-VERIFY` (passed / failed / skipped, exit code) |
 
-### First-run freeze fix (verified)
+Gate commands run from the repository root unless noted:
 
-1. With a fresh WebView2 profile the old `img-fx` hero failed shader creation,
-   lost its context, and stopped the renderer thread (CDP evaluations timed out).
-2. `BrandFx` now always renders the CSS orbital mark; `OnboardingHero` and
-   `MetalBrand` load no WebGL module. Fresh-profile verification: overlay
-   visible, zero canvases, evaluations answered in 1–2 ms.
-3. `tauri-plugin-single-instance` focuses the running window and exits the
-   second process. Verified: second launch exited, process count stayed one.
-   This prevents the WebView2 setup failure (`0x8007139F`) seen with duplicate
-   launches.
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+cargo deny check
+npm.cmd --prefix apps/selora-desktop/frontend run typecheck
+npm.cmd --prefix apps/selora-desktop/frontend test
+npm.cmd --prefix apps/selora-desktop/frontend run build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase8-acceptance.ps1
+```
 
-A backup of the replaced WebView2 profile remains at
-`%LOCALAPPDATA%\lol.selora.ide\EBWebView.bak`; the new profile carries first-run
-state.
+## Packaging artifacts (POST-MERGE: NOT BUILT)
 
-Wave 4 closed the five recorded gaps at the automated level: Windows Job Object
-containment for `world.run`; detected unfinished asks with default-refused resume
-and explicit `Resume anyway`; clean-buffer refresh with `BufferSnapshot` events;
-completed-run history from the terminal journal report; and a release binary plus
-a compiled installer. Every acceptance step still carries an `OWNER` row.
+Rebuild both artifacts from the final merged commit. Do not reuse a pre-merge
+binary.
 
-### Packaging artifacts (built this tree, unsigned)
+### Packaging artifacts (Phase 8 build, unsigned - historical)
+
+| Artifact | Path | Size | SHA-256 | Signature |
+|---|---|---|---|---|
+| Release app | `target\release\selora-desktop.exe` | `TODO-VERIFY` | `TODO-VERIFY` | `NotSigned` / `TODO-VERIFY` |
+| Installer | `installer\output\Selora-IDE-Setup-<version>.exe` or owner-chosen path | `TODO-VERIFY` | `TODO-VERIFY` | `NotSigned` / `TODO-VERIFY` |
+
+Current known state: **unsigned artifacts, no clean-VM install, no owner
+acceptance, no visual pass.** The update check still targets a repository that
+returns 404 until the owner publishes it.
+
+The earlier Phase 8 smoke artifacts landed outside `installer/output/` because
+`prebuild.bat` could not find the `%TEMP%` ISCC copy. Both are `NotSigned`.
+Release build process smoke: window created and shown; no visual/manual UI
+acceptance was performed.
+
+### 0.1.0 release dry run (2026-10-27, pre-merge)
 
 | Artifact | Path | Size | SHA-256 |
 |---|---|---|---|
-| Release app | `target\release\selora-desktop.exe` | 18,823,168 | `167fcf8b4271bc558b413535dd2757d1d73168b48a1e134376b20ab21a4de50f` |
-| Installer | `%TEMP%\selora-phase8-installer\Selora-IDE-Setup-0.1.0.exe` | 9,388,643 | `7a20d776e9d31e9293036f9fb1314d3ec3008bde7fd841ffcdfc616abb806fa1` |
+| Release app | `target\release\selora-desktop.exe` | 18,875,904 | `acab5f75eb34a53525918c8b8e770f902adf8aa5c622419e3e13c4c1cc13cfd5` |
+| Installer | `installer\output\Selora-IDE-Setup-0.1.0.exe` | 9,408,027 | `95b2f4deb29fa851215fd08fd6f6a88918ec46757884b19866d4a829882360b0` |
 
-The installer is outside `installer/output/` because ISCC lives in `%TEMP%`.
-Both artifacts are `NotSigned`. Release build process smoke: window created and
-shown; no visual/manual UI acceptance was performed.
+`installer\prebuild.bat` now resolves ISCC through `installer\find-iscc.ps1`
+(the local installer is registered under `%TEMP%`) and passes an absolute
+`/O`, so the setup lands in `installer\output`. The artifact is `NotSigned`,
+ProductVersion 0.1.0. Release metadata, tag gates, draft-asset checks, and
+owner-only steps are in `RELEASE_0.1.0_CHECKLIST.md`. These values describe the
+pre-merge tree; rebuild from the final commit before recording them again.
 
 Wave 3/4 review fixes include argument-safe `world.run`, approval retries,
 hydration, late events, concurrent folder switches, configured git diff helpers,
@@ -89,34 +131,34 @@ were yanked). No source API changed.
 | Git/workspace | Staged rows show the HEAD-to-index diff; `GitStatusDto.files` carries both slots so an `MM` file appears in both sections; literal/regex whole-word parity for `@foo`, `C++`, `->`; activity-bar badge counts unique paths |
 | UI/release | Settings panel shows truthful values and real commands; dirty tab close has Save / Discard / Cancel; remaining a11y fixes (file-tree roving focus, plan-spine buttons, progressbar, notification inert background, dialog Escape/restore); `CHANGELOG [0.1.0]`; release workflow gates tags on `main` and runs fmt/clippy/deny; release docs reconciled |
 
-## Phase 8 status (Workflows, waves 2–4)
+## Phase 8 status (Workflows, waves 2-4)
 
 | Slice | State |
 |---|---|
-| 8a engine core | **done**: `crates/selora-workflow` is a root-workspace member with boa 0.22 (`default-features=false`), hardened realm (no fetch/fs/process/timers/Date/eval/random), 64 KiB script + 256 step caps, literal-only `world.run` command extraction, schema-validated `ask`, `prepare`/`run_workflow`; 56 unit + 2 integration + 1 doctest |
-| 8b journal/budget/subagents | **done on the run path**: durable spec + JSONL journal, index-keyed replay, strict damaged-journal refusal, torn-tail recovery, exclusive run lock, restored spend/tokens, named-agent FIFO/concurrency |
-| 8c protocol/bridge | **done**: run/resume/stop/decision commands, seven events, origin workspace id, bootstrap listing with completed history, old JSON defaults |
-| 8c Host | **done**: root-contained files/git, Job Object tree kill for `world.run`, real §17 agent turns with tools, lossless history, explicit approvals, receipts |
-| 8c dispatch | **done**: starts/stops/resumes, answers live approvals, unfinished-ask consent gate, single terminal event |
-| 8c tool/card | **done**: manifest v2, strict validation, full workflow payload, mounted card, exactly-once launch |
-| 8d panel | **done**: live events, exact approval cards, retry-safe actions, safe Resume, `Resume anyway` confirmation, completed-run history |
-| 8d buffers | **done**: terminal event reloads clean buffers, emits `BufferSnapshot`, preserves dirty tabs with a toast, refuses cross-workspace refresh |
-| 8d shell/docs/package | **done**: lazy route, release EXE, installer compiled under `%TEMP%`, `docs/PHASE8_ACCEPTANCE.md`, automation script |
+| 8a engine core | Implemented on `main`: boa engine, hardened realm, caps, schema-validated `ask`, command extraction, `prepare`/`run_workflow` |
+| 8b journal/budget/subagents | Implemented on `main`; follow-ups for history, budget preflight, and buffer conflicts are on `integration` (`TODO-VERIFY`) |
+| 8c protocol/bridge | Implemented on `main`; `TODO-VERIFY` after merge |
+| 8c Host | Implemented on `main`: root-contained files/git, Job Object tree kill, agent turns, approvals, receipts |
+| 8c dispatch | Implemented on `main`: start/stop/resume, live approvals, unfinished-ask consent |
+| 8c tool/card | Implemented on `main`: manifest v2, strict validation, workflow card |
+| 8d panel | Implemented on `main`; completed-run history is on `integration` (`TODO-VERIFY`) |
+| 8d buffers | Implemented on `main`; conflict handling and LSP reload sync are on `integration` (`TODO-VERIFY`) |
+| 8d shell/docs/package | Automation script and release EXE exist pre-merge; rebuild and re-verify after merge |
+| Owner acceptance | **UNRUN** - ROADMAP Phase 8 steps 1-9 |
 
-**Still pending (honest gaps):**
+## Phase 9 status (Agent Workbench)
 
-1. Job assignment happens just after `CreateProcess`, so a descendant spawned in
-   that sub-startup window could escape; everything after assignment is killed.
-2. “Resume anyway” is explicit, but tools in a previously unfinished ask may
-   already have applied effects. Exactly-once subagent side effects are not
-   claimed.
-3. Dirty editor buffers are intentionally not overwritten; LSP documents are not
-   re-sent after a clean-buffer reload. Budget-tripped runs are only pre-refused
-   by the listing, not the direct resume handler.
-4. Persisted history comes from the terminal journal report: per-step phases are
-   unknown and reports reconstruct only from successful, parsable report steps.
-5. Owner acceptance steps 1–9 remain unrun; no clean-VM install, no signing, no
-   update check (404), and no `.git` history.
+| Wave | State |
+|---|---|
+| 9a Agent window | Commits on `selora-p3-window`; not merged in this lane; frontend contract in `docs/ui/PHASE9A_AGENT_WORKBENCH.md` |
+| 9b Plan mode + todos + **effects gating** | Commits on `selora-p3-plan`; not merged in this lane; acceptance **UNRUN**; see `docs/ui/PHASE9B_PLAN_TODOS.md` |
+| 9c Subagent runtime + escalations | Commits on `selora-p3-subagent`; not merged in this lane; acceptance **UNRUN** |
+| 9d Sessions + compaction | Commits on `selora-wt-session` and `selora-p3-sessions`; not merged in this lane; durable resume, compaction, and session auto-approve unverified here |
+| 9e Background runs + notifications | Commits on `selora-p3-background`; not merged in this lane; acceptance **UNRUN** |
+| Owner acceptance | **UNRUN** - see `docs/PHASE9_ACCEPTANCE.md` |
+
+Phase 9 is **not** accepted, and no wave beyond the unmerged 9a frontend exists
+in this tree. Do not describe the Agent Workbench as complete.
 
 ## What is real now
 
@@ -124,50 +166,67 @@ were yanked). No source API changed.
 |---|---|
 | Shell / layout / persistence | Real: seven regions, drag + keyboard resize, layout restore |
 | Workspace / files / editor | Real: folder picker, tree, 2 MiB UTF-8 open, tabs, save, find/replace, minimap |
-| Search / Git / Problems | Real: literal + regex search, stage/unstage/commit, staged/unstaged diffs, live diagnostics |
-| LSP | Real for Rust and TS/JS from `PATH`; `.cmd` shims handled; no settings path overrides in the desktop bridge |
-| Agent Mode | Real tools, streaming, cards, approvals, stop; **Full auto-apply** for file tools in the session; plan-only arms read tools only |
-| Workflows (Phase 8) | Engine, Host, approvals, durable resume/history, buffer refresh, live panel, and confirmation card are wired; owner acceptance pending |
-| Settings | Theme + reduced motion persist through Rust; every other control is disabled/read-only |
+| Search / Git / Problems | Real: literal + regex search, stage/unstage/commit, diffs, live diagnostics |
+| LSP | Real for Rust and TS/JS from `PATH`; branch fixes pending merge |
+| Agent Mode | Real tools, streaming, cards, approvals, stop; Full auto-apply for file tools in the session |
+| Workflows (Phase 8) | Engine, Host, approvals, durable resume, buffer refresh, live panel, confirmation card wired; owner acceptance pending |
+| Agent Workbench (Phase 9) | 9a frontend and 9b-9e work exist on unmerged branches; only the 9a shell pieces present on `main` are real here |
+| Settings | Theme + reduced motion persist; branch adds real editor settings (`TODO-VERIFY`) |
 | Terminal / Output | Intentionally inert placeholders |
-| Packaging | Release EXE and an unsigned installer were built from this tree; artifacts live in `target\release` and `%TEMP%`, not `installer/output` |
+| Packaging | Unsigned 0.1.0 dry-run EXE and installer were built from the pre-merge tree into `target\release` and `installer\output`; rebuild from the final commit |
 
-## Next
+## Next (finalization order)
 
-1. **Phase 8 owner acceptance:** run roadmap steps 1–9 with a real key and
-   workspace. The release EXE was smoke-launched (window created/shown), but no
-   human visual or interaction check ran. Use `docs/PHASE8_ACCEPTANCE.md`.
-2. **Owner-run manual walkthrough** (`PHASE_Z_TAURI_PROMPT.md` lines 707-726):
-   Open Folder, dirty-tab save/discard, LSP hover/definition with
-   `rust-analyzer` on PATH, agent read/write + full auto-apply, agent approval
-   for bash, Settings persistence, resize/restart.
-3. **Clean-VM installer test** — Windows 11, plus Windows 10 without WebView2.
-   The compiled installer is unsigned and currently under `%TEMP%`.
-4. **Session lifecycle** remains the main functional gap:
-   `SwitchSession` / `NewSession` / `RetryMessage` are still local-only or
-   `unsupported_phase_slice`. The design is recorded in the audit; implement it
-   before/with Phase 9, or scope the rail explicitly as local.
-5. **Phase 9 (Agent Workbench)** follows Phase 8; do not start it until
-   Phase 8 is wired and accepted.
+1. Merge remaining feature branches in dependency order. Run the full gate after
+   each merge. Resolve conflicts in `STATUS.md`, `ROADMAP.md`, `CHANGELOG.md`,
+   and `docs/` deliberately; this skeleton is the intended shape. The release
+   prep, walkthrough, and docs lanes are merged into this release branch.
+2. Fill every `TODO-VERIFY` in this file, `docs/PHASE8_ACCEPTANCE.md`,
+   `docs/PHASE9_ACCEPTANCE.md`, `docs/ui/PHASE9_*.md`, `CHANGELOG.md`, and
+   `RELEASE.md` from the final gate output.
+3. Run Phase 8 owner acceptance steps 1-9 with a real key and workspace
+   (`docs/PHASE8_ACCEPTANCE.md`). The release EXE was only smoke-launched
+   pre-merge; no human visual or interaction check ran.
+4. Run the owner manual walkthrough (`PHASE_Z_TAURI_PROMPT.md` lines 707-726)
+   through `scripts/walkthrough.ps1` and `docs/WALKTHROUGH.md`: Open Folder,
+   dirty-tab save/discard, LSP hover/definition with `rust-analyzer` on PATH,
+   agent read/write + full auto-apply, agent approval for bash, Settings
+   persistence, resize/restart.
+5. Run the Phase 9 acceptance checklist that applies to the merged waves. Mark
+   unbuilt waves **NOT RUN / NOT IMPLEMENTED**, never passed.
+6. Build the release EXE and installer from the final commit. Record sizes,
+   SHA-256 values, and Authenticode state. Sign only if the owner supplied the
+   certificate secrets.
+7. Install on a clean Windows 11 VM. Repeat without WebView2 on Windows 10 if
+   the runtime branch changed. Record the result.
+8. Update `ROADMAP.md` phase status and this restart point. Commit only after
+   the documentation matches the merged tree.
 
 ## Blockers (owner decisions or human-only)
 
-1. **No `.git` in this checkout.** Nothing was committed. If history/rollback
-   matter, initialise a repository (or point the folder at
-   `github.com/ToxicAngelX/Selora-IDE`) before more parallel work.
-2. **Update check returns 404.** The About dialog queries
-   `api.github.com/repos/ToxicAngelX/Selora-IDE/releases/latest`; publish the
-   repo or change the slug.
-3. **Five of seven Libraries.dev packages are not installed**
+1. **No signing certificate.** `SIGNING_CERT_BASE64` / `SIGNING_CERT_PASSWORD`
+   are owner-only. Artifacts stay `NotSigned` until then.
+2. **Upstream repository not published.** Local git history exists (no remote
+   configured), but `github.com/ToxicAngelX/Selora-IDE` returns HTTP 404. The
+   tag merge gate needs `origin/main`, and the About dialog and Rust update
+   check need a published release for
+   `api.github.com/repos/<owner>/<repo>/releases/latest`. Create/push the
+   repository, or change the slug in the four sources that
+   `scripts/check-release-metadata.ps1` enforces. Publishing v0.1.0 resolves
+   the 404.
+3. **No clean-VM run.** WebView2-missing install, per-user install, file
+   association, launch, and uninstall remain unverified.
+4. **Five of seven Libraries.dev packages are not installed**
    (`border-beam`, `thinking-orbs`, `bot-avatars`, `liquid-gooey`,
-   `voice-glow`). The tree uses local ports; decide install-and-verify or
-   accept the ports as the shipped implementation.
-4. **Signing certificate** for `SIGNING_CERT_BASE64` / `SIGNING_CERT_PASSWORD`;
-   artifacts are unsigned until then.
-5. **Session lifecycle and the single-theme selector** remain documented gaps.
+   `voice-glow`). Decide install-and-verify or accept the local ports.
+5. **Session lifecycle is only partially delivered.** Backend
+   new/switch/retry exists on a branch; durable resume, compaction, and
+   cross-session trust rules are Phase 9d work.
 6. **Full auto-apply is the default composer mode.** File writes apply without
-   a card for the session; bash still cards. Confirm this is the intended
-   default, or switch the default back to Ask before changes.
+   a card for the session; bash still cards. Confirm the default, or switch
+   back to Ask before changes.
+7. **Inno Setup may live under `%TEMP%`.** Install it durably before the owner
+   packaging run; `installer\prebuild.bat` does not find a temp-only copy.
 
 ## Working agreements that still apply
 
@@ -182,7 +241,10 @@ were yanked). No source API changed.
 
 - Gate logs (`*.log`) and the old `service.json` / empty text file are ignored
   by `.gitignore`; `target/`, `node_modules/`, `dist/`, and `installer/output/`
-  were already ignored.
-- No `target/release/selora-desktop.exe` and no `installer/output/` exist in
-  this checkout; `bundle.active=false`, so the Inno script is the packaging
-  path.
+  were already ignored. `/.selora/` is ignored for workflow journals.
+- `target/release/selora-desktop.exe` and
+  `installer/output/Selora-IDE-Setup-0.1.0.exe` exist as unsigned dry-run
+  artifacts (gitignored); rebuild both from the final commit.
+  `bundle.active=false`, so the Inno script remains the packaging path.
+- Pre-merge evidence lives in git history; it is not evidence for the merged
+  tree.

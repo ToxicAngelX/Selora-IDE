@@ -2,6 +2,13 @@
 
 Audit date: 2026-10-26. This report describes the working tree as found; it does not treat historical prose as evidence. The repository has no `.git` directory, so there is no commit, branch, or merge record to cite. Z6 changed only files under `docs/ui/`; no source file was changed.
 
+> **Status update 2026-10-27:** this audit predates Phase 8 and Phase 9. Phase 8
+> workflows are implemented on `main` with post-merge follow-ups pending; Phase
+> 9a is branch-only; Phase 9b-9e are not implemented. Item 13 below and the
+> "Remaining gaps" section are historical findings, not current status. Use
+> `STATUS.md`, `docs/PHASE8_ACCEPTANCE.md`, and
+> `docs/PHASE9_ACCEPTANCE.md` for current state.
+
 ## Gate results
 
 All commands below were run from the current tree on 2026-10-26.

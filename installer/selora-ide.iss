@@ -4,9 +4,14 @@
 ;     installer\prebuild.bat
 ; prebuild reads the workspace version from Cargo.toml, stages the MSVC
 ; runtime DLLs beside the exe, fetches the WebView2 bootstrapper, and invokes
-; ISCC with /DMyAppVersion, /DMyTargetDir, and /DMyCrtDlls. CI passes the
-; tag's version and runs the same staging steps before calling:
-;     ISCC.exe /DMyAppVersion=X.Y.Z installer\selora-ide.iss
+; ISCC with /DMyAppVersion, /DMyTargetDir, /DMyCrtDlls, and an absolute /O.
+; CI passes the tag's version and runs the same staging steps before calling:
+;     ISCC.exe /DMyAppVersion=X.Y.Z /O<repo>\installer\output installer\selora-ide.iss
+;
+; OutputDir below is the default for a hand-run ISCC and resolves against this
+; script's directory. prebuild.bat and CI pass /O so the setup lands in
+; installer\output even when ISCC is invoked from another directory or the
+; compiler is installed outside Program Files.
 ;
 ; Requires Inno Setup 6.3 or newer, or 7.x (x64compatible architectures).
 
@@ -56,6 +61,10 @@ DisableReadyPage=yes
 WizardStyle=modern
 WizardImageFile={#SourcePath}..\assets\icons\wizard_large.bmp
 WizardSmallImageFile={#SourcePath}..\assets\icons\wizard_small.bmp
+; Hand-run default. {#SourcePath} ends with a backslash and is the script's
+; directory, so this is installer\output for any invocation. prebuild.bat and
+; release.yml still pass an absolute /O (see the header) so the artifact path
+; does not depend on ISCC's current directory or install location.
 OutputDir={#SourcePath}output
 OutputBaseFilename=Selora-IDE-Setup-{#MyAppVersion}
 Compression=lzma2/ultra64
