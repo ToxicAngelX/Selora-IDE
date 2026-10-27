@@ -155,7 +155,9 @@ pub struct EditorSettings {
     pub word_wrap: bool,
 }
 
-/// `ui.*` (ARCHITECTURE.md §8.1). Only `"selora-dark"` is honored in Lite.
+/// `ui.*` (ARCHITECTURE.md §8.1). `theme` is `"selora-dark"` by default;
+/// `"light"` selects the Moonlight palette. `"dark"` and `"space-black"`
+/// are accepted aliases for the ink ramp.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiSettings {
     #[serde(default = "default_theme")]
@@ -724,6 +726,29 @@ pub(crate) mod tests {
         assert_eq!(s.keybinds.save, "Ctrl+S");
         assert!(!s.ui.reduce_motion);
         assert_eq!(s.agent.brave_search_api_key, None);
+    }
+
+    /// The UI theme is one persisted string shared by the egui app and the
+    /// Tauri shell. The light theme is a real palette selection, not a
+    /// display-only alias, so it must survive a save/load cycle verbatim.
+    #[test]
+    fn ui_theme_round_trips_light_and_every_accepted_spelling() {
+        let dir = temp_settings_dir("ui-theme-round-trip");
+        let path = dir.join(SETTINGS_FILE_NAME);
+
+        for theme in ["selora-dark", "dark", "space-black", "light"] {
+            let mut settings = Settings::default();
+            settings.ui.theme = theme.to_owned();
+            settings.save_to(&path).expect("save theme");
+
+            let loaded = Settings::load_from(&path).expect("load theme");
+            assert_eq!(loaded.ui.theme, theme, "theme {theme} must round-trip");
+            // The file keeps the exact Rust spelling, not a resolved alias.
+            let text = std::fs::read_to_string(&path).expect("read settings");
+            assert!(text.contains(&format!(r#""theme": "{theme}""#)));
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
