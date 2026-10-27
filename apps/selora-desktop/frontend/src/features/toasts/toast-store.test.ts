@@ -252,3 +252,47 @@ describe('toast store notification history (Z5a)', () => {
     expect(wrongShape.toastStore.getSnapshot().history).toEqual([]);
   });
 });
+
+describe('Phase 9e subagent completion notifications', () => {
+  it('emits one actionable notification per child id, even under a new sequence', () => {
+    expect(
+      toastStore.pushSubagentCompletion(1001, {
+        childId: 'child-toast-1',
+        sessionId: 'sess-parent',
+        ok: true,
+        message: 'Subagent finished: review complete',
+      }),
+    ).toBe(1001);
+
+    expect(
+      toastStore.pushSubagentCompletion(1002, {
+        childId: 'child-toast-1',
+        sessionId: 'sess-parent',
+        ok: true,
+        message: 'Subagent finished: duplicate',
+      }),
+    ).toBeNull();
+
+    const state = toastStore.getSnapshot();
+    expect(state.toasts).toHaveLength(1);
+    expect(state.toasts[0]?.severity).toBe('success');
+    expect(state.history).toHaveLength(1);
+    expect(toastStore.actionFor(1001)).toEqual({
+      kind: 'subagent',
+      childId: 'child-toast-1',
+      sessionId: 'sess-parent',
+    });
+  });
+
+  it('keeps a failed child as a warning, never a success', () => {
+    toastStore.pushSubagentCompletion(2001, {
+      childId: 'child-toast-failed',
+      sessionId: 'sess-parent',
+      ok: false,
+      message: 'Subagent failed: gateway said no',
+    });
+    const state = toastStore.getSnapshot();
+    expect(state.toasts[0]?.severity).toBe('warning');
+    expect(state.history[0]?.severity).toBe('warning');
+  });
+});

@@ -1264,3 +1264,74 @@ describe('agentStore', () => {
     expect(decided?.resultSummary).toContain('Revision requested');
   });
 });
+
+describe('Phase 9e background subagent completions', () => {
+  it('handles a completion once and never claims a failed child as success', () => {
+    resetAndHydrate('sess-subagent');
+    const ok = agentStore.handleSubagentCompleted({
+      child_id: 'child-ok-1',
+      parent_session_id: 'sess-subagent',
+      policy: 'read_only',
+      ok: true,
+      final_message: 'review complete',
+      artifacts: [{ kind: 'diff', path: 'src/lib.rs' }],
+    });
+    expect(ok).toBe(true);
+    expect(
+      agentStore.handleSubagentCompleted({
+        child_id: 'child-ok-1',
+        parent_session_id: 'sess-subagent',
+        policy: 'read_only',
+        ok: true,
+        final_message: 'review complete',
+      }),
+    ).toBe(false);
+
+    agentStore.handleSubagentCompleted({
+      child_id: 'child-failed-1',
+      parent_session_id: 'sess-subagent',
+      policy: 'read_only',
+      ok: false,
+      error: 'gateway said no',
+      final_message: '',
+    });
+
+    const snapshot = agentStore.getSnapshot();
+    expect(snapshot.subagents.filter((subagent) => subagent.id === 'child-ok-1')).toHaveLength(1);
+    const done = snapshot.subagents.find((subagent) => subagent.id === 'child-ok-1');
+    expect(done?.status).toBe('done');
+    expect(done?.result).toBe('review complete');
+    expect(done?.artifacts?.[0]?.path).toBe('src/lib.rs');
+    const failed = snapshot.subagents.find((subagent) => subagent.id === 'child-failed-1');
+    expect(failed?.status).toBe('failed');
+    expect(failed?.error).toBe('gateway said no');
+    expect(failed?.result).toBe('');
+    expect(snapshot.unreadSubagentCount).toBe(2);
+  });
+
+  it('reveals the child result under its parent session and clears the badge', () => {
+    resetAndHydrate('sess-parent');
+    for (const subagent of agentStore.getSnapshot().subagents) {
+      agentStore.markSubagentRead(subagent.id);
+    }
+    const parent = agentStore.getSnapshot().activeSessionId;
+    agentStore.createSession('Other');
+    agentStore.handleSubagentCompleted({
+      child_id: 'child-reveal-1',
+      parent_session_id: parent,
+      policy: 'full',
+      ok: true,
+      final_message: 'found it',
+    });
+    expect(agentStore.getSnapshot().activeSessionId).not.toBe(parent);
+
+    agentStore.revealSubagent(parent, 'child-reveal-1');
+
+    const snapshot = agentStore.getSnapshot();
+    expect(snapshot.activeSessionId).toBe(parent);
+    expect(snapshot.revealedSubagentId).toBe('child-reveal-1');
+    const child = snapshot.subagents.find((subagent) => subagent.id === 'child-reveal-1');
+    expect(child?.unread).toBe(false);
+    expect(snapshot.unreadSubagentCount).toBe(0);
+  });
+});

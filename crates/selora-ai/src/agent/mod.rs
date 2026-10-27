@@ -21,6 +21,7 @@
 pub mod plan;
 pub mod router;
 pub mod session;
+pub mod subagent;
 pub mod tools;
 pub mod turn;
 
@@ -41,6 +42,13 @@ pub use session::{
     LoadedAgentSession, ParkSummary, ParkedCard, PlanState, PlanStatus, TranscriptEntry,
     TranscriptLoad, AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD,
     MAX_SUMMARY_CHARS, SESSION_SCHEMA, STATE_FILE, TODOS_FILE, TRANSCRIPT_FILE,
+};
+#[allow(unused_imports)]
+pub use subagent::{
+    wait_tool_result, wait_tool_spec, ArtifactRef, CancelToken, ChildId, ChildOutcome, ChildState,
+    CompletionDisposition, SpawnError, SpawnRequest, SubagentCompletion, SubagentEvent,
+    SubagentHandle, SubagentPolicy, SubagentRuntime, WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT,
+    MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{

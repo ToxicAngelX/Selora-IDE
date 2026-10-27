@@ -24,6 +24,8 @@ export type Toast = {
   id: number;
   severity: ToastSeverity;
   message: string;
+  /** Phase 9e: present when clicking should reveal a subagent result. */
+  action?: NotificationAction;
 };
 
 export type NotificationEntry = {
@@ -32,6 +34,18 @@ export type NotificationEntry = {
   message: string;
   at: number;
   read: boolean;
+  action?: NotificationAction;
+};
+
+/**
+ * Phase 9e: a clickable notification target. Selecting the parent session
+ * and revealing the child result is the UI's job; the store only carries
+ * the intent so history survives a reload.
+ */
+export type NotificationAction = {
+  kind: 'subagent';
+  childId: string;
+  sessionId: string;
 };
 
 export type ToastState = {
@@ -59,6 +73,16 @@ function getStorage(): Storage | null {
   }
 }
 
+function isNotificationAction(value: unknown): value is NotificationAction {
+  if (!value || typeof value !== 'object') return false;
+  const action = value as Record<string, unknown>;
+  return (
+    action.kind === 'subagent' &&
+    typeof action.childId === 'string' &&
+    typeof action.sessionId === 'string'
+  );
+}
+
 function isNotificationEntry(value: unknown): value is NotificationEntry {
   if (!value || typeof value !== 'object') return false;
   const entry = value as Record<string, unknown>;
@@ -71,7 +95,8 @@ function isNotificationEntry(value: unknown): value is NotificationEntry {
     Math.abs(entry.at) <= 8_640_000_000_000_000 &&
     typeof entry.read === 'boolean' &&
     typeof entry.severity === 'string' &&
-    VALID_SEVERITIES.has(entry.severity as ToastSeverity)
+    VALID_SEVERITIES.has(entry.severity as ToastSeverity) &&
+    (entry.action === undefined || isNotificationAction(entry.action))
   );
 }
 
@@ -112,6 +137,12 @@ let snapshot: ToastState = {
   unreadCount: countUnread(history),
 };
 const timers = new Map<number, ReturnType<typeof setTimeout>>();
+/**
+ * Phase 9e: a child completion notifies exactly once. Protocol sequence
+ * dedupe already catches replay, but the child id is the durable key: a
+ * second delivery under a new sequence must not stack another toast.
+ */
+const notifiedSubagentIds = new Set<string>();
 const lowestStoredLocalId = history.reduce(
   (lowest, entry) => (entry.id < 0 ? Math.min(lowest, entry.id) : lowest),
   -1,
@@ -129,10 +160,15 @@ function notify(): void {
 }
 
 function recordNotification(toast: Toast): void {
-  history = [
-    { id: toast.id, severity: toast.severity, message: toast.message, at: Date.now(), read: false },
-    ...history,
-  ].slice(0, NOTIFICATION_HISTORY_MAX);
+  const entry: NotificationEntry = {
+    id: toast.id,
+    severity: toast.severity,
+    message: toast.message,
+    at: Date.now(),
+    read: false,
+  };
+  if (toast.action) entry.action = { ...toast.action };
+  history = [entry, ...history].slice(0, NOTIFICATION_HISTORY_MAX);
   persistHistory();
 }
 
@@ -216,6 +252,41 @@ export const toastStore = {
     nextLocalId -= 1;
     push({ id, severity, message });
     return id;
+  },
+
+  /**
+   * Phase 9e: a background child completion. Exactly one toast and one
+   * history entry per child id. `ok: false` is a warning - never a success.
+   * Returns the toast id, or null when this child was already notified.
+   */
+  pushSubagentCompletion(
+    sequence: number,
+    completion: {
+      childId: string;
+      sessionId: string;
+      ok: boolean;
+      message: string;
+    },
+  ): number | null {
+    if (notifiedSubagentIds.has(completion.childId)) return null;
+    notifiedSubagentIds.add(completion.childId);
+    const toast: Toast = {
+      id: sequence,
+      severity: completion.ok ? 'success' : 'warning',
+      message: completion.message,
+      action: {
+        kind: 'subagent',
+        childId: completion.childId,
+        sessionId: completion.sessionId,
+      },
+    };
+    push(toast);
+    return sequence;
+  },
+
+  /** The click target for a history entry (survives read/clear of live toasts). */
+  actionFor(id: number): NotificationAction | undefined {
+    return history.find((entry) => entry.id === id)?.action;
   },
 
   /** Click on × — immediate leave (UI_SPEC §13). */

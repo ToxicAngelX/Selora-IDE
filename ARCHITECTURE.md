@@ -1035,6 +1035,18 @@ the way any turn's do. The runtime lives at
 `crates/selora-ai/src/agent/subagent.rs` (additive; Phase 8's engine consumes
 the same module).
 
+**Background completion contract (Phase 9e).** The runtime outlives the
+parent turn: its child task is not joined into the turn future. Exactly one
+accepted terminal result per child is stored and emitted as
+`subagent_completed` carrying `child_id`, `parent_session_id`, `policy`,
+`ok`, `error`, `final_message`, and artifact refs. Duplicate deliveries are
+dropped by child id; a cancelled child (or a result arriving after its
+parent was cancelled) emits nothing and is never resurrected. The parent
+waits with the manifest v3 `wait(child_ids?, timeout?)` tool: completed
+results, a truthful `status: "timeout"` with pending ids, or a model-visible
+unknown-id error. The wait is watch-channel based, bounded to 30s by default
+(300s max), and wakes immediately when the parent turn is cancelled.
+
 ### 19.4 Escalations and the generalized park channel
 
 §17.4 parks a turn on an approval card; a **question card** parks it the same

@@ -302,6 +302,25 @@ export type AgentCompactionFailedPayload = {
   partial_summary?: string;
 };
 
+/**
+ * Phase 9e: one background child's accepted terminal result. `child_id` is
+ * the dedupe key; a cancelled child never produces this event. A failed
+ * child is `ok: false` with `error`, never a success.
+ */
+export type SubagentPolicy = 'read_only' | 'full';
+
+export type SubagentArtifact = { kind: string; path: string };
+
+export type SubagentCompletedPayload = {
+  child_id: string;
+  parent_session_id: Id;
+  policy: SubagentPolicy;
+  ok: boolean;
+  error?: string | null;
+  final_message: string;
+  artifacts?: SubagentArtifact[];
+};
+
 export type ChatCompletedPayload = {
   request_id: Id;
   session_id: Id;
@@ -480,6 +499,7 @@ export type FrontendEvent =
   | { type: 'agent_state_changed'; payload: AgentStateChangedPayload }
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
   | { type: 'agent_compaction_failed'; payload: AgentCompactionFailedPayload }
+  | { type: 'subagent_completed'; payload: SubagentCompletedPayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'lsp_server_state_changed'; payload: LspServerState }

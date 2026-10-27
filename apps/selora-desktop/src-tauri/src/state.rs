@@ -1923,7 +1923,7 @@ impl DesktopState {
             .workspace_root_path()
             .map(|root| persisted_workflow_runs(&root))
             .unwrap_or_default();
-// P1: the live bridge store, never a hard-coded empty vector.
+        // P1: the live bridge store, never a hard-coded empty vector.
         let (diagnostics, lsp_servers) = self.lsp_snapshot();
         let agent_sessions = self.sessions.agent_sessions();
         BootstrapState {

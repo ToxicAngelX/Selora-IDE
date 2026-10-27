@@ -1295,6 +1295,46 @@ pub struct AgentEventDto {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 9e - background subagent completion (ARCHITECTURE 19.3).
+//
+// One event per accepted terminal result, keyed by `child_id` for frontend
+// dedupe. `parent_session_id` is explicit so a toast/badge can select the
+// right session after the spawning turn has ended. A cancelled child emits
+// no completion event at all; a failed child is `ok: false` with `error`.
+// ---------------------------------------------------------------------------
+
+/// The child's structural tool policy (19.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPolicyDto {
+    ReadOnly,
+    Full,
+}
+
+/// One artifact reference a child produced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubagentArtifactDto {
+    pub kind: String,
+    /// Workspace-relative path, or an engine-owned virtual artifact id.
+    pub path: String,
+}
+
+/// A background subagent's one terminal result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCompletedDto {
+    pub child_id: String,
+    #[serde(alias = "parent_session")]
+    pub parent_session_id: SessionId,
+    pub policy: SubagentPolicyDto,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub final_message: String,
+    #[serde(default, alias = "artifact_refs")]
+    pub artifacts: Vec<SubagentArtifactDto>,
+}
+
+// ---------------------------------------------------------------------------
 // Phase 8 — workflow wire contract (ROADMAP Phase 8, ARCHITECTURE §18).
 //
 // Additive to protocol_version 1: the four commands and seven progress events
@@ -1598,6 +1638,9 @@ pub enum FrontendEvent {
     /// Phase 9d: the summarize round failed. The turn ends with a typed
     /// `CompactionFailed` end too; this event carries the partial summary.
     AgentCompactionFailed(AgentCompactionFailedDto),
+    /// Phase 9e: one background child reached a terminal result. Keyed by
+    /// `child_id`; never emitted for a cancelled child.
+    SubagentCompleted(SubagentCompletedDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     /// P1: one language server changed lifecycle (starting/ready/failed).
     /// `failed` carries a truthful, typed reason for the UI.
@@ -2497,6 +2540,29 @@ mod tests {
             .unwrap(),
             r#"{"type":"agent_turn_done","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","total_tokens":12400,"cost_usd":0.041,"num_tools":6,"approved":3,"denied":1,"completed":true,"end_message":"agent turn complete"}}"#
         );
+    }
+    #[test]
+    fn phase_9e_subagent_completion_wire_shape_is_stable() {
+        // One event carries the child, the parent, the policy, the honest
+        // ok/error pair, the final message and artifact refs.
+        let event = FrontendEvent::SubagentCompleted(SubagentCompletedDto {
+            child_id: "child-1".into(),
+            parent_session_id: sid("session-1"),
+            policy: SubagentPolicyDto::ReadOnly,
+            ok: false,
+            error: Some("gateway said no".into()),
+            final_message: String::new(),
+            artifacts: vec![SubagentArtifactDto {
+                kind: "diff".into(),
+                path: "src/lib.rs".into(),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"subagent_completed","payload":{"child_id":"child-1","parent_session_id":"session-1","policy":"read_only","ok":false,"error":"gateway said no","final_message":"","artifacts":[{"kind":"diff","path":"src/lib.rs"}]}}"#
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
     #[test]
     fn z3_serde_boundaries_reject_malformed_payloads() {
