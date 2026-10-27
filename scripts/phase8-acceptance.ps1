@@ -7,8 +7,11 @@
 
       * the release executable exists (and its size/hash are recorded);
       * targeted Rust tests for the engine, desktop host/dispatch, and protocol;
-      * targeted frontend tests for the workflows panel and bridge;
-      * the `.selora/workflow-runs/...` journal path contract and .gitignore;
+      * targeted frontend tests for the workflows panel, bridge, and card;
+      * deterministic mock-host evidence for ROADMAP steps 1-9, selected by
+        exact test name so a renamed or removed test cannot pass silently;
+      * the `.selora/workflow-runs/...` journal path contract, the workspace
+        `.selora/.gitignore`, and this repository's ignore rule;
       * installer prerequisites (Inno Setup ISCC.exe, WebView2 bootstrapper).
 
     It then prints the ROADMAP Phase 8 acceptance steps 1-9 with an automated
@@ -16,8 +19,17 @@
     workspace, a visible window, a crash/relaunch, or a human judgement is
     NEVER reported as an automated pass.
 
-    Exit code 0 means every automated check passed. Exit code 1 means at least
-    one automated check failed. Owner/SKIP rows never change the exit code.
+    Status vocabulary:
+
+      PASS    - the named automated evidence ran here and passed;
+      FAIL    - the named evidence ran and failed, or a required check failed;
+      PENDING - the exact evidence is absent from this tree, or the capability
+                is a known unimplemented limit. It is never counted as a pass;
+      SKIP    - an optional local artifact/environment is absent.
+
+    Exit code 0 means no automated check failed. Pending and owner rows never
+    change the exit code, but the summary prints every pending gap so a green
+    exit is never mistaken for full Phase 8 acceptance.
 
 .PARAMETER Build
     Build the frontend and the release binary before checking them. Without
@@ -63,7 +75,7 @@ $checks = New-Object System.Collections.ArrayList
 function Add-Check {
     param(
         [string]$Id,
-        [ValidateSet('PASS', 'FAIL', 'SKIP')]
+        [ValidateSet('PASS', 'FAIL', 'SKIP', 'PENDING')]
         [string]$Status,
         [string]$Detail
     )
@@ -76,6 +88,7 @@ function Add-Check {
     if ($Status -eq 'PASS') { $color = 'Green' }
     if ($Status -eq 'FAIL') { $color = 'Red' }
     if ($Status -eq 'SKIP') { $color = 'Yellow' }
+    if ($Status -eq 'PENDING') { $color = 'Magenta' }
     Write-Host ("[{0}] {1} - {2}" -f $Status, $Id, $Detail) -ForegroundColor $color
 }
 
@@ -172,6 +185,121 @@ function Get-Tail {
     param([string[]]$Lines, [int]$Count)
     if ($Lines.Count -le $Count) { return $Lines }
     return $Lines[($Lines.Count - $Count)..($Lines.Count - 1)]
+}
+
+# Run one Rust test by exact name. Unit tests carry their module path
+# (`sandbox::tests::name`), so a short name is first resolved against the test
+# binary's `--list` output and then run with `--exact`. A short name that
+# matches nothing is reported PENDING, never PASS, so a removed/renamed test or
+# an API that does not exist yet cannot fake acceptance.
+$script:rustTestListCache = @{}
+
+function Get-RustTestListing {
+    param(
+        [string]$Crate,
+        [string]$Target
+    )
+    $key = $Crate + '|' + $Target
+    if ($script:rustTestListCache.ContainsKey($key)) {
+        return $script:rustTestListCache[$key]
+    }
+    $arguments = @('test', '-p', $Crate, '--locked')
+    if (-not [string]::IsNullOrWhiteSpace($Target)) {
+        $arguments += @('--test', $Target)
+    }
+    $arguments += @('--', '--list')
+    $logName = 'list-' + ($Crate + '-' + $Target -replace '[^A-Za-z0-9_.-]', '-') + '.log'
+    $run = Invoke-Native -FilePath 'cargo' -Arguments $arguments `
+        -WorkingDirectory $RepoRoot -LogName $logName
+    $names = @()
+    foreach ($line in $run.Lines) {
+        if ($line -match '^(?<name>\S.*): test$') {
+            $names += $Matches['name']
+        }
+    }
+    $listing = [pscustomobject]@{
+        Ok      = ($run.ExitCode -eq 0)
+        Names   = $names
+        Seconds = $run.Seconds
+    }
+    $script:rustTestListCache[$key] = $listing
+    return $listing
+}
+
+function Add-NamedRustTestCheck {
+    param(
+        [string]$Id,
+        [string]$Crate,
+        [string]$Test,
+        [string]$Target = ''
+    )
+    $where = $Crate
+    if (-not [string]::IsNullOrWhiteSpace($Target)) { $where = $Crate + ' --test ' + $Target }
+    $listing = Get-RustTestListing -Crate $Crate -Target $Target
+    if (-not $listing.Ok) {
+        Add-Check -Id $Id -Status 'FAIL' `
+            -Detail ("cannot list tests for {0}; the crate or test target does not build (see list log)" -f $where)
+        return
+    }
+    $names = @($listing.Names)
+    $matches = @($names | Where-Object { $_ -eq $Test -or $_.EndsWith('::' + $Test) })
+    if ($matches.Count -eq 0) {
+        Add-Check -Id $Id -Status 'PENDING' `
+            -Detail ("{0} is not present in {1}; no evidence claimed" -f $Test, $where)
+        return
+    }
+    if ($matches.Count -gt 1) {
+        Add-Check -Id $Id -Status 'FAIL' `
+            -Detail ("{0} is ambiguous in {1}: {2}" -f $Test, $where, ($matches -join ', '))
+        return
+    }
+    $fullName = $matches[0]
+    $arguments = @('test', '-p', $Crate, '--locked')
+    if (-not [string]::IsNullOrWhiteSpace($Target)) {
+        $arguments += @('--test', $Target)
+    }
+    $arguments += @($fullName, '--', '--exact')
+    $logName = 'named-' + ($Id -replace '[^A-Za-z0-9_.-]', '-') + '.log'
+    $run = Invoke-Native -FilePath 'cargo' -Arguments $arguments `
+        -WorkingDirectory $RepoRoot -LogName $logName
+    $totals = Get-RustTestTotals -Lines $run.Lines
+    if ($run.ExitCode -eq 0 -and $totals.Failed -eq 0 -and $totals.Passed -ge 1) {
+        $label = $where + ' ' + $fullName
+        Add-Check -Id $Id -Status 'PASS' `
+            -Detail ("{0}: {1} passed, {2}s" -f $label, $totals.Passed, $run.Seconds)
+    }
+    elseif ($run.ExitCode -eq 0 -and $totals.Passed -eq 0) {
+        Add-Check -Id $Id -Status 'PENDING' `
+            -Detail ("{0} matched no test at run time in {1}; no evidence claimed" -f $fullName, $where)
+    }
+    else {
+        Add-Check -Id $Id -Status 'FAIL' `
+            -Detail ("{0} exit {1}: {2} passed, {3} failed; see {4}" -f $fullName, $run.ExitCode, $totals.Passed, $totals.Failed, $logName)
+        Get-Tail -Lines $run.Lines -Count 20 | ForEach-Object { Write-Host ("       " + $_) }
+    }
+}
+
+# Run one frontend test file. Vitest exits non-zero when no test matches, so a
+# missing file/test is FAIL here; the evidence file is versioned with this tree.
+function Add-NamedFrontendTestCheck {
+    param(
+        [string]$Id,
+        [string]$RelativePath
+    )
+    $logName = 'named-' + ($Id -replace '[^A-Za-z0-9_.-]', '-') + '.log'
+    $run = Invoke-Native -FilePath 'npm.cmd' `
+        -Arguments @('--prefix', $frontendDir, 'run', 'test', '--', $RelativePath) `
+        -WorkingDirectory $RepoRoot -LogName $logName
+    $totals = Get-VitestTotals -Lines $run.Lines
+    if ($run.ExitCode -eq 0 -and $totals.Seen -and $totals.Failed -eq 0 -and $totals.Passed -gt 0) {
+        Add-Check -Id $Id -Status 'PASS' `
+            -Detail ("vitest {0}: {1} passed, 0 failed, {2}s" -f $RelativePath, $totals.Passed, $run.Seconds)
+    }
+    else {
+        Add-Check -Id $Id -Status 'FAIL' `
+            -Detail ("vitest {0} exit {1}: {2} passed, {3} failed; see {4}" -f $RelativePath, $run.ExitCode, $totals.Passed, $totals.Failed, $logName)
+        Get-Tail -Lines $run.Lines -Count 20 | ForEach-Object { Write-Host ("       " + $_) }
+    }
 }
 
 function Find-Iscc {
@@ -364,6 +492,108 @@ else {
 }
 
 # ---------------------------------------------------------------------------
+# 2b. Deterministic mock-host evidence for ROADMAP Phase 8 steps 1-9.
+#
+# Every check selects an exact test name. A name that no longer exists matches
+# zero tests and is reported PENDING, so a renamed/removed test cannot look
+# green. The engine matrix lives in
+# crates/selora-workflow/tests/phase8_matrix.rs; approval, process-tree,
+# resume-shell and history evidence lives in the desktop suite.
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host 'Phase 8 step evidence (deterministic mock host)' -ForegroundColor Cyan
+
+# Step 1 - confirmation payload.
+Add-NamedRustTestCheck -Id 'evidence.step1.confirmation' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step1_confirmation_payload_matches_the_grant'
+Add-NamedRustTestCheck -Id 'evidence.step1.command-extraction' -Crate 'selora-workflow' `
+    -Test 'command_set_is_extracted_from_literals_only'
+Add-NamedRustTestCheck -Id 'evidence.step1.protocol-wire' -Crate 'selora-protocol' `
+    -Test 'p8_workflow_command_wire_shapes_are_stable'
+Add-NamedFrontendTestCheck -Id 'test.workflow-card' `
+    -RelativePath 'src/features/agent/components/WorkflowCard.test.tsx'
+
+# Step 2 - approve -> phase graph + agent dispatch.
+Add-NamedRustTestCheck -Id 'evidence.step2.dispatch' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step2_approval_starts_the_phase_graph_and_agent_dispatch'
+Add-NamedRustTestCheck -Id 'evidence.step2.shell-stream' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_run_streams_started_then_phase_step_finished'
+
+# Step 3 - approval parks the run; deny continues; approve writes once.
+Add-NamedRustTestCheck -Id 'evidence.step3.deny' -Crate 'selora-desktop' `
+    -Test 'proposed_write_parks_deny_does_not_write_and_wrong_ids_reject'
+Add-NamedRustTestCheck -Id 'evidence.step3.approve' -Crate 'selora-desktop' `
+    -Test 'explicit_approve_writes_once_and_rejects_duplicate_and_stale_ids'
+Add-NamedRustTestCheck -Id 'evidence.step3.decision' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_approval_maps_exact_diff_and_consumes_only_matching_id'
+
+# Step 4 - resume safe / unsafe / partial effects.
+Add-NamedRustTestCheck -Id 'evidence.step4.safe-resume' -Crate 'selora-workflow' `
+    -Target 'persisted_execution' `
+    -Test 'actual_resume_replays_paid_asks_distinct_reads_commands_and_display_events'
+Add-NamedRustTestCheck -Id 'evidence.step4.unsafe-resume' -Crate 'selora-workflow' `
+    -Target 'resume_preflight' -Test 'default_resume_is_refused_before_any_effect'
+Add-NamedRustTestCheck -Id 'evidence.step4.partial-effects' -Crate 'selora-workflow' `
+    -Target 'persisted_execution' `
+    -Test 'interrupted_ask_redispatches_but_ambiguous_command_never_does'
+Add-NamedRustTestCheck -Id 'evidence.step4.shell-consent' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_resume_refuses_until_incomplete_asks_are_confirmed'
+Add-Check -Id 'evidence.step4.exactly-once-effects' -Status 'PENDING' `
+    -Detail 'Resume re-dispatches unfinished asks; tools in the interrupted turn may already have applied effects. Safe/unsafe/partial policy is automated; exactly-once subagent effects are not claimed (STATUS.md gap 2).'
+
+# Step 5 - failing gate drives the fix-loop rounds.
+Add-NamedRustTestCheck -Id 'evidence.step5.gate-loop' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step5_failing_gate_drives_a_visible_fix_loop_round'
+Add-NamedRustTestCheck -Id 'evidence.step5.gate-exit-code' -Crate 'selora-workflow' `
+    -Test 'confirmed_command_runs_and_exit_code_reaches_the_script'
+
+# Step 6 - stop + process-tree death.
+Add-NamedRustTestCheck -Id 'evidence.step6.stop-engine' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step6_stop_before_the_next_effect_ends_the_run_stopped'
+Add-NamedRustTestCheck -Id 'evidence.step6.stop-shell' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_stop_flips_the_active_host_cancel'
+Add-NamedRustTestCheck -Id 'evidence.step6.process-tree-cancel' -Crate 'selora-desktop' `
+    -Test 'world_run_cancel_kills_detached_grandchildren'
+Add-NamedRustTestCheck -Id 'evidence.step6.process-tree-timeout' -Crate 'selora-desktop' `
+    -Test 'world_run_timeout_kills_detached_grandchildren'
+Add-Check -Id 'evidence.step6.job-startup-race' -Status 'PENDING' `
+    -Detail 'Job assignment follows CreateProcess; a descendant spawned in that sub-startup window can escape. Kill-after-assignment is test-covered; the race is a documented limit (STATUS.md gap 1).'
+
+# Step 7 - cost/tokens + known per-phase gap.
+Add-NamedRustTestCheck -Id 'evidence.step7.usage' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step7_cost_and_tokens_match_every_ask'
+Add-NamedRustTestCheck -Id 'evidence.step7.shell-summary' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_completed_run_is_durable_and_resume_never_reexecutes_it'
+Add-NamedRustTestCheck -Id 'evidence.step7.host-receipts' -Crate 'selora-desktop' `
+    -Test 'reports_artifacts_logs_and_cost_are_collected'
+Add-Check -Id 'evidence.step7.per-phase-cost' -Status 'PENDING' `
+    -Detail 'Run totals (tokens + USD + cap) are automated; the protocol DTO carries no per-phase USD, so ROADMAP step 7 per-phase cost is not implemented in this tree.'
+
+# Step 8 - journal path/gitignore + completed history.
+Add-NamedRustTestCheck -Id 'evidence.step8.journal-path' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step8_journal_lands_in_the_gitignored_workspace_path'
+Add-NamedRustTestCheck -Id 'evidence.step8.history' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_completed_run_history_reconstructs_from_the_journal'
+Add-NamedRustTestCheck -Id 'evidence.step8.multi-phase-history' -Crate 'selora-desktop' `
+    -Test 'p8_workflow_multi_phase_history_keeps_reports_phases_and_artifact_content'
+
+# Step 9 - facade fetch/fs/process denial.
+Add-NamedRustTestCheck -Id 'evidence.step9.facade-denial' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_step9_fetch_fs_process_fail_before_any_host_effect'
+Add-NamedRustTestCheck -Id 'evidence.step9.ambient-globals' -Crate 'selora-workflow' `
+    -Test 'ambient_globals_are_structurally_absent'
+Add-NamedRustTestCheck -Id 'evidence.step9.realm-hardening' -Crate 'selora-workflow' `
+    -Test 'realm_hardening_removes_the_ambient_names'
+
+# Cross-cut: the confirmed workflow budget cap.
+Add-NamedRustTestCheck -Id 'evidence.budget.matrix' -Crate 'selora-workflow' `
+    -Target 'phase8_matrix' -Test 'phase8_budget_cap_stops_the_run_between_steps'
+Add-NamedRustTestCheck -Id 'evidence.budget.engine' -Crate 'selora-workflow' `
+    -Test 'budget_violation_is_checked_between_steps'
+Add-NamedRustTestCheck -Id 'evidence.budget.shell' -Crate 'selora-desktop' `
+    -Test 'p9_workflow_budget_exhausted_resume_is_refused_before_worker'
+
+# ---------------------------------------------------------------------------
 # 3. Journal path contract (.selora/workflow-runs/<run_id>/journal.jsonl).
 # ---------------------------------------------------------------------------
 $journalSource = Join-Path $RepoRoot 'crates\selora-workflow\src\journal.rs'
@@ -409,6 +639,29 @@ if ($ignoredOk) {
 }
 else {
     Add-Check -Id 'journal.gitignore' -Status 'FAIL' -Detail '.gitignore does not ignore .selora/'
+}
+
+# Prove the rule with git itself when this checkout is a repository. A textual
+# regex alone cannot show that a nested journal path is ignored.
+$gitCommand = Get-Command git -ErrorAction SilentlyContinue
+if ($null -eq $gitCommand) {
+    Add-Check -Id 'journal.git-check-ignore' -Status 'SKIP' -Detail 'git is not on PATH'
+}
+elseif (-not (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
+    Add-Check -Id 'journal.git-check-ignore' -Status 'SKIP' -Detail 'this checkout has no .git directory'
+}
+else {
+    $probe = '.selora/workflow-runs/probe/journal.jsonl'
+    $ignoreRun = Invoke-Native -FilePath 'git' -Arguments @('check-ignore', '-q', '--', $probe) `
+        -WorkingDirectory $RepoRoot -LogName 'git-check-ignore.log'
+    if ($ignoreRun.ExitCode -eq 0) {
+        Add-Check -Id 'journal.git-check-ignore' -Status 'PASS' `
+            -Detail ("git check-ignore confirms " + $probe)
+    }
+    else {
+        Add-Check -Id 'journal.git-check-ignore' -Status 'FAIL' `
+            -Detail ("git check-ignore exit {0}: {1} is not ignored; see git-check-ignore.log" -f $ignoreRun.ExitCode, $probe)
+    }
 }
 
 $workspaceJournal = Join-Path $RepoRoot '.selora\workflow-runs'
@@ -490,55 +743,55 @@ $steps = @(
     [pscustomobject]@{
         Number   = 1
         Title    = 'Chat agent proposes run_workflow; confirmation card shows script + commands'
-        Requires = @('test.engine', 'test.desktop', 'test.frontend')
+        Requires = @('evidence.step1.confirmation', 'evidence.step1.command-extraction', 'evidence.step1.protocol-wire', 'test.workflow-card')
         Owner    = 'Send "review every Rust file in src/ for unwrap() calls; report the worst five" and read the confirmation card: script body, command set, cost cap.'
     },
     [pscustomobject]@{
         Number   = 2
         Title    = 'Approve -> phase graph, subagent fan-out, live cards'
-        Requires = @('test.engine', 'test.desktop', 'test.frontend', 'release-exe')
+        Requires = @('evidence.step2.dispatch', 'evidence.step2.shell-stream', 'test.frontend', 'release-exe')
         Owner    = 'Approve, then watch the Workflows panel: phases appear, subagents fan out, step status changes live.'
     },
     [pscustomobject]@{
         Number   = 3
         Title    = 'Subagent edit parks on an approval card; Deny lets the run continue'
-        Requires = @('test.desktop', 'test.engine')
+        Requires = @('evidence.step3.deny', 'evidence.step3.approve', 'evidence.step3.decision', 'test.frontend')
         Owner    = 'Wait for a write card, click Deny, confirm the run continues and the file did not change.'
     },
     [pscustomobject]@{
         Number   = 4
         Title    = 'Kill the app mid-run; relaunch offers Resume and finishes'
-        Requires = @('test.engine', 'journal.path-constants', 'journal.gitignore')
+        Requires = @('evidence.step4.safe-resume', 'evidence.step4.unsafe-resume', 'evidence.step4.partial-effects', 'evidence.step4.shell-consent', 'evidence.step4.exactly-once-effects', 'journal.path-constants')
         Owner    = 'Kill selora-desktop.exe mid-run, relaunch, use Resume, confirm the run finishes with earlier asks not re-billed.'
     },
     [pscustomobject]@{
         Number   = 5
         Title    = 'Failing world.run gate shows the fix-loop round in the panel'
-        Requires = @('test.engine', 'test.desktop')
+        Requires = @('evidence.step5.gate-loop', 'evidence.step5.gate-exit-code', 'test.frontend')
         Owner    = 'Use a gate that fails (for example cargo test on a broken tree) and watch the retry round in the panel.'
     },
     [pscustomobject]@{
         Number   = 6
         Title    = 'Stop mid-run ends the run and kills in-flight children'
-        Requires = @('test.desktop', 'test.engine')
-        Owner    = 'Click Stop during bash work; confirm the run ends in seconds and no child process of that command survives (grandchildren are a documented limit on Windows).'
+        Requires = @('evidence.step6.stop-engine', 'evidence.step6.stop-shell', 'evidence.step6.process-tree-cancel', 'evidence.step6.process-tree-timeout', 'evidence.step6.job-startup-race')
+        Owner    = 'Click Stop during bash work; confirm the run ends in seconds and no child process of that command survives (a child spawned before Job assignment is a documented limit on Windows).'
     },
     [pscustomobject]@{
         Number   = 7
         Title    = 'Cost meter/summary reflect every ask (tokens + USD per phase)'
-        Requires = @('test.engine', 'test.desktop')
+        Requires = @('evidence.step7.usage', 'evidence.step7.shell-summary', 'evidence.step7.host-receipts', 'evidence.step7.per-phase-cost')
         Owner    = 'Compare the run summary tokens/USD with the receipts; confirm the workflow budget cap is visible.'
     },
     [pscustomobject]@{
         Number   = 8
         Title    = 'Journal lands under .selora/workflow-runs/ and never in git'
-        Requires = @('journal.path-constants', 'journal.layout-test', 'journal.gitignore', 'test.engine')
-        Owner    = 'After a real run, confirm .selora/workflow-runs/<run_id>/journal.jsonl exists and git status stays clean (this checkout has no .git).'
+        Requires = @('journal.path-constants', 'journal.layout-test', 'journal.gitignore', 'journal.git-check-ignore', 'evidence.step8.journal-path', 'evidence.step8.history', 'evidence.step8.multi-phase-history')
+        Owner    = 'After a real run, confirm .selora/workflow-runs/<run_id>/journal.jsonl exists and git status stays clean.'
     },
     [pscustomobject]@{
         Number   = 9
         Title    = 'fetch/fs/process attempts fail at the facade (structurally absent)'
-        Requires = @('test.sandbox-absence', 'test.engine')
+        Requires = @('evidence.step9.facade-denial', 'evidence.step9.ambient-globals', 'evidence.step9.realm-hardening', 'test.sandbox-absence')
         Owner    = 'Paste a script that calls fetch/fs/process and confirm the run fails with a facade error, not an effect.'
     }
 )
@@ -549,25 +802,35 @@ function Get-StepAutomatedStatus {
     foreach ($id in $Requires) {
         $value = Get-CheckStatus -Id $id
         if ($value -eq 'FAIL') { return 'FAIL' }
-        if ($value -eq 'SKIP') { $status = 'SKIP' }
+        if ($value -eq 'PENDING') { $status = 'PENDING' }
+        elseif ($value -eq 'SKIP' -and $status -ne 'PENDING') { $status = 'SKIP' }
     }
     return $status
 }
 
+$budgetStatus = Get-StepAutomatedStatus -Requires @('evidence.budget.matrix', 'evidence.budget.engine', 'evidence.budget.shell')
+
 Write-Host ''
 Write-Host 'ROADMAP Phase 8 acceptance steps' -ForegroundColor Cyan
-Write-Host 'OWNER rows are never automated passes. They need a live key, a real workspace, and a visible window.' -ForegroundColor DarkGray
+Write-Host 'OWNER rows are never automated passes. They require a live key, a real workspace, and a visible window.' -ForegroundColor DarkGray
 Write-Host ''
 $stepFailures = 0
+$stepPending = 0
 foreach ($step in $steps) {
     $automated = Get-StepAutomatedStatus -Requires $step.Requires
     if ($automated -eq 'FAIL') { $stepFailures += 1 }
+    if ($automated -eq 'PENDING') { $stepPending += 1 }
     $color = 'Green'
     if ($automated -eq 'FAIL') { $color = 'Red' }
     if ($automated -eq 'SKIP') { $color = 'Yellow' }
-    Write-Host ("Step {0}  AUTOMATED: {1}  OWNER: OWNER  {2}" -f $step.Number, $automated, $step.Title) -ForegroundColor $color
+    if ($automated -eq 'PENDING') { $color = 'Magenta' }
+    Write-Host ("Step {0}  AUTOMATED: {1}  OWNER: OWNER (UNRUN)  {2}" -f $step.Number, $automated, $step.Title) -ForegroundColor $color
     Write-Host ("        owner: " + $step.Owner) -ForegroundColor DarkGray
 }
+$budgetColor = 'Green'
+if ($budgetStatus -eq 'FAIL') { $budgetColor = 'Red' }
+if ($budgetStatus -eq 'PENDING') { $budgetColor = 'Magenta' }
+Write-Host ("Cross-cut  AUTOMATED: {0}  OWNER: OWNER (UNRUN)  workflow budget cap stops the run" -f $budgetStatus) -ForegroundColor $budgetColor
 
 # ---------------------------------------------------------------------------
 # 6. Summary and exit code.
@@ -575,11 +838,12 @@ foreach ($step in $steps) {
 $failed = @($checks | Where-Object { $_.Status -eq 'FAIL' })
 $passed = @($checks | Where-Object { $_.Status -eq 'PASS' })
 $skipped = @($checks | Where-Object { $_.Status -eq 'SKIP' })
+$pending = @($checks | Where-Object { $_.Status -eq 'PENDING' })
 
 Write-Host ''
 Write-Host 'Summary' -ForegroundColor Cyan
-Write-Host ("  automated checks : {0} passed, {1} failed, {2} skipped" -f $passed.Count, $failed.Count, $skipped.Count)
-Write-Host ("  roadmap steps    : {0} with an automated failure, 9 owner observations pending" -f $stepFailures)
+Write-Host ("  automated checks : {0} passed, {1} failed, {2} pending, {3} skipped" -f $passed.Count, $failed.Count, $pending.Count, $skipped.Count)
+Write-Host ("  roadmap steps    : {0} with an automated failure, {1} with pending evidence, 9 owner observations UNRUN" -f $stepFailures, $stepPending)
 Write-Host ("  logs             : " + $logDir)
 
 if ($failed.Count -gt 0) {
@@ -591,6 +855,14 @@ if ($failed.Count -gt 0) {
     exit 1
 }
 
+if ($pending.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'PENDING evidence (not passes, not failures):' -ForegroundColor Magenta
+    foreach ($check in $pending) {
+        Write-Host ("  - " + $check.Id + ": " + $check.Detail) -ForegroundColor Magenta
+    }
+}
+
 Write-Host ''
-Write-Host 'RESULT: automated checks passed. Phase 8 acceptance still requires the OWNER steps.' -ForegroundColor Green
+Write-Host 'RESULT: no automated check failed. Pending evidence and the 9 OWNER steps still block Phase 8 acceptance.' -ForegroundColor Green
 exit 0

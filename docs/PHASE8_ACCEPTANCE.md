@@ -299,3 +299,115 @@ mark Phase 8 accepted from the headless result alone.
 - [ ] Remaining limits reviewed; no limit silently dropped
 - [ ] `ROADMAP.md` Phase 8 status updated
 - [ ] `CHANGELOG.md` entries moved out of `Unreleased` only after the gate
+
+## Historical branch evidence (not final integration acceptance)
+The first runtime launch exposed two startup defects that the headless gate did
+not cover:
+
+1. **Onboarding WebGL hang.** `img-fx` created a context successfully but its
+   shader failed under this WebView2/GPU combination; the renderer thread then
+   stopped answering (CDP evaluations timed out). `BrandFx` now ships the CSS
+   orbital mark only and loads no WebGL module. Verified with a fresh WebView2
+   profile: overlay visible, `canvas` count 0, evaluations answered in 1–2 ms.
+2. **Duplicate-launch WebView2 conflict.** Two processes raced for one profile;
+   one died during setup with `0x8007139F`. `tauri-plugin-single-instance` now
+   focuses the running window and exits the second process. Verified: second
+   launch exited and the process count stayed at one.
+
+Rebuilt artifacts supersede §2/§4:
+
+| Artifact | Size | SHA-256 |
+|---|---|---|
+| `target\release\selora-desktop.exe` | 18,823,168 | `167fcf8b4271bc558b413535dd2757d1d73168b48a1e134376b20ab21a4de50f` |
+| `%TEMP%\selora-phase8-installer\Selora-IDE-Setup-0.1.0.exe` | 9,388,643 | `7a20d776e9d31e9293036f9fb1314d3ec3008bde7fd841ffcdfc616abb806fa1` |
+
+The release was rebuilt again after the File/Edit/Help menus were implemented;
+the installer was recompiled against it.
+
+The installer was recompiled against the rebuilt binary. It remains unsigned and
+uninstalled. Automated acceptance was rerun after the fix: 13 passed, 0 failed,
+2 skipped. Owner UI steps remain unrun.
+
+## 10. Upgraded step automation (2026-10-27, `selora-phase8-accept` on `integration`)
+
+This section supersedes section 5's status vocabulary and step table for the
+current tree. Sections 1-9 stay as the historical record of the earlier run.
+
+`scripts/phase8-acceptance.ps1` now selects deterministic evidence by exact test
+name instead of relying only on whole-suite green:
+
+- `crates/selora-workflow/tests/phase8_matrix.rs` adds eight mock-host tests for
+  the confirmation payload, approval dispatch, a failing gate fix loop, Stop
+  before the next effect, usage totals, the journal/gitignore contract, the
+  budget cap, and `fetch`/`fs`/`process` denial.
+- Approval/deny, Job Object process-tree death, resume safe/unsafe/partial
+  effects, completed history and the shell budget preflight are selected by name
+  from the existing desktop, persisted-execution and resume-preflight suites.
+- A short test name is resolved through `cargo test -- --list`. A name that is
+  missing, ambiguous, or belongs to a crate that does not build is reported
+  `PENDING` or `FAIL`; it is never counted as a pass.
+- The script now also runs `git check-ignore` against a nested journal path when
+  the checkout has `.git`, and runs the agent `WorkflowCard` suite.
+
+### 10.1 Result
+
+Command:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase8-acceptance.ps1
+```
+
+`SCRIPT_EXIT=0`. Summary:
+
+```text
+automated checks : 44 passed, 0 failed, 3 pending, 3 skipped
+roadmap steps    : 0 with an automated failure, 3 with pending evidence,
+                   9 owner observations UNRUN
+```
+
+| Step | Automated | Basis |
+|---|---|---|
+| 1. Confirmation card | PASS | engine payload test, literal extraction, protocol wire shape, WorkflowCard suite |
+| 2. Approve -> graph/fan-out | PASS | engine phase/agent dispatch, desktop stream, Workflows panel suite |
+| 3. Edit card / Deny | PASS | deny/approve host tests, desktop decision mapping |
+| 4. Kill/relaunch/Resume | **PENDING** | replay, fail-closed refusal, partial-effect command refusal and shell consent pass; exactly-once subagent effects are not claimed |
+| 5. Failing gate fix loop | PASS | engine loop test with three gate exits and two visible fix phases |
+| 6. Stop kills children | **PENDING** | engine Stop, shell cancel and Job Object grandchild-kill tests pass; a child spawned before Job assignment can escape |
+| 7. Cost meter/summary | **PENDING** | run tokens/USD/cap match the host receipts; no per-phase USD exists in the protocol DTO |
+| 8. Journal in `.selora`, never git | PASS | durable path test, workspace `.selora/.gitignore`, repo rule, `git check-ignore`, completed/multi-phase history |
+| 9. `fetch`/`fs`/`process` denied | PASS | direct calls fail as typed ambient-global errors before any host effect; realm hardening tests |
+| Cross-cut: budget cap | PASS | engine between-step abort, desktop resume preflight, mock-host cap test |
+
+All nine OWNER rows remain **UNRUN**. No live key was used, no window was
+observed, and no crash/relaunch or clean-VM install was performed.
+
+### 10.2 Gates run in this worktree
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
+| `cargo test --workspace --locked` | PASS |
+| `cargo deny check` | PASS (advisories, bans, licenses, sources) |
+| `npm run typecheck` | PASS |
+| `npm run build` | PASS |
+| `npm test` (default parallelism) | 5-7 `ShellGrid.test.tsx` lazy-load timeouts under load; files pass alone |
+| `npm test -- --poolOptions.threads.maxThreads=2 --poolOptions.threads.minThreads=1` | PASS, 489/489 |
+
+The default-parallelism frontend failure is a pre-existing test-infra timeout,
+not a product or Phase 8 change: `ShellGrid.test.tsx` passes 12/12 when run
+alone and the full 51-file suite passes with bounded threads. It is recorded
+here rather than hidden or "fixed" by changing application code.
+
+### 10.3 Artifact
+
+`target\release\selora-desktop.exe` was rebuilt from this tree after the
+frontend `dist`:
+
+| Field | Value |
+|---|---|
+| Size | 19,051,008 bytes |
+| SHA-256 | `18b193c638a75649e7ea6d7ddcb587868d0501e9726790a52aa2b813f8f59c58` |
+| Authenticode | NotSigned |
+
+The installer was not rebuilt; `installer.artifact` remains SKIP.
