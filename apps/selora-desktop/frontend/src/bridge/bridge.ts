@@ -16,7 +16,16 @@ export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
 export type TextPosition = { line: number; utf16_column: number };
 export type Selection = { anchor: TextPosition; active: TextPosition; version: number };
 export type FileTreeNode = { path: string; name: string; kind: 'directory' | 'file'; children: FileTreeNode[] };
-export type Approval = { approval_id: Id; request_id: Id; turn_id: Id; session_id: Id; summary: string; can_approve_all_this_turn: boolean };
+export type Approval = {
+  approval_id: Id;
+  request_id: Id;
+  turn_id: Id;
+  session_id: Id;
+  summary: string;
+  can_approve_all_this_turn: boolean;
+  /** Phase 9a additive: a parked question / plan survives a bootstrap replay. */
+  decision_prompt?: AgentDecisionPrompt;
+};
 export type Diagnostic = { path: string; line: number; column: number; severity: 'error' | 'warning' | 'info' | 'hint'; message: string };
 
 // --- Z2 additions (ARCHITECTURE §2.5) ---------------------------------------
@@ -95,6 +104,20 @@ export type SearchQuery = { query: string; case_sensitive: boolean; whole_word: 
 export type SearchHit = { path: string; line: number; column: number; preview: string };
 export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean };
 export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
+/**
+ * Phase 9a additive session clock (ROADMAP §"Phase 9", task 9a).
+ *
+ * The authoritative todo list for a session. `ChatStateDto` does not expose it
+ * until 9b lands, so the field is optional and hydrate treats absence as an
+ * empty list (`No todos yet`) — never as a reason to synthesize steps.
+ */
+export type ChatTodoDto = {
+  id: Id;
+  session_id?: Id;
+  title: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  assigned_subagent?: string;
+};
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
@@ -129,6 +152,8 @@ export type BootstrapState = {
     active_request_id: Id | null;
     active_turn_id: Id | null;
     pending_approval: Approval | null;
+    /** Phase 9a additive authoritative todos (see `ChatTodoDto`). */
+    todos?: ChatTodoDto[];
   };
   settings: SettingsView;
   layout: Layout;
@@ -202,6 +227,61 @@ export type ToolResultPayload = {
   is_err: boolean;
 };
 
+/**
+ * Phase 9a additive decision prompts (ROADMAP §"Phase 9", task 9a).
+ *
+ * `approval_needed` already parks the turn; a question or plan rides the same
+ * card and the same `agent_decision` route, with a richer payload. The Rust
+ * `ApprovalNeededDto` does not carry this field until 9b/9c land, so it is
+ * optional here and the card only renders when the backend actually sends it.
+ * Nothing is invented on the frontend when it is absent.
+ */
+export type AgentQuestionOption = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
+export type AgentQuestionPrompt = {
+  kind: 'question';
+  header?: string;
+  question: string;
+  options: AgentQuestionOption[];
+  /** When true (or when `options` is empty) the card offers a free-text answer. */
+  allow_free_text?: boolean;
+  free_text_placeholder?: string;
+};
+
+export type AgentPlanStep = {
+  title: string;
+  detail?: string;
+};
+
+export type AgentPlanPrompt = {
+  kind: 'plan';
+  title?: string;
+  summary?: string;
+  steps: AgentPlanStep[];
+};
+
+export type AgentDecisionPrompt = AgentQuestionPrompt | AgentPlanPrompt;
+
+/** The additive answer attached to an `AgentDecision` for a prompt card. */
+export type AgentDecisionResolution =
+  | {
+      kind: 'question';
+      /** The chosen option id, when the question offered options. */
+      option_id?: string;
+      /** The free-text answer, when the user typed one. */
+      text?: string;
+    }
+  | {
+      kind: 'plan';
+      decision: 'approve' | 'request_changes';
+      /** Required for `request_changes`; the revision note for the agent. */
+      feedback?: string;
+    };
+
 export type ApprovalNeededPayload = {
   request_id: Id;
   session_id: Id;
@@ -215,6 +295,8 @@ export type ApprovalNeededPayload = {
    * a workflow card; absent on every other card and on pre-8 payloads.
    */
   workflow?: WorkflowApproval;
+  /** Phase 9a: structured question / plan review on the same park channel. */
+  prompt?: AgentDecisionPrompt;
 };
 
 export type AgentStateChangedPayload = {
@@ -362,7 +444,7 @@ export type FrontendCommand =
   | { type: 'send_chat'; payload: { request_id: Id; request: { session_id: Id; message: string; model_id: string | null } } }
   | { type: 'stop_chat'; payload: { request_id: Id } }
   | { type: 'send_agent'; payload: { request_id: Id; request: { session_id: Id; prompt: string; model_id: string | null; mode: AgentMode; reasoning_effort?: 'quick' | 'standard' | 'max'; system_instructions?: string; temperature?: number; editor_context?: EditorContextDto } } }
-  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
+  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision; resolution?: AgentDecisionResolution } }
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
@@ -751,6 +833,7 @@ export const agentDecision = (
   approvalId: Id,
   decision: Decision,
   ctx: EnvelopeContext,
+  resolution?: AgentDecisionResolution,
 ): Promise<unknown> =>
   dispatchZ2Command(
     {
@@ -759,6 +842,7 @@ export const agentDecision = (
         request_id: requestId,
         approval_id: approvalId,
         decision,
+        ...(resolution ? { resolution } : {}),
       },
     },
     ctx,

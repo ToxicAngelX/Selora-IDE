@@ -100,6 +100,42 @@ const EFFORT_OPTIONS: Array<{ id: ReasoningEffort; label: string; desc: string }
   { id: 'quick', label: 'Quick', desc: 'Fast, minimal thought overhead' },
 ];
 
+/**
+ * Phase 9a composer mode row. Labels are ZCode-class; each maps to a real
+ * existing session policy rather than inventing a fourth backend mode.
+ */
+const COMPOSER_MODES: Array<{
+  id: 'ask' | 'agent' | 'plan';
+  label: string;
+  mode: PermissionMode;
+  description: string;
+}> = [
+  {
+    id: 'ask',
+    label: 'Ask',
+    mode: 'ask_before_change',
+    description: 'Ask before changes: every file write and command pauses for your approval.',
+  },
+  {
+    id: 'agent',
+    label: 'Agent',
+    mode: 'full',
+    description: 'Agent: file writes apply immediately for this session; commands still ask.',
+  },
+  {
+    id: 'plan',
+    label: 'Plan',
+    mode: 'plan_only',
+    description: 'Plan: explore read-only and propose a plan without writing files.',
+  },
+];
+
+function composerModeId(mode: PermissionMode): 'ask' | 'agent' | 'plan' {
+  if (mode === 'plan_only') return 'plan';
+  if (mode === 'ask_before_change') return 'ask';
+  return 'agent';
+}
+
 /** Provider label derived from the real backend model id (no fake metadata). */
 function describeModel(model: Model): ModelItem {
   const idLower = `${model.id} ${model.display_name}`.toLowerCase();
@@ -404,7 +440,27 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
       {/* 1. Border Beam (Animated perimeter aura during in-flight runs) */}
       <BorderBeam active={inFlight} durationMs={2400} borderRadius={8} colorPreset="emerald" />
 
-      {/* 2. Smooth Auto-Expanding Text Input Area */}
+      {/* 2. Composer mode row (Ask / Agent / Plan). Each entry is a real
+          session permission policy — not a cosmetic toggle. */}
+      <div className="composer-mode-row" role="group" aria-label="Composer mode">
+        {COMPOSER_MODES.map((option) => {
+          const active = composerModeId(permissionMode) === option.id;
+          return (
+            <button
+              key={option.id}
+              type="button"
+              className={`composer-mode-btn${active ? ' is-active' : ''}`}
+              aria-pressed={active}
+              title={option.description}
+              onClick={() => agentStore.setPermissionMode(option.mode)}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 3. Smooth Auto-Expanding Text Input Area */}
       <div className="composer-input-row" style={{ position: 'relative' }}>
         {!isFocused && !text && (
           <p

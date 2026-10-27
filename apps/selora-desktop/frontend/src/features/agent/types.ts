@@ -1,6 +1,8 @@
 // Selora IDE — Phase Z3 Agentic Window Types
 // Traceable to DESIGN_TOKENS.md, ROADMAP.md Phase 5/9, and ZCode benchmark.
 
+import type { AgentDecisionPrompt, AgentDecisionResolution } from '../../bridge/bridge';
+
 export type ThinkingState =
   | 'breathing'
   | 'working'
@@ -76,6 +78,14 @@ export type AgentToolCall = {
   exitCode?: number;
   durationMs?: number;
   startedAt: number;
+  /** Phase 9a: a parked question or plan review carried on the approval card. */
+  decisionPrompt?: AgentDecisionPrompt;
+  /** The answer already sent, once the decision route succeeds. */
+  resolution?: AgentDecisionResolution;
+  /** True while the answer is in flight; the card's controls stay disabled. */
+  decisionSubmitting?: boolean;
+  /** Truthful failure text from the decision route (card stays parked). */
+  decisionError?: string;
 };
 
 export type MessageRole = 'user' | 'assistant' | 'system';
@@ -141,6 +151,8 @@ export type AgentSession = {
   costUsd: number;
   branchName?: string;
   isCompacted?: boolean;
+  /** True while the backend reports an active request for this session. */
+  isRunning?: boolean;
 };
 
 export type AgentMetrics = {
