@@ -42,6 +42,9 @@ pub enum PlanPhase {
 pub struct TodoItem {
     pub id: String,
     pub title: String,
+    /// Durable sessions persisted todos before Phase 9b, so a missing
+    /// status hydrates as `Pending` instead of failing the load.
+    #[serde(default)]
     pub status: TodoStatus,
 }
 

@@ -20,6 +20,7 @@
 
 pub mod plan;
 pub mod router;
+pub mod session;
 pub mod tools;
 pub mod turn;
 
@@ -33,11 +34,19 @@ pub use router::{
     denied_result, execute_approved, execute_tool, plan_approved_result, revise_plan_result,
     tool_manifest, AgentToolSettings, ToolContext, ToolOutcome,
 };
+pub use session::{
+    bound_summary, compact_conversation, compacted_conversation, now_millis, should_compact,
+    summary_request, transcript_conversation, AgentSessionMode, AgentSessionState,
+    AgentSessionStore, AgentSessionSummary, CompactionCursor, CompactionError, CompactionOutcome,
+    LoadedAgentSession, ParkSummary, ParkedCard, PlanState, PlanStatus, TranscriptEntry,
+    TranscriptLoad, AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD,
+    MAX_SUMMARY_CHARS, SESSION_SCHEMA, STATE_FILE, TODOS_FILE, TRANSCRIPT_FILE,
+};
 pub use tools::bash::BashAbortHandle;
 pub use turn::{
     run_agent_turn, spawn_agent_turn, AgentEvent, AgentSummary, AgentTurn, AgentTurnReport,
-    AgentTurnState, ChatStream, ClientChatStream, RouterToolRunner, ToolRunner, TurnCaps,
-    TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
+    AgentTurnState, ChatStream, ClientChatStream, CompactionConfig, RouterToolRunner, ToolRunner,
+    TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
 };
 
 use serde::{Deserialize, Serialize};

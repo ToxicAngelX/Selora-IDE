@@ -22,12 +22,18 @@ mod types;
 mod updates;
 
 pub use agent::{
-    denied_result, execute_approved, execute_tool, new_store, plan, plan_approved_result,
-    revise_plan_result, run_agent_turn, spawn_agent_turn, tool_manifest, AgentDecision, AgentEvent,
-    AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport, AgentTurnState, ApprovalCard,
-    ApprovalId, BashAbortHandle, ChatStream, ClientChatStream, PlanDraft, PlanPhase, PlanSession,
-    PlanSnapshot, PlanStore, RouterToolRunner, TodoItem, TodoStatus, ToolContext, ToolOutcome,
-    ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE,
+    bound_summary, compact_conversation, compacted_conversation, denied_result, execute_approved,
+    execute_tool, new_store, now_millis, plan, plan_approved_result, revise_plan_result,
+    run_agent_turn, should_compact, spawn_agent_turn, summary_request, tool_manifest,
+    transcript_conversation, AgentDecision, AgentEvent, AgentSessionMode, AgentSessionState,
+    AgentSessionStore, AgentSessionSummary, AgentSummary, AgentToolSettings, AgentTurn,
+    AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle, ChatStream,
+    ClientChatStream, CompactionConfig, CompactionCursor, CompactionError, CompactionOutcome,
+    LoadedAgentSession, ParkSummary, ParkedCard, PlanDraft, PlanPhase, PlanSession, PlanSnapshot,
+    PlanState, PlanStatus, PlanStore, RouterToolRunner, TodoItem, TodoStatus, ToolContext,
+    ToolOutcome, ToolRunner, TranscriptEntry, TranscriptLoad, TurnCaps, TurnDecision, TurnEnd,
+    TurnInput, AGENT_SESSIONS_DIR, COMPACTION_KEEP_LAST, COMPACTION_THRESHOLD, DENIED_MESSAGE,
+    MAX_SUMMARY_CHARS, SESSION_SCHEMA, STATE_FILE, TODOS_FILE, TRANSCRIPT_FILE,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

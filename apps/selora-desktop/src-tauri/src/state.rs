@@ -1923,10 +1923,12 @@ impl DesktopState {
             .workspace_root_path()
             .map(|root| persisted_workflow_runs(&root))
             .unwrap_or_default();
-        // P1: the live bridge store, never a hard-coded empty vector.
+// P1: the live bridge store, never a hard-coded empty vector.
         let (diagnostics, lsp_servers) = self.lsp_snapshot();
+        let agent_sessions = self.sessions.agent_sessions();
         BootstrapState {
             workflows,
+            agent_sessions,
             protocol_version: PROTOCOL_VERSION,
             core_instance_id: self.log.core_instance_id(),
             snapshot_sequence: self.log.snapshot_sequence(),
@@ -1994,6 +1996,11 @@ impl DesktopState {
                 | FrontendCommand::StopChat { .. }
                 | FrontendCommand::SendAgent { .. }
                 | FrontendCommand::AgentDecision { .. }
+                | FrontendCommand::RetryMessage { .. }
+                | FrontendCommand::SwitchSession { .. }
+                | FrontendCommand::NewSession
+                | FrontendCommand::ListAgentSessions
+                | FrontendCommand::SetAgentAutoApprove { .. }
         );
         // §2.3: a command may name the workspace it was composed against —
         // "no-workspace" before one is open, or the live id after. An
@@ -2068,6 +2075,57 @@ impl DesktopState {
                     &approval_id,
                     decision,
                     envelope.session_id,
+                )?;
+                Ok(self.bootstrap())
+            }
+            // Phase 9d — durable sessions. Every arm publishes a bootstrap
+            // so the rail/transcript follow without a reload.
+            FrontendCommand::SwitchSession { session_id } => {
+                self.sessions.switch_session(&session_id)?;
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::NewSession => {
+                self.sessions.new_session()?;
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::ListAgentSessions => {
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
+            FrontendCommand::SetAgentAutoApprove {
+                session_id,
+                enabled,
+            } => {
+                self.sessions.set_auto_approve(&session_id, enabled)?;
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::RetryMessage {
+                session_id,
+                message_id,
+            } => {
+                self.sessions.retry_message(
+                    self.event_log(),
+                    app.clone(),
+                    request_id,
+                    session_id,
+                    message_id,
                 )?;
                 Ok(self.bootstrap())
             }

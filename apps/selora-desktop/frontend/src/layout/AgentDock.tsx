@@ -238,6 +238,7 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
             <AgentSessionRail
               sessions={state.sessions}
               activeSessionId={state.activeSessionId}
+              resumableSessions={state.resumableSessions}
               onClose={closeSessionRail}
             />
             <div

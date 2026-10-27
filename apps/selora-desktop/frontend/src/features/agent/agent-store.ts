@@ -14,6 +14,7 @@ import type {
   PermissionMode,
   QueuedPrompt,
   ReasoningEffort,
+  ResumableAgentSession,
   SubagentInfo,
   ThinkingState,
   TodoStatus,
@@ -22,10 +23,15 @@ import type {
 import {
   agentDecision,
   fetchModels,
+  listAgentSessions,
+  newSession as bridgeNewSession,
+  retryMessage as bridgeRetryMessage,
   runWorkflow,
   sendAgent,
   sendChat,
+  setAgentAutoApprove,
   stopChat,
+  switchSession as bridgeSwitchSession,
   type AgentMode,
   type AgentStateChangedPayload,
   type AgentTurnDonePayload,
@@ -53,6 +59,8 @@ export type ModelSettings = {
 
 export type AgentState = {
   sessions: AgentSession[];
+  /** Phase 9d: durable sessions from Rust (the resume picker). */
+  resumableSessions: ResumableAgentSession[];
   activeSessionId: string;
   messages: ChatMessage[];
   todos: AgentTodo[];
@@ -190,6 +198,7 @@ const INITIAL_ARTIFACTS: ArtifactItem[] = [];
 
 let state: AgentState = {
   sessions: INITIAL_SESSIONS,
+  resumableSessions: [],
   activeSessionId: DEFAULT_SESSION_ID,
   messages: [],
   todos: INITIAL_TODOS,
@@ -619,6 +628,21 @@ export const agentStore = {
       costUsd: 0,
     }));
 
+    // Durable sessions come from `.selora/agent-sessions` — a read-only
+    // projection Rust owns. Never synthesized locally.
+    const resumableSessions: ResumableAgentSession[] = (bootstrap.agent_sessions ?? []).map(
+      (session) => ({
+        id: session.session_id,
+        title: session.title,
+        updatedAt: session.updated_at,
+        ...(session.model ? { model: session.model } : {}),
+        mode: session.mode,
+        ...(session.pending ? { pending: session.pending } : {}),
+        compacted: session.compacted,
+        messageCount: session.message_count,
+      }),
+    );
+
     const messages: ChatMessage[] = [];
     for (const message of bootstrap.chat.messages) {
       if (message.role !== 'user' && message.role !== 'assistant') continue;
@@ -727,6 +751,7 @@ export const agentStore = {
       selectedModel: modelToSelect,
       workspace,
       sessions,
+      resumableSessions,
       messages,
       activeSessionId,
       todos: hydratedTodos,
@@ -775,6 +800,7 @@ export const agentStore = {
       availableModels: [],
       selectedModel: '',
       workspace: null,
+      resumableSessions: [],
     };
     notify();
   },
@@ -824,6 +850,73 @@ export const agentStore = {
       activeSessionId: nextActive,
     };
     notify();
+  },
+
+  /** Phase 9d — open a durable session restored by Rust. */
+  resumeSession(sessionId: string): boolean {
+    if (!state.resumableSessions.some((session) => session.id === sessionId)) return false;
+    this.switchSession(sessionId);
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void bridgeSwitchSession(sessionId, ctx).catch((err: unknown) => {
+        console.error('Failed to restore agent session:', err);
+      });
+    }
+    return true;
+  },
+
+  /** Phase 9d — new session (Rust owns the id and the empty on-disk store). */
+  newDurableSession(title = 'New Agent Session'): string {
+    const localId = this.createSession(title);
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void bridgeNewSession(ctx).catch((err: unknown) => {
+        console.error('Failed to create agent session:', err);
+      });
+    }
+    return localId;
+  },
+
+  /** Phase 9d — refresh the resume picker from disk. */
+  refreshResumableSessions(): void {
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void listAgentSessions(ctx).catch((err: unknown) => {
+        console.error('Failed to list agent sessions:', err);
+      });
+    }
+  },
+
+  /**
+   * Phase 9d — arm/disarm session full access. The flag is Rust session
+   * memory only: it never reaches disk and resets on switch/new/restart.
+   */
+  setSessionAutoApprove(enabled: boolean): void {
+    const ctx = sessionEnvelopeContext();
+    if (ctx) {
+      void setAgentAutoApprove(state.activeSessionId, enabled, ctx).catch((err: unknown) => {
+        console.error('Failed to set session auto-approve:', err);
+      });
+    }
+  },
+
+  /** Phase 9d — retry a user message (Rust rewinds the durable transcript). */
+  retryFromMessage(messageId: string): boolean {
+    const ctx = sessionEnvelopeContext();
+    const index = state.messages.findIndex((message) => message.id === messageId);
+    if (!ctx || index < 0 || state.messages[index]?.role !== 'user') return false;
+    state = {
+      ...state,
+      messages: state.messages.slice(0, index),
+      inFlight: false,
+      thinkingState: 'breathing',
+      streamingActivityLevel: 0,
+    };
+    notify();
+    void bridgeRetryMessage(state.activeSessionId, messageId, ctx).catch((err: unknown) => {
+      console.error('Failed to retry message:', err);
+    });
+    return true;
   },
 
   setPermissionMode(mode: PermissionMode) {

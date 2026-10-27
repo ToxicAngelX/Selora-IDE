@@ -59,6 +59,7 @@ function AgentSidebarView() {
       <AgentSessionRail
         sessions={agentState.sessions}
         activeSessionId={agentState.activeSessionId}
+        resumableSessions={agentState.resumableSessions}
       />
     </div>
   );

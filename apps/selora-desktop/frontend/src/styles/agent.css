@@ -554,6 +554,27 @@
   white-space: nowrap;
 }
 
+/* Phase 9d — durable session resume list */
+.session-rail-subtitle {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--type-xs);
+  color: var(--fg-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.session-item-resumable {
+  opacity: 0.9;
+}
+
+.session-pending-badge,
+.session-compacted-badge {
+  background: var(--ink-mid);
+  padding: 0 4px;
+  border-radius: var(--radius-1);
+  font-family: var(--font-mono);
+}
+
 /* --- 7. Execution Feed -------------------------------------------------- */
 
 .agent-execution-feed {

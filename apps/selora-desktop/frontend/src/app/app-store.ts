@@ -354,12 +354,23 @@ function reduceEvent(event: EventEnvelope): void {
     case 'agent_turn_done':
       agentStore.handleAgentTurnDone(payload.payload);
       return;
-    case 'plan_state_changed':
+case 'plan_state_changed':
       agentStore.handlePlanStateChanged(payload.payload);
       return;
     case 'todos_changed':
       agentStore.handleTodosChanged(payload.payload);
       return;
+    case 'agent_compaction_failed': {
+      const failure = payload.payload;
+      const partial = failure.partial_summary
+        ? ` A partial summary (${failure.partial_summary.length} chars) was kept.`
+        : '';
+      toastStore.pushProtocol(event.sequence, {
+        severity: 'error',
+        message: `Context compaction failed: ${failure.message}.${partial}`,
+      });
+      return;
+    }
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;
