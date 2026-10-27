@@ -1,11 +1,12 @@
 use selora_protocol::{
-    clamp_region_size, ApprovalId, BootstrapState, CoreInstanceId, DecisionDto, EventEnvelope,
-    FileTreeDto, FrontendCommand, FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto,
-    RegionId, RequestEnvelope, RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId,
-    ToastDto, ToastSeverity, WorkflowApprovalNeededDto, WorkflowArtifactDto,
-    WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto, WorkflowPhaseEventDto,
-    WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus,
-    WorkflowStepDto, WorkflowStepEventDto, WorkspaceId, PROTOCOL_VERSION,
+    clamp_region_size, ApprovalId, BootstrapState, CommandAckDto, CommandResultDto, CoreInstanceId,
+    DecisionDto, EventEnvelope, FileTreeDto, FrontendCommand, FrontendEvent, LayoutConstraintsDto,
+    LayoutDto, ProtocolErrorDto, RegionId, RequestEnvelope, RequestId, SessionId, SettingsPatchDto,
+    SettingsViewDto, SurfaceId, ToastDto, ToastSeverity, WorkflowApprovalNeededDto,
+    WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto,
+    WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto,
+    WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto, WorkspaceId,
+    PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
@@ -469,6 +470,13 @@ pub(crate) struct EventLog {
     core_instance_id: CoreInstanceId,
     sequence: Mutex<u64>,
     events: Mutex<Vec<EventEnvelope<FrontendEvent>>>,
+    /// Serializes sequence assignment with emission. The sequence is assigned
+    /// while this guard is held and the event is emitted before it is
+    /// released, so two producers can never deliver n+1 before n.
+    emit_lock: Mutex<()>,
+    /// Test-only capture of emission order (the monotonic-delivery test).
+    #[cfg(test)]
+    emitted: Mutex<Vec<u64>>,
 }
 
 impl EventLog {
@@ -477,6 +485,9 @@ impl EventLog {
             core_instance_id,
             sequence: Mutex::new(0),
             events: Mutex::new(Vec::new()),
+            emit_lock: Mutex::new(()),
+            #[cfg(test)]
+            emitted: Mutex::new(Vec::new()),
         }
     }
 
@@ -496,8 +507,7 @@ impl EventLog {
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
     ) {
-        let event = self.push(payload, request_id, None);
-        let _ = app.emit("selora://event", &event);
+        self.emit(app, payload, request_id, None);
     }
 
     /// Record and emit with the session on the envelope — the Z3 session
@@ -510,7 +520,25 @@ impl EventLog {
         request_id: Option<selora_protocol::RequestId>,
         session_id: SessionId,
     ) {
-        let event = self.push(payload, request_id, Some(session_id));
+        self.emit(app, payload, request_id, Some(session_id));
+    }
+
+    /// The one emission path: assign the sequence, append to the replay ring,
+    /// and emit before releasing the order guard.
+    fn emit<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: Option<SessionId>,
+    ) {
+        let _order = self.emit_lock.lock().expect("emit lock");
+        let event = self.prepare(payload, request_id, session_id);
+        #[cfg(test)]
+        self.emitted
+            .lock()
+            .expect("emitted lock")
+            .push(event.sequence);
         let _ = app.emit("selora://event", &event);
     }
 
@@ -518,6 +546,18 @@ impl EventLog {
     /// `DesktopState` construction, before any `AppHandle` exists; the
     /// replay flow (§3.4) delivers it.
     pub(crate) fn push(
+        &self,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: Option<SessionId>,
+    ) -> EventEnvelope<FrontendEvent> {
+        // A no-emit record still takes the order guard, so it cannot take a
+        // sequence that an in-flight emission is about to deliver.
+        let _order = self.emit_lock.lock().expect("emit lock");
+        self.prepare(payload, request_id, session_id)
+    }
+
+    fn prepare(
         &self,
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
@@ -542,6 +582,12 @@ impl EventLog {
             events.drain(0..overflow);
         }
         event
+    }
+
+    /// The emission order captured by [`EventLog::emit`] (test only).
+    #[cfg(test)]
+    pub(crate) fn emitted_sequences(&self) -> Vec<u64> {
+        self.emitted.lock().expect("emitted lock").clone()
     }
 
     /// §3.4's replay backing store for the `get_events_after` command.
@@ -1102,6 +1148,10 @@ pub struct DesktopState {
     /// the folder picker succeeds; every workspace command answers the typed
     /// no_workspace error while it is unset.
     workspace: Arc<Mutex<Option<Workspace>>>,
+    /// Phase 9 session slice: the buffer the user actually selected. The
+    /// bootstrap prefers it over the first buffer in path order. Cleared when
+    /// the buffer closes or a different workspace opens.
+    active_buffer: Arc<Mutex<Option<selora_protocol::BufferId>>>,
     /// Phase Z4b: the language-server bridge for the open workspace, created
     /// lazily on the first editor command (it needs an AppHandle to emit).
     lsp: Arc<Mutex<Option<LspBridge>>>,
@@ -1219,6 +1269,7 @@ impl DesktopState {
                 key_source,
             })),
             workspace: Arc::new(Mutex::new(None)),
+            active_buffer: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             workflow_hosts: Arc::new(Mutex::new(
@@ -1249,6 +1300,10 @@ impl DesktopState {
             .workspace
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(workspace);
+        *self
+            .active_buffer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
         Ok(())
     }
 
@@ -1278,6 +1333,36 @@ impl DesktopState {
                 message: "Open a folder first.".into(),
                 retryable: false,
             }),
+        }
+    }
+
+    /// Record a buffer as the user's active one, but only if it is actually
+    /// open. The bootstrap then reports it instead of path order.
+    fn set_active_buffer(&self, buffer_id: &selora_protocol::BufferId) {
+        let open = self
+            .workspace
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|workspace| workspace.buffer(buffer_id).is_ok())
+            .unwrap_or(false);
+        if open {
+            *self
+                .active_buffer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(buffer_id.clone());
+        }
+    }
+
+    /// After a close, drop a stale selection so the next bootstrap falls back
+    /// to the first remaining buffer.
+    fn forget_closed_buffer(&self, buffer_id: &selora_protocol::BufferId) {
+        let mut active = self
+            .active_buffer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if active.as_ref() == Some(buffer_id) {
+            *active = None;
         }
     }
 
@@ -1457,7 +1542,17 @@ impl DesktopState {
         let (workspace_dto, buffers, active_buffer_id, file_tree, git) = match workspace.as_ref() {
             Some(open) => {
                 let buffers = open.buffers();
-                let active = buffers.first().map(|buffer| buffer.buffer_id.clone());
+                let preferred = self
+                    .active_buffer
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
+                // The user's actual selection wins; only when it is absent or
+                // no longer open does path order decide (the pre-Phase-9
+                // fallback).
+                let active = preferred
+                    .filter(|id| buffers.iter().any(|buffer| &buffer.buffer_id == id))
+                    .or_else(|| buffers.first().map(|buffer| buffer.buffer_id.clone()));
                 let tree = open.tree().unwrap_or(FileTreeDto { root: None });
                 let git = open.git_status().unwrap_or(selora_protocol::GitStatusDto {
                     branch: None,
@@ -1541,13 +1636,16 @@ impl DesktopState {
         }
     }
     /// The Z1-era envelope validation (§2.3 steps 1–3), unchanged, then the
-    /// Z2 layout arms and the Z3 session arms. The response remains a full
-    /// `BootstrapState` — used for error inspection, not state (§2.4).
-    pub fn dispatch<R: tauri::Runtime>(
+    /// Z2 layout arms and the Z3 session arms. The typed reply is a
+    /// [`CommandResultDto`]: reads/folder opens keep the full bootstrap
+    /// shape, event-backed mutations answer the small ack. See the protocol
+    /// doc comment for the additive contract. [`Self::dispatch`] keeps the
+    /// pre-existing `BootstrapState` signature for internal callers/tests.
+    pub fn dispatch_result<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         envelope: RequestEnvelope<FrontendCommand>,
-    ) -> Result<BootstrapState, ProtocolErrorDto> {
+    ) -> Result<CommandResultDto, ProtocolErrorDto> {
         if envelope.protocol_version != PROTOCOL_VERSION {
             return Err(ProtocolErrorDto {
                 code: "protocol_version_mismatch".into(),
@@ -1572,6 +1670,7 @@ impl DesktopState {
                 | FrontendCommand::StopChat { .. }
                 | FrontendCommand::SendAgent { .. }
                 | FrontendCommand::AgentDecision { .. }
+                | FrontendCommand::RetryMessage { .. }
         );
         // §2.3: a command may name the workspace it was composed against —
         // "no-workspace" before one is open, or the live id after. An
@@ -1597,7 +1696,9 @@ impl DesktopState {
         }
         let request_id = envelope.request_id.clone();
         match envelope.payload {
-            FrontendCommand::GetBootstrapState => Ok(self.bootstrap()),
+            FrontendCommand::GetBootstrapState => {
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
+            }
             // The session commands carry their own request identity (the
             // `request_id` field on the variant — stable across the
             // request's lifetime, the id `StopChat`/`AgentDecision` name
@@ -1614,14 +1715,14 @@ impl DesktopState {
                     command_request,
                     payload,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::StopChat {
                 request_id: command_request,
             } => {
                 self.sessions
                     .stop_chat(&command_request, envelope.session_id)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SendAgent {
                 request_id: command_request,
@@ -1634,7 +1735,7 @@ impl DesktopState {
                     command_request,
                     payload,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::AgentDecision {
                 request_id: command_request,
@@ -1647,7 +1748,36 @@ impl DesktopState {
                     decision,
                     envelope.session_id,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            // Phase 9 session slice: real sessions owned by the engine. Each
+            // accepted transition publishes the same full bootstrap snapshot
+            // the boot path hydrates from, then answers the small ack.
+            FrontendCommand::NewSession => {
+                self.sessions.new_session()?;
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::SwitchSession { session_id } => {
+                self.sessions.switch_session(&session_id)?;
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::RetryMessage {
+                session_id,
+                message_id,
+            } => {
+                self.sessions.retry_message(
+                    self.event_log(),
+                    app.clone(),
+                    envelope.session_id,
+                    session_id,
+                    message_id,
+                )?;
+                // The retry minted a new request id inside the engine; the
+                // snapshot is how the frontend learns which stream to route.
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::ToggleSurface { surface } => {
                 // §2.2: the region a surface acts on is determined in Rust,
@@ -1659,7 +1789,7 @@ impl DesktopState {
                     FrontendEvent::WorkspaceLayoutChanged(layout),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::ResizeRegion { region, size_px } => {
                 // §2.3 item 5: finite out-of-range values are clamped, never
@@ -1678,7 +1808,7 @@ impl DesktopState {
                     );
                 }
                 // An idempotent drag end: success, no event (§2.3 item 5).
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SaveLayout => {
                 // §2.3 item 7: persistence failure → `layout_save_failed`
@@ -1688,7 +1818,7 @@ impl DesktopState {
                     message: format!("Failed to save the layout: {error}"),
                     retryable: true,
                 })?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenExternal { url } => {
                 // The About dialog's repository link and the update toast's
@@ -1704,7 +1834,7 @@ impl DesktopState {
                         retryable: true,
                     }
                 })?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenFolder => {
                 // The keyboard/palette entry: prefer the boot override, and
@@ -1725,7 +1855,7 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::OpenFolderAt { root } => {
                 self.attach_workspace(PathBuf::from(root))
@@ -1738,15 +1868,16 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::RefreshTree => {
                 let tree = self.with_workspace(|workspace| workspace.tree())?;
                 self.record_event(app, FrontendEvent::FileTreeChanged(tree), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenFile { path } => {
                 let buffer = self.with_workspace(|workspace| workspace.open_file(path.as_str()))?;
+                self.set_active_buffer(&buffer.buffer_id);
                 self.record_event(
                     app,
                     FrontendEvent::BufferSnapshot(buffer.clone()),
@@ -1759,12 +1890,13 @@ impl DesktopState {
                         bridge.open(absolute, buffer.text.clone());
                     });
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::CloseBuffer { buffer_id } => {
                 let buffer = self.with_workspace(|workspace| workspace.buffer(&buffer_id))?;
                 let root = self.workspace_root_path();
                 self.with_workspace(|workspace| workspace.close_buffer(&buffer_id))?;
+                self.forget_closed_buffer(&buffer_id);
                 if let Some(root) = root {
                     let absolute = root.join(buffer.path.as_str());
                     self.with_lsp(app, |bridge| {
@@ -1779,10 +1911,10 @@ impl DesktopState {
                 let snapshot = self.bootstrap();
                 self.record_event(
                     app,
-                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    FrontendEvent::BootstrapState(Box::new(snapshot)),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SaveBuffer { buffer_id } => {
                 let buffer = self.with_workspace(|workspace| workspace.save_buffer(&buffer_id))?;
@@ -1795,7 +1927,7 @@ impl DesktopState {
                     let absolute = root.join(buffer.path.as_str());
                     self.with_lsp(app, |bridge| bridge.save(absolute));
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::ApplyEditorChange {
                 buffer_id,
@@ -1805,6 +1937,7 @@ impl DesktopState {
                 let changed = self.with_workspace(|workspace| {
                     workspace.apply_change(&buffer_id, version, &changes)
                 })?;
+                self.set_active_buffer(&buffer_id);
                 self.record_event(app, FrontendEvent::BufferChanged(changed), Some(request_id));
                 if let Ok(snapshot) = self.with_workspace(|workspace| workspace.buffer(&buffer_id))
                 {
@@ -1813,14 +1946,22 @@ impl DesktopState {
                         self.with_lsp(app, |bridge| bridge.change(absolute, snapshot.text.clone()));
                     }
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SetSelection {
                 buffer_id,
                 selection,
             } => {
                 self.with_workspace(|workspace| workspace.set_selection(&buffer_id, selection))?;
-                Ok(self.bootstrap())
+                self.set_active_buffer(&buffer_id);
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::SetActiveBuffer { buffer_id } => {
+                // Reject unknown/closed buffers instead of recording a
+                // selection the next bootstrap would silently drop.
+                self.with_workspace(|workspace| workspace.buffer(&buffer_id))?;
+                self.set_active_buffer(&buffer_id);
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::HoverAt {
                 buffer_id,
@@ -1829,7 +1970,7 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.hover(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::DefinitionAt {
                 buffer_id,
@@ -1838,7 +1979,7 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.definition(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::CompletionAt {
                 buffer_id,
@@ -1847,12 +1988,12 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.completion(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::Search { query } => {
                 let results = self.with_workspace(|workspace| workspace.search(&query))?;
                 self.record_event(app, FrontendEvent::SearchResults(results), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitStage { path } => {
                 let status = self.with_workspace(|workspace| workspace.git_stage(path.as_str()))?;
@@ -1861,7 +2002,7 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitUnstage { path } => {
                 let status =
@@ -1871,7 +2012,7 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitCommit { message } => {
                 let status = self.with_workspace(|workspace| workspace.git_commit(&message))?;
@@ -1880,15 +2021,18 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenGitDiff { path } => {
                 let diff = self.with_workspace(|workspace| workspace.git_diff(path.as_str()))?;
                 self.record_event(app, FrontendEvent::GitDiffReady(diff), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SettingsUpdate { patch } => {
-                self.apply_settings_update(app, patch, Some(request_id))
+                // The settings mutation emits its own full bootstrap snapshot;
+                // the command reply is only an ack.
+                self.apply_settings_update(app, patch, Some(request_id))?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             // Phase 8 wave 2: dispatch only. The workflow commands carry
             // their own request id (the lifetime id `WorkflowStop` names and
@@ -1898,13 +2042,13 @@ impl DesktopState {
                 spec,
             } => {
                 self.start_workflow(app, command_request, spec)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowStop {
                 request_id: command_request,
             } => {
                 self.stop_workflow(&command_request)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowResume {
                 request_id,
@@ -1965,7 +2109,7 @@ impl DesktopState {
                         allow_incomplete_asks,
                     },
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowDecision {
                 request_id: command_request,
@@ -1973,12 +2117,56 @@ impl DesktopState {
                 decision,
             } => {
                 self.workflow_decision(&command_request, &approval_id, decision)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             // Everything outside Z4 keeps the typed unsupported_phase_slice
             // error (the contract's "Explicit non-goals" list; adapter.rs).
             other => Err(crate::adapter::unsupported(&other)),
         }
+    }
+
+    /// The pre-Phase-9 dispatch signature: run the command and materialize a
+    /// full bootstrap for callers (tests, internal seams) that inspect it.
+    /// The IPC path uses [`Self::dispatch_result`] so an event-backed
+    /// mutation does not pay for a tree walk and libgit2 status.
+    #[cfg(test)]
+    pub fn dispatch<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        envelope: RequestEnvelope<FrontendCommand>,
+    ) -> Result<BootstrapState, ProtocolErrorDto> {
+        match self.dispatch_result(app, envelope)? {
+            CommandResultDto::Snapshot(snapshot) => Ok(*snapshot),
+            CommandResultDto::Ack(_) => Ok(self.bootstrap()),
+        }
+    }
+
+    /// The small mutation reply (no tree walk, no Git status, no transcript).
+    fn command_ack(&self) -> CommandAckDto {
+        CommandAckDto {
+            protocol_version: PROTOCOL_VERSION,
+            core_instance_id: self.log.core_instance_id(),
+            snapshot_sequence: self.log.snapshot_sequence(),
+            acknowledged: true,
+            session_id: self.sessions.active_session_id(),
+        }
+    }
+
+    /// Emit the full snapshot a session transition hydrates from, and return
+    /// it for callers that still want the body. The event is the contract:
+    /// the frontend ignores command replies.
+    fn publish_chat_bootstrap<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        request_id: Option<RequestId>,
+    ) -> BootstrapState {
+        let snapshot = self.bootstrap();
+        self.record_event(
+            app,
+            FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+            request_id,
+        );
+        snapshot
     }
 
     // -----------------------------------------------------------------
@@ -2361,8 +2549,8 @@ impl DesktopState {
 mod tests {
     use super::*;
     use selora_protocol::{
-        BufferSnapshotDto, EventEnvelope, FrontendCommand, RequestId, WorkflowSpecDto, WorkspaceId,
-        WorkspacePath,
+        BufferSnapshotDto, CommandResultDto, EventEnvelope, FrontendCommand, RequestId,
+        WorkflowSpecDto, WorkspaceId, WorkspacePath,
     };
     use selora_workflow::{CommandOutput, GitCommit, GrepMatch, Host, HostError};
     use std::sync::atomic::Ordering;
@@ -3248,6 +3436,180 @@ mod tests {
             )
             .expect("open folder");
         dir
+    }
+
+    // ------------------------------------------------------------------
+    // P1 state slice: active buffer, ack replies, monotonic delivery
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bootstrap_prefers_the_users_active_buffer_over_path_order() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+
+        // `hello.rs` sorts before `src/lib.rs`; opening both would report
+        // `hello.rs` under the old first-alphabetical rule.
+        let hello = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: WorkspacePath::new("hello.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open hello");
+        let lib = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: WorkspacePath::new("src/lib.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open lib");
+        let hello_id = hello
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "hello.rs")
+            .expect("hello buffer")
+            .buffer_id
+            .clone();
+        let lib_id = lib
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "src/lib.rs")
+            .expect("lib buffer")
+            .buffer_id
+            .clone();
+
+        // OpenFile records the opened buffer as active.
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+
+        // The user clicking the other tab records it explicitly.
+        let reply = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: hello_id.clone(),
+                    },
+                ),
+            )
+            .expect("set active");
+        assert!(matches!(reply, CommandResultDto::Ack(_)));
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&hello_id));
+
+        // Closing the active buffer falls back to the remaining one.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: hello_id.clone(),
+                    },
+                ),
+            )
+            .expect("close hello");
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+
+        // An unknown buffer is refused, not stored.
+        let error = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: selora_protocol::BufferId::new("no-such-buffer").expect("id"),
+                    },
+                ),
+            )
+            .expect_err("unknown buffer");
+        assert_eq!(error.code, "unknown_buffer");
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+    }
+
+    #[test]
+    fn dispatch_result_returns_a_small_ack_for_event_backed_mutations() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+
+        let reply = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ToggleSurface {
+                        surface: SurfaceId::Agent,
+                    },
+                ),
+            )
+            .expect("toggle");
+        match reply {
+            CommandResultDto::Ack(ack) => {
+                assert!(ack.acknowledged);
+                assert_eq!(ack.core_instance_id, state.core_instance_id());
+                assert_eq!(ack.snapshot_sequence, state.bootstrap().snapshot_sequence);
+            }
+            CommandResultDto::Snapshot(_) => panic!("a toggle answers the small ack"),
+        }
+
+        // The read path still answers the full bootstrap shape unchanged.
+        let reply = state
+            .dispatch_result(&app, envelope(&state, FrontendCommand::GetBootstrapState))
+            .expect("bootstrap");
+        assert!(matches!(reply, CommandResultDto::Snapshot(_)));
+    }
+
+    #[test]
+    fn concurrent_emitters_deliver_in_assigned_sequence_order() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = state.event_log();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for worker in 0..8u32 {
+            let log = std::sync::Arc::clone(&log);
+            let app = mock_app_handle();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for index in 0..25u32 {
+                    log.record(
+                        &app,
+                        FrontendEvent::Toast(ToastDto {
+                            severity: ToastSeverity::Info,
+                            message: format!("worker {worker} event {index}"),
+                        }),
+                        None,
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("producer thread");
+        }
+
+        let emitted = log.emitted_sequences();
+        assert_eq!(emitted.len(), 200);
+        assert!(
+            emitted.windows(2).all(|pair| pair[0] < pair[1]),
+            "emission order must be strictly increasing: {emitted:?}"
+        );
+        assert_eq!(emitted, (1..=200).collect::<Vec<u64>>());
+
+        // The replay ring carries the same order.
+        let logged: Vec<u64> = state
+            .events_after(0)
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(logged, emitted);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // Selora IDE — Phase Z3 Agent Dock / Agentic Window (DESIGN §3.5, REVAMP_SPEC §2/§8, ZCode benchmark)
 //
 // The flagship agentic surface: multi-session rail, execution feed with tool cards,
-// plan spine with live todos, subagents tracking, and hero composer card.
+// plan spine with backend-authoritative todos, and hero composer card.
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ChevronDown, ShieldCheck } from '../components/icons';
 import { agentStore, getComposerGate } from '../features/agent/agent-store';
@@ -264,8 +264,6 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
               <div className="zcode-floating-plan-popover">
                 <AgentPlanSpine
                   todos={state.todos}
-                  subagents={state.subagents}
-                  artifacts={state.artifacts}
                   gitStatus={bootstrap?.git}
                   isFloatingPopover={true}
                   onClosePopover={() => setShowFloatingPlan(false)}
@@ -306,8 +304,6 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
                   <div id="zcode-infeed-progress-body" className="zcode-infeed-expanded-body">
                     <AgentPlanSpine
                       todos={state.todos}
-                      subagents={state.subagents}
-                      artifacts={state.artifacts}
                       gitStatus={bootstrap?.git}
                       isCompactInfeed={true}
                     />
@@ -364,7 +360,7 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
             />
           </div>
         ) : (
-          /* Plan & Subagents Tab */
+          /* Plan Tab */
           <div
             style={{
               position: 'relative',
@@ -378,8 +374,6 @@ export function AgentDock({ bootstrap }: AgentDockProps = {}) {
             <div style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
               <AgentPlanSpine
                 todos={state.todos}
-                subagents={state.subagents}
-                artifacts={state.artifacts}
                 gitStatus={bootstrap?.git}
               />
             </div>

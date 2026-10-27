@@ -335,6 +335,9 @@ function reduceEvent(event: EventEnvelope): void {
     case 'agent_turn_done':
       agentStore.handleAgentTurnDone(payload.payload);
       return;
+    case 'session_todos_changed':
+      agentStore.applySessionTodos(payload.payload);
+      return;
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;

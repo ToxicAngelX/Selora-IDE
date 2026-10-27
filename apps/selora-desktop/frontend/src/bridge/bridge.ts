@@ -89,8 +89,10 @@ export type EditorContextDto = {
 export type Model = { id: string; display_name: string; available: boolean };
 export type SearchQuery = { query: string; case_sensitive: boolean; whole_word: boolean; use_regex: boolean };
 export type SearchHit = { path: string; line: number; column: number; preview: string };
-export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean };
+export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean; todos?: TodoDto[] };
 export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
+/** The authoritative `manage_todo` list (session-scoped). */
+export type TodoDto = { id: string; text: string; status: 'pending' | 'in_progress' | 'completed' };
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
@@ -116,6 +118,8 @@ export type BootstrapState = {
     active_request_id: Id | null;
     active_turn_id: Id | null;
     pending_approval: Approval | null;
+    /** Additive Phase 9 field: absent on older payloads = no todos. */
+    todos?: TodoDto[];
   };
   settings: SettingsView;
   layout: Layout;
@@ -337,6 +341,7 @@ export type FrontendCommand =
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
+  | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'open_folder_at'; payload: { root: string } }
   | { type: 'refresh_tree' }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
@@ -408,6 +413,7 @@ export type FrontendEvent =
   | { type: 'workflow_artifact'; payload: WorkflowArtifactPayload }
   | { type: 'workflow_approval_needed'; payload: WorkflowApprovalNeededPayload }
   | { type: 'workflow_finished'; payload: WorkflowFinishedPayload }
+  | { type: 'session_todos_changed'; payload: { session_id: Id; todos: TodoDto[] } }
   | { type: 'toast'; payload: { severity: ToastSeverity; message: string } }
   | { type: 'error'; payload: ProtocolError };
 
@@ -712,6 +718,19 @@ export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unkn
 
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);
+
+export const retryMessage = (
+  sessionId: Id,
+  messageId: Id,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'retry_message', payload: { session_id: sessionId, message_id: messageId } },
+    ctx,
+  );
+
+export const setActiveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'set_active_buffer', payload: { buffer_id: bufferId } }, ctx);
 
 // --- Phase 8 workflow commands (ARCHITECTURE §18.4) -------------------------
 

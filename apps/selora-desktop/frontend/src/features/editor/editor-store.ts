@@ -9,6 +9,7 @@ import {
   closeBuffer as closeBufferCommand,
   openFile as openFileCommand,
   saveBuffer as saveBufferCommand,
+  setActiveBuffer as setActiveBufferCommand,
   type BootstrapState,
   type BufferSnapshot,
   type EditorContextDto,
@@ -196,6 +197,18 @@ function reportMissingContext(): void {
   toastStore.pushLocal('warning', 'Connect to a workspace before editing files.');
 }
 
+/**
+ * Tell Rust which tab the user is looking at, so the next bootstrap's
+ * `active_buffer_id` is the real selection and not path order. Fire and
+ * forget: the pane already applied the switch locally; a failed ack leaves
+ * the previous (still valid) selection.
+ */
+function recordActiveBuffer(bufferId: string): void {
+  const context = currentEnvelopeContext();
+  if (!context) return;
+  void setActiveBufferCommand(bufferId, context).catch(() => undefined);
+}
+
 export function currentEditorContext(): EnvelopeContext | null {
   return currentEnvelopeContext();
 }
@@ -265,6 +278,7 @@ export const editorStore = {
     if (!state.tabs.some((tab) => tab.id === id)) return;
     if (localActiveId === id) return;
     localActiveId = id;
+    recordActiveBuffer(id);
     rebuild();
   },
 
@@ -291,6 +305,7 @@ export const editorStore = {
     const existing = state.tabs.find((tab) => pathsEqual(tab.path, path));
     if (existing) {
       localActiveId = existing.id;
+      recordActiveBuffer(existing.id);
     } else {
       const context = currentEditorContext();
       if (!context) {

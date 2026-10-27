@@ -31,6 +31,7 @@ const harness = vi.hoisted(() => {
       openFile: vi.fn(() => Promise.resolve(undefined)),
       closeBuffer: vi.fn(() => Promise.resolve(undefined)),
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
+      setActiveBuffer: vi.fn(() => Promise.resolve(undefined)),
     },
   };
 });
@@ -45,6 +46,7 @@ vi.mock('../../bridge/bridge', () => ({
   openFile: harness.bridge.openFile,
   closeBuffer: harness.bridge.closeBuffer,
   saveBuffer: harness.bridge.saveBuffer,
+  setActiveBuffer: harness.bridge.setActiveBuffer,
 }));
 
 import { activeEditorContext, editorStore, recordEditorSelection } from './editor-store';

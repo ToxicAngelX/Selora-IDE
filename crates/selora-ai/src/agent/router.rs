@@ -147,6 +147,10 @@ pub struct ToolContext {
     pub settings: AgentToolSettings,
     /// The Stop button's kill switch for bash children (§17.3).
     pub abort: bash::BashAbortHandle,
+    /// The session's authoritative todo list (`manage_todo`). `None` means
+    /// no session store is attached; the tool then answers a typed error
+    /// instead of pretending it stored anything.
+    todo_sink: Option<std::sync::Arc<dyn super::todo::TodoSink>>,
 }
 
 impl ToolContext {
@@ -159,7 +163,20 @@ impl ToolContext {
             root,
             settings,
             abort: bash::BashAbortHandle::default(),
+            todo_sink: None,
         }
+    }
+
+    /// Attach the session's todo store (Phase 9 session slice). The desktop
+    /// engine binds one per session; workflow subagents and unit tests leave
+    /// it unset.
+    pub fn with_todo_sink(mut self, sink: std::sync::Arc<dyn super::todo::TodoSink>) -> Self {
+        self.todo_sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn todo_sink(&self) -> Option<&std::sync::Arc<dyn super::todo::TodoSink>> {
+        self.todo_sink.as_ref()
     }
 }
 
@@ -497,17 +514,35 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
             }))
         }
         "manage_todo" => {
-            let todos_str = args
+            let raw = args
                 .get("todos")
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_else(|| "[]".to_string());
-            Ok(ToolOutcome::Ready(ToolResult::success(
-                &call.id,
-                format!("Progress and to-do list updated: {todos_str}"),
-            )))
+                .ok_or_else(|| "`todos` is required".to_string())?;
+            let todos = super::todo::parse_todos(raw)
+                .map_err(|error| format!("manage_todo rejected the list: {error}"))?;
+            let Some(sink) = ctx.todo_sink() else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "manage_todo has no session todo store attached; nothing was stored",
+                )));
+            };
+            if let Err(error) = sink.store(todos) {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    format!("manage_todo could not store the list: {error}"),
+                )));
+            }
+            // Report the store's contents, not the model's input: a sink may
+            // normalize, and a failed load must not read as success.
+            match sink.load() {
+                Ok(stored) => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    super::todo::stored_result(&stored),
+                ))),
+                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    format!("manage_todo stored the list but could not read it back: {error}"),
+                ))),
+            }
         }
 
         // -- §17.1: the manifest is closed --------------------------------
@@ -1489,5 +1524,100 @@ mod tests {
         // A path inside the root still resolves (containment compares
         // canonical against canonical).
         assert!(fs::resolve_rooted(&ctx.root, ".").is_ok());
+    }
+
+    /// The session todo store, held in a mutex so the router test can inspect
+    /// exactly what the tool wrote.
+    #[derive(Default)]
+    struct MemoryTodos(std::sync::Mutex<Vec<super::super::todo::TodoItem>>);
+
+    impl super::super::todo::TodoSink for MemoryTodos {
+        fn load(&self) -> Result<Vec<super::super::todo::TodoItem>, String> {
+            Ok(self.0.lock().expect("todo lock").clone())
+        }
+        fn store(&self, todos: Vec<super::super::todo::TodoItem>) -> Result<(), String> {
+            *self.0.lock().expect("todo lock") = todos;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_todo_stores_the_validated_list_and_reports_it() {
+        let root = temp_root("todo-store");
+        let store = std::sync::Arc::new(MemoryTodos::default());
+        let ctx =
+            ToolContext::new(&root, AgentToolSettings::default()).with_todo_sink(store.clone());
+        let result = execute_tool(
+            &ctx,
+            call(
+                "manage_todo",
+                r#"{"todos":[
+                    {"id":"t1","text":"read the router","status":"completed"},
+                    {"id":"t2","text":"store the todos","status":"in_progress"}
+                ]}"#,
+            ),
+        )
+        .await;
+        let ToolOutcome::Ready(result) = result else {
+            panic!("manage_todo is a read-type tool");
+        };
+        assert!(result.ok, "{}", result.content);
+        assert!(result.content.contains("Stored 2 todo(s):"));
+        assert!(result
+            .content
+            .contains("[in_progress] store the todos (id: t2)"));
+        let stored = store.0.lock().expect("todo lock").clone();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].id, "t1");
+        assert_eq!(stored[1].status, super::super::todo::TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn manage_todo_rejects_malformed_input_without_storing() {
+        let root = temp_root("todo-reject");
+        let store = std::sync::Arc::new(MemoryTodos::default());
+        let ctx =
+            ToolContext::new(&root, AgentToolSettings::default()).with_todo_sink(store.clone());
+        for arguments in [
+            r#"{}"#,
+            r#"{"todos":"not json"}"#,
+            r#"{"todos":[{"id":"t1","text":"x","status":"doing"}]}"#,
+            r#"{"todos":[{"id":"t1","text":"x","status":"pending"},{"id":"t1","text":"y","status":"pending"}]}"#,
+        ] {
+            let ToolOutcome::Ready(result) =
+                execute_tool(&ctx, call("manage_todo", arguments)).await
+            else {
+                panic!("a malformed list is an error result");
+            };
+            assert!(!result.ok, "accepted {arguments}");
+            assert!(
+                result.content.contains("manage_todo") || result.content.contains("todos"),
+                "{}",
+                result.content
+            );
+        }
+        assert!(
+            store.0.lock().expect("todo lock").is_empty(),
+            "a rejected write stores nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_todo_without_a_session_store_errors() {
+        let root = temp_root("todo-no-store");
+        let ctx = ctx(&root);
+        let ToolOutcome::Ready(result) = execute_tool(
+            &ctx,
+            call(
+                "manage_todo",
+                r#"{"todos":[{"id":"t1","text":"x","status":"pending"}]}"#,
+            ),
+        )
+        .await
+        else {
+            panic!("no store is an error result");
+        };
+        assert!(!result.ok);
+        assert!(result.content.contains("no session todo store"));
     }
 }

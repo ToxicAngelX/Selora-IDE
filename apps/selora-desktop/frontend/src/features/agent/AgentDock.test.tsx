@@ -17,14 +17,14 @@ describe('AgentDock Component', () => {
   });
 
   it('switches between Chat and Plan tabs to reveal live plan execution', () => {
-    const { getByRole, getByText, getAllByText } = render(<AgentDock />);
+    const { getByRole, getByText, queryByText } = render(<AgentDock />);
 
     const planTab = getByRole('button', { name: /Plan \(/ });
     fireEvent.click(planTab);
 
-    expect(getByText('Subagents Swarm')).toBeTruthy();
     expect(getByText('Plan Execution')).toBeTruthy();
-    expect(getAllByText('frontend-developer').length).toBeGreaterThan(0);
+    // Backend-authoritative: no fabricated subagent roster.
+    expect(queryByText('Subagents Swarm')).toBeNull();
 
     const chatTab = getByRole('button', { name: 'Chat' });
     fireEvent.click(chatTab);

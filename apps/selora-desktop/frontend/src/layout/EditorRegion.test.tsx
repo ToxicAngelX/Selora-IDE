@@ -35,6 +35,7 @@ const harness = vi.hoisted(() => {
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
       applyEditorChange: vi.fn(() => Promise.resolve(undefined)),
       setSelection: vi.fn(() => Promise.resolve(undefined)),
+      setActiveBuffer: vi.fn(() => Promise.resolve(undefined)),
     },
   };
 });
@@ -53,6 +54,7 @@ vi.mock('../bridge/bridge', () => ({
   saveBuffer: harness.bridge.saveBuffer,
   applyEditorChange: harness.bridge.applyEditorChange,
   setSelection: harness.bridge.setSelection,
+  setActiveBuffer: harness.bridge.setActiveBuffer,
 }));
 
 vi.mock('../features/editor/CodeMirrorPane', async () => {

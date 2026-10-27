@@ -17,6 +17,9 @@ const bridgeMocks = vi.hoisted(() => {
       requestId: nextRequestId('req-workflow'),
       promise: Promise.resolve(),
     })),
+    newSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    switchSession: vi.fn((..._args: unknown[]) => Promise.resolve()),
+    retryMessage: vi.fn((..._args: unknown[]) => Promise.resolve()),
     fetchModels: vi.fn((..._args: unknown[]) => Promise.resolve([])),
   };
 });
@@ -330,18 +333,15 @@ function makeAgentBootstrap(
 }
 
 describe('agentStore', () => {
-  it('creates, switches, and deletes sessions', () => {
-    const s1 = agentStore.createSession('Test Session 1');
-    expect(agentStore.getSnapshot().activeSessionId).toBe(s1);
+  it('creates sessions through the backend, never locally', async () => {
+    const before = agentStore.getSnapshot().sessions;
+    await expect(agentStore.createSession()).resolves.toBe(true);
+    expect(bridgeMocks.newSession).toHaveBeenCalledTimes(1);
+    // The mock backend does not emit a snapshot, so no local row appears.
+    expect(agentStore.getSnapshot().sessions).toEqual(before);
 
-    const s2 = agentStore.createSession('Test Session 2');
-    expect(agentStore.getSnapshot().activeSessionId).toBe(s2);
-
-    agentStore.switchSession(s1);
-    expect(agentStore.getSnapshot().activeSessionId).toBe(s1);
-
-    agentStore.deleteSession(s2);
-    expect(agentStore.getSnapshot().sessions.some((s) => s.id === s2)).toBe(false);
+    agentStore.reset();
+    await expect(agentStore.createSession()).resolves.toBe(false);
   });
 
   it('manages conversation turns, deltas, and in-flight states', () => {
@@ -406,17 +406,35 @@ describe('agentStore', () => {
     expect(tool?.exitCode).toBe(0);
   });
 
-  it('updates todos and manages prompt recall history', () => {
-    agentStore.addTodo('Verify border-beam animation', 'frontend-developer');
+  it('renders backend todos and ignores another session event', () => {
+    const base = makeAgentBootstrap('sess-todos');
+    agentStore.hydrate({
+      ...base,
+      chat: {
+        ...base.chat,
+        todos: [
+          { id: 't1', text: 'inspect router', status: 'completed' },
+          { id: 't2', text: 'write tests', status: 'in_progress' },
+        ],
+      },
+    });
     const todos = agentStore.getSnapshot().todos;
-    const lastTodo = todos[todos.length - 1];
-    expect(lastTodo.title).toBe('Verify border-beam animation');
-    expect(lastTodo.status).toBe('pending');
+    expect(todos.map((todo) => todo.text)).toEqual(['inspect router', 'write tests']);
+    expect(todos[1]?.status).toBe('in_progress');
 
-    agentStore.updateTodoStatus(lastTodo.id, 'completed');
-    expect(
-      agentStore.getSnapshot().todos.find((t) => t.id === lastTodo.id)?.status
-    ).toBe('completed');
+    agentStore.applySessionTodos({
+      session_id: 'sess-other',
+      todos: [{ id: 'x', text: 'wrong session', status: 'pending' }],
+    });
+    expect(agentStore.getSnapshot().todos).toHaveLength(2);
+
+    agentStore.applySessionTodos({
+      session_id: 'sess-todos',
+      todos: [{ id: 't3', text: 'verify', status: 'pending' }],
+    });
+    expect(agentStore.getSnapshot().todos).toEqual([
+      { id: 't3', text: 'verify', status: 'pending' },
+    ]);
 
     agentStore.addPromptToHistory('Prompt A');
     agentStore.addPromptToHistory('Prompt B');
@@ -725,20 +743,25 @@ describe('agentStore', () => {
     expect(updated.inFlight).toBe(true);
   });
 
-  it('forks new session from prompt checkpoint', () => {
+  it('retries a user turn through the backend command', async () => {
     resetAndHydrate();
     agentStore.sendUserMessage('Step 1: Explore files');
     agentStore.completeActiveTurn();
-    agentStore.sendUserMessage('Step 2: Modify code');
-    agentStore.completeActiveTurn();
+    const userMessage = agentStore.getSnapshot().messages[0];
 
-    const firstMsgId = agentStore.getSnapshot().messages[0].id;
-    const forkedId = agentStore.forkSessionFromPrompt(firstMsgId);
+    await expect(agentStore.retryMessage(userMessage.id)).resolves.toBe(true);
+    expect(bridgeMocks.retryMessage).toHaveBeenCalledWith(
+      'sess-hydrated',
+      userMessage.id,
+      expect.objectContaining({ session_id: 'sess-hydrated' }),
+    );
 
-    expect(forkedId).toBeTruthy();
-    expect(agentStore.getSnapshot().activeSessionId).toBe(forkedId);
-    expect(agentStore.getSnapshot().messages.length).toBe(1);
-    expect(agentStore.getSnapshot().messages[0].content).toBe('Step 1: Explore files');
+    // An assistant message is never a retry target.
+    agentStore.handleChatFailed({
+      request_id: 'req-missing',
+      error: { message: 'failed' },
+    });
+    await expect(agentStore.retryMessage('not-a-user')).resolves.toBe(false);
   });
 
   it('manages prompt queue: enqueue, reorder, promote, and auto-execution on turn done', () => {
@@ -930,7 +953,6 @@ describe('agentStore', () => {
     expect(assistant.status).toBe('streaming');
     expect(snapshot.inFlight).toBe(true);
     expect(snapshot.metrics.totalTokens).not.toBe(111);
-    expect(snapshot.subagents[0]?.activeStep).not.toContain('stale result');
 
     // Matching events still apply.
     agentStore.handleChatDelta({ request_id: secondRequestId, text: 'CURRENT-DELTA' });
