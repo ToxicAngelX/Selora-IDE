@@ -31,7 +31,12 @@ const listenProtocolEventMock = vi.mocked(listenProtocolEvent);
 type Harness = {
   startApp: () => Promise<void>;
   subscribeApp: (listener: () => void) => () => void;
-  getAppSnapshot: () => { phase: string; bootstrap: unknown; error: string | null };
+  getAppSnapshot: () => {
+    phase: string;
+    bootstrap: unknown;
+    error: string | null;
+    bufferConflicts?: Record<string, string>;
+  };
   currentEnvelopeContext: () => EnvelopeContext | null;
   currentSessionEnvelopeContext: (sessionId?: string | null) => EnvelopeContext | null;
   toastStore: { getSnapshot: () => { toasts: Array<{ id: number; message: string }> } };
@@ -106,6 +111,26 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
     expect(h.layoutStore.getSnapshot().layout).toEqual(makeLayout({ primary_sidebar_width_px: 300 }));
     h.emit(makeEvent(3, { type: 'toast', payload: { severity: 'info', message: 'later' } }));
     expect(h.toastStore.getSnapshot().toasts.map((toast) => toast.id)).toEqual([1, 3]);
+  });
+
+  it('tracks buffer conflict events and clears the marker on resolution', async () => {
+    const h = await freshHarness();
+    await h.startApp();
+    h.emit(
+      makeEvent(3, {
+        type: 'buffer_conflict',
+        payload: { buffer_id: 'buffer-1', path: 'src/main.rs' },
+      }),
+    );
+    expect(h.getAppSnapshot().bufferConflicts).toEqual({ 'buffer-1': 'src/main.rs' });
+
+    h.emit(
+      makeEvent(4, {
+        type: 'buffer_conflict_cleared',
+        payload: { buffer_id: 'buffer-1', path: 'src/main.rs' },
+      }),
+    );
+    expect(h.getAppSnapshot().bufferConflicts).toEqual({});
   });
 
   it('buffers live events until the replay finishes, then applies both in order exactly once', async () => {

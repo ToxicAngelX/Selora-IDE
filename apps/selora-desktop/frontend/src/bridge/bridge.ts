@@ -77,6 +77,10 @@ export type BufferSnapshot = {
   buffer_id: Id; path: string; language: string; text: string; version: number;
   dirty: boolean; selection: Selection | null;
 };
+/** P2 gap 3: a dirty buffer's file also changed on disk; local text is intact. */
+export type BufferConflict = { buffer_id: Id; path: string };
+/** P2 gap 3: the external-change marker for this buffer is cleared. */
+export type BufferConflictCleared = { buffer_id: Id; path: string };
 export type TextChange = { start: TextPosition; end: TextPosition; replacement: string };
 /** Where the user was when the turn was sent. Reference only, never file text. */
 export type EditorContextDto = {
@@ -342,6 +346,8 @@ export type FrontendCommand =
   | { type: 'reveal_in_explorer'; payload: { path: string } }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
   | { type: 'save_buffer'; payload: { buffer_id: Id } }
+  | { type: 'reload_buffer_from_disk'; payload: { buffer_id: Id } }
+  | { type: 'keep_buffer_edits'; payload: { buffer_id: Id } }
   | { type: 'apply_editor_change'; payload: { buffer_id: Id; version: number; changes: TextChange[] } }
   | { type: 'set_selection'; payload: { buffer_id: Id; selection: Selection } }
   | { type: 'hover_at'; payload: { buffer_id: Id; position: TextPosition } }
@@ -388,6 +394,8 @@ export type FrontendEvent =
   | { type: 'file_tree_changed'; payload: { root: FileTreeNode | null } }
   | { type: 'buffer_snapshot'; payload: BufferSnapshot }
   | { type: 'buffer_changed'; payload: { buffer_id: Id; version: number; changes: TextChange[] } }
+  | { type: 'buffer_conflict'; payload: BufferConflict }
+  | { type: 'buffer_conflict_cleared'; payload: BufferConflictCleared }
   | { type: 'search_results'; payload: { request_id: Id | null; query: SearchQuery; hits: SearchHit[] } }
   | {
       type: 'git_status_changed';
@@ -555,6 +563,14 @@ export const saveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown>
 /** Select one workspace-relative file in the OS file manager. */
 export const revealInExplorer = (path: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'reveal_in_explorer', payload: { path } }, ctx);
+
+/** P2 gap 3: discard the local edits and take the disk text. */
+export const reloadBufferFromDisk = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'reload_buffer_from_disk', payload: { buffer_id: bufferId } }, ctx);
+
+/** P2 gap 3: keep the local edits and clear the external-change marker. */
+export const keepBufferEdits = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'keep_buffer_edits', payload: { buffer_id: bufferId } }, ctx);
 
 export const applyEditorChange = (
   bufferId: Id,

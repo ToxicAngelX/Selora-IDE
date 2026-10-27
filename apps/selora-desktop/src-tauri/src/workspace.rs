@@ -17,9 +17,10 @@ use std::{
 };
 
 use selora_protocol::{
-    BufferChangedDto, BufferId, BufferSnapshotDto, FileTreeDto, FileTreeNodeDto, FileTreeNodeKind,
-    GitDiffDto, GitFileDto, GitStatusDto, SearchHitDto, SearchQueryDto, SearchResultsDto,
-    Selection, TextChange, TextPosition, WorkspacePath,
+    BufferChangedDto, BufferConflictClearedDto, BufferConflictDto, BufferId, BufferSnapshotDto,
+    FileTreeDto, FileTreeNodeDto, FileTreeNodeKind, GitDiffDto, GitFileDto, GitStatusDto,
+    SearchHitDto, SearchQueryDto, SearchResultsDto, Selection, TextChange, TextPosition,
+    WorkspacePath,
 };
 
 /// Maximum size of a file that may be opened in the text editor.
@@ -75,14 +76,20 @@ pub struct SkippedBufferRefresh {
 /// The result of [Workspace::refresh_clean_buffers].
 ///
 /// `updated` holds the bumped snapshots, `dirty` the buffers left untouched
-/// because they hold unsaved edits, and `skipped` the buffers whose disk file
-/// disappeared or can no longer be read as editor text.
+/// because they hold unsaved edits, `conflicts` the dirty buffers whose disk
+/// file also changed (the caller must offer a Reload/Keep choice), and
+/// `skipped` the buffers whose disk file disappeared or can no longer be read
+/// as editor text.
 #[derive(Clone, Debug, Default)]
 pub struct BufferRefreshOutcome {
     /// Clean buffers whose text changed on disk, each with one version bump.
     pub updated: Vec<BufferSnapshotDto>,
     /// Dirty buffers (local edits preserved) — reported so the user can save.
     pub dirty: Vec<WorkspacePath>,
+    /// Dirty buffers that changed on disk; their local text is preserved.
+    pub conflicts: Vec<BufferConflictDto>,
+    /// Conflicts cleared because the disk change reverted or was reloaded.
+    pub cleared: Vec<BufferConflictClearedDto>,
     /// Buffers the refresh could not reload; their tabs stay intact.
     pub skipped: Vec<SkippedBufferRefresh>,
 }
@@ -122,6 +129,7 @@ struct RefreshCandidate {
     path: WorkspacePath,
     abs_path: PathBuf,
     version: u64,
+    /// The local buffer text at capture time.
     text: String,
 }
 
@@ -129,6 +137,9 @@ struct RefreshCandidate {
 pub struct Workspace {
     root: PathBuf,
     buffers: Mutex<BTreeMap<String, BufferState>>,
+    /// P2 gap 3: in-memory external-change markers, keyed by the buffer path.
+    /// Nothing here is persisted; a restart simply has no conflict.
+    conflicts: Mutex<BTreeMap<String, BufferConflictDto>>,
     git: Mutex<Option<selora_git::GitRepo>>,
 }
 
@@ -168,6 +179,7 @@ impl Workspace {
         Ok(Self {
             root,
             buffers: Mutex::new(BTreeMap::new()),
+            conflicts: Mutex::new(BTreeMap::new()),
             git: Mutex::new(git),
         })
     }
@@ -281,6 +293,29 @@ impl Workspace {
         Ok(state.snapshot())
     }
 
+    /// Remove and return one buffer's external-change marker.
+    ///
+    /// Saving the local text makes it the disk text, so the conflict is
+    /// resolved: the command layer emits `BufferConflictCleared` when this
+    /// returns `Some`.
+    pub fn take_conflict(
+        &self,
+        id: &selora_protocol::BufferId,
+    ) -> Option<BufferConflictClearedDto> {
+        let buffers = self.buffers_lock();
+        let (key, path) = buffers
+            .iter()
+            .find(|(_, state)| &state.id == id)
+            .map(|(key, state)| (key.clone(), state.path.clone()))?;
+        drop(buffers);
+        self.conflicts_lock()
+            .remove(&key)
+            .map(|conflict| BufferConflictClearedDto {
+                buffer_id: conflict.buffer_id,
+                path,
+            })
+    }
+
     /// Apply one versioned batch of UTF-16 text edits.
     pub fn apply_change(
         &self,
@@ -339,41 +374,32 @@ impl Workspace {
     /// This is the post-run refresh: a workflow (or any external writer) may
     /// have rewritten files while their tabs were open. A clean buffer whose
     /// disk text differs is replaced and its version bumps exactly once; a
-    /// buffer with unsaved local edits keeps that text and is reported in
-    /// [`BufferRefreshOutcome::dirty`]. A file that disappeared or can no
-    /// longer be read as editor text is reported in
-    /// [`BufferRefreshOutcome::skipped`] and its tab stays open, so the user
-    /// can still save, close, or inspect it.
+    /// buffer with unsaved local edits keeps that text. When such a dirty
+    /// buffer's disk text also changed since its saved baseline, a
+    /// [`BufferConflictDto`] is reported so the UI can offer Reload/Keep.
+    /// A file that disappeared or can no longer be read as editor text is
+    /// reported in [`BufferRefreshOutcome::skipped`] and its tab stays open,
+    /// so the user can still save, close, or inspect it.
     ///
     /// Disk reads happen outside the buffer lock; the second phase re-checks
-    /// that each candidate is still clean and still at the version it was
-    /// captured at, so an edit racing the refresh is never overwritten.
+    /// that each candidate is still at the version and text it was captured
+    /// at, so an edit racing the refresh is never overwritten.
     pub fn refresh_clean_buffers(&self) -> BufferRefreshOutcome {
-        let (mut dirty, candidates) = {
+        let candidates = {
             let buffers = self.buffers_lock();
-            let mut dirty = Vec::new();
-            let mut candidates = Vec::new();
-            for (key, state) in buffers.iter() {
-                if state.text != state.saved_text {
-                    dirty.push(state.path.clone());
-                    continue;
-                }
-                candidates.push(RefreshCandidate {
+            buffers
+                .iter()
+                .map(|(key, state)| RefreshCandidate {
                     key: key.clone(),
                     path: state.path.clone(),
                     abs_path: state.abs_path.clone(),
                     version: state.version,
                     text: state.text.clone(),
-                });
-            }
-            (dirty, candidates)
+                })
+                .collect::<Vec<_>>()
         };
 
-        let mut outcome = BufferRefreshOutcome {
-            updated: Vec::new(),
-            dirty: Vec::new(),
-            skipped: Vec::new(),
-        };
+        let mut outcome = BufferRefreshOutcome::default();
         let mut reloaded = Vec::new();
         for candidate in candidates {
             let rel = candidate.path.as_str().to_owned();
@@ -415,20 +441,47 @@ impl Workspace {
         }
 
         let mut buffers = self.buffers_lock();
+        let mut conflicts = self.conflicts_lock();
         for (candidate, text) in reloaded {
             let Some(state) = buffers.get_mut(&candidate.key) else {
                 // The tab was closed while the disk read ran; nothing to update.
                 continue;
             };
-            if state.text != state.saved_text {
-                // The user edited this buffer while the refresh was reading.
-                dirty.push(state.path.clone());
+            if state.version != candidate.version || state.text != candidate.text {
+                // Edited (or already refreshed) while the disk read ran: leave
+                // the current text and version alone. The next refresh sees it.
                 continue;
             }
-            if state.version != candidate.version || state.text != candidate.text {
-                // Already updated (or edited and undone) since capture: leave
-                // the current text and version alone.
+            let dirty = state.text != state.saved_text;
+            if dirty {
+                outcome.dirty.push(state.path.clone());
+                if text == state.saved_text {
+                    // The disk still matches the saved baseline: the local
+                    // edits are the only difference. Any old marker is stale.
+                    if conflicts.remove(&candidate.key).is_some() {
+                        outcome.cleared.push(BufferConflictClearedDto {
+                            buffer_id: state.id.clone(),
+                            path: state.path.clone(),
+                        });
+                    }
+                    continue;
+                }
+                let conflict = BufferConflictDto {
+                    buffer_id: state.id.clone(),
+                    path: state.path.clone(),
+                };
+                conflicts.insert(candidate.key.clone(), conflict.clone());
+                outcome.conflicts.push(conflict);
                 continue;
+            }
+            let cleared = conflicts
+                .remove(&candidate.key)
+                .map(|_| BufferConflictClearedDto {
+                    buffer_id: state.id.clone(),
+                    path: state.path.clone(),
+                });
+            if let Some(cleared) = cleared {
+                outcome.cleared.push(cleared);
             }
             if state.text == text {
                 continue;
@@ -449,8 +502,92 @@ impl Workspace {
             state.version = next_version;
             outcome.updated.push(state.snapshot());
         }
-        outcome.dirty = dirty;
         outcome
+    }
+
+    /// Reload one conflicting buffer from disk, discarding the local edits.
+    ///
+    /// The caller only offers this while a conflict is stored; asking for a
+    /// buffer with no conflict is a typed error rather than a silent reload,
+    /// so a stale banner cannot throw away edits.
+    pub fn reload_buffer_from_disk(
+        &self,
+        id: &selora_protocol::BufferId,
+    ) -> WsResult<BufferSnapshotDto> {
+        let (key, path, abs_path) = {
+            let buffers = self.buffers_lock();
+            let (key, state) = buffers
+                .iter()
+                .find(|(_, state)| &state.id == id)
+                .ok_or_else(|| unknown_buffer_error(id))?;
+            (key.clone(), state.path.clone(), state.abs_path.clone())
+        };
+        {
+            let conflicts = self.conflicts_lock();
+            if !conflicts.contains_key(&key) {
+                return Err(WorkspaceError::new(
+                    "no_buffer_conflict",
+                    format!("'{}' has no external change to reload", path.as_str()),
+                ));
+            }
+        }
+
+        let text = Self::read_editor_text(&abs_path, path.as_str())?;
+        let mut buffers = self.buffers_lock();
+        let mut conflicts = self.conflicts_lock();
+        // Keep wins if the two decisions race: never discard text after the
+        // user cleared the marker while the disk read was in flight.
+        if !conflicts.contains_key(&key) {
+            return Err(WorkspaceError::new(
+                "no_buffer_conflict",
+                format!("'{}' has no external change to reload", path.as_str()),
+            ));
+        }
+        let state = buffers
+            .get_mut(&key)
+            .ok_or_else(|| unknown_buffer_error(id))?;
+        // Keep the conflict until the disk read succeeds; a failed read leaves
+        // the banner up so the user can retry or keep the local edits.
+        let next_version = state
+            .version
+            .checked_add(1)
+            .ok_or_else(|| WorkspaceError::new("io_error", "buffer version counter overflowed"))?;
+        state.text = text.clone();
+        state.saved_text = text;
+        state.version = next_version;
+        let snapshot = state.snapshot();
+        conflicts.remove(&key);
+        Ok(snapshot)
+    }
+
+    /// Keep the local edits for a conflicting buffer and clear the marker.
+    pub fn keep_buffer_edits(&self, id: &selora_protocol::BufferId) -> WsResult<BufferSnapshotDto> {
+        let buffers = self.buffers_lock();
+        let (key, path) = buffers
+            .iter()
+            .find(|(_, state)| &state.id == id)
+            .map(|(key, state)| (key.clone(), state.path.clone()))
+            .ok_or_else(|| unknown_buffer_error(id))?;
+        let mut conflicts = self.conflicts_lock();
+        if conflicts.remove(&key).is_none() {
+            return Err(WorkspaceError::new(
+                "no_buffer_conflict",
+                format!("'{}' has no external change to keep", path.as_str()),
+            ));
+        }
+        buffers
+            .get(&key)
+            .map(BufferState::snapshot)
+            .ok_or_else(|| unknown_buffer_error(id))
+    }
+
+    /// This buffer's external-change marker, if any (test/diagnostic seam).
+    #[cfg(test)]
+    pub fn conflict_for(&self, id: &selora_protocol::BufferId) -> Option<BufferConflictDto> {
+        self.conflicts_lock()
+            .values()
+            .find(|conflict| &conflict.buffer_id == id)
+            .cloned()
     }
 
     /// Search workspace files, literal or regular-expression per the query.
@@ -587,6 +724,12 @@ impl Workspace {
 
     fn buffers_lock(&self) -> MutexGuard<'_, BTreeMap<String, BufferState>> {
         self.buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn conflicts_lock(&self) -> MutexGuard<'_, BTreeMap<String, BufferConflictDto>> {
+        self.conflicts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1686,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_leaves_a_dirty_buffer_alone_and_reports_it() {
+    fn refresh_leaves_a_dirty_buffer_alone_and_reports_a_conflict() {
         let fixture = Fixture::new();
         let workspace = fixture.workspace();
         let buffer = workspace.open_file("README.md").expect("open");
@@ -1709,11 +1852,144 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["README.md"]
         );
+        assert_eq!(outcome.conflicts.len(), 1, "{outcome:#?}");
+        assert_eq!(outcome.conflicts[0].buffer_id, buffer.buffer_id);
+        assert_eq!(outcome.conflicts[0].path.as_str(), "README.md");
         assert!(outcome.skipped.is_empty(), "{outcome:#?}");
         let stored = workspace.buffer(&buffer.buffer_id).expect("buffer");
         assert_eq!(stored.text, "# Local\n", "unsaved local edits survive");
         assert_eq!(stored.version, 2, "a dirty buffer is not reloaded");
         assert!(stored.dirty);
+        assert!(
+            workspace.conflict_for(&buffer.buffer_id).is_some(),
+            "the conflict is tracked in memory"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_flag_a_dirty_buffer_whose_disk_baseline_is_unchanged() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let buffer = workspace.open_file("README.md").expect("open");
+        workspace
+            .apply_change(
+                &buffer.buffer_id,
+                1,
+                &[change(position(0, 0), position(0, 9), "# Local")],
+            )
+            .expect("local edit");
+
+        let outcome = workspace.refresh_clean_buffers();
+        assert!(outcome.updated.is_empty(), "{outcome:#?}");
+        assert!(outcome.conflicts.is_empty(), "{outcome:#?}");
+        assert_eq!(outcome.dirty.len(), 1, "{outcome:#?}");
+        assert!(workspace.conflict_for(&buffer.buffer_id).is_none());
+        assert_eq!(
+            workspace.buffer(&buffer.buffer_id).unwrap().text,
+            "# Local\n"
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_discards_the_conflict_and_bumps_the_version() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let buffer = workspace.open_file("README.md").expect("open");
+        workspace
+            .apply_change(
+                &buffer.buffer_id,
+                1,
+                &[change(position(0, 0), position(0, 9), "# Local")],
+            )
+            .expect("local edit");
+        fs::write(fixture.root.join("README.md"), "# Workflow won\n").expect("external write");
+        workspace.refresh_clean_buffers();
+
+        let reloaded = workspace
+            .reload_buffer_from_disk(&buffer.buffer_id)
+            .expect("reload");
+        assert_eq!(reloaded.text, "# Workflow won\n");
+        assert_eq!(reloaded.version, 3);
+        assert!(!reloaded.dirty);
+        assert!(workspace.conflict_for(&buffer.buffer_id).is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("README.md")).unwrap(),
+            "# Workflow won\n",
+            "reload never writes the discarded local text to disk"
+        );
+        assert_eq!(
+            workspace
+                .reload_buffer_from_disk(&buffer.buffer_id)
+                .unwrap_err()
+                .code,
+            "no_buffer_conflict",
+            "a second reload cannot discard edits after the decision"
+        );
+    }
+
+    #[test]
+    fn keep_edits_clears_the_conflict_and_preserves_text_and_version() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let buffer = workspace.open_file("README.md").expect("open");
+        workspace
+            .apply_change(
+                &buffer.buffer_id,
+                1,
+                &[change(position(0, 0), position(0, 9), "# Local")],
+            )
+            .expect("local edit");
+        fs::write(fixture.root.join("README.md"), "# Workflow won\n").expect("external write");
+        workspace.refresh_clean_buffers();
+
+        let kept = workspace
+            .keep_buffer_edits(&buffer.buffer_id)
+            .expect("keep edits");
+        assert_eq!(kept.text, "# Local\n", "local text survives");
+        assert_eq!(kept.version, 2, "keep does not bump the version");
+        assert!(kept.dirty);
+        assert!(workspace.conflict_for(&buffer.buffer_id).is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("README.md")).unwrap(),
+            "# Workflow won\n",
+            "keep never overwrites the disk"
+        );
+        assert_eq!(
+            workspace
+                .keep_buffer_edits(&buffer.buffer_id)
+                .unwrap_err()
+                .code,
+            "no_buffer_conflict"
+        );
+    }
+
+    #[test]
+    fn save_after_a_conflict_clears_the_marker_and_writes_local_text() {
+        let fixture = Fixture::new();
+        let workspace = fixture.workspace();
+        let buffer = workspace.open_file("README.md").expect("open");
+        workspace
+            .apply_change(
+                &buffer.buffer_id,
+                1,
+                &[change(position(0, 0), position(0, 9), "# Local")],
+            )
+            .expect("local edit");
+        fs::write(fixture.root.join("README.md"), "# Workflow won\n").expect("external write");
+        workspace.refresh_clean_buffers();
+
+        let saved = workspace.save_buffer(&buffer.buffer_id).expect("save");
+        assert_eq!(saved.text, "# Local\n");
+        assert!(!saved.dirty);
+        let cleared = workspace
+            .take_conflict(&buffer.buffer_id)
+            .expect("save leaves the marker for the command layer to clear");
+        assert_eq!(cleared.buffer_id, buffer.buffer_id);
+        assert!(workspace.conflict_for(&buffer.buffer_id).is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("README.md")).unwrap(),
+            "# Local\n",
+        );
     }
 
     #[test]

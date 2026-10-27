@@ -31,6 +31,8 @@ const harness = vi.hoisted(() => {
       openFile: vi.fn(() => Promise.resolve(undefined)),
       closeBuffer: vi.fn(() => Promise.resolve(undefined)),
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
+      reloadBufferFromDisk: vi.fn(() => Promise.resolve(undefined)),
+      keepBufferEdits: vi.fn(() => Promise.resolve(undefined)),
     },
   };
 });
@@ -45,6 +47,8 @@ vi.mock('../../bridge/bridge', () => ({
   openFile: harness.bridge.openFile,
   closeBuffer: harness.bridge.closeBuffer,
   saveBuffer: harness.bridge.saveBuffer,
+  reloadBufferFromDisk: harness.bridge.reloadBufferFromDisk,
+  keepBufferEdits: harness.bridge.keepBufferEdits,
 }));
 
 import { activeEditorContext, editorStore, recordEditorSelection } from './editor-store';
@@ -102,6 +106,8 @@ describe('editor store', () => {
     harness.bridge.openFile.mockClear();
     harness.bridge.closeBuffer.mockClear();
     harness.bridge.saveBuffer.mockClear();
+    harness.bridge.reloadBufferFromDisk.mockClear();
+    harness.bridge.keepBufferEdits.mockClear();
     harness.app.setSnapshot(appWith([], null));
     editorStore.reset();
   });
@@ -126,6 +132,7 @@ describe('editor store', () => {
         filename: 'main.rs',
         language: 'rust',
         isDirty: false,
+        externallyChanged: false,
         version: 3,
       },
       {
@@ -134,12 +141,37 @@ describe('editor store', () => {
         filename: 'lib.rs',
         language: 'rust',
         isDirty: false,
+        externallyChanged: false,
         version: 7,
       },
     ]);
     expect(state.activeBufferId).toBe('b2');
     expect(state.activeBuffer?.buffer_id).toBe('b2');
     expect(state.workspaceRoot).toBe('C:/workspace');
+  });
+
+  it('marks a tab externally changed and dispatches the chosen resolution', () => {
+    harness.app.setSnapshot({
+      ...appWith([buffer('b1', 'C:/workspace/src/main.rs')], 'b1'),
+      bufferConflicts: { b1: 'C:/workspace/src/main.rs' },
+    });
+    editorStore.reset();
+
+    const state = editorStore.getSnapshot();
+    expect(state.conflicts).toEqual({ b1: 'C:/workspace/src/main.rs' });
+    expect(state.tabs[0].externallyChanged).toBe(true);
+
+    editorStore.reloadFromDisk('b1');
+    expect(harness.bridge.reloadBufferFromDisk).toHaveBeenCalledWith(
+      'b1',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
+
+    editorStore.keepMyEdits('b1');
+    expect(harness.bridge.keepBufferEdits).toHaveBeenCalledWith(
+      'b1',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
   });
 
   it('falls back to the first remaining buffer when the active one closes', () => {

@@ -7,7 +7,9 @@
 import { currentEnvelopeContext, getAppSnapshot, subscribeApp } from '../../app/app-store';
 import {
   closeBuffer as closeBufferCommand,
+  keepBufferEdits as keepBufferEditsCommand,
   openFile as openFileCommand,
+  reloadBufferFromDisk as reloadBufferFromDiskCommand,
   saveBuffer as saveBufferCommand,
   type BootstrapState,
   type BufferSnapshot,
@@ -24,6 +26,8 @@ export type EditorTab = {
   filename: string;
   language: string;
   isDirty: boolean;
+  /** P2 gap 3: the file also changed on disk (local edits were kept). */
+  externallyChanged: boolean;
   version: number;
 };
 
@@ -44,6 +48,8 @@ export type EditorStoreState = {
   workspaceRoot: string | null;
   workspaceName: string | null;
   fileTree: FileTreeNode | null;
+  /** P2 gap 3: buffer id → path for tabs with an unresolved disk conflict. */
+  conflicts: Record<string, string>;
 };
 
 type Listener = () => void;
@@ -90,12 +96,14 @@ function deriveState(
 ): EditorStoreState {
   const bootstrap: BootstrapState | null = app.bootstrap;
   const buffers = bootstrap?.buffers ?? [];
+  const conflicts = app.bufferConflicts ?? {};
   const tabs: EditorTab[] = buffers.map((buffer) => ({
     id: buffer.buffer_id,
     path: buffer.path,
     filename: filenameOf(buffer.path),
     language: buffer.language,
     isDirty: buffer.dirty,
+    externallyChanged: Object.prototype.hasOwnProperty.call(conflicts, buffer.buffer_id),
     version: buffer.version,
   }));
 
@@ -130,6 +138,7 @@ function deriveState(
     workspaceRoot: bootstrap?.workspace.root ?? null,
     workspaceName: bootstrap?.workspace.display_name ?? null,
     fileTree: bootstrap?.file_tree.root ?? null,
+    conflicts,
   };
 }
 
@@ -384,5 +393,29 @@ export const editorStore = {
     const active = state.activeBuffer;
     if (!active) return;
     void editorStore.saveBuffer(active.buffer_id);
+  },
+
+  /** P2 gap 3: take the disk text, discarding the kept local edits. */
+  reloadFromDisk(id: string): void {
+    syncFromApp();
+    if (!state.tabs.some((tab) => tab.id === id)) return;
+    const context = currentEditorContext();
+    if (!context) {
+      reportMissingContext();
+      return;
+    }
+    void reloadBufferFromDiskCommand(id, context).catch(() => undefined);
+  },
+
+  /** P2 gap 3: keep the local text and clear the external-change marker. */
+  keepMyEdits(id: string): void {
+    syncFromApp();
+    if (!state.tabs.some((tab) => tab.id === id)) return;
+    const context = currentEditorContext();
+    if (!context) {
+      reportMissingContext();
+      return;
+    }
+    void keepBufferEditsCommand(id, context).catch(() => undefined);
   },
 };

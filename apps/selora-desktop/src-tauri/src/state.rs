@@ -729,6 +729,9 @@ struct WorkflowStream<R: tauri::Runtime> {
     /// The shell's one open-workspace slot. The terminal refresh locks it,
     /// reloads clean buffers, then releases it before emitting any event.
     workspace: Arc<Mutex<Option<Workspace>>>,
+    /// The language-server bridge slot. A clean reload sends the new full
+    /// text and retracts stale diagnostics before the next request.
+    lsp: Arc<Mutex<Option<LspBridge>>>,
     max_cost_usd: f64,
     name: String,
     started: AtomicBool,
@@ -760,9 +763,10 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
     ///
     /// The refresh only runs when the open workspace is still the one this run
     /// started in — a workspace switch during the run must never update the
-    /// new workspace's buffers. The workspace lock is taken for the reload
-    /// only: the engine call already finished, and every event is emitted
-    /// after the guard is dropped.
+    /// new workspace's buffers, raise its conflicts, or sync its language
+    /// server. The workspace lock is taken for the reload only: the engine
+    /// call already finished, and every event is emitted after the guard is
+    /// dropped.
     fn refresh_workspace_buffers(&self) {
         let outcome = {
             let guard = self
@@ -782,43 +786,65 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
         self.publish_refresh(outcome);
     }
 
-    /// Emit one `BufferSnapshot` per changed clean buffer and one warning toast
-    /// naming every buffer the refresh had to leave alone (dirty edits, a
-    /// deleted file, or a file that is no longer editor text).
+    /// Emit one `BufferSnapshot` per changed clean buffer (after syncing its
+    /// language server), one `BufferConflict` per dirty buffer whose disk text
+    /// changed, one `BufferConflictCleared` for a marker that no longer
+    /// applies, and one warning toast naming files the refresh could not read.
+    /// Dirty local text is never replaced here.
     fn publish_refresh(&self, outcome: crate::workspace::BufferRefreshOutcome) {
-        let dirty: Vec<&str> = outcome
-            .dirty
-            .iter()
-            .map(selora_protocol::WorkspacePath::as_str)
-            .collect();
-        if dirty.is_empty() && outcome.skipped.is_empty() && outcome.updated.is_empty() {
-            return;
-        }
         for snapshot in outcome.updated {
+            self.sync_lsp_reload(&snapshot.path, &snapshot.text);
             self.record(FrontendEvent::BufferSnapshot(snapshot));
         }
-        let mut notes = Vec::new();
-        if !dirty.is_empty() {
-            notes.push(format!(
-                "kept unsaved edits in {}",
-                dirty
-                    .iter()
-                    .map(|path| format!("'{path}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        for cleared in outcome.cleared {
+            self.record(FrontendEvent::BufferConflictCleared(cleared));
         }
         for skipped in &outcome.skipped {
-            notes.push(format!("'{}' ({})", skipped.path.as_str(), skipped.message));
+            let absolute = self.workspace_root.join(skipped.path.as_str());
+            self.with_lsp(|bridge| bridge.invalidate_diagnostics(&absolute));
         }
-        if !notes.is_empty() {
-            self.record(FrontendEvent::Toast(ToastDto {
-                severity: ToastSeverity::Warning,
-                message: format!(
-                    "Workflow files changed on disk; the editor {}.",
-                    notes.join("; ")
-                ),
-            }));
+        for conflict in outcome.conflicts {
+            self.record(FrontendEvent::BufferConflict(conflict));
+        }
+        if outcome.skipped.is_empty() {
+            return;
+        }
+        let notes = outcome
+            .skipped
+            .iter()
+            .map(|skipped| format!("'{}' ({})", skipped.path.as_str(), skipped.message))
+            .collect::<Vec<_>>();
+        self.record(FrontendEvent::Toast(ToastDto {
+            severity: ToastSeverity::Warning,
+            message: format!(
+                "Workflow files changed on disk; the editor {}.",
+                notes.join("; ")
+            ),
+        }));
+    }
+
+    /// Send the reloaded text to the language server, then retract this path's
+    /// diagnostics from the old text. A bridge that never started has no open
+    /// document and no diagnostics, so there is nothing to sync.
+    fn sync_lsp_reload(&self, path: &selora_protocol::WorkspacePath, text: &str) {
+        let absolute = self.workspace_root.join(path.as_str());
+        self.with_lsp(|bridge| bridge.reload(absolute, text.to_owned()));
+    }
+
+    /// Run `action` against the run workspace's bridge, starting it if needed.
+    /// Only called after the run's workspace identity matched the open one.
+    fn with_lsp(&self, action: impl FnOnce(&LspBridge)) {
+        let log: Arc<EventLog> = Arc::clone(&self.log);
+        let app = self.app.clone();
+        let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
+            log.record(&app, event, None);
+        });
+        let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            *guard = Some(LspBridge::start(self.workspace_root.clone(), emit));
+        }
+        if let Some(bridge) = guard.as_ref() {
+            action(bridge);
         }
     }
 
@@ -1886,12 +1912,62 @@ impl DesktopState {
                 self.record_event(
                     app,
                     FrontendEvent::BufferSnapshot(buffer.clone()),
-                    Some(request_id),
+                    Some(request_id.clone()),
                 );
                 if let Some(root) = self.workspace_root_path() {
                     let absolute = root.join(buffer.path.as_str());
                     self.with_lsp(app, |bridge| bridge.save(absolute));
                 }
+                // A save writes the local text, so any external-change marker
+                // is resolved. Clear the banner explicitly.
+                if let Some(cleared) =
+                    self.with_workspace(|workspace| Ok(workspace.take_conflict(&buffer_id)))?
+                {
+                    self.record_event(
+                        app,
+                        FrontendEvent::BufferConflictCleared(cleared),
+                        Some(request_id),
+                    );
+                }
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::ReloadBufferFromDisk { buffer_id } => {
+                let buffer =
+                    self.with_workspace(|workspace| workspace.reload_buffer_from_disk(&buffer_id))?;
+                if let Some(root) = self.workspace_root_path() {
+                    let absolute = root.join(buffer.path.as_str());
+                    self.with_lsp(app, |bridge| bridge.reload(absolute, buffer.text.clone()));
+                }
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferSnapshot(buffer.clone()),
+                    Some(request_id.clone()),
+                );
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferConflictCleared(
+                        selora_protocol::BufferConflictClearedDto {
+                            buffer_id: buffer.buffer_id,
+                            path: buffer.path,
+                        },
+                    ),
+                    Some(request_id),
+                );
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::KeepBufferEdits { buffer_id } => {
+                let buffer =
+                    self.with_workspace(|workspace| workspace.keep_buffer_edits(&buffer_id))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferConflictCleared(
+                        selora_protocol::BufferConflictClearedDto {
+                            buffer_id: buffer.buffer_id,
+                            path: buffer.path,
+                        },
+                    ),
+                    Some(request_id),
+                );
                 Ok(self.bootstrap())
             }
             FrontendCommand::ApplyEditorChange {
@@ -2138,6 +2214,7 @@ impl DesktopState {
             workspace_id: workspace_id.clone(),
             workspace_root: root.clone(),
             workspace: Arc::clone(&self.workspace),
+            lsp: Arc::clone(&self.lsp),
             max_cost_usd: spec.max_cost_usd,
             name: spec.name.clone(),
             started: AtomicBool::new(false),
@@ -4037,6 +4114,38 @@ mod tests {
             .expect("the opened buffer is in the bootstrap")
     }
 
+    /// Replace the first line through the real edit command.
+    fn apply_local_edit(
+        state: &DesktopState,
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        buffer: &BufferSnapshotDto,
+        replacement: &str,
+    ) {
+        state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: buffer.buffer_id.clone(),
+                        version: buffer.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: replacement.into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
+    }
+
     /// Poll until the fake workflow's disk write is visible, so a stop or a
     /// workspace switch provably happens while the run owns the file.
     fn wait_for_disk_text(path: &std::path::Path, expected: &str) {
@@ -5370,7 +5479,7 @@ mod tests {
     }
 
     #[test]
-    fn p8_workflow_dirty_buffer_keeps_local_text_with_a_toast() {
+    fn p8_workflow_dirty_conflict_keeps_local_text_and_offers_a_choice() {
         let app = mock_app_handle();
         let state = DesktopState::with_settings(selora_settings::Settings::default());
         let dir = open_workspace(&state, &app);
@@ -5421,16 +5530,30 @@ mod tests {
         let events = state.events_after(baseline);
         assert!(
             snapshots_for(&events, &opened.buffer_id).is_empty(),
-            "a dirty buffer is never reloaded: {events:#?}"
+            "a dirty buffer is never auto-reloaded: {events:#?}"
         );
-        let toasts = toast_messages(&events);
-        assert_eq!(
-            toasts.len(),
-            1,
-            "one toast for the skipped dirty tab: {events:#?}"
+        let conflicts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                FrontendEvent::BufferConflict(conflict) => Some(conflict),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conflicts.len(), 1, "one conflict banner: {events:#?}");
+        assert_eq!(conflicts[0].buffer_id, opened.buffer_id);
+        assert_eq!(conflicts[0].path.as_str(), "hello.rs");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.payload, FrontendEvent::BufferConflictCleared(_))),
+            "the conflict stays until the user chooses: {events:#?}"
         );
-        assert!(toasts[0].contains("hello.rs"), "{}", toasts[0]);
-        assert!(toasts[0].contains("unsaved"), "{}", toasts[0]);
+        assert!(
+            !toast_messages(&events)
+                .iter()
+                .any(|message| message.contains("unsaved")),
+            "the conflict is a banner, not a silent toast: {events:#?}"
+        );
 
         let stored = state
             .bootstrap()
@@ -5441,6 +5564,239 @@ mod tests {
         assert_eq!(stored.text, "fn local() {}\n", "local text survives");
         assert_eq!(stored.version, 2, "the local edit's version is kept");
         assert!(stored.dirty);
+    }
+
+    #[test]
+    fn p8_workflow_reload_from_disk_resolves_the_conflict_and_syncs_lsp() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        let absolute = dir.path().join("hello.rs");
+        {
+            let guard = state
+                .lsp
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let bridge = guard.as_ref().expect("OpenFile starts the bridge");
+            bridge.seed_error_diagnostic_for_test(&absolute, "stale diagnostic");
+        }
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: opened.buffer_id.clone(),
+                        version: opened.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: "fn local() {}".into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
+        let edited = "fn main() { /* workflow text */ }\n";
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate_and_writes(
+                Arc::clone(&gate),
+                vec![(absolute.clone(), Some(edited.as_bytes().to_vec()))],
+            ),
+        )));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-reload",
+                        r#"world.run("edit", []);"#,
+                        vec!["edit".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_disk_text(&absolute, edited);
+        let baseline = state.log.snapshot_sequence();
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let before_choice = state.events_after(baseline);
+        assert!(
+            before_choice.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflict(conflict)
+                    if conflict.buffer_id == opened.buffer_id
+            )),
+            "the conflict is raised before the choice: {before_choice:#?}"
+        );
+        assert!(
+            snapshots_for(&before_choice, &opened.buffer_id).is_empty(),
+            "the refresh alone never overwrites: {before_choice:#?}"
+        );
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ReloadBufferFromDisk {
+                        buffer_id: opened.buffer_id.clone(),
+                    },
+                ),
+            )
+            .expect("reload from disk");
+
+        let events = state.events_after(baseline);
+        let snapshots = snapshots_for(&events, &opened.buffer_id);
+        assert_eq!(snapshots.len(), 1, "one reload snapshot: {events:#?}");
+        assert_eq!(snapshots[0].text, edited);
+        assert_eq!(
+            snapshots[0].version,
+            opened.version + 2,
+            "local edit + reload"
+        );
+        assert!(!snapshots[0].dirty);
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflictCleared(cleared)
+                    if cleared.buffer_id == opened.buffer_id
+            )),
+            "the marker is cleared: {events:#?}"
+        );
+
+        let stored = state
+            .bootstrap()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.buffer_id == opened.buffer_id)
+            .expect("tab still open");
+        assert_eq!(stored.text, edited);
+        assert_eq!(stored.version, opened.version + 2);
+        assert!(!stored.dirty);
+
+        {
+            let guard = state
+                .lsp
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let bridge = guard.as_ref().expect("bridge");
+            assert_eq!(
+                bridge.text_for_test(&absolute).as_deref(),
+                Some(edited),
+                "the language server got the reloaded full text"
+            );
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::DiagnosticsChanged(diagnostics)
+                    if diagnostics.iter().all(|diagnostic| diagnostic.path.as_str() != "hello.rs")
+            )),
+            "the reload retracted the stale diagnostics: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn p8_workflow_keep_my_edits_clears_the_conflict_without_touching_text() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: opened.buffer_id.clone(),
+                        version: opened.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: "fn local() {}".into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
+        let edited = "fn main() { /* workflow text */ }\n";
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_writes(vec![(
+                dir.path().join("hello.rs"),
+                Some(edited.as_bytes().to_vec()),
+            )]),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run("wf-keep", r#"world.run("edit", []);"#, vec!["edit".into()]),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let baseline = state.log.snapshot_sequence();
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::KeepBufferEdits {
+                        buffer_id: opened.buffer_id.clone(),
+                    },
+                ),
+            )
+            .expect("keep my edits");
+
+        let events = state.events_after(baseline);
+        assert!(
+            snapshots_for(&events, &opened.buffer_id).is_empty(),
+            "keep never replaces the local text: {events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflictCleared(cleared)
+                    if cleared.buffer_id == opened.buffer_id
+            )),
+            "the marker is cleared: {events:#?}"
+        );
+        let stored = state
+            .bootstrap()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.buffer_id == opened.buffer_id)
+            .expect("tab still open");
+        assert_eq!(stored.text, "fn local() {}\n");
+        assert_eq!(stored.version, opened.version + 1);
+        assert!(stored.dirty);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).unwrap(),
+            edited,
+            "keep never writes over the workflow's disk text"
+        );
     }
 
     #[test]
@@ -5548,6 +5904,13 @@ mod tests {
                 .any(|event| matches!(&event.payload, FrontendEvent::BufferSnapshot(_))),
             "no snapshot at all belongs to the switched workspace: {after_switch:#?}"
         );
+        assert!(
+            !after_switch.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflict(_) | FrontendEvent::BufferConflictCleared(_)
+            )),
+            "the run must not raise a conflict in the new workspace: {after_switch:#?}"
+        );
         let stored = state
             .bootstrap()
             .buffers
@@ -5648,6 +6011,120 @@ mod tests {
         assert_eq!(snapshots.len(), 1, "a stopped run still refreshes");
         assert_eq!(snapshots[0].text, edited);
         assert_eq!(snapshots[0].version, 2);
+    }
+
+    #[test]
+    fn p8_workflow_failure_raises_the_dirty_conflict_too() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        apply_local_edit(&state, &app, &opened, "fn local() {}");
+        let baseline = state.log.snapshot_sequence();
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_writes(vec![(
+                dir.path().join("hello.rs"),
+                Some(b"fn main() { /* before failure */ }\n".to_vec()),
+            )]),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-failed-conflict",
+                        r#"world.run("edit", []); throw new Error("boom");"#,
+                        vec!["edit".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let events = state.events_after(baseline);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BufferConflict(conflict) if conflict.buffer_id == opened.buffer_id
+        )));
+        assert!(snapshots_for(&events, &opened.buffer_id).is_empty());
+        assert_eq!(
+            state
+                .bootstrap()
+                .buffers
+                .into_iter()
+                .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                .unwrap()
+                .text,
+            "fn local() {}\n"
+        );
+    }
+
+    #[test]
+    fn p8_workflow_stop_raises_the_dirty_conflict_too() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        let edited = "fn main() { /* before stop */ }\n";
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate_and_writes(
+                Arc::clone(&gate),
+                vec![(
+                    dir.path().join("hello.rs"),
+                    Some(edited.as_bytes().to_vec()),
+                )],
+            ),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-stopped-conflict",
+                        r#"world.run("sleep", []);"#,
+                        vec!["sleep".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_disk_text(&dir.path().join("hello.rs"), edited);
+        apply_local_edit(&state, &app, &opened, "fn local() {}");
+        let baseline = state.log.snapshot_sequence();
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowStop {
+                        request_id: RequestId::new("wf-stopped-conflict").expect("valid id"),
+                    },
+                ),
+            )
+            .expect("stop accepted");
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let events = state.events_after(baseline);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BufferConflict(conflict) if conflict.buffer_id == opened.buffer_id
+        )));
+        assert!(snapshots_for(&events, &opened.buffer_id).is_empty());
+        assert_eq!(
+            state
+                .bootstrap()
+                .buffers
+                .into_iter()
+                .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                .unwrap()
+                .text,
+            "fn local() {}\n"
+        );
     }
 
     /// P1 hardening: the Tauri commands clone `DesktopState` into

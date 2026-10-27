@@ -154,6 +154,60 @@
   width: 100%;
 }
 
+.tab-conflict-indicator {
+  font-size: var(--type-xs);
+  line-height: 1;
+  color: var(--warn);
+  margin-right: 2px;
+  display: inline-block;
+}
+
+/* --- 2b. External-change banner (P2 gap 3) ------------------------------ */
+
+.editor-conflict-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 6px 16px;
+  background: color-mix(in srgb, var(--warn) 14%, var(--ink-faint));
+  border-bottom: 1px solid var(--warn);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  flex-shrink: 0;
+}
+
+.editor-conflict-message {
+  min-width: 0;
+}
+
+.editor-conflict-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.editor-conflict-action {
+  border: 1px solid var(--ink-hi);
+  border-radius: var(--radius-1);
+  background: var(--ink-mid);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.editor-conflict-action:hover {
+  background: var(--ink-hi);
+}
+
+.editor-conflict-action.is-primary {
+  border-color: var(--warn);
+}
+
 .tab-close-btn {
   position: absolute;
   right: 6px;
