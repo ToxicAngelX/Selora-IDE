@@ -1525,6 +1525,12 @@ fn workflow_partial_effects_message(partial: selora_workflow::PartialEffects) ->
             partial.unfinished_effects
         ));
     }
+    if partial.failed_effects > 0 {
+        reasons.push(format!(
+            "{} tool call(s) reported an error and may have applied part of the effect",
+            partial.failed_effects
+        ));
+    }
     if partial.unfinished_ask_effects > 0 {
         reasons.push(format!(
             "{} side effect(s) belong to an unfinished ask",
@@ -6726,7 +6732,7 @@ mod tests {
         // the process died before its finish line.
         let ledger = selora_workflow::ToolEffectLedger::open_for_run(dir.path(), &run_id).unwrap();
         ledger
-            .record_started(
+            .begin_effect(
                 Some(&selora_workflow::ToolEffectStep {
                     step_id: "1".into(),
                     agent: Some("reviewer".into()),

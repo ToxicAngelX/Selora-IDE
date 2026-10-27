@@ -30,11 +30,15 @@
 //! * `report` / `artifact.*` / `log` are stored on the host, per run, so the
 //!   shell can render them next to the engine's own event stream.
 //! * Side-effecting agent tools (`write_file`, `edit_file`, `delete_file`,
-//!   `bash`) append a flushed `started` record to the run's tool-effect ledger
+//!   `bash`) append a durable `started` record to the run's tool-effect ledger
 //!   before execution and a matching `finished` record after. Records carry the
-//!   durable step/ask identity and a redacted argument summary (paths and byte
-//!   counts only). A crash leaves `started` without `finished`, which the
-//!   resume preflight refuses until explicitly acknowledged.
+//!   durable step/ask identity, a stable effect id and a redacted argument
+//!   summary (paths and byte counts only). A crash leaves `started` without
+//!   `finished`, which the resume preflight refuses until explicitly
+//!   acknowledged. A call id the ledger proves completed is replayed, never
+//!   executed twice; a retry of an unfinished attempt needs durable
+//!   acknowledgement evidence. This is not exactly-once across OS/power loss;
+//!   the remaining windows are documented on `selora_workflow::effects`.
 //!
 //! # Caps
 //!
@@ -373,8 +377,9 @@ impl EffectRecorder {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(identity);
     }
 
-    /// Record `started` before the tool executes. Never run the tool on error.
-    fn started(&self, call: &selora_ai::ToolCall) -> Result<String, String> {
+    /// Record and resolve the start of one tool call. On a completed attempt
+    /// the same call must not run again; never run it on error.
+    fn begin(&self, call: &selora_ai::ToolCall) -> Result<selora_workflow::EffectBegin, String> {
         let ledger = self
             .ledger
             .as_ref()
@@ -386,7 +391,7 @@ impl EffectRecorder {
             .clone();
         let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         ledger
-            .record_started(
+            .begin_effect(
                 step.as_ref(),
                 &call.id,
                 &call.name,
@@ -397,13 +402,20 @@ impl EffectRecorder {
 
     /// Record the outcome after the tool returns. An append failure means the
     /// completion is unconfirmed, so it must surface as a tool error.
-    fn finished(&self, effect_id: &str, call_id: &str, tool: &str, ok: bool) -> Result<(), String> {
+    fn finished(
+        &self,
+        effect_id: &str,
+        attempt: u32,
+        call_id: &str,
+        tool: &str,
+        ok: bool,
+    ) -> Result<(), String> {
         let ledger = self
             .ledger
             .as_ref()
             .map_err(|error| format!("tool effect ledger unavailable: {error}"))?;
         ledger
-            .record_finished(effect_id, call_id, tool, ok)
+            .record_finished(effect_id, attempt, call_id, tool, ok)
             .map_err(|error| error.to_string())
     }
 }

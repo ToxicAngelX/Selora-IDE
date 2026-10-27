@@ -310,9 +310,26 @@ impl ToolRunner for WorkflowTools {
         }
         // Durable evidence before the effect: a crash after this append leaves
         // `started` without `finished`, which the resume preflight refuses.
+        // A stable effect id also proves a tool call that already completed:
+        // it is replayed, never executed twice.
         let effect = if selora_workflow::is_side_effecting_tool(&call.name) {
-            match self.effects.as_ref().map(|effects| effects.started(&call)) {
-                Some(Ok(effect_id)) => Some(effect_id),
+            match self.effects.as_ref().map(|effects| effects.begin(&call)) {
+                Some(Ok(selora_workflow::EffectBegin::Execute { effect_id, attempt })) => {
+                    Some((effect_id, attempt))
+                }
+                Some(Ok(selora_workflow::EffectBegin::AlreadyCompleted { effect_id, .. })) => {
+                    let id = call.id.clone();
+                    return Box::pin(async move {
+                        ToolResult::success(
+                            &id,
+                            format!(
+                                "Tool call `{id}` already completed in an earlier attempt \
+                                 (durable effect {effect_id}); it was not executed again. \
+                                 The workspace already contains its result."
+                            ),
+                        )
+                    });
+                }
                 Some(Err(error)) => {
                     let id = call.id.clone();
                     return Box::pin(async move {
@@ -342,8 +359,10 @@ impl ToolRunner for WorkflowTools {
         let future = self.on_worker(operation, move |error| ToolResult::error(&id, error));
         Box::pin(async move {
             let result = future.await;
-            if let (Some(recorder), Some(effect_id)) = (recorder, effect) {
-                if let Err(error) = recorder.finished(&effect_id, &result.id, &tool, result.ok) {
+            if let (Some(recorder), Some((effect_id, attempt))) = (recorder, effect) {
+                if let Err(error) =
+                    recorder.finished(&effect_id, attempt, &result.id, &tool, result.ok)
+                {
                     // The tool already ran: never report success when its
                     // completion could not be made durable.
                     return ToolResult::error(
@@ -994,6 +1013,68 @@ mod tests {
         assert!(
             !ledger.contains(secret),
             "the ledger must never hold a file body: {ledger}"
+        );
+    }
+
+    #[test]
+    fn a_completed_ledger_effect_replays_instead_of_writing_twice() {
+        let root = tempfile::tempdir().expect("workspace");
+        let script = Script::new(vec![write("w1", "new.txt"), answer("{}")]);
+        let (handler, cards) = cards();
+        let ledger_path = root
+            .path()
+            .join(".selora/workflow-runs/run-1/tool-effects.jsonl");
+        let ledger =
+            selora_workflow::ToolEffectLedger::open_path(ledger_path.clone(), "run-1".into())
+                .expect("ledger");
+        let args = selora_workflow::redacted_tool_arguments(
+            "write_file",
+            &json!({"path": "new.txt", "content": "approved"}),
+        );
+        let (effect, attempt) = match ledger
+            .begin_effect(None, "w1", "write_file", args)
+            .expect("seed")
+        {
+            selora_workflow::EffectBegin::Execute { effect_id, attempt } => (effect_id, attempt),
+            other => panic!("expected a fresh seed, got {other:?}"),
+        };
+        ledger
+            .record_finished(&effect, attempt, "w1", "write_file", true)
+            .expect("finish");
+        drop(ledger);
+
+        let config = script
+            .config()
+            .with_approval_handler(handler)
+            .with_tool_effect_ledger(ledger_path.clone(), "run-1");
+        let host = WorkflowHost::new(root.path().to_owned(), config);
+        let result = ask(&host, "writer");
+        let (id, _) = cards.recv_timeout(WAIT).expect("card");
+        host.decide(id, AgentDecision::Approve).expect("approve");
+        result
+            .recv_timeout(WAIT)
+            .expect("unparked")
+            .expect("completed");
+
+        assert!(
+            !root.path().join("new.txt").exists(),
+            "a completed durable effect must never run a second write"
+        );
+        assert!(host
+            .conversation("writer")
+            .expect("history")
+            .iter()
+            .any(|message| message.role == Role::Tool
+                && message.content.contains("already completed")));
+        let ledger = fs::read_to_string(&ledger_path).expect("ledger");
+        assert!(ledger.contains("\"phase\":\"replayed\""));
+        assert_eq!(
+            ledger
+                .lines()
+                .filter(|line| line.contains("\"phase\":\"started\""))
+                .count(),
+            1,
+            "replay must not append a second started record"
         );
     }
 

@@ -312,16 +312,35 @@ The §10 table was written before the wave-2 agents landed. Current state:
   `delete_file`, `bash`) writes a per-run ledger at
   `.selora/workflow-runs/{run_id}/tool-effects.jsonl`: `started` before the
   tool executes, `finished` after it returns. Both records carry the same
-  `effect_id`; only the redacted argument summary (paths and byte counts) is
+  stable `effect_id` (hash of run, step/ask, model call id, tool) and
+  `attempt`; only the redacted argument summary (paths and byte counts) is
   stored, never file bodies, command text, or secrets.
+- Each append is one `write_all` plus `sync_all`; a per-run
+  `tool-effects.lock` file serializes read/append/sync across hosts and
+  threads. On Unix the run directory is also `fsync`ed after creation.
 - A crash leaves `started` without `finished`. Bootstrap then marks the run
   `resumable=false` with `partial_effects=true`, and Resume returns
   `workflow_partial_effects` before starting a worker. The panel shows a
   separate acknowledgement action ("Acknowledge and resume anyway"); only that
   click sets `acknowledge_partial_effects`.
+- The acknowledgement is durable evidence: resume first appends one
+  `acknowledged` record per risky effect, naming its step/ask, the actor and
+  the reason. A preflight without that evidence still refuses. A failed
+  `finished` record (the tool errored after possibly applying part of its
+  effect) counts as risk too.
+- A resumed ask that re-issues a call id the ledger proves completed is
+  replayed, not executed: one `replayed` record, no second `started`, and a
+  synthetic success to the agent. A retry of an unfinished or failed attempt
+  needs that attempt's `acknowledged` record.
 - Completed asks' paired effects do not block. A read-only unfinished ask keeps
   ordinary Resume. A corrupt ledger is a typed refusal
   (`workflow_effect_ledger_corrupt`), never treated as empty.
+- Remaining windows (not exactly-once): a crash after the effect lands but
+  before `finished` still relies on the fail-closed preflight; a new model turn
+  can issue a new call id and therefore a new effect; Windows directory
+  metadata is not `fsync`able; and work spawned outside the tool call (a
+  background `bash` descendant) is fenced only by process containment, not by
+  this ledger.
 
 ## 11. Acceptance checklist (ROADMAP Phase 8, "Acceptance tests")
 
