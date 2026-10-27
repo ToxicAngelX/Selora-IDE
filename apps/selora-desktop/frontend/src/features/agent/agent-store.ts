@@ -1,7 +1,7 @@
 // Selora IDE — Phase Z3 Agent Store
 //
 // Manages agent sessions, messages, tool executions, approval gates,
-// live todos, subagents, and hero composer interactions.
+// backend-authoritative todos, and hero composer interactions.
 // Implemented via React 18 external store subscription pattern.
 import type {
   AgentSession,
@@ -22,23 +22,31 @@ import type {
 import {
   agentDecision,
   fetchModels,
+  newSession as requestNewSessionCommand,
+  retryMessage as retryMessageCommand,
   runWorkflow,
   sendAgent,
   sendChat,
   stopChat,
+  switchSession as switchSessionCommand,
+  type AgentDecisionResolution,
   type AgentMode,
   type AgentStateChangedPayload,
   type AgentTurnDonePayload,
+  type Approval,
   type ApprovalNeededPayload,
   type BootstrapState,
   type ChatCompletedPayload,
+  type ChatTodoDto,
   type EditorContextDto,
   type EnvelopeContext,
   type Model,
   type ToolCallStartedPayload,
   type ToolResultPayload,
+  type TodoDto,
   type WorkflowApproval,
 } from '../../bridge/bridge';
+import { toastStore } from '../toasts/toast-store';
 
 export type ModelSettings = {
   temperature: number;
@@ -50,8 +58,17 @@ export type AgentState = {
   sessions: AgentSession[];
   activeSessionId: string;
   messages: ChatMessage[];
+/** Authoritative `manage_todo` list for the active session (backend-owned). */
+  /**
+   * The active session's transcript / todos. The maps below keep every
+   * backend-known session's copy so a tab switch never invents a blank one.
+   */
+  transcripts: Record<string, ChatMessage[]>;
+  todosBySession: Record<string, AgentTodo[]>;
   todos: AgentTodo[];
+  /** Live subagent roster. Empty until the backend reports one. */
   subagents: SubagentInfo[];
+  /** Artifacts the session produced; empty unless a real event adds one. */
   artifacts: ArtifactItem[];
   inFlight: boolean;
   thinkingState: ThinkingState;
@@ -67,10 +84,15 @@ export type AgentState = {
   promptHistory: string[];
   metrics: AgentMetrics;
   promptQueue: QueuedPrompt[];
+  /** A NewSession / SwitchSession command is in flight. */
+  sessionBusy: boolean;
+  /** Truthful session-command failure (unsupported slice, transport, ...). */
+  sessionError: string | null;
 };
 
-const DEFAULT_SESSION_ID = 'sess_default';
 const STORED_SETTINGS_KEY = 'selora:model_settings';
+
+const INITIAL_SESSIONS: AgentSession[] = [];
 
 function loadStoredSettings(): ModelSettings {
   try {
@@ -146,46 +168,17 @@ export function getComposerGate(snapshot: AgentState): ComposerGate {
   return { ready: true, reason: null, message: null };
 }
 
-const INITIAL_SESSIONS: AgentSession[] = [
-  {
-    id: DEFAULT_SESSION_ID,
-    title: 'Agent Session 1',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    tokenCount: 0,
-    costUsd: 0,
-    branchName: 'main',
-  },
-];
-
 const INITIAL_TODOS: AgentTodo[] = [];
-
-const INITIAL_SUBAGENTS: SubagentInfo[] = [
-  {
-    id: 'sub-1',
-    name: 'frontend-developer',
-    model: 'Auto',
-    status: 'idle',
-    activeStep: 'Ready for instructions',
-  },
-  {
-    id: 'sub-2',
-    name: 'rust-developer',
-    model: 'Auto',
-    status: 'idle',
-    activeStep: 'Ready for instructions',
-  },
-];
-
-const INITIAL_ARTIFACTS: ArtifactItem[] = [];
 
 let state: AgentState = {
   sessions: INITIAL_SESSIONS,
-  activeSessionId: DEFAULT_SESSION_ID,
+  activeSessionId: '',
   messages: [],
+  transcripts: {},
+  todosBySession: {},
   todos: INITIAL_TODOS,
-  subagents: INITIAL_SUBAGENTS,
-  artifacts: INITIAL_ARTIFACTS,
+  subagents: [],
+  artifacts: [],
   inFlight: false,
   thinkingState: 'breathing',
   permissionMode: 'full',
@@ -209,8 +202,19 @@ let state: AgentState = {
     latencyMs: 0,
   },
   promptQueue: [],
+  sessionBusy: false,
+  sessionError: null,
 };
 
+/** Protocol todo → the plan-spine row shape. Text is the task; no invented fields. */
+function todoFromDto(todo: TodoDto): AgentTodo {
+  return { id: todo.id, text: todo.text ?? todo.title ?? '', status: todo.status };
+}
+
+/**
+ * A `manage_todo` payload may also arrive as a markdown checklist. Read it
+ * without inventing rows; `null` means "no checklist in this text".
+ */
 export function extractMarkdownChecklist(text: string): AgentTodo[] | null {
   const lines = text.split('\n');
   const todos: AgentTodo[] = [];
@@ -228,7 +232,7 @@ export function extractMarkdownChecklist(text: string): AgentTodo[] | null {
         mark === 'x' ? 'completed' : mark === '/' ? 'in_progress' : 'pending';
       todos.push({
         id: `todo_md_${idx++}`,
-        title,
+        text: title,
         status,
       });
     }
@@ -236,6 +240,10 @@ export function extractMarkdownChecklist(text: string): AgentTodo[] | null {
   return todos.length > 0 ? todos : null;
 }
 
+/**
+ * Parse a `manage_todo` argument payload (array, object list, JSON string or
+ * checklist) into plan rows. Malformed entries are dropped, never guessed.
+ */
 export function parseModelTodos(input: unknown): AgentTodo[] | null {
   if (!input) return null;
 
@@ -247,7 +255,7 @@ export function parseModelTodos(input: unknown): AgentTodo[] | null {
         if (trimmed) {
           todos.push({
             id: `todo_${Date.now()}_${idx}`,
-            title: trimmed,
+            text: trimmed,
             status: 'pending',
           });
         }
@@ -260,11 +268,11 @@ export function parseModelTodos(input: unknown): AgentTodo[] | null {
           rawStatus === 'completed' || rawStatus === 'done' || itemObj.completed === true
             ? 'completed'
             : rawStatus === 'in_progress' || rawStatus === 'active' || rawStatus === 'working'
-            ? 'in_progress'
-            : 'pending';
+              ? 'in_progress'
+              : 'pending';
         todos.push({
           id: String(itemObj.id || `todo_${Date.now()}_${idx}`),
-          title,
+          text: title,
           status,
           assignedSubagent: itemObj.assignedSubagent ? String(itemObj.assignedSubagent) : undefined,
         });
@@ -293,6 +301,83 @@ export function parseModelTodos(input: unknown): AgentTodo[] | null {
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
+
+const PENDING_APPROVAL_PREFIX = 'msg_pending_';
+
+/**
+ * Map the backend's authoritative session todos (ChatStateDto.todos once 9b
+ * lands) without inventing titles. A malformed status falls back to `pending`
+ * because that is the least-claiming state, never `completed`.
+ */
+export function parseSessionTodos(todos: ChatTodoDto[] | undefined): AgentTodo[] {
+  if (!todos || todos.length === 0) return [];
+  return todos
+    .map((todo) => ({
+      id: todo.id,
+      // `text` is the authoritative Phase 9b field; `title` is the 9a spelling
+      // older payloads and local plans carry.
+      text: (todo.text ?? todo.title ?? '').trim(),
+      status: todo.status,
+      ...(todo.assigned_subagent ? { assignedSubagent: todo.assigned_subagent } : {}),
+    }))
+    .filter((todo) => todo.text !== '')
+    .map((todo) => ({
+      ...todo,
+      status:
+        todo.status === 'completed'
+          ? 'completed'
+          : todo.status === 'in_progress'
+            ? 'in_progress'
+            : 'pending',
+    }));
+}
+
+function updateToolCallCard(
+  approvalId: string,
+  update: Partial<AgentToolCall>,
+): void {
+  state = {
+    ...state,
+    messages: state.messages.map((message) => ({
+      ...message,
+      toolCalls: message.toolCalls?.map((call) =>
+        call.approvalId === approvalId ? { ...call, ...update } : call,
+      ),
+    })),
+  };
+  notify();
+}
+
+function decisionErrorMessage(error: unknown): string {
+  const message =
+    error && typeof error === 'object' && 'message' in error
+      ? String((error as { message: unknown }).message)
+      : typeof error === 'string'
+        ? error
+        : 'The decision could not be sent. Try again.';
+  return message || 'The decision could not be sent. Try again.';
+}
+
+function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unknown): string {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : '';
+  if (code === 'unsupported_phase_slice') {
+    return action === 'create'
+      ? 'Creating agent sessions is not supported by this backend build yet.'
+      : action === 'switch'
+        ? 'Switching agent sessions is not supported by this backend build yet.'
+        : 'Retrying a turn is not supported by this backend build yet.';
+  }
+  const prefix =
+    action === 'create'
+      ? 'Could not create an agent session: '
+      : action === 'switch'
+        ? 'Could not switch agent sessions: '
+        : 'Could not retry the turn: ';
+  return `${prefix}${decisionErrorMessage(error)}`;
+}
 
 /**
  * A `run_workflow` card also carries the §18.1 confirmation payload (script,
@@ -508,6 +593,58 @@ function notify() {
   }
 }
 
+function findApprovalCard(approvalId: string): AgentToolCall | undefined {
+  return state.messages
+    .flatMap((message) => message.toolCalls ?? [])
+    .find((call) => call.approvalId === approvalId);
+}
+
+/**
+ * Phase 9a question/plan decisions ride the existing `AgentDecision` command.
+ * The optional `resolution` is additive: a pre-9b Rust build ignores the extra
+ * field and still records the permit/deny, so the turn never wedges. The card
+ * only flips once the command resolves; a transport failure leaves it parked
+ * with the real message visible.
+ */
+async function submitPromptDecision(
+  approvalId: string,
+  decision: 'approve' | 'deny',
+  resolution: AgentDecisionResolution,
+): Promise<boolean> {
+  const card = findApprovalCard(approvalId);
+  if (!card?.decisionPrompt || card.status !== 'needs_approval') return false;
+  if (card.decisionSubmitting) return false;
+  const requestId = pendingApprovalRequests.get(approvalId) ?? activeRequestId;
+  const ctx = requestId ? sessionEnvelopeContext() : null;
+  if (!requestId || !ctx) {
+    updateToolCallCard(approvalId, {
+      decisionError: 'The request that asked this question is no longer live.',
+    });
+    return false;
+  }
+  updateToolCallCard(approvalId, {
+    decisionSubmitting: true,
+    decisionError: undefined,
+  });
+  try {
+    await agentDecision(requestId, approvalId, decision, ctx, resolution);
+    pendingApprovalRequests.delete(approvalId);
+    updateToolCallCard(approvalId, {
+      status: decision === 'deny' ? 'denied' : 'approved',
+      resolution,
+      decisionSubmitting: false,
+      decisionError: undefined,
+    });
+    return true;
+  } catch (error) {
+    updateToolCallCard(approvalId, {
+      decisionSubmitting: false,
+      decisionError: decisionErrorMessage(error),
+    });
+    return false;
+  }
+}
+
 export const agentStore = {
   subscribe(listener: Listener): () => void {
     listeners.add(listener);
@@ -556,12 +693,23 @@ export const agentStore = {
       updatedAt: Date.now(),
       tokenCount: 0,
       costUsd: 0,
+      isRunning: session.active,
     }));
 
-    const messages: ChatMessage[] = [];
+const activeSessionId =
+      bootstrap.chat.active_session_id ??
+      bootstrap.chat.sessions.find((session) => session.active)?.session_id ??
+      sessions[0]?.id ??
+      state.activeSessionId;
+
+    // Keep each backend session's transcript separate: switching a tab must
+    // show that session's messages, not the flattened union of every session.
+    const transcripts: Record<string, ChatMessage[]> = {};
+    for (const session of sessions) transcripts[session.id] = [];
     for (const message of bootstrap.chat.messages) {
+      if (!transcripts[message.session_id]) continue;
       if (message.role !== 'user' && message.role !== 'assistant') continue;
-      messages.push({
+      transcripts[message.session_id]!.push({
         id: message.message_id,
         role: message.role,
         content: message.text,
@@ -570,11 +718,14 @@ export const agentStore = {
       });
     }
 
-    const activeSessionId =
-      bootstrap.chat.active_session_id ??
-      bootstrap.chat.sessions.find((session) => session.active)?.session_id ??
-      sessions[0]?.id ??
-      state.activeSessionId;
+    // Phase 9a additive seam: `ChatStateDto.todos` is authoritative once 9b
+    // lands. Without it the list stays empty; no step is ever synthesized.
+    const todosBySession: Record<string, AgentTodo[]> = {};
+    for (const todo of bootstrap.chat.todos ?? []) {
+      const sessionId = todo.session_id ?? activeSessionId;
+      if (!sessionId) continue;
+      (todosBySession[sessionId] ??= []).push(...parseSessionTodos([todo]));
+    }
 
     // Keep request routing aligned with the turn Rust says is live.
     activeRequestId = bootstrap.chat.active_request_id ?? null;
@@ -616,24 +767,29 @@ export const agentStore = {
         argsSummary: pending.summary,
         status: 'needs_approval',
         approvalId: pending.approval_id,
+        decisionPrompt: pending.decision_prompt,
         resultSummary: isWorkflow
           ? 'Workflow confirmation is unavailable after refresh. Wait for the full approval_needed payload before deciding.'
           : undefined,
         startedAt: Date.now(),
       };
-      const lastAssistantIndex = messages.reduce(
+      const pendingSessionId = pending.session_id || activeSessionId;
+      const pendingMessages = pendingSessionId
+        ? (transcripts[pendingSessionId] ??= [])
+        : (transcripts[activeSessionId] ??= []);
+      const lastAssistantIndex = pendingMessages.reduce(
         (found, message, index) => (message.role === 'assistant' ? index : found),
         -1,
       );
       if (lastAssistantIndex >= 0) {
-        const target = messages[lastAssistantIndex]!;
-        messages[lastAssistantIndex] = {
+        const target = pendingMessages[lastAssistantIndex]!;
+        pendingMessages[lastAssistantIndex] = {
           ...target,
           toolCalls: [...(target.toolCalls ?? []), approvalCall],
         };
       } else {
-        messages.push({
-          id: `msg_pending_${pending.approval_id}`,
+        pendingMessages.push({
+          id: `${PENDING_APPROVAL_PREFIX}${pending.approval_id}`,
           role: 'assistant',
           content: '',
           status: 'complete',
@@ -649,9 +805,14 @@ export const agentStore = {
       selectedModel: modelToSelect,
       workspace,
       sessions,
-      messages,
+      transcripts,
+      todosBySession,
+      messages: transcripts[activeSessionId] ?? [],
+      todos: todosBySession[activeSessionId] ?? [],
       activeSessionId,
       inFlight: Boolean(bootstrap.chat.active_request_id),
+      sessionBusy: false,
+      sessionError: null,
     };
     notify();
   },
@@ -683,7 +844,11 @@ export const agentStore = {
     terminalRequests.clear();
     state = {
       ...state,
+      sessions: [],
+      activeSessionId: '',
       messages: [],
+      transcripts: {},
+      todosBySession: {},
       todos: [],
       inFlight: false,
       thinkingState: 'breathing',
@@ -692,11 +857,68 @@ export const agentStore = {
       availableModels: [],
       selectedModel: '',
       workspace: null,
+      sessionBusy: false,
+      sessionError: null,
     };
     notify();
   },
 
-  createSession(title = 'New Agent Session'): string {
+  /**
+   * Ask the backend for a real session. Rust creates it, selects it, and
+   * emits the bootstrap snapshot this store hydrates from — no local
+   * placeholder row is ever fabricated.
+   */
+  async createSession(): Promise<boolean> {
+    if (!context) {
+      toastStore.pushLocal('warning', 'Open a folder and connect before starting a session.');
+      return false;
+    }
+    try {
+      await requestNewSessionCommand({ ...context, session_id: null });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('create', error));
+      return false;
+    }
+  },
+
+  /** Select an existing backend session (unknown ids are refused by Rust). */
+  async switchSession(sessionId: string): Promise<boolean> {
+    if (!state.sessions.some((session) => session.id === sessionId)) return false;
+    if (!context) return false;
+    if (sessionId === state.activeSessionId) return true;
+    try {
+      await switchSessionCommand(sessionId, { ...context, session_id: null });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('switch', error));
+      return false;
+    }
+  },
+
+  /** Retry a user turn: Rust truncates the failed tail and dispatches once. */
+  async retryMessage(messageId: string): Promise<boolean> {
+    const target = state.messages.find((message) => message.id === messageId);
+    if (!target || target.role !== 'user') return false;
+    if (!context || !state.activeSessionId) return false;
+    try {
+      await retryMessageCommand(state.activeSessionId, messageId, {
+        ...context,
+        session_id: state.activeSessionId,
+      });
+      return true;
+    } catch (error) {
+      toastStore.pushLocal('error', sessionCommandError('retry', error));
+      return false;
+    }
+  },
+
+  /**
+   * Local fork helper (Phase Z3 `forkSessionFromPrompt`). Session tabs never
+   * call this: their New session goes through `requestNewSession`, which is the
+   * real `NewSession` command and never invents a session on failure.
+   */
+  createLocalSession(title = 'New Agent Session'): string {
     const newId = `sess_${Date.now().toString(36)}`;
     const newSession: AgentSession = {
       id: newId,
@@ -711,6 +933,8 @@ export const agentStore = {
       sessions: [newSession, ...state.sessions],
       activeSessionId: newId,
       messages: [],
+      transcripts: { ...state.transcripts, [newId]: [] },
+      todosBySession: { ...state.todosBySession, [newId]: [] },
       todos: [],
       inFlight: false,
       thinkingState: 'breathing',
@@ -720,23 +944,134 @@ export const agentStore = {
     return newId;
   },
 
-  switchSession(sessionId: string) {
+  /**
+   * Phase 9a — the real `NewSession` command. A failure (today the backend
+   * answers `unsupported_phase_slice`) surfaces as `sessionError` and leaves
+   * the session list untouched: no local placeholder session is ever created.
+   * On success the authoritative `bootstrap_state` event rehydrates the rail.
+   */
+  async requestNewSession(): Promise<boolean> {
+    // Section-scoped commands stay off the envelope (state.rs only allows the
+    // envelope session for SendChat/StopChat/SendAgent/AgentDecision). NewSession
+    // has no target at all.
+    const ctx = context;
+    if (!ctx) {
+      state = {
+        ...state,
+        sessionError: 'Open a workspace before creating an agent session.',
+      };
+      notify();
+      return false;
+    }
+    if (state.sessionBusy) return false;
+    state = { ...state, sessionBusy: true, sessionError: null };
+    notify();
+    try {
+      await requestNewSessionCommand(ctx);
+      return true;
+    } catch (error) {
+      state = { ...state, sessionError: sessionCommandError('create', error) };
+      return false;
+    } finally {
+      state = { ...state, sessionBusy: false };
+      notify();
+    }
+  },
+
+  /**
+   * Select a backend session locally without a command; only the fork/tests
+   * use it, because session tabs dispatch the real `SwitchSession`.
+   */
+  selectSessionLocally(sessionId: string) {
     if (state.activeSessionId === sessionId) return;
     state = {
       ...state,
       activeSessionId: sessionId,
-      messages: sessionId === DEFAULT_SESSION_ID ? state.messages : [],
+      messages: state.transcripts[sessionId] ?? [],
+      todos: state.todosBySession[sessionId] ?? [],
     };
     notify();
   },
 
+  /**
+   * Phase 9a — the real `SwitchSession` command. The target must already be a
+   * backend-reported session; after the command succeeds the local view moves
+   * to that session's backend transcript. A rejected command changes nothing.
+   */
+  async requestSwitchSession(sessionId: string): Promise<boolean> {
+    if (sessionId === state.activeSessionId) return true;
+    if (!state.sessions.some((session) => session.id === sessionId)) {
+      state = {
+        ...state,
+        sessionError: 'That session is not in the backend session list.',
+      };
+      notify();
+      return false;
+    }
+    const ctx = context;
+    if (!ctx) {
+      state = {
+        ...state,
+        sessionError: 'Open a workspace before switching agent sessions.',
+      };
+      notify();
+      return false;
+    }
+    if (state.sessionBusy) return false;
+    state = { ...state, sessionBusy: true, sessionError: null };
+    notify();
+    try {
+      await switchSessionCommand(sessionId, ctx);
+      state = {
+        ...state,
+        activeSessionId: sessionId,
+        messages: state.transcripts[sessionId] ?? [],
+        todos: state.todosBySession[sessionId] ?? [],
+        sessionBusy: false,
+      };
+      notify();
+      return true;
+    } catch (error) {
+      state = {
+        ...state,
+        sessionBusy: false,
+        sessionError: sessionCommandError('switch', error),
+      };
+      notify();
+      return false;
+    }
+  },
+
+  /**
+   * Apply a `session_todos_changed` event. The list is authoritative and
+   * session-scoped: a late event from another session is ignored (the next
+   * bootstrap restores that session's own list on switch).
+   */
+  applySessionTodos(payload: { session_id: string; todos: TodoDto[] }): void {
+    const todos = payload.todos.map(todoFromDto);
+    const todosBySession = { ...state.todosBySession, [payload.session_id]: todos };
+    if (payload.session_id !== state.activeSessionId) {
+      state = { ...state, todosBySession };
+      return;
+    }
+    state = { ...state, todos, todosBySession };
+    notify();
+  },
+
+  /** Drop a locally-known session tab (fork helpers/tests). */
   deleteSession(sessionId: string) {
     const remaining = state.sessions.filter((s) => s.id !== sessionId);
     const nextActive = remaining[0]?.id || '';
+    const { [sessionId]: _removedTranscript, ...transcripts } = state.transcripts;
+    const { [sessionId]: _removedTodos, ...todosBySession } = state.todosBySession;
     state = {
       ...state,
       sessions: remaining,
+      transcripts,
+      todosBySession,
       activeSessionId: nextActive,
+      messages: transcripts[nextActive] ?? [],
+      todos: todosBySession[nextActive] ?? [],
     };
     notify();
   },
@@ -828,18 +1163,8 @@ export const agentStore = {
       toolCalls: [],
     };
 
-    // If existing todos are all completed or empty, initialize a new plan starting with this user task
-    const hasPending = state.todos.some((t) => t.status !== 'completed');
-    const initialTodo: AgentTodo = {
-      id: `todo_${Date.now()}`,
-      title: isSteer ? `Steer: ${trimmed.slice(0, 45)}` : trimmed,
-      status: 'in_progress',
-      assignedSubagent: 'coding-agent',
-    };
-    const updatedTodos = hasPending
-      ? [...state.todos, initialTodo]
-      : [initialTodo];
-
+// The backend owns the transcript; these are the live render rows only.
+    // Todos are NOT seeded from the prompt — `manage_todo` is the only writer.
     const updatedSubagents = state.subagents.map((sub, i) =>
       i === 0
         ? {
@@ -855,7 +1180,6 @@ export const agentStore = {
     state = {
       ...state,
       messages: [...state.messages, userMsg, assistantMsg],
-      todos: updatedTodos,
       subagents: updatedSubagents,
       inFlight: true,
       thinkingState: 'working',
@@ -1004,21 +1328,6 @@ export const agentStore = {
     this.sendUserMessage(trimmed);
   },
 
-  forkSessionFromPrompt(messageId: string): string {
-    const idx = state.messages.findIndex((m) => m.id === messageId);
-    if (idx === -1) return '';
-    const targetMsg = state.messages[idx];
-    const sliced = state.messages.slice(0, idx + 1);
-    const titleSnippet = targetMsg.content.slice(0, 24).trim();
-    const newSessionId = this.createSession(`Fork: ${titleSnippet || 'Checkpoint'}`);
-    state = {
-      ...state,
-      messages: sliced.map((m) => ({ ...m })),
-    };
-    notify();
-    return newSessionId;
-  },
-
   queuePrompt(text: string, mode?: PermissionMode): string {
     const trimmed = text.trim();
     if (!trimmed) return '';
@@ -1118,16 +1427,9 @@ export const agentStore = {
     const newMessages = [...state.messages];
     newMessages[lastMsgIndex] = updated;
 
-    let updatedTodos = state.todos;
-    const mdTodos = extractMarkdownChecklist(newContent);
-    if (mdTodos && mdTodos.length > 0) {
-      updatedTodos = mdTodos;
-    }
-
     state = {
       ...state,
       messages: newMessages,
-      todos: updatedTodos,
       thinkingState: 'connecting',
       streamingActivityLevel: Math.min(1.0, state.streamingActivityLevel + 0.1),
     };
@@ -1331,24 +1633,16 @@ export const agentStore = {
         ? workflowApprovalFromArgs(parsedArgs)
         : undefined;
 
-    // 1. If tool is manage_todo or update_plan, extract and update todos
+// `session_todos_changed` is authoritative; a `manage_todo` tool start also
+    // carries the same list, so apply it as the optimistic live view. Every
+    // other tool leaves the list exactly as the session reported it — no
+    // inferred state.
     let updatedTodos = state.todos;
     if (payload.tool_name === 'manage_todo' || payload.tool_name === 'update_plan') {
       const raw = parsedArgs ? (parsedArgs.todos ?? parsedArgs.tasks ?? parsedArgs.steps ?? parsedArgs) : payload.args_json;
       const modelTodos = parseModelTodos(raw);
       if (modelTodos && modelTodos.length > 0) {
         updatedTodos = modelTodos;
-      }
-    } else {
-      // If there are pending todos and one is in_progress, keep it; if none in_progress, make first pending in_progress
-      const hasInProgress = updatedTodos.some((t) => t.status === 'in_progress');
-      if (!hasInProgress && updatedTodos.length > 0) {
-        const firstPending = updatedTodos.find((t) => t.status === 'pending');
-        if (firstPending) {
-          updatedTodos = updatedTodos.map((t) =>
-            t.id === firstPending.id ? { ...t, status: 'in_progress' as const } : t
-          );
-        }
       }
     }
 
@@ -1387,6 +1681,10 @@ export const agentStore = {
         ...state,
         messages: newMessages,
         todos: updatedTodos,
+        todosBySession: {
+          ...state.todosBySession,
+          ...(state.activeSessionId ? { [state.activeSessionId]: updatedTodos } : {}),
+        },
         subagents: updatedSubagents,
         thinkingState: payload.tool_name === 'read_file' ? 'searching' : 'solving',
       };
@@ -1395,7 +1693,12 @@ export const agentStore = {
       state = {
         ...state,
         todos: updatedTodos,
+        todosBySession: {
+          ...state.todosBySession,
+          ...(state.activeSessionId ? { [state.activeSessionId]: updatedTodos } : {}),
+        },
         subagents: updatedSubagents,
+        thinkingState: payload.tool_name === 'read_file' ? 'searching' : 'solving',
       };
       notify();
     }
@@ -1404,18 +1707,6 @@ export const agentStore = {
   handleToolResult(payload: ToolResultPayload) {
     if (!isActiveEvent(payload)) return;
     this.updateToolResult(payload.call_id, payload.result_summary, payload.is_err);
-    const updatedSubagents = state.subagents.map((sub, i) =>
-      i === 0
-        ? {
-            ...sub,
-            activeStep: payload.is_err
-              ? `Error: ${payload.result_summary.slice(0, 40)}`
-              : `Completed: ${payload.result_summary.slice(0, 40)}`,
-          }
-        : sub
-    );
-    state = { ...state, subagents: updatedSubagents };
-    notify();
   },
 
   handleApprovalNeeded(payload: ApprovalNeededPayload) {
@@ -1459,6 +1750,7 @@ export const agentStore = {
       status: 'needs_approval',
       approvalId: payload.approval_id,
       workflow,
+      decisionPrompt: payload.prompt,
       resultSummary: undefined,
       diff: diffHunks
         ? {
@@ -1568,11 +1860,8 @@ export const agentStore = {
       state = { ...state, messages: newMessages };
     }
 
-    // Mark in-progress todos as completed on successful turn completion
-    const finishedTodos = state.todos.map((t) =>
-      t.status === 'in_progress' ? { ...t, status: 'completed' as const } : t
-    );
-
+// Todos are not rewritten here: the plan stays exactly what the backend
+    // last stored. A turn ending is not a todo status change.
     const idleSubagents = state.subagents.map((s) => ({
       ...s,
       status: 'idle' as const,
@@ -1581,7 +1870,6 @@ export const agentStore = {
 
     state = {
       ...state,
-      todos: finishedTodos,
       subagents: idleSubagents,
       inFlight: false,
       thinkingState: 'breathing',
@@ -1600,7 +1888,7 @@ export const agentStore = {
     this.checkAndExecuteNextQueued();
   },
 
-  handleAgentEvent(payload: { request_id: string; approval: { approval_id: string; summary: string } | null; message: string }) {
+  handleAgentEvent(payload: { request_id: string; approval: Approval | null; message: string }) {
     if (!isActiveEvent(payload)) return;
     if (payload.approval) {
       this.handleApprovalNeeded({
@@ -1610,11 +1898,73 @@ export const agentStore = {
         approval_id: payload.approval.approval_id,
         tool_name: 'operation',
         path_or_command: payload.approval.summary,
+        prompt: payload.approval.decision_prompt,
       });
     }
     if (payload.message) {
       this.appendAssistantDelta(payload.message);
     }
+  },
+
+  /**
+   * Answer a parked structured question. Exactly one answer path is required:
+   * a known option id and/or non-empty free text. Nothing is sent on an empty
+   * form, and the card shows the transport error if the decision fails.
+   */
+  answerQuestion(
+    approvalId: string,
+    optionId: string | null,
+    freeText: string,
+  ): Promise<boolean> {
+    const card = findApprovalCard(approvalId);
+    const prompt = card?.decisionPrompt;
+    if (!prompt || prompt.kind !== 'question') return Promise.resolve(false);
+    const text = freeText.trim();
+    const ownsOption = optionId
+      ? prompt.options.some((option) => option.id === optionId)
+      : false;
+    if (!ownsOption && !text) {
+      updateToolCallCard(approvalId, {
+        decisionError: 'Choose an option or type an answer before sending.',
+      });
+      return Promise.resolve(false);
+    }
+    return submitPromptDecision(approvalId, 'approve', {
+      kind: 'question',
+      ...(ownsOption ? { option_id: optionId! } : {}),
+      ...(text ? { text } : {}),
+    });
+  },
+
+  /**
+   * Answer a parked plan review. `request_changes` maps to Deny (the loop
+   * continues) and carries the revision note; approve maps to the normal
+   * permit so the session can flip into execution.
+   */
+  resolvePlan(
+    approvalId: string,
+    decision: 'approve' | 'request_changes',
+    feedback = '',
+  ): Promise<boolean> {
+    const card = findApprovalCard(approvalId);
+    const prompt = card?.decisionPrompt;
+    if (!prompt || prompt.kind !== 'plan') return Promise.resolve(false);
+    const note = feedback.trim();
+    if (decision === 'request_changes' && !note) {
+      updateToolCallCard(approvalId, {
+        decisionError: 'Describe the changes you want before sending.',
+      });
+      return Promise.resolve(false);
+    }
+    return submitPromptDecision(
+      approvalId,
+      decision === 'approve' ? 'approve' : 'deny',
+      {
+        kind: 'plan',
+        decision,
+        ...(note ? { feedback: note } : {}),
+      },
+    );
   },
 
   updateTodoStatus(todoId: string, status: TodoStatus) {
@@ -1624,23 +1974,46 @@ export const agentStore = {
       }
       return todo;
     });
-    state = { ...state, todos: updated };
+    state = {
+      ...state,
+      todos: updated,
+      todosBySession: {
+        ...state.todosBySession,
+        ...(state.activeSessionId ? { [state.activeSessionId]: updated } : {}),
+      },
+    };
     notify();
   },
 
   addTodo(title: string, assignedSubagent?: string) {
     const newTodo: AgentTodo = {
       id: `todo-${Date.now().toString(36)}`,
-      title,
+      text: title,
       status: 'pending',
       assignedSubagent,
     };
-    state = { ...state, todos: [...state.todos, newTodo] };
+    const updated = [...state.todos, newTodo];
+    state = {
+      ...state,
+      todos: updated,
+      todosBySession: {
+        ...state.todosBySession,
+        ...(state.activeSessionId ? { [state.activeSessionId]: updated } : {}),
+      },
+    };
     notify();
   },
 
   removeTodo(todoId: string) {
-    state = { ...state, todos: state.todos.filter((t) => t.id !== todoId) };
+    const updated = state.todos.filter((t) => t.id !== todoId);
+    state = {
+      ...state,
+      todos: updated,
+      todosBySession: {
+        ...state.todosBySession,
+        ...(state.activeSessionId ? { [state.activeSessionId]: updated } : {}),
+      },
+    };
     notify();
   },
 

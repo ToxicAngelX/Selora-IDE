@@ -370,10 +370,30 @@ pub fn clamp_region_size(region: RegionId, size_px: f32) -> Result<f32, Protocol
     };
     Ok(size_px.clamp(min, max))
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsPatchDto {
+    #[serde(default)]
     pub reduced_motion: Option<bool>,
+    #[serde(default)]
     pub theme: Option<String>,
+    /// Editor preferences (P1 settings slice). Every field is optional and
+    /// serde-defaulted, so a pre-P1 patch (`{"theme": "light"}`) still parses.
+    #[serde(default)]
+    pub editor_font_size: Option<u32>,
+    #[serde(default)]
+    pub editor_tab_size: Option<u32>,
+    #[serde(default)]
+    pub editor_word_wrap: Option<bool>,
+    /// Rebindable keybinds (the same grammar as `Keybind::parse`). The
+    /// desktop validates and canonicalizes each one before persisting.
+    #[serde(default)]
+    pub keybind_command_palette: Option<String>,
+    #[serde(default)]
+    pub keybind_fuzzy_find: Option<String>,
+    #[serde(default)]
+    pub keybind_toggle_chat: Option<String>,
+    #[serde(default)]
+    pub keybind_save: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -387,6 +407,10 @@ pub enum FrontendCommand {
     OpenFolderAt {
         root: String,
     },
+    /// P1: close the open folder. Drops every buffer, stops the language
+    /// servers and clears their diagnostics; the shell returns to the
+    /// no-workspace state.
+    CloseFolder,
     /// Phase Z4: rebuild the file tree from disk and emit
     /// FileTreeChanged (the explorer's refresh affordance).
     RefreshTree,
@@ -400,7 +424,22 @@ pub enum FrontendCommand {
     CloseBuffer {
         buffer_id: BufferId,
     },
+    /// P1 active-buffer fix: the web shell's tab switch. Bootstrap then
+    /// reports the buffer the user actually selected, not the first one in
+    /// path order.
+    SetActiveBuffer {
+        buffer_id: BufferId,
+    },
     SaveBuffer {
+        buffer_id: BufferId,
+    },
+    /// P2 gap 3: a dirty buffer changed on disk. Reload it from disk,
+    /// discarding the local edits, and sync the language server.
+    ReloadBufferFromDisk {
+        buffer_id: BufferId,
+    },
+    /// P2 gap 3: keep the local edits and clear the external-change marker.
+    KeepBufferEdits {
         buffer_id: BufferId,
     },
     ApplyEditorChange {
@@ -427,6 +466,12 @@ pub enum FrontendCommand {
     CompletionAt {
         buffer_id: BufferId,
         position: TextPosition,
+    },
+    /// P1: restart one language server (truthful status follows as
+    /// `LspServerStateChanged` events). `language` is a wire language id
+    /// (`rust`, `typescript`, `javascript`) or a server name.
+    LspRestart {
+        language: String,
     },
     SendChat {
         request_id: RequestId,
@@ -510,6 +555,16 @@ pub enum FrontendCommand {
         /// pre-flag payload resumes fail-closed.
         #[serde(default)]
         allow_incomplete_asks: bool,
+        // No `max_cost_usd` here on purpose: resume replays the confirmed
+        // grant and never raises it. A run that exhausted its cap is refused
+        // with `workflow_budget_exhausted`; continuing needs a new run and a
+        // newly confirmed budget.
+        /// Whether the user has accepted durable evidence that tool effects
+        /// may already exist for this run (an unfinished `started` record, or
+        /// an effect owned by an unfinished ask). This is a separate action
+        /// from ordinary Resume; false by default so old payloads refuse.
+        #[serde(default)]
+        acknowledge_partial_effects: bool,
     },
     WorkflowStop {
         request_id: RequestId,
@@ -538,6 +593,19 @@ pub struct BufferSnapshotDto {
     pub dirty: bool,
     pub selection: Option<Selection>,
 }
+/// P2 gap 3: an open dirty buffer also changed on disk. The local text is
+/// still the buffer's text; the banner offers Reload or Keep.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BufferConflictDto {
+    pub buffer_id: BufferId,
+    pub path: WorkspacePath,
+}
+/// P2 gap 3: the conflict for this buffer was resolved (reload or keep).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BufferConflictClearedDto {
+    pub buffer_id: BufferId,
+    pub path: WorkspacePath,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileTreeDto {
     pub root: Option<FileTreeNodeDto>,
@@ -561,6 +629,28 @@ pub struct SessionDto {
     pub title: String,
     pub message_ids: Vec<MessageId>,
     pub active: bool,
+    /// Phase 9 session slice: this session's authoritative todo list, written
+    /// only by the `manage_todo` tool. Additive: a pre-Phase-9 snapshot
+    /// deserializes as an empty list.
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
+}
+/// One authoritative session todo (`manage_todo`), in the order the tool
+/// stored it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TodoDto {
+    /// The tool-supplied stable id, unique within the session.
+    pub id: String,
+    /// The task text, already validated and length-bounded by the tool.
+    pub text: String,
+    pub status: TodoStatusDto,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatusDto {
+    Pending,
+    InProgress,
+    Completed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageDto {
@@ -600,6 +690,11 @@ pub struct ChatStateDto {
     pub active_request_id: Option<RequestId>,
     pub active_turn_id: Option<TurnId>,
     pub pending_approval: Option<ApprovalDto>,
+    /// Phase 9 session slice: the active session's authoritative todo list.
+    /// Additive and serde-defaulted, so a pre-Phase-9 bootstrap loads with no
+    /// todos rather than failing. Per-session copies ride [`SessionDto`].
+    #[serde(default)]
+    pub todos: Vec<TodoDto>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -618,19 +713,45 @@ fn default_keybind_command_palette() -> String {
 fn default_keybind_toggle_chat() -> String {
     "Ctrl+L".into()
 }
+fn default_keybind_fuzzy_find() -> String {
+    "Ctrl+P".into()
+}
+fn default_keybind_save() -> String {
+    "Ctrl+S".into()
+}
+fn default_editor_font_size() -> u32 {
+    14
+}
+fn default_editor_tab_size() -> u32 {
+    4
+}
+fn default_editor_word_wrap() -> bool {
+    false
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsViewDto {
     pub reduced_motion: bool,
     pub theme: String,
     /// §7.1's rebindable pair, populated from `settings.keybinds` (§5.1) so a
-    /// user's egui-side rebind carries into the web shell. The other two
-    /// settings keybinds (`fuzzy_find`, `save`) are not exposed until their
-    /// slices use them.
+    /// user's egui-side rebind carries into the web shell.
     #[serde(default = "default_keybind_command_palette")]
     pub keybind_command_palette: String,
     #[serde(default = "default_keybind_toggle_chat")]
     pub keybind_toggle_chat: String,
+    /// The other two settings keybinds (`fuzzy_find`, `save`), now resolved by
+    /// the web shell's command keymap.
+    #[serde(default = "default_keybind_fuzzy_find")]
+    pub keybind_fuzzy_find: String,
+    #[serde(default = "default_keybind_save")]
+    pub keybind_save: String,
+    /// Editor preferences applied to CodeMirror at runtime.
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u32,
+    #[serde(default = "default_editor_tab_size")]
+    pub editor_tab_size: u32,
+    #[serde(default = "default_editor_word_wrap")]
+    pub editor_word_wrap: bool,
 }
 /// Phase Z2 serde defaults (§5.1 / §4.2): every field is defaulted so a
 /// partial or pre-Z2 `LayoutDto` JSON deserializes — the values are §1.1's
@@ -818,6 +939,31 @@ pub struct TextRangeDto {
     pub start: TextPosition,
     pub end: TextPosition,
 }
+/// The lifecycle of one language server as the bridge observes it.
+///
+/// `failed` carries the truthful reason in [`LspServerStateDto::error`] (a
+/// spawn failure, a dead process, or an unresolvable command). There is no
+/// "unknown" state: a server that has not started yet is absent from the
+/// bootstrap list rather than reported healthy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspServerHealth {
+    Starting,
+    Ready,
+    Failed,
+}
+/// One language server's live state (bootstrap and `LspServerStateChanged`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LspServerStateDto {
+    /// Wire language id (`rust`, `typescript`, `javascript`).
+    pub language: String,
+    /// Display/server name (`rust-analyzer`, `typescript-language-server`).
+    pub server: String,
+    pub state: LspServerHealth,
+    /// Why the server failed; `None` for starting/ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 /// The answer to `HoverAt`; `contents: None` means the server had nothing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HoverResultDto {
@@ -889,11 +1035,49 @@ pub struct BootstrapState {
     pub layout_constraints: LayoutConstraintsDto,
     pub git: GitStatusDto,
     pub diagnostics: Vec<DiagnosticDto>,
+    /// P1: live language-server state from the bridge store. Additive and
+    /// defaulted so pre-P1 payloads still deserialize.
+    #[serde(default)]
+    pub lsp_servers: Vec<LspServerStateDto>,
     pub feature_flags: FeatureFlagsDto,
     /// Phase 8: unmounted durable runs found in the open workspace. Live runs
     /// arrive as `workflow_*` events instead.
     #[serde(default)]
     pub workflows: Vec<WorkflowPersistedRunDto>,
+}
+
+/// The reply shape of `dispatch_command` (P1 state slice).
+///
+/// Additive strategy: the union is untagged, so every reply is still one JSON
+/// object. `GetBootstrapState` (and the two folder-open commands) keep the
+/// exact pre-existing `BootstrapState` shape, so a protocol client that reads
+/// those replies is unaffected. Commands that previously answered
+/// `unsupported_phase_slice`, plus event-backed mutations, may answer the
+/// small [`CommandAckDto`] instead: a client that only used the event stream
+/// (the shipped frontend) sees no difference, and a client that reads the
+/// reply can distinguish the two by `acknowledged`. `protocol_version` stays
+/// 1 because the variants are additive.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CommandResultDto {
+    Snapshot(Box<BootstrapState>),
+    Ack(CommandAckDto),
+}
+
+/// A mutation acknowledgement: the core identity, the log position after the
+/// mutation, and the session the engine now considers active (if any). It is
+/// intentionally much smaller than a `BootstrapState` (no tree walk, no
+/// libgit2 status, no transcript).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandAckDto {
+    pub protocol_version: u32,
+    pub core_instance_id: CoreInstanceId,
+    pub snapshot_sequence: u64,
+    /// Always true: the command was accepted and the mutation applied (or was
+    /// an idempotent no-op). Failures come back as `ProtocolErrorDto`.
+    pub acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 /// One durable run discovered under `.selora/workflow-runs/` at bootstrap.
@@ -903,29 +1087,38 @@ pub struct WorkflowPersistedRunDto {
     pub name: String,
     pub status: WorkflowStatus,
     /// False when the journal proved the run ambiguous (an interrupted command)
-    /// and replay would be unsafe, or when the run already completed.
+    /// and replay would be unsafe, when the tool-effect ledger proves a partial
+    /// effect, or when the run already completed.
     pub resumable: bool,
+    /// True when durable ledger evidence says a side effect may already have
+    /// applied. Resume stays unavailable; a separate explicit
+    /// `acknowledge_partial_effects` action is required.
+    #[serde(default)]
+    pub partial_effects: bool,
     /// Why resume is unavailable, or the terminal journal's error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Phase names from the run's terminal journal report, in first-marker
-    /// order. Empty when the journal does not carry a terminal report.
+    /// Phase names from the run's `phase_started` records, in first-marker
+    /// order. Empty when the journal does not carry them.
     #[serde(default)]
     pub phases: Vec<String>,
-    /// Steps from the run's terminal journal report.
+    /// Steps reconstructed from `engine_step_started`/`engine_step_finished`
+    /// records, with the phase recorded for each step.
     #[serde(default)]
     pub steps: Vec<WorkflowStepDto>,
-    /// Report items reconstructed from the journal's `engine_step_started`
-    /// inputs for successful report steps.
+    /// Report items reconstructed from `engine_report_item` records, keyed by
+    /// their run-wide ordinal. A journal that predates those records falls
+    /// back to the successful report steps' inputs.
     #[serde(default)]
     pub reports: Vec<WorkflowReportDto>,
-    /// Artifacts from the run's terminal journal report.
+    /// Artifacts reconstructed from `engine_artifact` records (or the terminal
+    /// report on an older journal), with their full content.
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifactDto>,
-    /// Receipt tokens recorded by the terminal report.
+    /// Receipt tokens: the terminal report's total, or the step records' sum.
     #[serde(default = "default_tokens")]
     pub tokens: u64,
-    /// Spend recorded by the terminal report.
+    /// Spend: the terminal report's total, or the step records' sum.
     #[serde(default = "default_cost_usd")]
     pub cost_usd: f64,
 }
@@ -1139,6 +1332,10 @@ pub struct WorkflowReportDto {
     pub item: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
+    /// The phase marker in effect when the item was reported, when known.
+    /// Additive: old payloads omit it and loaders may leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// One artifact produced by a run (`kind` is the producer's spelling, e.g.
@@ -1152,6 +1349,9 @@ pub struct WorkflowArtifactDto {
     pub kind: String,
     #[serde(default)]
     pub body: String,
+    /// The phase marker in effect when the artifact was produced, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// The ARCHITECTURE §18.1 workflow-level cost cap default ($5).
@@ -1375,6 +1575,9 @@ pub enum FrontendEvent {
     AgentStateChanged(AgentStateDto),
     AgentTurnDone(AgentTurnDoneDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
+    /// P1: one language server changed lifecycle (starting/ready/failed).
+    /// `failed` carries a truthful, typed reason for the UI.
+    LspServerStateChanged(LspServerStateDto),
     // Phase Z4b — the LSP request answers (each echoes the buffer so the
     // editor can drop a result for a tab that closed mid-flight).
     HoverResult(HoverResultDto),
@@ -1383,6 +1586,10 @@ pub enum FrontendEvent {
     FileTreeChanged(FileTreeDto),
     BufferSnapshot(BufferSnapshotDto),
     BufferChanged(BufferChangedDto),
+    /// P2 gap 3: a dirty tab's file changed on disk; local text is untouched.
+    BufferConflict(BufferConflictDto),
+    /// P2 gap 3: the tab's external-change marker is cleared.
+    BufferConflictCleared(BufferConflictClearedDto),
     SearchResults(SearchResultsDto),
     GitStatusChanged(GitStatusDto),
     GitDiffReady(GitDiffDto),
@@ -1399,7 +1606,19 @@ pub enum FrontendEvent {
     WorkflowArtifact(WorkflowArtifactEventDto),
     WorkflowApprovalNeeded(WorkflowApprovalNeededDto),
     WorkflowFinished(WorkflowFinishedDto),
+    // Phase 9 session slice: the `manage_todo` tool wrote a session's list.
+    // The full list is authoritative; the active session's copy is also in
+    // the next `ChatStateDto`. Additive (protocol_version stays 1).
+    SessionTodosChanged(SessionTodosDto),
     Error(ProtocolErrorDto),
+}
+
+/// The `manage_todo` write announcement. Carries the whole stored list so a
+/// concurrent switch cannot make the frontend apply another session's todos.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionTodosDto {
+    pub session_id: SessionId,
+    pub todos: Vec<TodoDto>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1604,18 +1823,25 @@ mod tests {
                     title: "Welcome".into(),
                     message_ids: vec![],
                     active: true,
+                    todos: vec![],
                 }],
                 messages: vec![],
                 active_session_id: None,
                 active_request_id: None,
                 active_turn_id: None,
                 pending_approval: None,
+                todos: vec![],
             },
             settings: SettingsViewDto {
                 reduced_motion: false,
                 theme: "selora-dark".into(),
                 keybind_command_palette: "Ctrl+Shift+P".into(),
                 keybind_toggle_chat: "Ctrl+L".into(),
+                keybind_fuzzy_find: "Ctrl+P".into(),
+                keybind_save: "Ctrl+S".into(),
+                editor_font_size: 14,
+                editor_tab_size: 4,
+                editor_word_wrap: false,
             },
             // §1.1: the Z1 stub values (280/220, agent dock open) were
             // diagnostic placeholders — Z2's fixture carries the table's
@@ -1639,6 +1865,7 @@ mod tests {
                 files: vec![],
             },
             diagnostics: vec![],
+            lsp_servers: vec![],
             feature_flags: FeatureFlagsDto {
                 agent: false,
                 git: false,
@@ -1657,6 +1884,42 @@ mod tests {
             serde_json::from_str::<BootstrapState>(&json).unwrap(),
             state
         );
+    }
+
+    /// P1 settings slice: a pre-P1 wire view (only the original four fields)
+    /// deserializes with the documented editor/keybind defaults.
+    #[test]
+    fn settings_view_old_wire_uses_editor_and_keybind_defaults() {
+        let view: SettingsViewDto = serde_json::from_str(
+            r#"{"reduced_motion":true,"theme":"light","keybind_command_palette":"F2","keybind_toggle_chat":"Alt+L"}"#,
+        )
+        .expect("pre-P1 view must load");
+        assert!(view.reduced_motion);
+        assert_eq!(view.theme, "light");
+        assert_eq!(view.keybind_command_palette, "F2");
+        assert_eq!(view.keybind_toggle_chat, "Alt+L");
+        assert_eq!(view.editor_font_size, 14);
+        assert_eq!(view.editor_tab_size, 4);
+        assert!(!view.editor_word_wrap);
+        assert_eq!(view.keybind_fuzzy_find, "Ctrl+P");
+        assert_eq!(view.keybind_save, "Ctrl+S");
+    }
+
+    /// The patch is additive: missing fields are `None`, so an old frontend
+    /// sending only a theme still parses.
+    #[test]
+    fn settings_patch_old_wire_is_additive() {
+        let patch: SettingsPatchDto =
+            serde_json::from_str(r#"{"theme":"light"}"#).expect("old patch parses");
+        assert_eq!(patch.theme.as_deref(), Some("light"));
+        assert!(patch.reduced_motion.is_none());
+        assert!(patch.editor_font_size.is_none());
+        assert!(patch.editor_tab_size.is_none());
+        assert!(patch.editor_word_wrap.is_none());
+        assert!(patch.keybind_command_palette.is_none());
+        assert!(patch.keybind_fuzzy_find.is_none());
+        assert!(patch.keybind_toggle_chat.is_none());
+        assert!(patch.keybind_save.is_none());
     }
     #[test]
     fn serde_rejects_invalid_ids_paths() {
@@ -1713,6 +1976,17 @@ mod tests {
             parsed,
             FrontendCommand::RevealInExplorer { path } if path.as_str() == "src/main.rs"
         ));
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::CloseFolder).unwrap(),
+            r#"{"type":"close_folder"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::LspRestart {
+                language: "rust".into()
+            })
+            .unwrap(),
+            r#"{"type":"lsp_restart","payload":{"language":"rust"}}"#
+        );
         assert_eq!(
             serde_json::to_string(&FrontendCommand::OpenFile {
                 path: WorkspacePath::new("src/main.rs").unwrap()
@@ -2214,6 +2488,68 @@ mod tests {
         assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
     #[test]
+    fn p9_todos_and_command_results_are_additive() {
+        // A pre-Phase-9 chat snapshot (no todos) still loads: the additive
+        // fields default to empty lists.
+        let chat = serde_json::from_str::<ChatStateDto>(
+            r#"{"sessions":[{"session_id":"s","title":"t","message_ids":[],"active":true}],
+                "messages":[],"active_session_id":null,"active_request_id":null,
+                "active_turn_id":null,"pending_approval":null}"#,
+        )
+        .unwrap();
+        assert!(chat.todos.is_empty());
+        assert!(chat.sessions[0].todos.is_empty());
+
+        // The full list round-trips, including the status spelling.
+        let with_todos = ChatStateDto {
+            todos: vec![TodoDto {
+                id: "t1".into(),
+                text: "build".into(),
+                status: TodoStatusDto::InProgress,
+            }],
+            ..chat.clone()
+        };
+        let json = serde_json::to_string(&with_todos).unwrap();
+        assert!(json.contains(r#""status":"in_progress""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ChatStateDto>(&json).unwrap(),
+            with_todos
+        );
+
+        // A full snapshot still parses as the snapshot arm; an ack parses as
+        // the small arm. The reply is always one JSON object.
+        let snapshot = sample();
+        let reply = CommandResultDto::Snapshot(Box::new(snapshot.clone()));
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandResultDto>(&json).unwrap(),
+            reply
+        );
+        let ack = CommandResultDto::Ack(CommandAckDto {
+            protocol_version: PROTOCOL_VERSION,
+            core_instance_id: cid("core-1"),
+            snapshot_sequence: 42,
+            acknowledged: true,
+            session_id: Some(sid("session-1")),
+        });
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.len() < serde_json::to_string(&snapshot).unwrap().len());
+        assert_eq!(
+            serde_json::from_str::<CommandResultDto>(&json).unwrap(),
+            ack
+        );
+
+        // The todo event rides the additive enum spelling.
+        let event = FrontendEvent::SessionTodosChanged(SessionTodosDto {
+            session_id: sid("session-1"),
+            todos: with_todos.todos.clone(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"session_todos_changed""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
     fn pre_z3_chat_completed_and_agent_request_load_with_defaults() {
         // A pre-Z3 ChatCompletedDto (no metering) deserializes with zeros.
         let completed = serde_json::from_str::<ChatCompletedDto>(
@@ -2414,16 +2750,18 @@ mod tests {
                 request_id: rid("request-2"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: false,
+                acknowledge_partial_effects: false,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false,"acknowledge_partial_effects":false}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowResume {
                 request_id: rid("request-5"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: true,
+                acknowledge_partial_effects: true,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true,"acknowledge_partial_effects":true}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowStop {
@@ -2492,6 +2830,7 @@ mod tests {
                     id: "report-1".into(),
                     item: "confirmed finding".into(),
                     artifact_id: Some("artifact-1".into()),
+                    phase: None,
                 },
             }),
             r#"{"type":"workflow_report","payload":{"run_id":"run-1","report":{"id":"report-1","item":"confirmed finding","artifact_id":"artifact-1"}}}"#,
@@ -2504,6 +2843,7 @@ mod tests {
                     title: "Review".into(),
                     kind: "markdown".into(),
                     body: "# Review".into(),
+                    phase: None,
                 },
             }),
             r##"{"type":"workflow_artifact","payload":{"run_id":"run-1","artifact":{"id":"artifact-1","title":"Review","kind":"markdown","body":"# Review"}}}"##,
@@ -2577,12 +2917,30 @@ mod tests {
         .unwrap();
         let FrontendCommand::WorkflowResume {
             allow_incomplete_asks,
+            request_id,
+            run_id,
+            acknowledge_partial_effects,
             ..
         } = legacy
         else {
             panic!("expected a resume command");
         };
         assert!(!allow_incomplete_asks);
+        assert!(!acknowledge_partial_effects);
+
+        // Resume carries no budget field: the confirmed grant is replayed, and
+        // a budget-exhausted run needs a new run, never a silent raise.
+        let encoded = serde_json::to_value(FrontendCommand::WorkflowResume {
+            request_id,
+            run_id,
+            allow_incomplete_asks,
+            acknowledge_partial_effects,
+        })
+        .unwrap();
+        assert!(
+            encoded["payload"].get("max_cost_usd").is_none(),
+            "resume must not accept a replacement budget: {encoded}"
+        );
 
         // A pre-history persisted run still loads: every additive field falls
         // to its empty/default value rather than failing the bootstrap.
@@ -2597,6 +2955,7 @@ mod tests {
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
+        assert!(!run.partial_effects);
     }
 
     #[test]
@@ -2622,5 +2981,43 @@ mod tests {
             validate_event_order(&event, PROTOCOL_VERSION, &cid("core-1"), Some(9)),
             Err(EventValidationError::StaleSequence { .. })
         ));
+    }
+
+    #[test]
+    fn p2_buffer_conflict_events_and_commands_keep_their_wire_names() {
+        let conflict = FrontendEvent::BufferConflict(BufferConflictDto {
+            buffer_id: bid("buffer-1"),
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        });
+        let json = serde_json::to_value(&conflict).unwrap();
+        assert_eq!(json["type"], "buffer_conflict");
+        assert_eq!(json["payload"]["buffer_id"], "buffer-1");
+        assert_eq!(json["payload"]["path"], "src/main.rs");
+
+        let cleared = FrontendEvent::BufferConflictCleared(BufferConflictClearedDto {
+            buffer_id: bid("buffer-1"),
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        });
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "buffer_conflict_cleared");
+
+        for (command, name) in [
+            (
+                FrontendCommand::ReloadBufferFromDisk {
+                    buffer_id: bid("buffer-1"),
+                },
+                "reload_buffer_from_disk",
+            ),
+            (
+                FrontendCommand::KeepBufferEdits {
+                    buffer_id: bid("buffer-1"),
+                },
+                "keep_buffer_edits",
+            ),
+        ] {
+            let json = serde_json::to_value(&command).unwrap();
+            assert_eq!(json["type"], name);
+            assert_eq!(json["payload"]["buffer_id"], "buffer-1");
+        }
     }
 }

@@ -28,7 +28,7 @@ use selora_workflow::{
 use tokio::sync::{mpsc, oneshot, Notify};
 use uuid::Uuid;
 
-use super::WorkflowHost;
+use super::{EffectRecorder, WorkflowHost};
 
 #[cfg(test)]
 pub(super) type StreamFactory = std::sync::Arc<dyn Fn() -> Box<dyn ChatStream> + Send + Sync>;
@@ -143,6 +143,7 @@ fn manifest() -> Vec<ToolSpec> {
 struct WorkflowTools {
     router: RouterToolRunner,
     control: Arc<ToolWorkerControl>,
+    effects: Option<Arc<EffectRecorder>>,
     #[cfg(test)]
     before_start: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -191,7 +192,7 @@ impl Drop for ToolJobGuard {
 }
 
 impl WorkflowTools {
-    fn new(context: ToolContext) -> Self {
+    fn new(context: ToolContext, effects: Option<Arc<EffectRecorder>>) -> Self {
         Self {
             control: Arc::new(ToolWorkerControl {
                 cancelled: AtomicBool::new(false),
@@ -199,6 +200,7 @@ impl WorkflowTools {
                 abort: context.abort.clone(),
             }),
             router: RouterToolRunner::new(context),
+            effects,
             #[cfg(test)]
             before_start: None,
         }
@@ -317,9 +319,48 @@ impl ToolRunner for WorkflowTools {
                 ToolResult::error(call.id, "tool disabled for workflow agents")
             });
         }
+        // Durable evidence before the effect: a crash after this append leaves
+        // `started` without `finished`, which the resume preflight refuses.
+        let effect = if selora_workflow::is_side_effecting_tool(&call.name) {
+            match self.effects.as_ref().map(|effects| effects.started(&call)) {
+                Some(Ok(effect_id)) => Some(effect_id),
+                Some(Err(error)) => {
+                    let id = call.id.clone();
+                    return Box::pin(async move {
+                        ToolResult::error(
+                            &id,
+                            format!("tool effect ledger refused the call: {error}"),
+                        )
+                    });
+                }
+                // No ledger configured: legacy hosts (and most tests) keep the
+                // existing behavior. Production always passes a ledger.
+                None => None,
+            }
+        } else {
+            None
+        };
         let id = call.id.clone();
+        let tool = call.name.clone();
+        let recorder = self.effects.clone();
         let operation = self.router.run_approved(call);
-        self.on_worker(operation, move |error| ToolResult::error(&id, error))
+        let future = self.on_worker(operation, move |error| ToolResult::error(&id, error));
+        Box::pin(async move {
+            let result = future.await;
+            if let (Some(recorder), Some(effect_id)) = (recorder, effect) {
+                if let Err(error) = recorder.finished(&effect_id, &result.id, &tool, result.ok) {
+                    // The tool already ran: never report success when its
+                    // completion could not be made durable.
+                    return ToolResult::error(
+                        &result.id,
+                        format!(
+                            "tool effect completion could not be recorded: {error}; completion is unconfirmed"
+                        ),
+                    );
+                }
+            }
+            result
+        })
     }
 
     fn abort(&mut self) {
@@ -494,7 +535,7 @@ impl WorkflowHost {
                 ..AgentToolSettings::default()
             },
         );
-        let tools = WorkflowTools::new(context);
+        let tools = WorkflowTools::new(context, self.tool_effects.clone());
         let chat = WorkflowChat::Client(ClientChatStream::new(SeloraClient::new(
             &self.config.base_url,
             &self.config.api_key,
@@ -881,6 +922,54 @@ mod tests {
     }
 
     #[test]
+    fn side_effecting_tool_writes_a_redacted_started_finished_ledger_pair() {
+        let root = tempfile::tempdir().expect("workspace");
+        let secret = "sk-live-SECRET-workflow-value";
+        let script = Script::new(vec![
+            tools(&[(
+                "w1",
+                "write_file",
+                json!({"path": "new.txt", "content": secret}),
+            )]),
+            answer("{}"),
+        ]);
+        let (handler, cards) = cards();
+        let ledger_path = root
+            .path()
+            .join(".selora/workflow-runs/run-1/tool-effects.jsonl");
+        let config = script
+            .config()
+            .with_approval_handler(handler)
+            .with_tool_effect_ledger(ledger_path.clone(), "run-1");
+        let host = WorkflowHost::new(root.path().to_owned(), config);
+        let result = ask(&host, "writer");
+        let (id, _) = cards.recv_timeout(WAIT).expect("card");
+        host.decide(id, AgentDecision::Approve).expect("approve");
+        result
+            .recv_timeout(WAIT)
+            .expect("unparked")
+            .expect("completed");
+
+        let ledger = fs::read_to_string(&ledger_path).expect("ledger");
+        let lines: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("record"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one started and one finished");
+        assert_eq!(lines[0]["phase"], "started");
+        assert_eq!(lines[1]["phase"], "finished");
+        assert_eq!(lines[0]["effect_id"], lines[1]["effect_id"]);
+        assert_eq!(lines[1]["ok"], true);
+        assert_eq!(lines[0]["tool"], "write_file");
+        assert_eq!(lines[0]["args"]["path"], "new.txt");
+        assert!(lines[0]["args"].get("content").is_none());
+        assert!(
+            !ledger.contains(secret),
+            "the ledger must never hold a file body: {ledger}"
+        );
+    }
+
+    #[test]
     fn approval_slot_exists_before_synchronous_callback_decides() {
         let root = tempfile::tempdir().expect("workspace");
         let script = Script::new(vec![write("w1", "new.txt"), answer("{}")]);
@@ -1047,10 +1136,13 @@ mod tests {
             .build()
             .expect("runtime");
         runtime.block_on(async {
-            let mut tools = WorkflowTools::new(ToolContext::new(
-                root.path(),
-                AgentToolSettings { auto_approve_commands: Vec::new(), ..AgentToolSettings::default() },
-            ));
+            let mut tools = WorkflowTools::new(
+                ToolContext::new(
+                    root.path(),
+                    AgentToolSettings { auto_approve_commands: Vec::new(), ..AgentToolSettings::default() },
+                ),
+                None,
+            );
             for name in ["run_workflow", "manage_todo"] {
                 let call = ToolCall { id: name.to_owned(), name: name.to_owned(), arguments: "{}".to_owned() };
                 assert!(matches!(tools.run(call.clone()).await, ToolOutcome::Ready(result) if !result.ok && result.content.contains("disabled")));

@@ -81,6 +81,10 @@ pub struct AgentTurnRequest {
 /// the frame loop never blocks on IO and the write is always of the text the
 /// user sees. The path names the write target.
 #[derive(Debug)]
+// The settings payload is the largest variant by design; boxing it would
+// ripple through every sender for no runtime benefit (this enum crosses
+// channels once per user action).
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     // File system
     OpenFile(PathBuf),
@@ -200,6 +204,9 @@ pub enum Effect {
 
 /// Messages workers send to the main thread (ARCHITECTURE.md §2.1).
 #[derive(Debug)]
+// Same rationale as `Effect`: the loaded settings snapshot is the outlier and
+// is delivered once at boot.
+#[allow(clippy::large_enum_variant)]
 pub enum AppMessage {
     // Selora
     ModelsLoaded(Result<Vec<Model>, SeloraError>),

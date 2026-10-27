@@ -129,18 +129,27 @@ export type WorkflowRun = {
   stop_error: string | null;
   /** Durable, non-completed run found at bootstrap. */
   resumable: boolean;
+  /**
+   * Durable ledger evidence that a tool effect may already exist. Resume is
+   * unavailable (`resumable: false`); the panel offers a separate explicit
+   * acknowledgement action.
+   */
+  partial_effects: boolean;
   resume_requested: boolean;
   resume_error: string | null;
   /**
    * Set when the backend refused a resume because unfinished asks would be
-   * dispatched again. The panel shows the warning and an explicit
-   * "Resume anyway" action; no retry happens without it.
+   * dispatched again, or because partial tool effects may already exist. The
+   * panel shows the warning and an explicit "Resume anyway" action; no retry
+   * happens without it.
    */
   resume_confirmation: WorkflowResumeConfirmation | null;
 };
 
 export type WorkflowResumeConfirmation = {
-  /** How many ask steps a resume would dispatch again. */
+  /** Which refusal this confirmation answers. */
+  kind: 'incomplete_asks' | 'partial_effects';
+  /** How many ask steps or effects the resume would replay. */
   count: number;
   /** The backend's refusal text, shown verbatim. */
   summary: string;
@@ -151,6 +160,8 @@ export type PersistedWorkflowRun = {
   name: string;
   status: 'pending' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'stopped';
   resumable: boolean;
+  /** Durable ledger evidence that a tool effect may already exist. */
+  partial_effects?: boolean;
   detail?: string | null;
   /** Terminal-journal history (additive; absent on pre-history bootstraps). */
   phases?: string[];
@@ -162,8 +173,14 @@ export type PersistedWorkflowRun = {
     agent?: string;
     detail?: string;
   }>;
-  reports?: Array<{ id: string; item: string; artifact_id?: string }>;
-  artifacts?: Array<{ id: string; title: string; kind: string; body: string }>;
+  reports?: Array<{ id: string; item: string; artifact_id?: string; phase?: string | null }>;
+  artifacts?: Array<{
+    id: string;
+    title: string;
+    kind: string;
+    body: string;
+    phase?: string | null;
+  }>;
   tokens?: number;
   cost_usd?: number;
 };
@@ -280,6 +297,7 @@ export type WorkflowStopHandler = (runId: string) => void | Promise<unknown>;
 export type WorkflowResumeHandler = (
   runId: string,
   allowIncompleteAsks: boolean,
+  acknowledgePartialEffects?: boolean,
 ) => void | Promise<unknown>;
 export type WorkflowApprovalHandler = (
   runId: string,
@@ -299,6 +317,11 @@ export type WorkflowsStore = {
   resume(runId: string): void;
   /** Confirm a refused resume: send it again with `allow_incomplete_asks`. */
   confirmResume(runId: string): void;
+  /**
+   * Acknowledge durable partial-effect evidence: a SEPARATE action that sends
+   * `acknowledge_partial_effects`. Never wired to ordinary Resume.
+   */
+  acknowledgePartialEffects(runId: string): void;
   /** Dismiss the incomplete-asks warning without resuming. */
   dismissResumeConfirmation(runId: string): void;
   applyEvent(event: WorkflowEvent): void;
@@ -442,7 +465,23 @@ function incompleteAsksConfirmation(error: unknown): WorkflowResumeConfirmation 
       ? candidate.message
       : 'Resume would dispatch unfinished ask steps again. Their tools may already have applied effects.';
   const match = /(\d+)\s+unfinished ask/i.exec(summary);
-  return { count: match ? Number(match[1]) : 0, summary };
+  return { kind: 'incomplete_asks', count: match ? Number(match[1]) : 0, summary };
+}
+
+/**
+ * Recognise the backend's `workflow_partial_effects` refusal. This is the
+ * separate acknowledgement: the ledger proved a tool effect may already have
+ * landed, so ordinary Resume is refused.
+ */
+function partialEffectsConfirmation(error: unknown): WorkflowResumeConfirmation | null {
+  if (!error || typeof error !== 'object') return null;
+  const candidate = error as { code?: unknown; message?: unknown };
+  if (candidate.code !== 'workflow_partial_effects') return null;
+  const summary =
+    typeof candidate.message === 'string' && candidate.message.trim() !== ''
+      ? candidate.message
+      : 'Earlier tool effects may already exist. Resume does not undo them.';
+  return { kind: 'partial_effects', count: 0, summary };
 }
 
 function upsertStep(
@@ -556,7 +595,11 @@ function replaceRun(
  * the panel calls `confirmResume`. Any other failure keeps the existing
  * resumable/error behavior.
  */
-function sendResume(runId: string, allowIncompleteAsks: boolean): void {
+function sendResume(
+  runId: string,
+  allowIncompleteAsks: boolean,
+  acknowledgePartialEffects = false,
+): void {
   if (!resumeHandler) return;
   replaceRun(runId, (current) => ({
     ...current,
@@ -568,23 +611,33 @@ function sendResume(runId: string, allowIncompleteAsks: boolean): void {
   const currentGeneration = generation;
   const failed = (error: unknown) => {
     if (generation !== currentGeneration) return;
-    const confirmation = allowIncompleteAsks ? null : incompleteAsksConfirmation(error);
-    replaceRun(runId, (current) => ({
-      ...current,
-      resume_requested: false,
-      resumable: true,
-      resume_error: confirmation ? null : transportError(error),
-      resume_confirmation: confirmation ?? current.resume_confirmation,
-    }));
+    const confirmation = acknowledgePartialEffects
+      ? null
+      : partialEffectsConfirmation(error) ?? incompleteAsksConfirmation(error);
+    replaceRun(runId, (current) => {
+      const partial = confirmation?.kind === 'partial_effects' ? true : current.partial_effects;
+      return {
+        ...current,
+        resume_requested: false,
+        resumable: partial ? false : true,
+        partial_effects: partial,
+        resume_error: confirmation ? null : transportError(error),
+        resume_confirmation: confirmation ?? current.resume_confirmation,
+      };
+    });
     notify();
   };
   try {
-    void Promise.resolve(resumeHandler(runId, allowIncompleteAsks)).then(() => {
+    void Promise.resolve(
+      resumeHandler(runId, allowIncompleteAsks, acknowledgePartialEffects),
+    ).then(() => {
       if (generation !== currentGeneration) return;
       // The command was accepted: the run is live now, so clear the resume
       // offer. The `started` event still owns request/origin metadata.
       replaceRun(runId, (current) =>
-        current.resumable ? { ...current, resumable: false } : current,
+        current.resumable || current.partial_effects
+          ? { ...current, resumable: false, partial_effects: false }
+          : current,
       );
       notify();
     }, failed);
@@ -656,7 +709,7 @@ export const workflowsStore: WorkflowsStore = {
         }));
         const reports: WorkflowReport[] = (run.reports ?? []).map((report) => ({
           id: report.id,
-          phase: null,
+          phase: report.phase && report.phase.trim() !== '' ? report.phase : null,
           text: report.item,
           artifact_id: report.artifact_id ?? null,
           at: null,
@@ -669,7 +722,7 @@ export const workflowsStore: WorkflowsStore = {
             title: artifact.title || null,
             content: markdown ? artifact.body : null,
             path: markdown ? null : artifact.body,
-            phase: null,
+            phase: artifact.phase && artifact.phase.trim() !== '' ? artifact.phase : null,
           };
         });
         const created = appendLog(
@@ -695,6 +748,8 @@ export const workflowsStore: WorkflowsStore = {
             stop_error: null,
             // A completed journal is history: never offer it for replay.
             resumable: completed ? false : run.resumable,
+            // Durable ledger evidence is additive; old bootstraps omit it.
+            partial_effects: completed ? false : run.partial_effects === true,
             resume_requested: false,
             resume_error: null,
             resume_confirmation: null,
@@ -725,9 +780,21 @@ export const workflowsStore: WorkflowsStore = {
 
   confirmResume(runId: string): void {
     const run = state.runs.find((item) => item.id === runId);
-    if (!run || !run.resumable || run.resume_requested || !resumeHandler) return;
+    if (!run || run.resume_requested || !resumeHandler) return;
     if (!run.resume_confirmation) return;
-    sendResume(runId, true);
+    // A partial-effect confirmation is shown while `resumable` is false (the
+    // bootstrap marks the run non-resumable). Only that explicit confirmation
+    // may proceed without it.
+    if (!run.resumable && run.resume_confirmation.kind !== 'partial_effects') return;
+    // The partial-effect acknowledgement also names the effects of an
+    // unfinished ask, so it subsumes `allow_incomplete_asks`.
+    sendResume(runId, true, run.partial_effects);
+  },
+
+  acknowledgePartialEffects(runId: string): void {
+    const run = state.runs.find((item) => item.id === runId);
+    if (!run || !run.partial_effects || run.resume_requested || !resumeHandler) return;
+    sendResume(runId, true, true);
   },
 
   dismissResumeConfirmation(runId: string): void {
@@ -767,6 +834,7 @@ export const workflowsStore: WorkflowsStore = {
                     max_cost_usd: event.max_cost_usd ?? run.max_cost_usd,
                     started_at: run.started_at ?? at,
                     resumable: false,
+                    partial_effects: false,
                     resume_requested: false,
                     resume_error: null,
                     resume_confirmation: null,
@@ -800,6 +868,7 @@ export const workflowsStore: WorkflowsStore = {
             stop_requested: false,
             stop_error: null,
             resumable: false,
+            partial_effects: false,
             resume_requested: false,
             resume_error: null,
             resume_confirmation: null,

@@ -4,10 +4,12 @@ import { makeBootstrap } from '../../testing/fixtures';
 
 const harness = vi.hoisted(() => ({
   updateSettings: vi.fn(),
+  restartLsp: vi.fn(),
 }));
 
 vi.mock('../../bridge/bridge', () => ({
   updateSettings: harness.updateSettings,
+  restartLsp: harness.restartLsp,
 }));
 
 import { SettingsPanelView } from './SettingsPanelView';
@@ -16,6 +18,7 @@ describe('SettingsPanelView persistence wiring', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     harness.updateSettings.mockResolvedValue(undefined);
+    harness.restartLsp.mockResolvedValue(undefined);
   });
 
   it('sends supported toggle changes through the bridge with the bootstrap context', async () => {
@@ -73,9 +76,12 @@ describe('SettingsPanelView persistence wiring', () => {
     render(<SettingsPanelView bootstrap={makeBootstrap()} />);
 
     expect(
-      screen.getByText('Theme and reduced motion save automatically through Rust.'),
+      screen.getByText(
+        'Theme, reduced motion, editor preferences, and the four keybinds save automatically through Rust.',
+      ),
     ).toBeTruthy();
-    expect(screen.getByText('The other controls are read-only in this build.')).toBeTruthy();
+    expect(screen.getByText('Disabled fields have no backend setting in this build.')).toBeTruthy();
+    expect(screen.queryByText('The other controls are read-only in this build.')).toBeNull();
     expect(screen.queryByText('Settings editing lands in a later slice.')).toBeNull();
   });
 
@@ -87,7 +93,7 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(provider.value).toBe('');
     expect(provider.options).toHaveLength(1);
     expect(provider.options[0].textContent).toBe('—');
-    expect(provider.title).toContain('no backend settings field');
+    expect(provider.title).toContain('no writable backend settings field');
 
     const model = screen.getByLabelText('Chat Model') as HTMLSelectElement;
     expect(model.disabled).toBe(true);
@@ -100,18 +106,18 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(temperature.disabled).toBe(true);
     expect(temperature.value).toBe('');
     expect(temperature.placeholder).toBe('—');
-    expect(temperature.title).toContain('no backend settings field');
+    expect(temperature.title).toContain('no writable backend settings field');
 
     const maxTokens = screen.getByLabelText('Max Output Tokens') as HTMLInputElement;
     expect(maxTokens.disabled).toBe(true);
     expect(maxTokens.value).toBe('');
     expect(maxTokens.placeholder).toBe('—');
-    expect(maxTokens.title).toContain('no backend settings field');
+    expect(maxTokens.title).toContain('no writable backend settings field');
 
     const streaming = screen.getByRole('checkbox', { name: 'Stream Completions' }) as HTMLInputElement;
     expect(streaming.disabled).toBe(true);
     expect(streaming.checked).toBe(false);
-    expect(streaming.title).toContain('no backend settings field');
+    expect(streaming.title).toContain('no writable backend settings field');
   });
 
   it('shows the active model read-only when the bootstrap reports one', () => {
@@ -128,29 +134,95 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(model.title).toContain('reported by the connected gateway');
   });
 
-  it('does not present editor defaults that the settings protocol never exposes', () => {
+  it('renders real editor controls and persists font size, tab size, and word wrap', async () => {
     render(<SettingsPanelView bootstrap={makeBootstrap()} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Editor' }));
 
-    for (const label of [
-      'Font family value',
-      'Font size value',
-      'Tab size value',
-      'Word wrap value',
-      'Minimap value',
-      'Line numbers value',
-    ]) {
-      const value = screen.getByLabelText(label);
-      expect(value.textContent).toBe('—');
-      expect(value.getAttribute('title')).toContain('no backend settings field');
-    }
+    const font = screen.getByLabelText('Font Size (px)') as HTMLInputElement;
+    expect(font.disabled).toBe(false);
+    expect(font.value).toBe('14');
+    expect(font.min).toBe('8');
+    expect(font.max).toBe('32');
 
-    expect(screen.queryByText('13.5')).toBeNull();
-    expect(screen.queryByText('2 spaces')).toBeNull();
-    expect(screen.queryByRole('checkbox', { name: 'Word Wrap' })).toBeNull();
-    expect(screen.queryByRole('checkbox', { name: 'Format On Save' })).toBeNull();
-    expect(screen.queryByRole('checkbox', { name: 'Minimap' })).toBeNull();
+    fireEvent.change(font, { target: { value: '18' } });
+    fireEvent.blur(font);
+    await waitFor(() =>
+      expect(harness.updateSettings).toHaveBeenCalledWith(
+        { editor_font_size: 18 },
+        expect.objectContaining({ core_instance_id: 'core-0001' }),
+      ),
+    );
+
+    const tab = screen.getByLabelText('Tab Size') as HTMLSelectElement;
+    expect(tab.value).toBe('4');
+    expect(Array.from(tab.options).map((option) => option.value)).toEqual([
+      '1', '2', '3', '4', '5', '6', '7', '8',
+    ]);
+    fireEvent.change(tab, { target: { value: '2' } });
+    await waitFor(() =>
+      expect(harness.updateSettings).toHaveBeenCalledWith(
+        { editor_tab_size: 2 },
+        expect.anything(),
+      ),
+    );
+
+    const wrap = screen.getByRole('checkbox', { name: 'Word Wrap' }) as HTMLInputElement;
+    expect(wrap.checked).toBe(false);
+    fireEvent.click(wrap);
+    await waitFor(() =>
+      expect(harness.updateSettings).toHaveBeenCalledWith(
+        { editor_word_wrap: true },
+        expect.anything(),
+      ),
+    );
+
+    // The old placeholder rows that lied about a read-only editor are gone.
+    expect(screen.queryByLabelText('Font size value')).toBeNull();
+    expect(screen.queryByText('—')).toBeNull();
+  });
+
+  it('keeps an invalid font size local and shows an error instead of saving it', async () => {
+    render(<SettingsPanelView bootstrap={makeBootstrap()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Editor' }));
+    const font = screen.getByLabelText('Font Size (px)');
+    fireEvent.change(font, { target: { value: '99' } });
+    fireEvent.blur(font);
+
+    expect(
+      screen.getByText('Font size must be a whole number from 8 to 32.'),
+    ).toBeTruthy();
+    expect(harness.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it('persists a valid keybind rebind and rejects garbage without sending it', async () => {
+    render(<SettingsPanelView bootstrap={makeBootstrap()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Keymap' }));
+
+    const save = screen.getByLabelText('Save') as HTMLInputElement;
+    expect(save.value).toBe('Ctrl+S');
+    fireEvent.change(save, { target: { value: 'ctrl + alt + s' } });
+    fireEvent.blur(save);
+    await waitFor(() =>
+      expect(harness.updateSettings).toHaveBeenCalledWith(
+        { keybind_save: 'Ctrl+Alt+S' },
+        expect.anything(),
+      ),
+    );
+
+    harness.updateSettings.mockClear();
+    const palette = screen.getByLabelText('Command Palette') as HTMLInputElement;
+    fireEvent.change(palette, { target: { value: 'Ctrl+Shift+P+L' } });
+    fireEvent.blur(palette);
+
+    expect(
+      screen.getByText(
+        'Command Palette must be one chord such as Ctrl+S. "Ctrl+Shift+P+L" is not valid.',
+      ),
+    ).toBeTruthy();
+    expect(harness.updateSettings).not.toHaveBeenCalled();
   });
 
   it('builds the keymap from the command registry and advertises no unhandled chords', () => {
@@ -158,12 +230,14 @@ describe('SettingsPanelView persistence wiring', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Keymap' }));
 
-    // Real registry commands, including the rebindable pair read from settings.
-    expect(screen.getByText('Toggle Agent Dock')).toBeTruthy();
+    // Real registry commands, including all four rebindable chords read from settings.
+    expect(screen.getAllByText('Toggle Agent Dock').length).toBeGreaterThan(0);
     expect(screen.getByText('Toggle Primary Sidebar')).toBeTruthy();
     expect(screen.getByText('Ctrl+Shift+P')).toBeTruthy();
     expect(screen.getByText('Ctrl+L')).toBeTruthy();
     expect(screen.getByText('Ctrl+B')).toBeTruthy();
+    expect(screen.getByText('Ctrl+S')).toBeTruthy();
+    expect(screen.getByText('Ctrl+P')).toBeTruthy();
     // Commands with no shortcut render an em dash instead of an invented chord.
     expect(screen.getByText('Save Layout')).toBeTruthy();
 
@@ -171,7 +245,6 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(screen.queryByText('Go to file')).toBeNull();
     expect(screen.queryByText('Format document')).toBeNull();
     expect(screen.queryByText('Git: Commit staged changes')).toBeNull();
-    expect(screen.queryByText('Ctrl+P')).toBeNull();
     expect(screen.queryByText('Shift+Alt+F')).toBeNull();
     expect(screen.queryByText('Ctrl+Enter')).toBeNull();
   });
@@ -187,5 +260,34 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(Array.from(accent.options).map((option) => option.value)).toEqual(['']);
     expect(screen.queryByText(/emerald/i)).toBeNull();
     expect(screen.queryByText(/22c55e/i)).toBeNull();
+  });
+
+  it('shows the truthful LSP state and restarts a server through the bridge', async () => {
+    const bootstrap = makeBootstrap({
+      lsp_servers: [
+        { language: 'rust', server: 'rust-analyzer', state: 'ready' },
+        {
+          language: 'typescript',
+          server: 'typescript-language-server',
+          state: 'failed',
+          error: 'spawn failed: not found',
+        },
+      ],
+    });
+    render(<SettingsPanelView bootstrap={bootstrap} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Editor' }));
+
+    expect(screen.getByTestId('lsp-state-rust').textContent).toContain('ready');
+    expect(screen.getByTestId('lsp-state-typescript').textContent).toContain(
+      'failed: spawn failed: not found',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restart rust-analyzer' }));
+    await waitFor(() =>
+      expect(harness.restartLsp).toHaveBeenCalledWith(
+        'rust',
+        expect.objectContaining({ core_instance_id: 'core-0001' }),
+      ),
+    );
   });
 });

@@ -508,6 +508,11 @@ impl Manager {
         if self.sessions.contains_key(&language) {
             return;
         }
+        if !self.config.registry.enabled() {
+            // The settings master switch is off: stay silent rather than
+            // claiming the server is missing.
+            return;
+        }
         let Some(spec) = self.config.registry.resolve(language) else {
             if self.missing_notified.insert(language) {
                 self.send(LspEvent::ServerMissing { server: language });

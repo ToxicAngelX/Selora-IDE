@@ -129,6 +129,7 @@ fn execute(
     host: Arc<TestHost>,
     resume: bool,
     allow_incomplete_asks: bool,
+    acknowledge_partial_effects: bool,
 ) -> (Result<WorkflowOutcome, WorkflowError>, Vec<WorkflowEvent>) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&events);
@@ -142,6 +143,7 @@ fn execute(
             run_id: id.clone(),
             resume,
             allow_incomplete_asks,
+            acknowledge_partial_effects,
         },
     );
     let recorded_events = events.lock().unwrap().clone();
@@ -162,7 +164,7 @@ fn crash_on_ask(workspace: &Workspace, id: &RunId) -> WorkflowSpec {
         ..TestHost::default()
     });
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute(workspace, id, &spec, host, false, false)
+        execute(workspace, id, &spec, host, false, false, false)
     }));
     assert!(crashed.is_err(), "the simulated crash must unwind");
     spec
@@ -194,7 +196,15 @@ fn default_resume_is_refused_before_any_effect() {
     let before = fs::read(workspace.journal(&id)).unwrap();
 
     let host = Arc::new(TestHost::default());
-    let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, false);
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host),
+        true,
+        false,
+        false,
+    );
     let error = result.unwrap_err();
     assert_eq!(error, WorkflowError::IncompleteAsks { count: 1 });
     assert!(
@@ -222,7 +232,7 @@ fn explicit_allow_redispatches_exactly_once_with_fresh_host_calls() {
     let spec = crash_on_ask(&workspace, &id);
 
     let host = Arc::new(TestHost::default());
-    let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, true);
+    let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, true, false);
     let outcome = result.unwrap();
     assert_eq!(outcome.report.status, selora_workflow::RunStatus::Completed);
     assert_eq!(
@@ -268,13 +278,22 @@ fn completed_asks_are_not_listed_and_completed_runs_still_cannot_resume() {
         Arc::new(TestHost::default()),
         false,
         false,
+        false,
     );
     result.unwrap();
 
     assert!(incomplete_asks(workspace.path(), &id).unwrap().is_empty());
 
     let host = Arc::new(TestHost::default());
-    let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, false);
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host),
+        true,
+        false,
+        false,
+    );
     assert!(result
         .unwrap_err()
         .to_string()
@@ -302,7 +321,15 @@ fn damaged_interior_journal_is_refused_even_when_asks_were_allowed() {
 
     for allow in [false, true] {
         let host = Arc::new(TestHost::default());
-        let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, allow);
+        let (result, events) = execute(
+            &workspace,
+            &id,
+            &spec,
+            Arc::clone(&host),
+            true,
+            allow,
+            false,
+        );
         let error = result.unwrap_err();
         assert!(
             error.to_string().contains("damaged interior record"),
@@ -352,7 +379,15 @@ fn malformed_journal_never_masquerades_as_no_asks() {
         );
 
         let host = Arc::new(TestHost::default());
-        let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, false);
+        let (result, events) = execute(
+            &workspace,
+            &id,
+            &spec,
+            Arc::clone(&host),
+            true,
+            false,
+            false,
+        );
         assert!(result.is_err());
         assert_eq!(host.asks.load(Ordering::SeqCst), 0);
         assert!(events.is_empty());
@@ -394,7 +429,15 @@ fn changed_confirmation_identity_is_refused_by_preflight() {
     );
 
     let host = Arc::new(TestHost::default());
-    let (result, events) = execute(&workspace, &id, &spec, Arc::clone(&host), true, false);
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host),
+        true,
+        false,
+        false,
+    );
     assert!(result.is_err());
     assert_eq!(host.asks.load(Ordering::SeqCst), 0);
     assert!(events.is_empty());
@@ -419,4 +462,63 @@ fn torn_tail_is_still_recovered_by_the_preflight() {
         }]
     );
     assert!(run_dir(workspace.path(), &id).join("spec.json").is_file());
+}
+
+#[test]
+fn budget_exhausted_run_is_refused_before_any_effect() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = prepare(
+        "budget",
+        r#"agent("a").ask("one"); agent("a").ask("two"); agent("a").ask("three");"#,
+        1.5,
+    )
+    .unwrap()
+    .spec();
+    let first_host = Arc::new(TestHost::default());
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&first_host),
+        false,
+        false,
+        false,
+    );
+    assert!(matches!(result, Err(WorkflowError::BudgetExceeded { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(WorkflowEvent::Finished { report })
+            if report.status == selora_workflow::RunStatus::BudgetExceeded
+    ));
+    assert_eq!(first_host.asks.load(Ordering::SeqCst), 2);
+
+    let path = workspace.journal(&id);
+    let before = fs::read(&path).unwrap();
+    let resume_host = Arc::new(TestHost::default());
+    let (result, events) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&resume_host),
+        true,
+        false,
+        false,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowError::BudgetExceeded {
+                limit: 1.5,
+                spent: 2.0
+            })
+        ),
+        "a spent grant is never resumed or raised"
+    );
+    assert!(
+        events.is_empty(),
+        "the refusal happens before the Run event"
+    );
+    assert_eq!(resume_host.asks.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&path).unwrap(), before, "journal was not touched");
 }

@@ -74,11 +74,11 @@ function toTerminalRunStatus(status: ProtocolWorkflowStatus): TerminalRunStatus 
  *   workflow_step           → { kind: 'step', run_id, step_id: step.id, phase,
  *                               label, agent, status, detail }
  *   workflow_report         → { kind: 'report', run_id, report_id: report.id,
- *                               text: report.item, phase: null,
+ *                               text: report.item, phase: report.phase ?? null,
  *                               artifact_id: report.artifact_id ?? null }
  *   workflow_artifact       → { kind: 'artifact', run_id, artifact_id: artifact.id,
  *                               artifact_kind: 'markdown' | 'file',
- *                               title, content, path, phase: null }
+ *                               title, content, path, phase: artifact.phase ?? null }
  *   workflow_approval_needed→ { kind: 'approval', run_id, approval_id,
  *                               request_id, state: 'pending', summary, path_or_command, diff_or_input,
  *                               step_id: null, tool_name: null }
@@ -86,9 +86,9 @@ function toTerminalRunStatus(status: ProtocolWorkflowStatus): TerminalRunStatus 
  *                               cost_usd, error }
  *
  * Field gaps in the protocol (documented rather than invented): `started`
- * carries no phase plan, reports carry no `phase`, artifacts carry no `phase`
- * and overload `kind`/`body`, approvals carry no `step_id`/`tool_name`, and
+ * carries no phase plan, approvals carry no `step_id`/`tool_name`, and
  * `finished.max_cost_usd` is not surfaced by the store's finished reducer.
+ * Report and artifact phases are additive: absent means unknown, not "".
  */
 export function toWorkflowStoreEvent(event: FrontendEvent): WorkflowStoreEvent | null {
   switch (event.type) {
@@ -136,7 +136,7 @@ export function toWorkflowStoreEvent(event: FrontendEvent): WorkflowStoreEvent |
         run_id: event.payload.run_id,
         report_id: report.id,
         text: report.item,
-        phase: null,
+        phase: report.phase && report.phase.trim() !== '' ? report.phase : null,
         artifact_id: report.artifact_id ?? null,
       };
     }
@@ -154,7 +154,7 @@ export function toWorkflowStoreEvent(event: FrontendEvent): WorkflowStoreEvent |
         // The protocol has no separate path field: for file artifacts the
         // body is the workspace-relative path.
         path: markdown ? null : artifact.body,
-        phase: null,
+        phase: artifact.phase && artifact.phase.trim() !== '' ? artifact.phase : null,
       };
     }
 
@@ -226,7 +226,7 @@ export function installWorkflowHandlers(): void {
     return workflowDecision(requestId, approvalId, decision, ctx);
   });
 
-  workflowsStore.setResumeHandler((runId, allowIncompleteAsks) => {
+  workflowsStore.setResumeHandler((runId, allowIncompleteAsks, acknowledgePartialEffects) => {
     // A journal-recovered run has no live origin yet. The backend resolves the
     // run id only inside the currently open workspace, so binding here cannot
     // resume a same-id run from a different project.
@@ -240,6 +240,6 @@ export function installWorkflowHandlers(): void {
     )) {
       throw new Error('Switch back to the workspace that started this workflow.');
     }
-    return resumeWorkflow(runId, { ...ctx, session_id: null }, allowIncompleteAsks).promise;
+    return resumeWorkflow(runId, { ...ctx, session_id: null }, allowIncompleteAsks, acknowledgePartialEffects).promise;
   });
 }

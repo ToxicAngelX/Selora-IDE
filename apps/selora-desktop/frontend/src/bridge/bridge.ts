@@ -16,7 +16,16 @@ export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
 export type TextPosition = { line: number; utf16_column: number };
 export type Selection = { anchor: TextPosition; active: TextPosition; version: number };
 export type FileTreeNode = { path: string; name: string; kind: 'directory' | 'file'; children: FileTreeNode[] };
-export type Approval = { approval_id: Id; request_id: Id; turn_id: Id; session_id: Id; summary: string; can_approve_all_this_turn: boolean };
+export type Approval = {
+  approval_id: Id;
+  request_id: Id;
+  turn_id: Id;
+  session_id: Id;
+  summary: string;
+  can_approve_all_this_turn: boolean;
+  /** Phase 9a additive: a parked question / plan survives a bootstrap replay. */
+  decision_prompt?: AgentDecisionPrompt;
+};
 export type Diagnostic = { path: string; line: number; column: number; severity: 'error' | 'warning' | 'info' | 'hint'; message: string };
 
 // --- Z2 additions (ARCHITECTURE §2.5) ---------------------------------------
@@ -63,12 +72,24 @@ export type SettingsView = {
   theme: string;
   keybind_command_palette: string;
   keybind_toggle_chat: string;
+  keybind_fuzzy_find: string;
+  keybind_save: string;
+  editor_font_size: number;
+  editor_tab_size: number;
+  editor_word_wrap: boolean;
 };
 
 /** The backend-supported writable subset of `SettingsView` (SettingsPatchDto). */
 export type SettingsPatch = {
   reduced_motion?: boolean;
   theme?: string;
+  editor_font_size?: number;
+  editor_tab_size?: number;
+  editor_word_wrap?: boolean;
+  keybind_command_palette?: string;
+  keybind_fuzzy_find?: string;
+  keybind_toggle_chat?: string;
+  keybind_save?: string;
 };
 
 // --- DTOs referenced by the full FrontendEvent union ------------------------
@@ -77,6 +98,10 @@ export type BufferSnapshot = {
   buffer_id: Id; path: string; language: string; text: string; version: number;
   dirty: boolean; selection: Selection | null;
 };
+/** P2 gap 3: a dirty buffer's file also changed on disk; local text is intact. */
+export type BufferConflict = { buffer_id: Id; path: string };
+/** P2 gap 3: the external-change marker for this buffer is cleared. */
+export type BufferConflictCleared = { buffer_id: Id; path: string };
 export type TextChange = { start: TextPosition; end: TextPosition; replacement: string };
 /** Where the user was when the turn was sent. Reference only, never file text. */
 export type EditorContextDto = {
@@ -89,14 +114,38 @@ export type EditorContextDto = {
 export type Model = { id: string; display_name: string; available: boolean };
 export type SearchQuery = { query: string; case_sensitive: boolean; whole_word: boolean; use_regex: boolean };
 export type SearchHit = { path: string; line: number; column: number; preview: string };
-export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean };
+export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean; todos?: TodoDto[] };
 export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
+/**
+ * The authoritative `manage_todo` list (session-scoped). The backend sends
+ * `text`; `title` is the Phase 9a spelling older payloads and local plans
+ * carry, and `assigned_subagent` is additive.
+ */
+export type TodoDto = {
+  id: string;
+  text?: string;
+  title?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  session_id?: Id;
+  assigned_subagent?: string;
+};
+/** Phase 9a alias for the same authoritative todo row. */
+export type ChatTodoDto = TodoDto;
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
 export type CompletionResult = { buffer_id: Id; items: CompletionItem[] };
 export type DefinitionLocation = { path: string; line: number; utf16_column: number };
 export type DefinitionResult = { buffer_id: Id; locations: DefinitionLocation[] };
+/** P1 — one language server's live lifecycle. */
+export type LspServerHealth = 'starting' | 'ready' | 'failed';
+export type LspServerState = {
+  language: string;
+  server: string;
+  state: LspServerHealth;
+  /** The truthful failure reason; only present when state is `failed`. */
+  error?: string | null;
+};
 
 export type BootstrapState = {
   protocol_version: number;
@@ -116,6 +165,8 @@ export type BootstrapState = {
     active_request_id: Id | null;
     active_turn_id: Id | null;
     pending_approval: Approval | null;
+/** Phase 9a additive authoritative todos (see `ChatTodoDto`). */
+    todos?: ChatTodoDto[];
   };
   settings: SettingsView;
   layout: Layout;
@@ -127,6 +178,9 @@ export type BootstrapState = {
     files?: { path: string; staged: boolean; worktree: boolean }[];
   };
   diagnostics: Diagnostic[];
+  /** P1: live language-server state (empty until the first file of a
+   * supported language opens). */
+  lsp_servers: LspServerState[];
   feature_flags: { agent: boolean; git: boolean; search: boolean; editor: boolean; later_slices: string[] };
   workflows?: WorkflowPersistedRun[];
 };
@@ -186,6 +240,61 @@ export type ToolResultPayload = {
   is_err: boolean;
 };
 
+/**
+ * Phase 9a additive decision prompts (ROADMAP §"Phase 9", task 9a).
+ *
+ * `approval_needed` already parks the turn; a question or plan rides the same
+ * card and the same `agent_decision` route, with a richer payload. The Rust
+ * `ApprovalNeededDto` does not carry this field until 9b/9c land, so it is
+ * optional here and the card only renders when the backend actually sends it.
+ * Nothing is invented on the frontend when it is absent.
+ */
+export type AgentQuestionOption = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
+export type AgentQuestionPrompt = {
+  kind: 'question';
+  header?: string;
+  question: string;
+  options: AgentQuestionOption[];
+  /** When true (or when `options` is empty) the card offers a free-text answer. */
+  allow_free_text?: boolean;
+  free_text_placeholder?: string;
+};
+
+export type AgentPlanStep = {
+  title: string;
+  detail?: string;
+};
+
+export type AgentPlanPrompt = {
+  kind: 'plan';
+  title?: string;
+  summary?: string;
+  steps: AgentPlanStep[];
+};
+
+export type AgentDecisionPrompt = AgentQuestionPrompt | AgentPlanPrompt;
+
+/** The additive answer attached to an `AgentDecision` for a prompt card. */
+export type AgentDecisionResolution =
+  | {
+      kind: 'question';
+      /** The chosen option id, when the question offered options. */
+      option_id?: string;
+      /** The free-text answer, when the user typed one. */
+      text?: string;
+    }
+  | {
+      kind: 'plan';
+      decision: 'approve' | 'request_changes';
+      /** Required for `request_changes`; the revision note for the agent. */
+      feedback?: string;
+    };
+
 export type ApprovalNeededPayload = {
   request_id: Id;
   session_id: Id;
@@ -199,6 +308,8 @@ export type ApprovalNeededPayload = {
    * a workflow card; absent on every other card and on pre-8 payloads.
    */
   workflow?: WorkflowApproval;
+  /** Phase 9a: structured question / plan review on the same park channel. */
+  prompt?: AgentDecisionPrompt;
 };
 
 export type AgentStateChangedPayload = {
@@ -249,9 +360,22 @@ export type WorkflowStep = {
   detail?: string;
 };
 
-export type WorkflowReport = { id: string; item: string; artifact_id?: string };
+export type WorkflowReport = {
+  id: string;
+  item: string;
+  artifact_id?: string;
+  /** Phase marker in effect when the item was reported, when known. */
+  phase?: string;
+};
 
-export type WorkflowArtifact = { id: string; title: string; kind: string; body: string };
+export type WorkflowArtifact = {
+  id: string;
+  title: string;
+  kind: string;
+  body: string;
+  /** Phase marker in effect when the artifact was produced, when known. */
+  phase?: string;
+};
 
 /** The full run snapshot (WorkflowRunDto) — the panel's resume/start state. */
 export type WorkflowRun = {
@@ -333,27 +457,41 @@ export type FrontendCommand =
   | { type: 'send_chat'; payload: { request_id: Id; request: { session_id: Id; message: string; model_id: string | null } } }
   | { type: 'stop_chat'; payload: { request_id: Id } }
   | { type: 'send_agent'; payload: { request_id: Id; request: { session_id: Id; prompt: string; model_id: string | null; mode: AgentMode; reasoning_effort?: 'quick' | 'standard' | 'max'; system_instructions?: string; temperature?: number; editor_context?: EditorContextDto } } }
-  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
+  | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision; resolution?: AgentDecisionResolution } }
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
+  | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'open_folder_at'; payload: { root: string } }
+  | { type: 'close_folder' }
   | { type: 'refresh_tree' }
   | { type: 'reveal_in_explorer'; payload: { path: string } }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
+  | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'save_buffer'; payload: { buffer_id: Id } }
+  | { type: 'reload_buffer_from_disk'; payload: { buffer_id: Id } }
+  | { type: 'keep_buffer_edits'; payload: { buffer_id: Id } }
   | { type: 'apply_editor_change'; payload: { buffer_id: Id; version: number; changes: TextChange[] } }
   | { type: 'set_selection'; payload: { buffer_id: Id; selection: Selection } }
   | { type: 'hover_at'; payload: { buffer_id: Id; position: TextPosition } }
   | { type: 'definition_at'; payload: { buffer_id: Id; position: TextPosition } }
   | { type: 'completion_at'; payload: { buffer_id: Id; position: TextPosition } }
+  | { type: 'lsp_restart'; payload: { language: string } }
   | { type: 'search'; payload: { query: SearchQuery } }
   | { type: 'git_stage'; payload: { path: string } }
   | { type: 'git_unstage'; payload: { path: string } }
   | { type: 'git_commit'; payload: { message: string } }
   | { type: 'open_git_diff'; payload: { path: string } }
   | { type: 'workflow_run'; payload: { request_id: Id; spec: WorkflowSpec } }
-  | { type: 'workflow_resume'; payload: { request_id: Id; run_id: Id; allow_incomplete_asks?: boolean } }
+  | {
+      type: 'workflow_resume';
+      payload: {
+        request_id: Id;
+        run_id: Id;
+        allow_incomplete_asks?: boolean;
+        acknowledge_partial_effects?: boolean;
+      };
+    }
   | { type: 'workflow_stop'; payload: { request_id: Id } }
   | { type: 'workflow_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
   | { type: 'open_external'; payload: { url: string } };
@@ -382,12 +520,15 @@ export type FrontendEvent =
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
+  | { type: 'lsp_server_state_changed'; payload: LspServerState }
   | { type: 'hover_result'; payload: HoverResult }
   | { type: 'completion_result'; payload: CompletionResult }
   | { type: 'definition_result'; payload: DefinitionResult }
   | { type: 'file_tree_changed'; payload: { root: FileTreeNode | null } }
   | { type: 'buffer_snapshot'; payload: BufferSnapshot }
   | { type: 'buffer_changed'; payload: { buffer_id: Id; version: number; changes: TextChange[] } }
+  | { type: 'buffer_conflict'; payload: BufferConflict }
+  | { type: 'buffer_conflict_cleared'; payload: BufferConflictCleared }
   | { type: 'search_results'; payload: { request_id: Id | null; query: SearchQuery; hits: SearchHit[] } }
   | {
       type: 'git_status_changed';
@@ -409,6 +550,7 @@ export type FrontendEvent =
   | { type: 'workflow_artifact'; payload: WorkflowArtifactPayload }
   | { type: 'workflow_approval_needed'; payload: WorkflowApprovalNeededPayload }
   | { type: 'workflow_finished'; payload: WorkflowFinishedPayload }
+  | { type: 'session_todos_changed'; payload: { session_id: Id; todos: TodoDto[] } }
   | { type: 'toast'; payload: { severity: ToastSeverity; message: string } }
   | { type: 'error'; payload: ProtocolError };
 
@@ -537,6 +679,14 @@ export const pickFolder = (): Promise<string | null> => invoke<string | null>('p
 export const openFolderAt = (root: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'open_folder_at', payload: { root } }, ctx);
 
+/** P1: close the open folder (stops every language server). */
+export const closeFolder = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'close_folder' }, ctx);
+
+/** P1: restart one language server; status follows as an event. */
+export const restartLsp = (language: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'lsp_restart', payload: { language } }, ctx);
+
 export const openExternal = (url: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'open_external', payload: { url } }, ctx);
 
@@ -549,12 +699,24 @@ export const openFile = (path: string, ctx: EnvelopeContext): Promise<unknown> =
 export const closeBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'close_buffer', payload: { buffer_id: bufferId } }, ctx);
 
+/** Record the active tab so the next bootstrap reports the real selection. */
+export const setActiveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'set_active_buffer', payload: { buffer_id: bufferId } }, ctx);
+
 export const saveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'save_buffer', payload: { buffer_id: bufferId } }, ctx);
 
 /** Select one workspace-relative file in the OS file manager. */
 export const revealInExplorer = (path: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'reveal_in_explorer', payload: { path } }, ctx);
+
+/** P2 gap 3: discard the local edits and take the disk text. */
+export const reloadBufferFromDisk = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'reload_buffer_from_disk', payload: { buffer_id: bufferId } }, ctx);
+
+/** P2 gap 3: keep the local edits and clear the external-change marker. */
+export const keepBufferEdits = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'keep_buffer_edits', payload: { buffer_id: bufferId } }, ctx);
 
 export const applyEditorChange = (
   bufferId: Id,
@@ -699,6 +861,7 @@ export const agentDecision = (
   approvalId: Id,
   decision: Decision,
   ctx: EnvelopeContext,
+  resolution?: AgentDecisionResolution,
 ): Promise<unknown> =>
   dispatchZ2Command(
     {
@@ -707,6 +870,7 @@ export const agentDecision = (
         request_id: requestId,
         approval_id: approvalId,
         decision,
+        ...(resolution ? { resolution } : {}),
       },
     },
     ctx,
@@ -717,6 +881,16 @@ export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unkn
 
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);
+
+export const retryMessage = (
+  sessionId: Id,
+  messageId: Id,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command(
+    { type: 'retry_message', payload: { session_id: sessionId, message_id: messageId } },
+    ctx,
+  );
 
 // --- Phase 8 workflow commands (ARCHITECTURE §18.4) -------------------------
 
@@ -737,12 +911,15 @@ export const runWorkflow = (
 /**
  * Resume a journaled run. `allowIncompleteAsks` is the user's explicit
  * confirmation that unfinished asks may re-dispatch tools whose earlier
- * effects already landed; omitting it keeps the backend's fail-closed default.
+ * effects already landed; `acknowledgePartialEffects` is the separate,
+ * stronger confirmation that the ledger proved effects may already exist.
+ * Omitting both keeps the backend's fail-closed default.
  */
 export const resumeWorkflow = (
   runId: Id,
   ctx: EnvelopeContext,
   allowIncompleteAsks = false,
+  acknowledgePartialEffects = false,
 ): { requestId: string; promise: Promise<unknown> } => {
   const requestId = newRequestId();
   return {
@@ -754,6 +931,7 @@ export const resumeWorkflow = (
           request_id: requestId,
           run_id: runId,
           allow_incomplete_asks: allowIncompleteAsks,
+          acknowledge_partial_effects: acknowledgePartialEffects,
         },
       },
       ctx,

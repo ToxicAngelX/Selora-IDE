@@ -39,11 +39,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use selora_ai::{
     AgentSummary, AgentTurnState, ApprovalCard, ChatEvent, ChatMessage, ChatReceipt, ChatRequest,
-    Model, RouterToolRunner, ToolContext, ToolSpec, TurnCaps, TurnInput,
+    Model, RouterToolRunner, TodoItem, TodoSink, TodoStatus, ToolContext, ToolSpec, TurnCaps,
+    TurnInput,
 };
 use selora_core::SeloraError;
 use selora_protocol::{
@@ -51,7 +52,8 @@ use selora_protocol::{
     ApprovalDto, ApprovalId, ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto,
     ChatRequestDto, ChatStateDto, ConnectionStatus, DecisionDto, FrontendEvent, MessageDto,
     MessageId, MessageRole, ModelDto, ModelsDto, ProtocolErrorDto, RequestId, SeloraStatusDto,
-    SessionDto, SessionId, ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
+    SessionDto, SessionId, SessionTodosDto, TodoDto, TodoStatusDto, ToolCallStartedDto,
+    ToolResultDto, TurnId, WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -175,6 +177,36 @@ struct StoredMessage {
     message_id: MessageId,
     role: MessageRole,
     text: String,
+    /// How this user message was dispatched, so `RetryMessage` can re-send the
+    /// same content through the same path exactly once. Assistant messages
+    /// carry `None`.
+    retry: Option<RetrySpec>,
+}
+
+/// The dispatch path a user message took. Capability fields are copied from
+/// the original request — a retry must not silently change mode, model, or
+/// reasoning depth.
+#[derive(Clone)]
+enum RetrySpec {
+    Chat {
+        model_id: Option<String>,
+    },
+    Agent {
+        model_id: Option<String>,
+        mode: AgentModeDto,
+        reasoning_effort: Option<String>,
+        system_instructions: Option<String>,
+        temperature: Option<f64>,
+    },
+}
+
+/// Which stored user message a retry re-dispatches. The send paths truncate
+/// the tail and register the new turn under one engine lock, so a concurrent
+/// send cannot slip between the truncation and the dispatch.
+#[derive(Clone)]
+struct RetryTarget {
+    session_id: SessionId,
+    message_id: MessageId,
 }
 
 struct ChatSession {
@@ -184,8 +216,10 @@ struct ChatSession {
     /// The turn's parked approval (§17.4) — `None` while none is pending.
     /// Consumed exactly once by a matching `AgentDecision`.
     pending_approval: Option<ApprovalDto>,
-    /// Monotonic recency stamp (bootstrap's `active_session_id` = the most
-    /// recently touched session).
+    /// The session's authoritative todo list, written only by the
+    /// `manage_todo` tool through [`SessionTodoSink`].
+    todos: Vec<TodoItem>,
+    /// Monotonic recency stamp (bootstrap's recency order).
     last_activity: u64,
 }
 
@@ -197,6 +231,10 @@ struct EngineInner {
     models: Vec<Model>,
     connection: ConnectionStatus,
     activity_counter: u64,
+    /// The session the user explicitly selected (new/switch/send). While a
+    /// turn is live, `chat_state` prefers that turn's session so the frontend
+    /// always routes events to the stream it can see.
+    active_session: Option<SessionId>,
 }
 
 /// The Z3 session engine. Every mutation locks [`EngineInner`] briefly on
@@ -245,6 +283,7 @@ impl SessionEngine {
                 models: initial_models,
                 connection: initial_connection,
                 activity_counter: 0,
+                active_session: None,
             }),
             config,
             workspace_root: Mutex::new(None),
@@ -298,18 +337,21 @@ impl SessionEngine {
     }
 
     /// The bootstrap's `chat` block: every session, the flattened
-    /// transcript, the live request/turn ids, and the newest parked
-    /// approval.
+    /// transcript, the live request/turn ids, the newest parked approval,
+    /// and the active session's authoritative todos.
     pub(crate) fn chat_state(&self) -> ChatStateDto {
         let inner = self.inner.lock().expect("engine lock");
         let mut sessions = Vec::new();
         let mut messages = Vec::new();
-        let mut active_session_id = None;
+        let mut active_session_id = inner
+            .active_session
+            .clone()
+            .filter(|id| inner.sessions.contains_key(id));
         let mut active_request_id = None;
         let mut active_turn_id = None;
         let mut pending_approval = None;
-        // Recency order (most recent last): `active_session_id` picks the
-        // most recently touched session that is still running a request.
+        // Recency order (most recent last). While a turn is live, its
+        // session wins: the frontend can only route one stream at a time.
         let mut ordered: Vec<(&SessionId, &ChatSession)> = inner.sessions.iter().collect();
         ordered.sort_by_key(|(_, session)| session.last_activity);
         for (session_id, session) in ordered {
@@ -322,6 +364,7 @@ impl SessionEngine {
                     .map(|message| message.message_id.clone())
                     .collect(),
                 active: session.active_request.is_some(),
+                todos: session.todos.iter().map(todo_dto).collect(),
             });
             for message in &session.messages {
                 messages.push(MessageDto {
@@ -342,6 +385,11 @@ impl SessionEngine {
                 pending_approval = session.pending_approval.clone();
             }
         }
+        let todos = active_session_id
+            .as_ref()
+            .and_then(|id| inner.sessions.get(id))
+            .map(|session| session.todos.iter().map(todo_dto).collect())
+            .unwrap_or_default();
         ChatStateDto {
             sessions,
             messages,
@@ -349,7 +397,162 @@ impl SessionEngine {
             active_request_id,
             active_turn_id,
             pending_approval,
+            todos,
         }
+    }
+
+    /// The session the engine currently considers active (new/switch/send).
+    pub(crate) fn active_session_id(&self) -> Option<SessionId> {
+        let inner = self.inner.lock().expect("engine lock");
+        inner.active_session.clone().or_else(|| {
+            inner
+                .sessions
+                .iter()
+                .max_by_key(|(_, session)| session.last_activity)
+                .map(|(id, _)| id.clone())
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // NewSession / SwitchSession
+    // -----------------------------------------------------------------
+
+    /// Create a real, empty session and make it active. Rejected while any
+    /// turn is live: the frontend's routing follows the live turn's session,
+    /// so creating-and-selecting another would show an empty transcript with
+    /// no way back to the stream.
+    pub(crate) fn new_session(&self) -> Result<SessionId, ProtocolErrorDto> {
+        let mut inner = self.inner.lock().expect("engine lock");
+        if !inner.active.is_empty() {
+            return Err(session_busy_switch());
+        }
+        let session_id =
+            SessionId::new(format!("sess_{}", Uuid::new_v4())).expect("uuid session id is valid");
+        inner.activity_counter += 1;
+        let activity = inner.activity_counter;
+        inner.sessions.insert(
+            session_id.clone(),
+            ChatSession {
+                title: "New session".into(),
+                messages: Vec::new(),
+                active_request: None,
+                pending_approval: None,
+                todos: Vec::new(),
+                last_activity: activity,
+            },
+        );
+        inner.active_session = Some(session_id.clone());
+        Ok(session_id)
+    }
+
+    /// Select an existing session. Unknown ids are refused (never created
+    /// implicitly), and a switch during any live turn is refused because the
+    /// live turn's events would otherwise land in another session's view.
+    pub(crate) fn switch_session(&self, session_id: &SessionId) -> Result<(), ProtocolErrorDto> {
+        let mut inner = self.inner.lock().expect("engine lock");
+        if !inner.sessions.contains_key(session_id) {
+            return Err(unknown_session(session_id));
+        }
+        if !inner.active.is_empty() {
+            return Err(session_busy_switch());
+        }
+        inner.activity_counter += 1;
+        let activity = inner.activity_counter;
+        inner.active_session = Some(session_id.clone());
+        if let Some(session) = inner.sessions.get_mut(session_id) {
+            session.last_activity = activity;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // RetryMessage
+    // -----------------------------------------------------------------
+
+    /// Remove the failed tail (the named user message and everything after
+    /// it) and re-dispatch that message's exact content once. The named
+    /// message must be an existing user turn with a recorded dispatch path;
+    /// a live turn or an unknown/non-user message is refused without
+    /// touching the transcript.
+    pub(crate) fn retry_message<R: tauri::Runtime>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        envelope_session: Option<SessionId>,
+        session_id: SessionId,
+        message_id: MessageId,
+    ) -> Result<RequestId, ProtocolErrorDto> {
+        let (spec, text) = {
+            let inner = self.inner.lock().expect("engine lock");
+            let session = inner
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| unknown_session(&session_id))?;
+            if session.active_request.is_some() {
+                return Err(session_busy());
+            }
+            let message = session
+                .messages
+                .iter()
+                .find(|message| message.message_id == message_id)
+                .ok_or_else(|| unknown_message(&message_id))?;
+            if message.role != MessageRole::User {
+                return Err(not_a_user_message(&message_id));
+            }
+            let spec = message.retry.clone().ok_or_else(|| ProtocolErrorDto {
+                code: "retry_unavailable".into(),
+                message: "That message has no recorded dispatch to retry.".into(),
+                retryable: false,
+            })?;
+            (spec, message.text.clone())
+        };
+        if envelope_session.is_some_and(|session| session != session_id) {
+            return Err(stale_session());
+        }
+
+        let request_id = RequestId::new(Uuid::new_v4().to_string()).expect("uuid is valid");
+        let target = RetryTarget {
+            session_id: session_id.clone(),
+            message_id,
+        };
+        match spec {
+            RetrySpec::Chat { model_id } => self.send_chat_inner(
+                log,
+                app,
+                Some(session_id.clone()),
+                request_id.clone(),
+                ChatRequestDto {
+                    session_id,
+                    message: text,
+                    model_id,
+                },
+                Some(target),
+            )?,
+            RetrySpec::Agent {
+                model_id,
+                mode,
+                reasoning_effort,
+                system_instructions,
+                temperature,
+            } => self.send_agent_inner(
+                log,
+                app,
+                Some(session_id.clone()),
+                request_id.clone(),
+                selora_protocol::AgentRequestDto {
+                    session_id,
+                    prompt: text,
+                    model_id,
+                    mode,
+                    reasoning_effort,
+                    system_instructions,
+                    temperature,
+                    editor_context: None,
+                },
+                Some(target),
+            )?,
+        }
+        Ok(request_id)
     }
 
     // -----------------------------------------------------------------
@@ -364,6 +567,18 @@ impl SessionEngine {
         request_id: RequestId,
         payload: ChatRequestDto,
     ) -> Result<(), ProtocolErrorDto> {
+        self.send_chat_inner(log, app, envelope_session, request_id, payload, None)
+    }
+
+    fn send_chat_inner<R: tauri::Runtime>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        envelope_session: Option<SessionId>,
+        request_id: RequestId,
+        payload: ChatRequestDto,
+        retry: Option<RetryTarget>,
+    ) -> Result<(), ProtocolErrorDto> {
         if envelope_session.is_some_and(|session| session != payload.session_id) {
             return Err(stale_session());
         }
@@ -375,11 +590,18 @@ impl SessionEngine {
             .ok_or_else(no_model_selected)?;
 
         let mut inner = self.inner.lock().expect("engine lock");
+        if let Some(target) = &retry {
+            truncate_for_retry(&mut inner, target)?;
+        }
+        let spec = RetrySpec::Chat {
+            model_id: payload.model_id.clone(),
+        };
         let session = begin_turn(
             &mut inner,
             &request_id,
             &payload.session_id,
             &payload.message,
+            Some(spec),
         )?;
         // One turn, one streaming assistant message. The conversation is
         // the transcript's tail — `begin_turn` already landed the user's
@@ -427,6 +649,18 @@ impl SessionEngine {
         request_id: RequestId,
         payload: selora_protocol::AgentRequestDto,
     ) -> Result<(), ProtocolErrorDto> {
+        self.send_agent_inner(log, app, envelope_session, request_id, payload, None)
+    }
+
+    fn send_agent_inner<R: tauri::Runtime>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+        envelope_session: Option<SessionId>,
+        request_id: RequestId,
+        payload: selora_protocol::AgentRequestDto,
+        retry: Option<RetryTarget>,
+    ) -> Result<(), ProtocolErrorDto> {
         if envelope_session.is_some_and(|session| session != payload.session_id) {
             return Err(stale_session());
         }
@@ -441,11 +675,22 @@ impl SessionEngine {
         let turn_id = fresh_turn_id();
 
         let mut inner = self.inner.lock().expect("engine lock");
+        if let Some(target) = &retry {
+            truncate_for_retry(&mut inner, target)?;
+        }
+        let spec = RetrySpec::Agent {
+            model_id: payload.model_id.clone(),
+            mode: payload.mode,
+            reasoning_effort: payload.reasoning_effort.clone(),
+            system_instructions: payload.system_instructions.clone(),
+            temperature: payload.temperature,
+        };
         let session = begin_turn(
             &mut inner,
             &request_id,
             &payload.session_id,
             &payload.prompt,
+            Some(spec),
         )?;
         let sys_prompt = system_prompt(&payload, &root);
         let mut conversation: Vec<ChatMessage> = vec![ChatMessage::system(sys_prompt)];
@@ -471,7 +716,14 @@ impl SessionEngine {
             input = input.with_reasoning_effort(effort.clone());
         }
         let tool_settings = agent_tool_settings(&self.config.agent, self.brave_key());
-        let tools = RouterToolRunner::new(ToolContext::new(root, tool_settings));
+        let tools = RouterToolRunner::new(ToolContext::new(root, tool_settings).with_todo_sink(
+            Arc::new(SessionTodoSink {
+                engine: Arc::downgrade(self),
+                session_id: payload.session_id.clone(),
+                log: Arc::clone(&log),
+                app: app.clone(),
+            }),
+        ));
         let chat = selora_ai::ClientChatStream::new(selora_ai::SeloraClient::new(
             &self.base_url(),
             &api_key,
@@ -712,7 +964,7 @@ impl SessionEngine {
                 session.active_request = None;
             }
             if let Some((message_id, text)) = assistant {
-                push_message(session, message_id, MessageRole::Assistant, text);
+                push_message(session, message_id, MessageRole::Assistant, text, None);
             }
         }
     }
@@ -733,7 +985,7 @@ impl SessionEngine {
             }
             session.pending_approval = None;
             if let Some((message_id, text)) = assistant {
-                push_message(session, message_id, MessageRole::Assistant, text);
+                push_message(session, message_id, MessageRole::Assistant, text, None);
             }
         }
     }
@@ -828,6 +1080,81 @@ impl SessionEngine {
             #[cfg(test)]
             ApiKeySource::Fixed(_) => None,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `manage_todo` store — one sink per agent turn, bound to its session
+// ---------------------------------------------------------------------------
+
+/// Writes the router's validated todo list into the owning session and
+/// announces the whole stored list on `selora://event`. The engine is held
+/// weakly so a finished session never keeps the app state alive.
+struct SessionTodoSink<R: tauri::Runtime> {
+    engine: Weak<SessionEngine>,
+    session_id: SessionId,
+    log: Arc<EventLog>,
+    app: tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> TodoSink for SessionTodoSink<R> {
+    fn load(&self) -> Result<Vec<TodoItem>, String> {
+        let engine = self
+            .engine
+            .upgrade()
+            .ok_or_else(|| "the session engine has shut down".to_string())?;
+        let inner = engine.inner.lock().expect("engine lock");
+        inner
+            .sessions
+            .get(&self.session_id)
+            .map(|session| session.todos.clone())
+            .ok_or_else(|| "the session no longer exists".to_string())
+    }
+
+    fn store(&self, todos: Vec<TodoItem>) -> Result<(), String> {
+        let engine = self
+            .engine
+            .upgrade()
+            .ok_or_else(|| "the session engine has shut down".to_string())?;
+        let announced: Vec<TodoDto>;
+        {
+            let mut inner = engine.inner.lock().expect("engine lock");
+            if !inner
+                .active
+                .values()
+                .any(|active| active.session_id() == &self.session_id)
+            {
+                return Err("the session has no live turn to own this list".to_string());
+            }
+            let session = inner
+                .sessions
+                .get_mut(&self.session_id)
+                .ok_or_else(|| "the session no longer exists".to_string())?;
+            session.todos.clone_from(&todos);
+            announced = todos.iter().map(todo_dto).collect();
+        }
+        self.log.record_session(
+            &self.app,
+            FrontendEvent::SessionTodosChanged(SessionTodosDto {
+                session_id: self.session_id.clone(),
+                todos: announced,
+            }),
+            None,
+            self.session_id.clone(),
+        );
+        Ok(())
+    }
+}
+
+fn todo_dto(todo: &TodoItem) -> TodoDto {
+    TodoDto {
+        id: todo.id.clone(),
+        text: todo.text.clone(),
+        status: match todo.status {
+            TodoStatus::Pending => TodoStatusDto::Pending,
+            TodoStatus::InProgress => TodoStatusDto::InProgress,
+            TodoStatus::Completed => TodoStatusDto::Completed,
+        },
     }
 }
 
@@ -1361,6 +1688,7 @@ fn begin_turn<'a>(
     request_id: &RequestId,
     session_id: &SessionId,
     user_text: &str,
+    retry: Option<RetrySpec>,
 ) -> Result<&'a mut ChatSession, ProtocolErrorDto> {
     if inner.active.contains_key(request_id) {
         return Err(ProtocolErrorDto {
@@ -1371,11 +1699,7 @@ fn begin_turn<'a>(
     }
     if let Some(session) = inner.sessions.get(session_id) {
         if session.active_request.is_some() {
-            return Err(ProtocolErrorDto {
-                code: "session_busy".into(),
-                message: "A request is already running for this session — stop it first.".into(),
-                retryable: false,
-            });
+            return Err(session_busy());
         }
     }
     inner.activity_counter += 1;
@@ -1390,25 +1714,67 @@ fn begin_turn<'a>(
             messages: Vec::new(),
             active_request: None,
             pending_approval: None,
+            todos: Vec::new(),
             last_activity: activity,
         });
     session.last_activity = activity;
     session.active_request = Some(request_id.clone());
+    // A session created by NewSession is still titled "New session" until its
+    // first user message; adopt the same auto-title rule then.
+    if session.messages.is_empty() && session.title == "New session" {
+        session.title = title_from(user_text);
+    }
+    inner.active_session = Some(session_id.clone());
     let user_message_id = fresh_message_id();
     push_message(
         session,
         user_message_id,
         MessageRole::User,
         user_text.to_owned(),
+        retry,
     );
     Ok(session)
 }
 
-fn push_message(session: &mut ChatSession, message_id: MessageId, role: MessageRole, text: String) {
+/// Validate and apply a `RetryMessage` truncation under the engine lock:
+/// remove the named user message and everything after it. Called by the send
+/// paths after their key/model/workspace preflight, so a refused preflight
+/// never mutates the transcript.
+fn truncate_for_retry(
+    inner: &mut EngineInner,
+    target: &RetryTarget,
+) -> Result<(), ProtocolErrorDto> {
+    let session = inner
+        .sessions
+        .get_mut(&target.session_id)
+        .ok_or_else(|| unknown_session(&target.session_id))?;
+    if session.active_request.is_some() {
+        return Err(session_busy());
+    }
+    let index = session
+        .messages
+        .iter()
+        .position(|message| message.message_id == target.message_id)
+        .ok_or_else(|| unknown_message(&target.message_id))?;
+    if session.messages[index].role != MessageRole::User {
+        return Err(not_a_user_message(&target.message_id));
+    }
+    session.messages.truncate(index);
+    Ok(())
+}
+
+fn push_message(
+    session: &mut ChatSession,
+    message_id: MessageId,
+    role: MessageRole,
+    text: String,
+    retry: Option<RetrySpec>,
+) {
     session.messages.push(StoredMessage {
         message_id,
         role,
         text,
+        retry,
     });
     if session.messages.len() > MAX_SESSION_MESSAGES {
         let overflow = session.messages.len() - MAX_SESSION_MESSAGES;
@@ -1473,13 +1839,28 @@ fn manifest_for(mode: AgentModeDto) -> Vec<ToolSpec> {
     };
     manifest.push(ToolSpec::new(
         "manage_todo",
-        "Create, update, or reorganize progress and to-do list tasks for tracking your work. Provide `todos` (JSON array or string description of tasks with title and status: 'pending', 'in_progress', 'completed').",
+        "Replace this session's authoritative todo list. Pass `todos` as a JSON array of \
+         objects: { id (unique, non-empty, ≤64 chars), text (non-empty, ≤500 chars), \
+         status ('pending' | 'in_progress' | 'completed') }. At most 50 items; an empty \
+         array clears the list. The result reports exactly what was stored.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "todos": {
-                    "type": "string",
-                    "description": "Tasks list or update description"
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "text": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["id", "text", "status"]
+                    }
                 }
             },
             "required": ["todos"]
@@ -1581,6 +1962,55 @@ fn stale_session() -> ProtocolErrorDto {
         code: "stale_workspace_or_session".into(),
         message: "Request a fresh bootstrap snapshot.".into(),
         retryable: true,
+    }
+}
+
+fn session_busy() -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "session_busy".into(),
+        message: "A request is already running for this session — stop it first.".into(),
+        retryable: false,
+    }
+}
+
+fn session_busy_switch() -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "session_busy".into(),
+        message: "A turn is running. Stop it before creating or switching sessions.".into(),
+        retryable: false,
+    }
+}
+
+fn unknown_session(session_id: &SessionId) -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "unknown_session".into(),
+        message: format!(
+            "No session `{}` exists; request a fresh bootstrap.",
+            session_id.as_str()
+        ),
+        retryable: true,
+    }
+}
+
+fn unknown_message(message_id: &MessageId) -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "unknown_message".into(),
+        message: format!(
+            "No message `{}` exists in this session.",
+            message_id.as_str()
+        ),
+        retryable: false,
+    }
+}
+
+fn not_a_user_message(message_id: &MessageId) -> ProtocolErrorDto {
+    ProtocolErrorDto {
+        code: "not_a_user_message".into(),
+        message: format!(
+            "Message `{}` is not a user turn; retry needs the user message.",
+            message_id.as_str()
+        ),
+        retryable: false,
     }
 }
 
@@ -2669,6 +3099,425 @@ mod tests {
                 .context_window,
             200_000
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 9 session slice — todos, new/switch isolation, retry
+    // ------------------------------------------------------------------
+
+    fn session_command(command: FrontendCommand) -> FrontendCommand {
+        command
+    }
+
+    fn new_session_command() -> FrontendCommand {
+        session_command(FrontendCommand::NewSession)
+    }
+
+    fn switch_session_command(session: &str) -> FrontendCommand {
+        FrontendCommand::SwitchSession {
+            session_id: SessionId::new(session).expect("valid id"),
+        }
+    }
+
+    fn retry_command(session: &str, message: MessageId) -> FrontendCommand {
+        FrontendCommand::RetryMessage {
+            session_id: SessionId::new(session).expect("valid id"),
+            message_id: message,
+        }
+    }
+
+    fn messages_for(
+        snapshot: &selora_protocol::BootstrapState,
+        session: &str,
+    ) -> Vec<selora_protocol::MessageDto> {
+        snapshot
+            .chat
+            .messages
+            .iter()
+            .filter(|message| message.session_id.as_str() == session)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn manage_todo_stores_session_scoped_todos_and_hydrates_the_chat_state() {
+        let app = mock_app_handle();
+        let root = temp_workspace("todos");
+        // Round 1: the model writes a plan. Round 2: the tool result is in the
+        // request body, so that marker only matches after the store.
+        let server = mock_gateway(
+            vec![
+                (
+                    "Stored 2 todo(s)",
+                    sse(&[
+                        content_chunk("The plan is stored."),
+                        usage_chunk("stop", 10, 5, 0.01),
+                    ]),
+                ),
+                (
+                    "plan the work",
+                    sse(&[
+                        fragment_chunk(
+                            0,
+                            "call_todo",
+                            "manage_todo",
+                            r#"{"todos":[
+                                {"id":"t1","text":"inspect the router","status":"completed"},
+                                {"id":"t2","text":"store the todos","status":"in_progress"}
+                            ]}"#,
+                        ),
+                        usage_chunk("tool_calls", 10, 5, 0.01),
+                    ]),
+                ),
+            ],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_agent("agent-todo", "session-todo", "plan the work"),
+                ),
+            )
+            .expect("send_agent accepted");
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+
+        // The live announcement carries the stored list (not the raw args).
+        let changed = find_payload(&events, |payload| match payload {
+            FrontendEvent::SessionTodosChanged(dto) => Some(dto.clone()),
+            _ => None,
+        });
+        assert_eq!(changed.session_id.as_str(), "session-todo");
+        assert_eq!(changed.todos.len(), 2);
+        assert_eq!(changed.todos[0].id, "t1");
+        assert_eq!(
+            changed.todos[0].status,
+            selora_protocol::TodoStatusDto::Completed
+        );
+        assert_eq!(changed.todos[1].text, "store the todos");
+
+        // The bootstrap (the hydrate path) carries the same list, both on
+        // the active session and per session.
+        let chat = state.bootstrap().chat;
+        assert_eq!(
+            chat.active_session_id.expect("active").as_str(),
+            "session-todo"
+        );
+        assert_eq!(chat.todos.len(), 2);
+        assert_eq!(
+            chat.todos[1].status,
+            selora_protocol::TodoStatusDto::InProgress
+        );
+        let session = chat
+            .sessions
+            .iter()
+            .find(|session| session.session_id.as_str() == "session-todo")
+            .expect("the session is listed");
+        assert_eq!(session.todos.len(), 2);
+
+        // New sessions start empty; switching back restores the same list.
+        state
+            .dispatch(&app, envelope(&state, new_session_command()))
+            .expect("new session");
+        let fresh = state.bootstrap().chat;
+        assert_eq!(fresh.todos.len(), 0, "todos are session-scoped");
+        let fresh_id = fresh.active_session_id.expect("new session active");
+        assert_ne!(fresh_id.as_str(), "session-todo");
+
+        state
+            .dispatch(
+                &app,
+                envelope(&state, switch_session_command("session-todo")),
+            )
+            .expect("switch back");
+        let back = state.bootstrap().chat;
+        assert_eq!(
+            back.active_session_id.expect("active").as_str(),
+            "session-todo"
+        );
+        assert_eq!(back.todos.len(), 2);
+        assert_eq!(back.todos[0].text, "inspect the router");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_and_switch_sessions_keep_independent_transcripts() {
+        let app = mock_app_handle();
+        let server = mock_gateway(
+            vec![(
+                "session A",
+                sse(&[content_chunk("answer A"), usage_chunk("stop", 1, 1, 0.0)]),
+            )],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(&state, send_chat("chat-a", "session-a", "session A")),
+            )
+            .expect("send accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatCompleted(_))
+        });
+        assert_eq!(messages_for(&state.bootstrap(), "session-a").len(), 2);
+
+        // NewSession is a real, empty session; A's transcript stays with A.
+        state
+            .dispatch(&app, envelope(&state, new_session_command()))
+            .expect("new session");
+        let created = state.bootstrap();
+        let new_id = created.chat.active_session_id.clone().expect("active");
+        assert_ne!(new_id.as_str(), "session-a");
+        assert!(messages_for(&created, new_id.as_str()).is_empty());
+        assert_eq!(messages_for(&created, "session-a").len(), 2);
+        // The transition emitted the hydrate snapshot.
+        assert!(state.events_after(0).iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BootstrapState(snapshot)
+                if snapshot.chat.active_session_id.as_ref() == Some(&new_id)
+        )));
+
+        // Switching back returns A's own transcript and marks A active.
+        state
+            .dispatch(&app, envelope(&state, switch_session_command("session-a")))
+            .expect("switch back");
+        let back = state.bootstrap();
+        assert_eq!(
+            back.chat
+                .active_session_id
+                .as_ref()
+                .expect("active")
+                .as_str(),
+            "session-a"
+        );
+        assert_eq!(messages_for(&back, "session-a").len(), 2);
+        assert!(messages_for(&back, new_id.as_str()).is_empty());
+
+        // An unknown id is refused, never created implicitly.
+        let error = state
+            .dispatch(
+                &app,
+                envelope(&state, switch_session_command("no-such-session")),
+            )
+            .expect_err("unknown session");
+        assert_eq!(error.code, "unknown_session");
+        assert_eq!(
+            state
+                .bootstrap()
+                .chat
+                .active_session_id
+                .expect("active")
+                .as_str(),
+            "session-a",
+            "a refused switch changes nothing"
+        );
+    }
+
+    #[test]
+    fn switch_and_new_are_refused_during_a_live_turn() {
+        let app = mock_app_handle();
+        let uri = stalling_gateway("first ");
+        let state = DesktopState::with_settings(gateway_settings(uri));
+
+        state
+            .dispatch(
+                &app,
+                envelope(&state, send_chat("chat-live", "session-live", "stay live")),
+            )
+            .expect("send accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatDelta(_))
+        });
+
+        let error = state
+            .dispatch(&app, envelope(&state, new_session_command()))
+            .expect_err("new is refused while a turn is live");
+        assert_eq!(error.code, "session_busy");
+        let error = state
+            .dispatch(
+                &app,
+                envelope(&state, switch_session_command("session-live")),
+            )
+            .expect_err("switch is refused while a turn is live");
+        assert_eq!(error.code, "session_busy");
+
+        state
+            .dispatch(&app, envelope(&state, stop_chat("chat-live")))
+            .expect("stop accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatCompleted(_))
+        });
+    }
+
+    #[test]
+    fn retry_truncates_the_failed_tail_and_dispatches_once() {
+        let app = mock_app_handle();
+        // The first attempt fails at the gateway (401 is never retried).
+        let failing = tauri::async_runtime::block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(body_string_contains("retry me"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        });
+        let state = DesktopState::with_settings(gateway_settings(failing.uri()));
+        state
+            .dispatch(
+                &app,
+                envelope(&state, send_chat("chat-first", "session-retry", "retry me")),
+            )
+            .expect("send accepted");
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatFailed(_))
+        });
+        assert_eq!(
+            find_payload(&events, |payload| match payload {
+                FrontendEvent::ChatFailed(dto) => Some(dto.error.code.clone()),
+                _ => None,
+            }),
+            "auth_failed"
+        );
+        let failed = state.bootstrap();
+        let user_message = messages_for(&failed, "session-retry")
+            .into_iter()
+            .find(|message| message.role == MessageRole::User)
+            .expect("the user turn survives a failure");
+        assert_eq!(messages_for(&failed, "session-retry").len(), 1);
+
+        // The retry re-dispatches the same content exactly once against the
+        // healthy gateway.
+        let success = mock_gateway(
+            vec![(
+                "retry me",
+                sse(&[
+                    content_chunk("answer on retry"),
+                    usage_chunk("stop", 2, 3, 0.0),
+                ]),
+            )],
+            true,
+        );
+        state.sessions().set_base_url(success.uri());
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    retry_command("session-retry", user_message.message_id.clone()),
+                ),
+            )
+            .expect("retry accepted");
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatCompleted(_))
+        });
+        assert_eq!(
+            find_payload(&events, |payload| match payload {
+                FrontendEvent::ChatCompleted(dto) => Some(dto.text.clone()),
+                _ => None,
+            }),
+            "answer on retry"
+        );
+        tauri::async_runtime::block_on(async { success.verify().await });
+
+        // Truncation: one user turn, then the retried answer — no duplicate
+        // user bubble, no leftover failed bubble.
+        let after = state.bootstrap();
+        let transcript = messages_for(&after, "session-retry");
+        assert_eq!(transcript.len(), 2, "{transcript:#?}");
+        assert_eq!(transcript[0].role, MessageRole::User);
+        assert_eq!(transcript[0].text, "retry me");
+        assert_eq!(transcript[1].role, MessageRole::Assistant);
+        assert_eq!(transcript[1].text, "answer on retry");
+        assert!(after.chat.active_request_id.is_none());
+
+        // The old user id is gone (it was re-created), and an assistant id
+        // is not a retry target.
+        let error = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    retry_command("session-retry", user_message.message_id),
+                ),
+            )
+            .expect_err("the old id was truncated");
+        assert_eq!(error.code, "unknown_message");
+        let error = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    retry_command("session-retry", transcript[1].message_id.clone()),
+                ),
+            )
+            .expect_err("only user messages retry");
+        assert_eq!(error.code, "not_a_user_message");
+        let error = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    retry_command(
+                        "session-retry",
+                        MessageId::new("no-such-message").expect("valid id"),
+                    ),
+                ),
+            )
+            .expect_err("unknown id");
+        assert_eq!(error.code, "unknown_message");
+    }
+
+    #[test]
+    fn retry_is_refused_during_a_live_turn() {
+        let app = mock_app_handle();
+        let uri = stalling_gateway("partial ");
+        let state = DesktopState::with_settings(gateway_settings(uri));
+        state
+            .dispatch(
+                &app,
+                envelope(&state, send_chat("chat-live", "session-live", "stay live")),
+            )
+            .expect("send accepted");
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatDelta(_))
+        });
+        let live_user = events
+            .iter()
+            .find(|event| matches!(event.payload, FrontendEvent::ChatDelta(_)))
+            .and_then(|_| {
+                state
+                    .bootstrap()
+                    .chat
+                    .messages
+                    .into_iter()
+                    .find(|message| message.role == MessageRole::User)
+            })
+            .expect("the live user turn");
+        let error = state
+            .dispatch(
+                &app,
+                envelope(&state, retry_command("session-live", live_user.message_id)),
+            )
+            .expect_err("a live turn cannot retry");
+        assert_eq!(error.code, "session_busy");
+        state
+            .dispatch(&app, envelope(&state, stop_chat("chat-live")))
+            .expect("stop accepted");
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::ChatCompleted(_))
+        });
     }
 
     // ------------------------------------------------------------------

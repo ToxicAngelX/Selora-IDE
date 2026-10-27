@@ -7,12 +7,16 @@
 //! the emitted events ride the same channel every other event rides.
 //!
 //! # Shape
-//! - [`LspBridge::start`] builds the registry (the settings overrides are
-//!   `None` here, so the registry's PATH lookup resolves `rust-analyzer` /
-//!   `typescript-language-server`), spawns the manager on Tauri's tokio
-//!   runtime and a drain task that maps each event as it arrives. A machine
-//!   without a language server is not an error: the manager itself reports
-//!   [`LspEvent::ServerMissing`], which becomes the install toast.
+//! - [`LspBridge::start_with_paths`] builds the registry from the
+//!   `settings.lsp` path/argument/enabled overrides (falling back to PATH
+//!   lookup), spawns the manager on Tauri's tokio runtime and a drain task
+//!   that maps each event as it arrives. A machine without a language server
+//!   is not an error: the manager itself reports [`LspEvent::ServerMissing`],
+//!   which becomes the install toast.
+//! - One bridge is bound to one workspace root. Switching or closing the
+//!   folder drops it, shuts its servers down and invalidates any event still
+//!   in flight, so stale diagnostics/hover/definition never apply to the new
+//!   root.
 //! - `selora-lsp` speaks in absolute path buffers; the protocol speaks in
 //!   workspace-relative forward-slash [`WorkspacePath`]s. Every mapping
 //!   helper here converts and *drops* anything outside the workspace root,
@@ -30,17 +34,18 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use selora_core::Position;
 use selora_lsp::{
-    spawn_manager, LspCompletionItem, LspDiagnostic, LspEffect, LspEvent, LspLocation,
+    spawn_manager, LanguageId, LspCompletionItem, LspDiagnostic, LspEffect, LspEvent, LspLocation,
     LspManagerConfig, LspRegistry, LspServerPaths, LspSeverity, Notify,
 };
 use selora_protocol::{
     BufferId, CompletionItemDto, CompletionResultDto, DefinitionLocationDto, DefinitionResultDto,
-    DiagnosticDto, DiagnosticSeverity, FrontendEvent, HoverResultDto, TextPosition, ToastDto,
-    ToastSeverity, WorkspacePath,
+    DiagnosticDto, DiagnosticSeverity, FrontendEvent, HoverResultDto, LspServerHealth,
+    LspServerStateDto, ProtocolErrorDto, TextPosition, ToastDto, ToastSeverity, WorkspacePath,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -67,11 +72,20 @@ type DiagnosticsMap = Mutex<BTreeMap<PathBuf, Vec<LspDiagnostic>>>;
 /// [`LspBridge::close`].
 type TextIndex = Mutex<HashMap<PathBuf, String>>;
 
+/// The lifecycle of every server this bridge has heard from, keyed by
+/// language so the bootstrap and restart replies are deterministic.
+type ServerStates = Mutex<BTreeMap<LanguageId, LspServerStateDto>>;
+
 /// The state shared with the event-drain task.
 struct Shared {
     buffers: Arc<BufferIndex>,
     diagnostics: Arc<DiagnosticsMap>,
+    states: Arc<ServerStates>,
     root: PathBuf,
+    /// False once the bridge is shut down (workspace switch/close). Every
+    /// emission checks this, so an event still in flight from the previous
+    /// root can never be applied to the new workspace.
+    active: Arc<AtomicBool>,
 }
 
 /// Strip Windows' verbatim prefix (`\\?\C:\...` → `C:\...`,
@@ -95,29 +109,40 @@ fn plain_path(path: &Path) -> PathBuf {
 
 /// The LSP manager plus the bookkeeping the protocol needs.
 ///
-/// Construct one per open workspace with [`LspBridge::start`]; dropping it
-/// closes the effect channel, which ends the manager task.
+/// Construct one per open workspace with [`LspBridge::start_with_paths`];
+/// dropping it closes the effect channel, which ends the manager task. A
+/// bridge is bound to its root for life: switching or closing the workspace
+/// drops this value and starts a fresh one, so no diagnostics or answer from
+/// the old root can reach the new shell.
 pub struct LspBridge {
     effects: UnboundedSender<LspEffect>,
     buffers: Arc<BufferIndex>,
     texts: Arc<TextIndex>,
     diagnostics: Arc<DiagnosticsMap>,
+    states: Arc<ServerStates>,
+    registry: LspRegistry,
+    enabled: bool,
     root: PathBuf,
     emit: Emit,
+    active: Arc<AtomicBool>,
 }
 
 impl LspBridge {
-    /// Start the manager on Tauri's tokio runtime. Never panics when no
-    /// language server exists (the manager reports `ServerMissing` itself).
-    ///
-    /// `root` is the open workspace folder: it is handed to servers at
-    /// `initialize` *and* used to relativize every path in an event.
-    pub fn start(root: PathBuf, emit: Emit) -> Self {
+    /// Start with the settings-fed path/args/enabled overrides.
+    pub fn start_with_paths(root: PathBuf, emit: Emit, paths: LspServerPaths) -> Self {
+        let registry = LspRegistry::new(paths);
+        Self::start_with_config(root, emit, LspManagerConfig::new(registry))
+    }
+
+    /// The injectable seam: tests pass a manager config with an in-memory
+    /// launcher. Production goes through [`LspBridge::start_with_paths`].
+    pub fn start_with_config(root: PathBuf, emit: Emit, config: LspManagerConfig) -> Self {
         // Normalize once: the manager, the servers and this bridge all key on
         // the plain path (`C:\...`), not the verbatim form canonicalize adds.
         let root = plain_path(&root);
-        let registry = LspRegistry::new(LspServerPaths::default());
-        let config = LspManagerConfig::new(registry).with_root(Some(root.clone()));
+        let registry = config.registry.clone();
+        let enabled = registry.enabled();
+        let config = config.with_root(Some(root.clone()));
 
         let (effect_tx, effect_rx) = unbounded_channel::<LspEffect>();
         let (event_tx, event_rx) = unbounded_channel::<LspEvent>();
@@ -130,10 +155,14 @@ impl LspBridge {
         let buffers: Arc<BufferIndex> = Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Arc<DiagnosticsMap> = Arc::new(Mutex::new(BTreeMap::new()));
         let texts: Arc<TextIndex> = Arc::new(Mutex::new(HashMap::new()));
+        let states: Arc<ServerStates> = Arc::new(Mutex::new(BTreeMap::new()));
+        let active = Arc::new(AtomicBool::new(true));
         let shared = Shared {
             buffers: Arc::clone(&buffers),
             diagnostics: Arc::clone(&diagnostics),
+            states: Arc::clone(&states),
             root: root.clone(),
+            active: Arc::clone(&active),
         };
         tauri::async_runtime::spawn(drain_events(event_rx, shared, emit.clone()));
 
@@ -142,9 +171,88 @@ impl LspBridge {
             buffers,
             texts,
             diagnostics,
+            states,
+            registry,
+            enabled,
             root,
             emit,
+            active,
         }
+    }
+
+    /// Stop accepting/emitting events for this root. Dropping the bridge
+    /// calls this too, but the explicit call lets the shell retract state
+    /// before the manager finishes shutting down.
+    pub fn shutdown(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    /// The live diagnostics store as one flat protocol list. The bootstrap
+    /// uses this instead of a hard-coded empty vector, so a Problems panel
+    /// that re-bootstraps sees the same findings as the live event stream.
+    pub fn diagnostics(&self) -> Vec<DiagnosticDto> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        flatten_diagnostics(&self.root, &lock(&self.diagnostics))
+    }
+
+    /// Test seam: seed the live store exactly as a `publishDiagnostics`
+    /// event would, without needing a server process.
+    #[cfg(test)]
+    pub(crate) fn inject_diagnostics(&self, path: PathBuf, diagnostics: Vec<LspDiagnostic>) {
+        lock(&self.diagnostics).insert(plain_path(&path), diagnostics);
+    }
+
+    /// Every server whose lifecycle this bridge has observed, sorted by
+    /// language. Empty before the first `Open` starts a server.
+    pub fn server_states(&self) -> Vec<LspServerStateDto> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        lock(&self.states).values().cloned().collect()
+    }
+
+    /// Restart one server for this workspace. The returned state is
+    /// `starting`; `ready`/`failed` follow as `LspServerStateChanged`
+    /// events. Unknown languages, a disabled settings switch, and an
+    /// unresolvable command are typed errors rather than silent no-ops.
+    pub fn restart(&self, language: &str) -> Result<LspServerStateDto, ProtocolErrorDto> {
+        let language = parse_language(language).ok_or_else(|| ProtocolErrorDto {
+            code: "lsp_unknown_language".into(),
+            message: format!("Unknown language server `{language}`."),
+            retryable: false,
+        })?;
+        if !self.enabled {
+            let state = server_state(
+                language,
+                LspServerHealth::Failed,
+                Some("Language servers are disabled in settings (lsp.enabled = false).".into()),
+            );
+            self.publish_state(state);
+            return Err(ProtocolErrorDto {
+                code: "lsp_disabled".into(),
+                message: "Language servers are disabled in settings (lsp.enabled = false).".into(),
+                retryable: false,
+            });
+        }
+        if self.registry.resolve(language).is_none() {
+            let message = format!(
+                "{} is not configured; install it or set its path in settings.",
+                language.server_name()
+            );
+            let state = server_state(language, LspServerHealth::Failed, Some(message.clone()));
+            self.publish_state(state);
+            return Err(ProtocolErrorDto {
+                code: "lsp_server_not_found".into(),
+                message,
+                retryable: true,
+            });
+        }
+        let state = server_state(language, LspServerHealth::Starting, None);
+        self.publish_state(state.clone());
+        self.send(LspEffect::Restart(language));
+        Ok(state)
     }
 
     /// Remember which buffer owns a path (responses carry buffer ids).
@@ -179,6 +287,33 @@ impl LspBridge {
         });
     }
 
+    /// P2 gap 3: the buffer was reloaded from disk. The server must receive
+    /// the new full text (not a delta against the discarded local document)
+    /// and the old text's diagnostics must be retracted now, so the Problems
+    /// panel never shows squiggles for text that is no longer open.
+    pub fn reload(&self, path: PathBuf, text: String) {
+        let path = plain_path(&path);
+        lock(&self.texts).insert(path.clone(), text.clone());
+        self.send(LspEffect::Change {
+            path: path.clone(),
+            text,
+        });
+        self.invalidate_diagnostics(&path);
+    }
+
+    /// Drop one path's diagnostics and push the pruned list. Used when a file
+    /// disappeared or was reloaded behind the open document: diagnostics from
+    /// the old text are stale immediately.
+    pub fn invalidate_diagnostics(&self, path: &Path) {
+        let pruned = {
+            let mut store = lock(&self.diagnostics);
+            prune_path(&mut store, &self.root, path)
+        };
+        if let Some(diagnostics) = pruned {
+            (self.emit)(FrontendEvent::DiagnosticsChanged(diagnostics));
+        }
+    }
+
     /// The buffer's tab closed.
     pub fn close(&self, path: PathBuf) {
         let path = plain_path(&path);
@@ -192,8 +327,10 @@ impl LspBridge {
             let mut store = lock(&self.diagnostics);
             prune_path(&mut store, &self.root, &path)
         };
-        if let Some(diagnostics) = pruned {
-            (self.emit)(FrontendEvent::DiagnosticsChanged(diagnostics));
+        if self.active.load(Ordering::SeqCst) {
+            if let Some(diagnostics) = pruned {
+                (self.emit)(FrontendEvent::DiagnosticsChanged(diagnostics));
+            }
         }
     }
 
@@ -226,7 +363,85 @@ impl LspBridge {
 
     /// Forward one effect, ignoring a manager that already ended.
     fn send(&self, effect: LspEffect) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = self.effects.send(effect);
+    }
+
+    /// A bridge with a caller-owned effect channel: tests assert the exact
+    /// `LspEffect` a reload sends without spawning a real language server.
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        root: PathBuf,
+        emit: Emit,
+    ) -> (Self, UnboundedReceiver<LspEffect>) {
+        let root = plain_path(&root);
+        let (effects, received) = unbounded_channel();
+        (
+            Self {
+                effects,
+                buffers: Arc::new(Mutex::new(HashMap::new())),
+                texts: Arc::new(Mutex::new(HashMap::new())),
+                diagnostics: Arc::new(Mutex::new(BTreeMap::new())),
+                states: Arc::new(Mutex::new(BTreeMap::new())),
+                registry: LspRegistry::new(LspServerPaths::default()),
+                enabled: true,
+                root,
+                emit,
+                active: Arc::new(AtomicBool::new(true)),
+            },
+            received,
+        )
+    }
+
+    /// The text this bridge last handed the server for `path`.
+    #[cfg(test)]
+    pub(crate) fn text_for_test(&self, path: &Path) -> Option<String> {
+        lock(&self.texts).get(&plain_path(path)).cloned()
+    }
+
+    /// Seed a stale diagnostic so a reload's retraction is observable.
+    #[cfg(test)]
+    pub(crate) fn seed_error_diagnostic_for_test(&self, path: &Path, message: &str) {
+        let position = selora_lsp::LspPosition {
+            line: 0,
+            character: 0,
+        };
+        lock(&self.diagnostics).insert(
+            plain_path(path),
+            vec![LspDiagnostic {
+                range: selora_lsp::LspRange {
+                    start: position,
+                    end: position,
+                },
+                severity: LspSeverity::Error,
+                source: Some("test".into()),
+                message: message.into(),
+            }],
+        );
+    }
+
+    /// Write one server state and push it to the shell, unless the bridge
+    /// has already been shut down.
+    fn publish_state(&self, state: LspServerStateDto) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        lock(&self.states).insert(
+            parse_language(&state.language).expect("state language was parsed"),
+            state.clone(),
+        );
+        (self.emit)(FrontendEvent::LspServerStateChanged(state));
+    }
+}
+
+impl Drop for LspBridge {
+    fn drop(&mut self) {
+        // The effect sender is dropped right after this, which ends the
+        // manager; setting `active` first makes a final in-flight event a
+        // no-op for the new workspace.
+        self.active.store(false, Ordering::SeqCst);
     }
 }
 
@@ -239,6 +454,11 @@ async fn drain_events(mut events: UnboundedReceiver<LspEvent>, shared: Shared, e
 
 /// Translate one manager event into a protocol event (or nothing).
 fn map_event(event: LspEvent, shared: &Shared, emit: &Emit) {
+    // A bridge for a workspace that was just switched/closed must never leak
+    // diagnostics or answers into the new root.
+    if !shared.active.load(Ordering::SeqCst) {
+        return;
+    }
     match event {
         LspEvent::Diagnostics { path, diagnostics } => {
             let all = {
@@ -282,8 +502,63 @@ fn map_event(event: LspEvent, shared: &Shared, emit: &Emit) {
                     "Language server not found for {server:?} — install it or set its path in settings."
                 ),
             }));
+            publish_shared_state(
+                shared,
+                emit,
+                server_state(
+                    server,
+                    LspServerHealth::Failed,
+                    Some(format!(
+                        "{} was not found; install it or set its path in settings.",
+                        server.server_name()
+                    )),
+                ),
+            );
         }
-        LspEvent::ServerStatus { .. } | LspEvent::Progress { .. } => {}
+        LspEvent::ServerStatus { server, status } => {
+            let (health, error) = match status {
+                selora_lsp::ServerStatus::Starting => (LspServerHealth::Starting, None),
+                selora_lsp::ServerStatus::Ready => (LspServerHealth::Ready, None),
+                selora_lsp::ServerStatus::Dead(reason) => (LspServerHealth::Failed, Some(reason)),
+            };
+            publish_shared_state(shared, emit, server_state(server, health, error));
+        }
+        LspEvent::Progress { .. } => {}
+    }
+}
+
+/// Record and emit one lifecycle state from the drain task.
+fn publish_shared_state(shared: &Shared, emit: &Emit, state: LspServerStateDto) {
+    lock(&shared.states).insert(
+        parse_language(&state.language).expect("state language is known"),
+        state.clone(),
+    );
+    emit(FrontendEvent::LspServerStateChanged(state));
+}
+
+/// The protocol state for one server lifecycle.
+fn server_state(
+    language: LanguageId,
+    health: LspServerHealth,
+    error: Option<String>,
+) -> LspServerStateDto {
+    LspServerStateDto {
+        language: language.as_str().to_owned(),
+        server: language.server_name().to_owned(),
+        state: health,
+        error,
+    }
+}
+
+/// Accept the wire language id or the display server name.
+fn parse_language(value: &str) -> Option<LanguageId> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rust-analyzer" | "rust_analyzer" => Some(LanguageId::Rust),
+        "typescript" | "typescript-language-server" | "typescript_language_server" | "ts" => {
+            Some(LanguageId::TypeScript)
+        }
+        "javascript" | "js" => Some(LanguageId::JavaScript),
+        _ => None,
     }
 }
 
@@ -560,7 +835,11 @@ mod tests {
             "canonicalize yields a verbatim path on Windows"
         );
 
-        let bridge = LspBridge::start(canonical.clone(), Arc::new(|_| {}));
+        let bridge = LspBridge::start_with_paths(
+            canonical.clone(),
+            Arc::new(|_| {}),
+            LspServerPaths::default(),
+        );
         assert_eq!(bridge.root, plain_path(&canonical), "root normalized once");
         #[cfg(windows)]
         assert!(!bridge
@@ -587,7 +866,9 @@ mod tests {
         let shared = Shared {
             buffers: Arc::clone(&bridge.buffers),
             diagnostics: Arc::clone(&bridge.diagnostics),
+            states: Arc::clone(&bridge.states),
             root: bridge.root.clone(),
+            active: Arc::clone(&bridge.active),
         };
 
         map_event(
@@ -662,6 +943,80 @@ mod tests {
             prune_path(&mut by_path, &root, &opened).is_none(),
             "a second close emits nothing"
         );
+    }
+
+    #[test]
+    fn reload_sends_the_full_text_and_retracts_stale_diagnostics() {
+        let root = repo();
+        let path = root.join("src").join("main.rs");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&emitted);
+        let emit: Emit = Arc::new(move |event| lock(&capture).push(event));
+        let (bridge, mut effects) = LspBridge::start_for_test(root.clone(), emit);
+
+        bridge.open(path.clone(), "fn main() { broken() }\n".into());
+        let opened = effects.try_recv().expect("open effect");
+        assert!(matches!(opened, LspEffect::Open { .. }));
+        bridge.seed_error_diagnostic_for_test(&path, "cannot find function `broken`");
+        assert!(bridge.text_for_test(&path).is_some());
+
+        bridge.reload(path.clone(), "fn main() {}\n".into());
+
+        // The reload's didChange carries the complete new document, so the
+        // manager never patches its old (discarded) text.
+        let effect = effects.try_recv().expect("reload effect");
+        match effect {
+            LspEffect::Change { path: sent, text } => {
+                assert_eq!(sent, plain_path(&path));
+                assert_eq!(text, "fn main() {}\n");
+            }
+            other => panic!("expected a full-text change, got {other:?}"),
+        }
+        assert_eq!(
+            bridge.text_for_test(&path).as_deref(),
+            Some("fn main() {}\n"),
+            "later position requests convert against the reloaded text"
+        );
+
+        // The old text's diagnostic is retracted in the same call, before any
+        // later publish can repaint squiggles for it.
+        let events = lock(&emitted);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                FrontendEvent::DiagnosticsChanged(diagnostics) if diagnostics.is_empty()
+            )),
+            "stale diagnostics are retracted: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_diagnostics_drops_only_the_deleted_path() {
+        let root = repo();
+        let deleted = root.join("src").join("a.rs");
+        let kept = root.join("src").join("b.rs");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&emitted);
+        let emit: Emit = Arc::new(move |event| lock(&capture).push(event));
+        let (bridge, _effects) = LspBridge::start_for_test(root, emit);
+
+        bridge.seed_error_diagnostic_for_test(&deleted, "gone");
+        bridge.seed_error_diagnostic_for_test(&kept, "still here");
+        bridge.invalidate_diagnostics(&deleted);
+
+        let events = lock(&emitted);
+        match events.last() {
+            Some(FrontendEvent::DiagnosticsChanged(diagnostics)) => {
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].path.as_str(), "src/b.rs");
+            }
+            other => panic!("expected pruned diagnostics, got {other:?}"),
+        }
+        drop(events);
+        // A path with nothing stored emits nothing: reopen cannot resurrect it.
+        let before = lock(&emitted).len();
+        bridge.invalidate_diagnostics(&deleted);
+        assert_eq!(lock(&emitted).len(), before);
     }
 
     #[test]
@@ -823,5 +1178,190 @@ mod tests {
             ),
             Position::new(1, 2)
         );
+    }
+
+    // -- P1 lifecycle ------------------------------------------------------
+
+    fn capture() -> (Emit, Arc<Mutex<Vec<FrontendEvent>>>) {
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&emitted);
+        let emit: Emit = Arc::new(move |event| lock(&sink).push(event));
+        (emit, emitted)
+    }
+
+    fn quiet_config(paths: LspServerPaths) -> LspManagerConfig {
+        // Pin the PATH lookup to an empty list so the test never depends on
+        // the machine's installed servers.
+        LspManagerConfig::new(LspRegistry::new(paths).with_search_dirs(vec![]))
+    }
+
+    #[test]
+    fn stale_root_events_are_suppressed_after_shutdown() {
+        let root = repo();
+        let (emit, emitted) = capture();
+        let shared = Shared {
+            buffers: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics: Arc::new(Mutex::new(BTreeMap::new())),
+            states: Arc::new(Mutex::new(BTreeMap::new())),
+            root: root.clone(),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+
+        map_event(
+            LspEvent::Diagnostics {
+                path: root.join("src").join("a.rs"),
+                diagnostics: vec![diagnostic(1, 0, LspSeverity::Error)],
+            },
+            &shared,
+            &emit,
+        );
+        assert_eq!(lock(&emitted).len(), 1, "active bridge emits");
+
+        shared.active.store(false, Ordering::SeqCst);
+        map_event(
+            LspEvent::Diagnostics {
+                path: root.join("src").join("a.rs"),
+                diagnostics: vec![diagnostic(2, 0, LspSeverity::Error)],
+            },
+            &shared,
+            &emit,
+        );
+        map_event(
+            LspEvent::Hover {
+                path: root.join("src").join("a.rs"),
+                position: Position::new(0, 0),
+                content: Some("stale".into()),
+            },
+            &shared,
+            &emit,
+        );
+        assert_eq!(
+            lock(&emitted).len(),
+            1,
+            "a shut-down bridge drops both diagnostics and hover answers"
+        );
+    }
+
+    #[test]
+    fn restart_is_typed_for_unknown_disabled_and_missing_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (emit, _) = capture();
+
+        let disabled = LspBridge::start_with_config(
+            dir.path().to_path_buf(),
+            Arc::clone(&emit),
+            quiet_config(LspServerPaths {
+                enabled: false,
+                ..LspServerPaths::default()
+            }),
+        );
+        let unknown = disabled.restart("cobol").expect_err("unknown language");
+        assert_eq!(unknown.code, "lsp_unknown_language");
+        let off = disabled.restart("rust").expect_err("disabled");
+        assert_eq!(off.code, "lsp_disabled");
+        let states = disabled.server_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, LspServerHealth::Failed);
+        assert!(states[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("disabled"));
+
+        let missing = LspBridge::start_with_config(
+            dir.path().to_path_buf(),
+            emit,
+            quiet_config(LspServerPaths::default()),
+        );
+        let error = missing.restart("rust").expect_err("not on PATH");
+        assert_eq!(error.code, "lsp_server_not_found");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn restart_reports_starting_then_failed_when_the_launcher_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (emit, emitted) = capture();
+        let mut registry = LspRegistry::new(LspServerPaths {
+            rust_analyzer: Some("C:/missing/rust-analyzer.exe".into()),
+            ..LspServerPaths::default()
+        })
+        .with_search_dirs(vec![]);
+        registry.register(
+            LanguageId::Rust,
+            selora_lsp::ServerSpec {
+                name: "rust-analyzer".into(),
+                program: "C:/missing/rust-analyzer.exe".into(),
+                args: vec![],
+            },
+        );
+        let mut config = LspManagerConfig::new(registry);
+        let launcher: selora_lsp::Launcher =
+            Arc::new(|_spec| Err(selora_core::SeloraError::Lsp("boom".into())));
+        config.launcher = launcher;
+        let bridge = LspBridge::start_with_config(dir.path().to_path_buf(), emit, config);
+
+        let state = bridge.restart("rust-analyzer").expect("restart accepted");
+        assert_eq!(state.state, LspServerHealth::Starting);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let states = bridge.server_states();
+            if states
+                .iter()
+                .any(|state| state.state == LspServerHealth::Failed)
+            {
+                let failed = states
+                    .iter()
+                    .find(|state| state.state == LspServerHealth::Failed)
+                    .expect("failed state");
+                assert!(failed.error.as_deref().unwrap_or("").contains("boom"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher failure did not surface: {states:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            lock(&emitted).iter().any(|event| matches!(
+                event,
+                FrontendEvent::LspServerStateChanged(state)
+                    if state.state == LspServerHealth::Failed
+            )),
+            "the failed state was emitted to the shell"
+        );
+    }
+
+    #[test]
+    fn diagnostics_snapshot_reads_the_live_store_and_drops_out_of_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (emit, _) = capture();
+        let bridge = LspBridge::start_with_config(
+            dir.path().to_path_buf(),
+            emit,
+            quiet_config(LspServerPaths::default()),
+        );
+        let inside = bridge.root.join("src").join("main.rs");
+        {
+            let mut store = lock(&bridge.diagnostics);
+            store.insert(inside.clone(), vec![diagnostic(3, 2, LspSeverity::Warning)]);
+            store.insert(
+                PathBuf::from("outside").join("other.rs"),
+                vec![diagnostic(0, 0, LspSeverity::Error)],
+            );
+        }
+        let snapshot = bridge.diagnostics();
+        assert_eq!(snapshot.len(), 1, "out-of-root diagnostics are dropped");
+        assert_eq!(snapshot[0].path.as_str(), "src/main.rs");
+        assert_eq!(snapshot[0].severity, DiagnosticSeverity::Warning);
+
+        bridge.shutdown();
+        assert!(
+            bridge.diagnostics().is_empty(),
+            "a closed bridge reports nothing"
+        );
+        assert!(bridge.server_states().is_empty());
     }
 }

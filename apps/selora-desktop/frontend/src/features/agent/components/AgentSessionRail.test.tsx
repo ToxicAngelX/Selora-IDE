@@ -1,6 +1,6 @@
-// Selora IDE — AgentSessionRail accessibility tests
+// Selora IDE — AgentSessionRail accessibility tests (Phase 9a).
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import React from 'react';
 import { AgentSessionRail } from './AgentSessionRail';
 import { agentStore } from '../agent-store';
@@ -12,18 +12,17 @@ const sessions: AgentSession[] = [
     title: 'Current session',
     createdAt: 1,
     updatedAt: 2,
-    tokenCount: 1200,
-    costUsd: 0.01,
-    branchName: 'main',
+    tokenCount: 0,
+    costUsd: 0,
+    isRunning: true,
   },
   {
     id: 'sess-older',
     title: 'Older session',
     createdAt: 3,
     updatedAt: 4,
-    tokenCount: 2400,
-    costUsd: 0.02,
-    branchName: 'feature/a11y',
+    tokenCount: 0,
+    costUsd: 0,
   },
 ];
 
@@ -48,10 +47,11 @@ describe('AgentSessionRail', () => {
     expect(otherRow?.hasAttribute('aria-current')).toBe(false);
   });
 
-  it('switches sessions with both Enter and Space', () => {
-    const switchSpy = vi.spyOn(agentStore, 'switchSession').mockImplementation(() => {});
+it('routes New and select through the backend session commands', async () => {
+    const switchSpy = vi.spyOn(agentStore, 'requestSwitchSession').mockResolvedValue(true);
+    const newSpy = vi.spyOn(agentStore, 'requestNewSession').mockResolvedValue(true);
     const onClose = vi.fn();
-    const { getByText } = render(
+    const { getByText, getByRole } = render(
       <AgentSessionRail
         sessions={sessions}
         activeSessionId="sess-active"
@@ -61,13 +61,26 @@ describe('AgentSessionRail', () => {
     const otherRow = getByText('Older session').closest('button');
     expect(otherRow).toBeTruthy();
 
-    fireEvent.keyDown(otherRow!, { key: 'Enter' });
-    expect(switchSpy).toHaveBeenLastCalledWith('sess-older');
+fireEvent.click(otherRow!);
+    await waitFor(() => expect(switchSpy).toHaveBeenCalledWith('sess-older'));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
 
     expect(fireEvent.keyDown(otherRow!, { key: ' ' })).toBe(false);
-    expect(switchSpy).toHaveBeenCalledTimes(2);
-    expect(onClose).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(switchSpy).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(getByRole('button', { name: /New/ }));
+    await waitFor(() => expect(newSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(3));
 
     switchSpy.mockRestore();
+    newSpy.mockRestore();
+  });
+
+  it('shows the empty session state without fabricating a row', () => {
+    const { getByText, queryByRole } = render(
+      <AgentSessionRail sessions={[]} activeSessionId="" />
+    );
+    expect(getByText('No sessions yet')).toBeTruthy();
+    expect(queryByRole('button', { name: /Current session/ })).toBeNull();
   });
 });

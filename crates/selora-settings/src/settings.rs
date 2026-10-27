@@ -83,6 +83,13 @@ fn default_save() -> String {
     "Ctrl+S".into()
 }
 
+/// Inclusive ranges the desktop validates a settings patch against. Kept here
+/// so the schema's documented range and the shell's check share one source.
+pub const EDITOR_FONT_SIZE_MIN: u32 = 8;
+pub const EDITOR_FONT_SIZE_MAX: u32 = 32;
+pub const EDITOR_TAB_SIZE_MIN: u32 = 1;
+pub const EDITOR_TAB_SIZE_MAX: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // The schema.
 // ---------------------------------------------------------------------------
@@ -174,13 +181,43 @@ pub struct UiSettings {
 }
 
 /// `lsp.*` (ARCHITECTURE.md §8.1) — `None` means "resolve from PATH".
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `*_args` replace the registry's built-in arguments only when non-empty
+/// (an empty list keeps the default, e.g. TypeScript's `--stdio`). `enabled`
+/// is the master switch: false starts no language server and makes an LSP
+/// restart answer the typed `lsp_disabled` error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LspSettings {
     #[serde(default)]
     pub rust_analyzer_path: Option<String>,
 
     #[serde(default)]
     pub typescript_server_path: Option<String>,
+
+    #[serde(default)]
+    pub rust_analyzer_args: Vec<String>,
+
+    #[serde(default)]
+    pub typescript_server_args: Vec<String>,
+
+    #[serde(default = "default_lsp_enabled")]
+    pub enabled: bool,
+}
+
+fn default_lsp_enabled() -> bool {
+    true
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self {
+            rust_analyzer_path: None,
+            typescript_server_path: None,
+            rust_analyzer_args: Vec::new(),
+            typescript_server_args: Vec::new(),
+            enabled: default_lsp_enabled(),
+        }
+    }
 }
 
 /// `selora.*` (ARCHITECTURE.md §8.1). The API key is NOT here — it lives in
@@ -683,6 +720,9 @@ pub(crate) mod tests {
         assert_eq!(s.ui.chat_sidebar_width, 360);
         assert_eq!(s.lsp.rust_analyzer_path, None);
         assert_eq!(s.lsp.typescript_server_path, None);
+        assert!(s.lsp.rust_analyzer_args.is_empty());
+        assert!(s.lsp.typescript_server_args.is_empty());
+        assert!(s.lsp.enabled, "language servers default on");
         assert_eq!(s.selora.base_url, "https://api.selora.lol");
         assert_eq!(s.selora.active_model, None);
         assert_eq!(s.keybinds.command_palette, "Ctrl+Shift+P");
@@ -700,6 +740,9 @@ pub(crate) mod tests {
         let mut settings = Settings::default();
         settings.editor.font_size = 18;
         settings.lsp.rust_analyzer_path = Some("C:/tools/rust-analyzer.exe".into());
+        settings.lsp.rust_analyzer_args = vec!["--log-file".into(), "ra.log".into()];
+        settings.lsp.typescript_server_args = vec!["--stdio".into()];
+        settings.lsp.enabled = false;
         settings.selora.active_model = Some("glm-5.3".into());
         // Phase 5d: the agent Brave key and the reduced-motion flag.
         settings.agent.brave_search_api_key = Some("brave-test-key".into());
@@ -714,6 +757,55 @@ pub(crate) mod tests {
         assert_eq!(loaded, settings);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P1 settings slice: the editor preferences and all four keybinds
+    /// round-trip through the real file, preserving every other section.
+    #[test]
+    fn editor_preferences_and_keybinds_round_trip() {
+        let dir = temp_settings_dir("editor-keybinds");
+        let path = dir.join(SETTINGS_FILE_NAME);
+        let mut settings = Settings::default();
+        settings.editor.font_size = 20;
+        settings.editor.tab_size = 2;
+        settings.editor.word_wrap = true;
+        settings.keybinds.save = "Ctrl+Alt+S".into();
+        settings.keybinds.fuzzy_find = "Ctrl+Shift+F".into();
+        settings.keybinds.command_palette = "F2".into();
+        settings.keybinds.toggle_chat = "Alt+L".into();
+        settings.ui.reduce_motion = true;
+        settings.ui.theme = "light".into();
+
+        settings.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.editor.font_size, 20);
+        assert_eq!(loaded.editor.tab_size, 2);
+        assert!(loaded.editor.word_wrap);
+        assert_eq!(loaded.keybinds.save, "Ctrl+Alt+S");
+        assert_eq!(loaded.keybinds.fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(loaded.keybinds.command_palette, "F2");
+        assert_eq!(loaded.keybinds.toggle_chat, "Alt+L");
+        // Unrelated sections survive the whole-file rewrite.
+        assert_eq!(loaded.agent.max_iterations, 25);
+        assert_eq!(loaded.layout, LayoutSettings::default());
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains(r#""font_size": 20"#));
+        assert!(text.contains(r#""word_wrap": true"#));
+        assert!(text.contains(r#""save": "Ctrl+Alt+S""#));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The published validation ranges are the documented ones and do not
+    /// overlap inverted (the desktop uses them for every patch).
+    #[test]
+    fn editor_range_constants_are_sane() {
+        assert_eq!((EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX), (8, 32));
+        assert_eq!((EDITOR_TAB_SIZE_MIN, EDITOR_TAB_SIZE_MAX), (1, 8));
+        assert!((EDITOR_FONT_SIZE_MIN..=EDITOR_FONT_SIZE_MAX).contains(&14));
+        assert!((EDITOR_TAB_SIZE_MIN..=EDITOR_TAB_SIZE_MAX).contains(&4));
     }
 
     #[test]

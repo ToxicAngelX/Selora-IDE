@@ -7,8 +7,11 @@
 import { currentEnvelopeContext, getAppSnapshot, subscribeApp } from '../../app/app-store';
 import {
   closeBuffer as closeBufferCommand,
+  keepBufferEdits as keepBufferEditsCommand,
   openFile as openFileCommand,
+  reloadBufferFromDisk as reloadBufferFromDiskCommand,
   saveBuffer as saveBufferCommand,
+  setActiveBuffer as setActiveBufferCommand,
   type BootstrapState,
   type BufferSnapshot,
   type EditorContextDto,
@@ -24,6 +27,8 @@ export type EditorTab = {
   filename: string;
   language: string;
   isDirty: boolean;
+  /** P2 gap 3: the file also changed on disk (local edits were kept). */
+  externallyChanged: boolean;
   version: number;
 };
 
@@ -44,6 +49,8 @@ export type EditorStoreState = {
   workspaceRoot: string | null;
   workspaceName: string | null;
   fileTree: FileTreeNode | null;
+  /** P2 gap 3: buffer id → path for tabs with an unresolved disk conflict. */
+  conflicts: Record<string, string>;
 };
 
 type Listener = () => void;
@@ -90,12 +97,14 @@ function deriveState(
 ): EditorStoreState {
   const bootstrap: BootstrapState | null = app.bootstrap;
   const buffers = bootstrap?.buffers ?? [];
+  const conflicts = app.bufferConflicts ?? {};
   const tabs: EditorTab[] = buffers.map((buffer) => ({
     id: buffer.buffer_id,
     path: buffer.path,
     filename: filenameOf(buffer.path),
     language: buffer.language,
     isDirty: buffer.dirty,
+    externallyChanged: Object.prototype.hasOwnProperty.call(conflicts, buffer.buffer_id),
     version: buffer.version,
   }));
 
@@ -130,6 +139,7 @@ function deriveState(
     workspaceRoot: bootstrap?.workspace.root ?? null,
     workspaceName: bootstrap?.workspace.display_name ?? null,
     fileTree: bootstrap?.file_tree.root ?? null,
+    conflicts,
   };
 }
 
@@ -202,6 +212,18 @@ function reportMissingContext(): void {
   toastStore.pushLocal('warning', 'Connect to a workspace before editing files.');
 }
 
+/**
+ * Tell Rust which tab the user is looking at, so the next bootstrap's
+ * `active_buffer_id` is the real selection and not path order. Fire and
+ * forget: the pane already applied the switch locally; a failed ack leaves
+ * the previous (still valid) selection.
+ */
+function recordActiveBuffer(bufferId: string): void {
+  const context = currentEnvelopeContext();
+  if (!context) return;
+  void setActiveBufferCommand(bufferId, context).catch(() => undefined);
+}
+
 export function currentEditorContext(): EnvelopeContext | null {
   return currentEnvelopeContext();
 }
@@ -272,7 +294,14 @@ export const editorStore = {
     if (!state.tabs.some((tab) => tab.id === id)) return;
     if (localActiveId === id) return;
     localActiveId = id;
+    recordActiveBuffer(id);
     rebuild();
+    // Tell Rust which tab is active so a later bootstrap reports this one
+    // instead of the path-sorted first buffer.
+    const context = currentEditorContext();
+    if (context) {
+      void setActiveBufferCommand(id, context).catch(() => undefined);
+    }
   },
 
   async openPath(path: string): Promise<void> {
@@ -298,6 +327,7 @@ export const editorStore = {
     const existing = state.tabs.find((tab) => pathsEqual(tab.path, path));
     if (existing) {
       localActiveId = existing.id;
+      recordActiveBuffer(existing.id);
     } else {
       const context = currentEditorContext();
       if (!context) {
@@ -384,5 +414,29 @@ export const editorStore = {
     const active = state.activeBuffer;
     if (!active) return;
     void editorStore.saveBuffer(active.buffer_id);
+  },
+
+  /** P2 gap 3: take the disk text, discarding the kept local edits. */
+  reloadFromDisk(id: string): void {
+    syncFromApp();
+    if (!state.tabs.some((tab) => tab.id === id)) return;
+    const context = currentEditorContext();
+    if (!context) {
+      reportMissingContext();
+      return;
+    }
+    void reloadBufferFromDiskCommand(id, context).catch(() => undefined);
+  },
+
+  /** P2 gap 3: keep the local text and clear the external-change marker. */
+  keepMyEdits(id: string): void {
+    syncFromApp();
+    if (!state.tabs.some((tab) => tab.id === id)) return;
+    const context = currentEditorContext();
+    if (!context) {
+      reportMissingContext();
+      return;
+    }
+    void keepBufferEditsCommand(id, context).catch(() => undefined);
   },
 };

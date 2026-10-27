@@ -3,7 +3,11 @@
 // status bar contents — and region open/close state follows the live layout
 // store (event-driven, not optimistic).
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, configure, fireEvent, render, waitFor, within } from '@testing-library/react';
+
+// The shell's route modules are lazy chunks; under the full parallel suite a
+// cold transform can exceed the 1s default. Give the lazy mount room.
+configure({ asyncUtilTimeout: 5000 });
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
@@ -128,7 +132,7 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
     // "Ask anything" heads the welcome; the inert composer carries its own
     // placeholder whose copy is gated by workspace/model readiness.
     // Lazy chunk (Z6 bundle split) — resolve before asserting its chrome.
-    expect((await findByText('Ask anything')).classList.contains('empty-heading')).toBe(true);
+    expect((await findByText('Ask anything', {}, { timeout: 5000 })).classList.contains('empty-heading')).toBe(true);
     expect(
       container.querySelector('.agent-composer-placeholder')?.textContent?.trim(),
     ).toBeTruthy();
@@ -190,7 +194,11 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
       layoutStore.applyLayoutEvent(makeLayout({ activity_view: 'settings' }));
     });
     expect((await findByText('Settings')).classList.contains('sidebar-header')).toBe(true);
-    expect(await findByText('The other controls are read-only in this build.')).toBeTruthy();
+    expect(
+      await findByText(
+        'Theme, reduced motion, editor preferences, and the four keybinds save automatically through Rust.',
+      ),
+    ).toBeTruthy();
     // The settings echo carries keybinds
     expect(getAllByText('Ctrl+Shift+P').length).toBeGreaterThan(0);
     expect(getAllByText('Ctrl+L').length).toBeGreaterThan(0);

@@ -44,6 +44,7 @@
 #![forbid(unsafe_code)]
 
 pub mod budget;
+pub mod effects;
 pub mod facade;
 pub mod journal;
 mod persisted;
@@ -57,8 +58,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub use budget::Budget;
+pub use effects::{
+    is_side_effecting_tool, load_tool_effects, redacted_tool_arguments, tool_effects_path,
+    ToolEffectLedger, ToolEffectPhase, ToolEffectRecord, ToolEffectStep,
+};
 pub use persisted::{
-    incomplete_asks, load_workflow_spec, run_workflow_persisted, IncompleteAsk, RunOptions,
+    incomplete_asks, load_workflow_spec, partial_effects, run_workflow_persisted, ArtifactRecord,
+    IncompleteAsk, PartialEffects, ReportItemRecord, RunOptions, StepFinishRecord, StepStartRecord,
 };
 pub use sandbox::{
     prepare, Confirmation, Limits, DEFAULT_MAX_COST_USD, MAX_SCRIPT_BYTES, MAX_STEPS,
@@ -515,6 +521,21 @@ pub enum WorkflowError {
         /// How many ask steps the resume would dispatch again.
         count: usize,
     },
+    /// A resume would replay tool effects the ledger cannot prove finished, or
+    /// effects that belong to an ask the resume would dispatch again.
+    /// Explicitly accepted via [`RunOptions::acknowledge_partial_effects`].
+    #[error("resume may replay {effects} tool effect(s) that already applied; set acknowledge_partial_effects to accept this risk")]
+    PartialEffects {
+        /// How many started effects lack a matching finish.
+        effects: usize,
+    },
+    /// The per-run tool-effect ledger could not be read or trusted. Never
+    /// treated as an empty ledger.
+    #[error("tool effect ledger: {message}")]
+    ToolEffectLedger {
+        /// What could not be proven.
+        message: String,
+    },
     /// The engine could not build or harden its realm (an engine bug, not a
     /// script bug).
     #[error("workflow engine error: {message}")]
@@ -628,6 +649,14 @@ pub trait Host: Send + Sync {
     fn restore_agent(&self, agent: &str, snapshot: &serde_json::Value) -> Result<(), HostError> {
         let _ = (agent, snapshot);
         Ok(())
+    }
+
+    /// Called before a non-replayed step executes, so a host can attribute
+    /// side effects raised by that step (for the durable tool-effect ledger).
+    /// Read-only facade calls are included; implementations should only store
+    /// the identity. Default is a no-op for hosts that do not need it.
+    fn note_step_started(&self, step: &WorkflowStep) {
+        let _ = step;
     }
 
     /// One subagent turn. `agent` is the run-unique identity the script used;

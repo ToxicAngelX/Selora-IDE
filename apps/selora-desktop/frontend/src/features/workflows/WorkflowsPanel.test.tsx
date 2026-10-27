@@ -254,7 +254,7 @@ describe('WorkflowsPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
 
-    expect(onResume).toHaveBeenCalledWith('run_durable', false);
+    expect(onResume).toHaveBeenCalledWith('run_durable', false, false);
     expect(await screen.findByRole('alert')).toHaveProperty(
       'textContent',
       'journal changed',
@@ -283,11 +283,12 @@ describe('WorkflowsPanel', () => {
     const warning = await screen.findByTestId('wf-resume-warning');
 
     expect(onResume).toHaveBeenCalledTimes(1);
-    expect(onResume).toHaveBeenNthCalledWith(1, 'run_asks', false);
+    expect(onResume).toHaveBeenNthCalledWith(1, 'run_asks', false, false);
     expect(warning.textContent).toContain('2 unfinished steps may run again');
     expect(warning.textContent).toContain('may already have applied effects');
     expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
     expect(workflowsStore.getSnapshot().runs[0]?.resume_confirmation).toEqual({
+      kind: 'incomplete_asks',
       count: 2,
       summary: message,
     });
@@ -300,10 +301,69 @@ describe('WorkflowsPanel', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(onResume).toHaveBeenCalledTimes(2);
-    expect(onResume).toHaveBeenNthCalledWith(2, 'run_asks', true);
+    expect(onResume).toHaveBeenNthCalledWith(2, 'run_asks', true, false);
     expect(workflowsStore.getSnapshot().runs[0]?.resume_confirmation).toBeNull();
     expect(workflowsStore.getSnapshot().runs[0]?.resumable).toBe(false);
     expect(screen.queryByTestId('wf-resume-warning')).toBeNull();
+  });
+
+  it('offers a separate acknowledgement for durable partial effects', async () => {
+    const onResume = vi.fn(() => Promise.resolve());
+    workflowsStore.setResumeHandler(onResume);
+    act(() => workflowsStore.hydratePersisted([{
+      run_id: 'run_effects',
+      name: 'Partially applied run',
+      status: 'failed',
+      // Bootstrap marks a partial-effect run non-resumable on purpose.
+      resumable: false,
+      partial_effects: true,
+      detail: 'Earlier tool effects may already exist.',
+    }]));
+    render(<WorkflowsPanel />);
+
+    // Ordinary Resume is not offered.
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
+    const warning = screen.getByTestId('wf-partial-effects');
+    expect(warning.textContent).toContain('Earlier tool effects may already exist');
+    expect(warning.textContent).toContain('not undone');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge and resume anyway' }));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(onResume).toHaveBeenCalledWith('run_effects', true, true);
+    expect(workflowsStore.getSnapshot().runs[0]?.partial_effects).toBe(false);
+    expect(screen.queryByTestId('wf-partial-effects')).toBeNull();
+  });
+
+  it('turns a workflow_partial_effects refusal into a separate confirmation', async () => {
+    const message =
+      'Resume would replay a run whose tools may already have applied effects (1 tool call(s) started without a recorded finish). Files or commands may already exist; resume does not undo them. Acknowledge partial effects to resume anyway.';
+    const onResume = vi.fn((_runId: string, _allow: boolean, acknowledge?: boolean) =>
+      acknowledge
+        ? Promise.resolve()
+        : Promise.reject({ code: 'workflow_partial_effects', message, retryable: false }));
+    workflowsStore.setResumeHandler(onResume);
+    act(() => workflowsStore.hydratePersisted([{
+      run_id: 'run_effects_late',
+      name: 'Partial effects discovered late',
+      status: 'failed',
+      resumable: true,
+    }]));
+    render(<WorkflowsPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
+    const warning = await screen.findByTestId('wf-resume-warning');
+    expect(warning.textContent).toContain('Earlier tool effects may already exist');
+    expect(workflowsStore.getSnapshot().runs[0]?.resume_confirmation?.kind).toBe(
+      'partial_effects',
+    );
+    expect(workflowsStore.getSnapshot().runs[0]?.resumable).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge and resume anyway' }));
+    await act(async () => { await Promise.resolve(); });
+    expect(onResume).toHaveBeenCalledTimes(2);
+    expect(onResume).toHaveBeenNthCalledWith(2, 'run_effects_late', true, true);
   });
 
   it('clears the confirmation on cancel without a second resume call', async () => {
@@ -388,6 +448,66 @@ describe('WorkflowsPanel', () => {
     expect(screen.getByText(/## Findings/)).toBeTruthy();
     const log = screen.getByRole('log', { name: 'Run log' });
     expect(within(log).getByText('Recovered from journal: Recovered completed review')).toBeTruthy();
+  });
+
+  it('hydrates multi-phase completed history with phase-grouped reports and artifacts', () => {
+    act(() => workflowsStore.hydratePersisted([{
+      run_id: 'run_history_phases',
+      name: 'Recovered multi-phase review',
+      status: 'completed',
+      resumable: false,
+      phases: ['scan', 'fix', 'verify'],
+      steps: [
+        { id: 'step-1', phase: '', label: 'pre report', status: 'completed' },
+        { id: 'step-2', phase: 'scan', label: 'scan step', status: 'completed' },
+        { id: 'step-3', phase: 'scan', label: 'inspect', status: 'completed' },
+        { id: 'step-4', phase: 'fix', label: 'apply', status: 'completed' },
+        { id: 'step-5', phase: 'verify', label: 'check', status: 'completed' },
+      ],
+      reports: [
+        { id: 'report-1', item: 'pre', phase: null },
+        { id: 'report-2', item: 'found', phase: 'scan', artifact_id: 'summary' },
+        { id: 'report-3', item: 'fixed', phase: 'fix' },
+        { id: 'report-4', item: 'verified', phase: 'verify' },
+      ],
+      artifacts: [
+        { id: 'summary', title: '', kind: 'markdown', body: '## Body', phase: 'scan' },
+      ],
+      tokens: 99,
+      cost_usd: 0.5,
+    }]));
+    render(<WorkflowsPanel />);
+
+    const run = workflowsStore.getSnapshot().runs[0];
+    expect(run?.phases).toEqual([
+      { name: 'scan', status: 'completed' },
+      { name: 'fix', status: 'completed' },
+      { name: 'verify', status: 'completed' },
+    ]);
+    expect(run?.steps.map((step) => step.phase)).toEqual([null, 'scan', 'scan', 'fix', 'verify']);
+    expect(run?.reports.map((report) => report.phase)).toEqual([null, 'scan', 'fix', 'verify']);
+    expect(run?.artifacts[0]).toMatchObject({ phase: 'scan', title: null, content: '## Body' });
+
+    const graph = screen.getByRole('list', { name: 'Workflow phase graph' });
+    expect(within(graph).getByText('scan')).toBeTruthy();
+    expect(within(graph).getByText('fix')).toBeTruthy();
+    expect(within(graph).getByText('verify')).toBeTruthy();
+
+    const steps = screen.getByRole('list', { name: 'Workflow steps' });
+    expect(within(steps).getAllByText('scan')).toHaveLength(2);
+    expect(within(steps).getByText('fix')).toBeTruthy();
+    expect(within(steps).getByText('verify')).toBeTruthy();
+
+    const reports = screen.getByRole('list', { name: 'Run reports' });
+    expect(within(reports).getByText('found')).toBeTruthy();
+    expect(within(reports).getByText('fixed')).toBeTruthy();
+    expect(within(reports).getByText('verified')).toBeTruthy();
+    expect(within(reports).getAllByText('scan')).toHaveLength(1);
+
+    const artifacts = screen.getByRole('list', { name: 'Run artifacts' });
+    expect(within(artifacts).getByText('## Body')).toBeTruthy();
+    expect(within(artifacts).getByText('scan')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
   });
 
   it('never offers resume for an ambiguous durable run', () => {

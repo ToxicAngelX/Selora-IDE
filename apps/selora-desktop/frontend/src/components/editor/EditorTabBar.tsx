@@ -14,8 +14,10 @@ export type EditorTabView = {
   path: string;
   language: string;
   isDirty: boolean;
-  /** Local "Keep Open" pin; bulk closes spare pinned tabs. */
+/** Local "Keep Open" pin; bulk closes spare pinned tabs. */
   isPinned?: boolean;
+  /** P2 gap 3: the file changed on disk while this tab held unsaved edits. */
+  externallyChanged?: boolean;
 };
 
 export type EditorTabBarProps = {
@@ -249,15 +251,28 @@ export function EditorTabBar({
                 type="button"
                 role="tab"
                 aria-selected={isActive}
-                aria-label={tab.filename}
+                aria-label={
+                  tab.externallyChanged
+                    ? `${tab.filename}, changed on disk`
+                    : tab.filename
+                }
                 aria-controls="editor-surface"
                 tabIndex={isActive ? 0 : -1}
-                className={`editor-tab${isActive ? ' is-active' : ''}${tab.isDirty ? ' is-dirty' : ''}`}
+                className={`editor-tab${isActive ? ' is-active' : ''}${tab.isDirty ? ' is-dirty' : ''}${tab.externallyChanged ? ' is-externally-changed' : ''}`}
                 onClick={() => selectAndFocus(tab.id)}
                 onKeyDown={(e) => handleKeyDown(e, tab.id, idx)}
               >
                 <FileTypeIcon language={tab.language} filename={tab.filename} />
                 <span className="tab-title">{tab.filename}</span>
+                {tab.externallyChanged ? (
+                  <span
+                    className="tab-conflict-indicator"
+                    title="File changed on disk"
+                    aria-hidden="true"
+                  >
+                    ↻
+                  </span>
+                ) : null}
                 {tab.isDirty ? (
                   <span className="tab-dirty-indicator" title="Unsaved changes" aria-hidden="true">
                     ●

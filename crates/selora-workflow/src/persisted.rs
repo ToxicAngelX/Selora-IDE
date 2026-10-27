@@ -2,19 +2,30 @@
 //!
 //! Completed calls replay without host IO. An interrupted `world.run` is
 //! ambiguous and cannot resume: its effects may already have happened.
+//! A per-run tool-effect ledger (`.selora/workflow-runs/{run_id}/tool-effects.jsonl`)
+//! records `started`/`finished` pairs around side-effecting ask tools. A
+//! `started` without `finished`, or an effect owned by an unfinished ask, makes
+//! the run non-resumable until [`RunOptions::acknowledge_partial_effects`]
+//! accepts that effects may already exist. A corrupt ledger is a typed error,
+//! never empty evidence. [`partial_effects`] is the shell's preflight.
 //! Unfinished asks are dispatched again through the host with fresh approval
-//! slots. Tools inside those asks may have partially applied effects before
-//! interruption; renewed approval is not an exactly-once guarantee. Resume is
-//! therefore fail-closed: when any ask would be dispatched again and
-//! [`RunOptions::allow_incomplete_asks`] is false, the run is refused before
-//! the host is called or the journal is appended to. [`incomplete_asks`] is
-//! the shell's preflight for the confirmation that flag represents.
+//! slots. When any ask would be dispatched again and neither
+//! [`RunOptions::allow_incomplete_asks`] nor the partial-effect acknowledgement
+//! is set, the run is refused before the host is called or the journal is
+//! appended to. [`incomplete_asks`] is the shell's preflight for that flag.
 //! Recorded usage includes failed turns. A process crash before the host returns
 //! its receipt cannot recover that unreported charge from this journal.
 //!
 //! Path checks reject existing symlinks/reparse points. As with ordinary
 //! workspace IO, callers must exclude concurrent hostile filesystem mutation;
 //! portable safe Rust path APIs cannot eliminate check/open races.
+//!
+//! Record vocabulary (all additive; older journals stay readable):
+//! `engine_run_started`, `engine_step_started` (with the phase in effect),
+//! `engine_step_finished` (with the phase in effect at completion),
+//! `engine_report_item` (one per `report` that reached the host, carrying its
+//! run-wide ordinal), `engine_artifact` (full markdown/file content),
+//! `engine_run_finished`, and `phase_started`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -25,6 +36,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::effects::{ToolEffectPhase, ToolEffectRecord};
 use crate::journal::{check_file, checked_run_dir, load_verified, Journal, JournalWriter};
 use crate::{
     EventSink, Host, RunId, RunStatus, StepKind, WorkflowError, WorkflowOutcome, WorkflowReport,
@@ -48,6 +60,16 @@ pub struct RunOptions {
     /// resume with [`WorkflowError::IncompleteAsks`] before any host call or
     /// journal append, because a re-dispatched ask is not exactly-once.
     pub allow_incomplete_asks: bool,
+    /// Accept that resume may replay tool effects the ledger proves may already
+    /// have applied: a `started` record without `finished`, or a side effect
+    /// owned by an ask the resume would dispatch again.
+    ///
+    /// Only consulted when `resume` is true. Default (`false`) refuses with
+    /// [`WorkflowError::PartialEffects`] before any host call or journal
+    /// append. Set this only from a separate, explicit user action that names
+    /// the existing-effect risk; it also accepts the unfinished-ask
+    /// re-dispatch, because that ask is the owner of those effects.
+    pub acknowledge_partial_effects: bool,
 }
 
 /// One ask step a resume would dispatch again.
@@ -106,15 +128,82 @@ pub fn incomplete_asks(root: &Path, run_id: &RunId) -> Result<Vec<IncompleteAsk>
     scan.unfinished_asks()
 }
 
+/// Durable evidence that a resume may replay already-applied tool effects.
+///
+/// Non-empty when the run's tool-effect ledger proves at least one of:
+///
+/// * a `started` side effect has no matching `finished` record (the crash
+///   window between the effect landing and its completion append);
+/// * a side effect is owned by an ask the resume would dispatch again (that
+///   ask's tools may run a second time);
+/// * a side effect cannot be attributed to any known step (fail closed, never
+///   guess it is safe).
+///
+/// Effects owned by completed asks are not reported, and a read-only unfinished
+/// ask produces no ledger records at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartialEffects {
+    /// `started` records with no matching `finished`.
+    pub unfinished_effects: usize,
+    /// Side effects owned by an ask the resume would dispatch again.
+    pub unfinished_ask_effects: usize,
+    /// Side effects whose step identity is unknown to the journal.
+    pub unattributed_effects: usize,
+}
+
+impl PartialEffects {
+    /// No durable partial-effect evidence.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.unfinished_effects == 0
+            && self.unfinished_ask_effects == 0
+            && self.unattributed_effects == 0
+    }
+
+    /// Distinct side effects that make a silent resume unsafe.
+    #[must_use]
+    pub fn risk_count(&self) -> usize {
+        self.unfinished_effects + self.unfinished_ask_effects + self.unattributed_effects
+    }
+}
+
+/// Read the run's tool-effect ledger against its journal: the shell's
+/// partial-effect preflight.
+///
+/// A missing ledger is empty evidence. A corrupt ledger is a typed
+/// [`WorkflowError::ToolEffectLedger`] error, never an empty success. It also
+/// runs the same strict spec/journal validation as a resume, so it cannot
+/// answer for a run the engine would refuse.
+///
+/// # Errors
+/// Invalid run id, untrusted path, missing or malformed spec, damaged journal,
+/// or a corrupt/foreign ledger.
+pub fn partial_effects(root: &Path, run_id: &RunId) -> Result<PartialEffects, WorkflowError> {
+    let spec = load_workflow_spec(root, run_id)?;
+    let verified = load_verified(root, run_id).map_err(persistence_error)?;
+    let scan = scan_journal(&verified.loaded.entries, &spec)?;
+    let records = crate::effects::load_tool_effects(root, run_id)?;
+    Ok(scan.partial_effects(&records))
+}
+
 /// Execute a confirmed workflow with durable, deterministic replay. Blocking.
 ///
-/// Completed runs cannot be resumed. Failed or stopped runs can resume, except
-/// when an interrupted command has an ambiguous side effect. Unfinished asks
-/// are new host dispatches and require fresh approval slots; their tools may
-/// already have partially applied effects before interruption. A resume that
-/// would dispatch one again is refused with [`WorkflowError::IncompleteAsks`]
-/// unless [`RunOptions::allow_incomplete_asks`] is true, and the refusal
-/// happens before any host call or journal append.
+/// Completed runs cannot be resumed. A run whose confirmed cost cap already
+/// fired ([`RunStatus::BudgetExceeded`]) cannot resume either: the grant is
+/// spent, resume never raises it silently, and the refusal happens before any
+/// host call or journal append. Continuing needs a new confirmed run and
+/// budget. Failed or stopped runs can resume, except when an interrupted
+/// command has an ambiguous side effect. The tool-effect ledger is consulted
+/// first: an unfinished `started` record, or an effect owned by an unfinished
+/// ask, is refused with [`WorkflowError::PartialEffects`] unless
+/// [`RunOptions::acknowledge_partial_effects`] is true. A corrupt ledger is
+/// [`WorkflowError::ToolEffectLedger`]. Unfinished asks are new host dispatches
+/// and require fresh approval slots; their tools may already have partially
+/// applied effects before interruption. A resume that would dispatch one again
+/// is refused with [`WorkflowError::IncompleteAsks`] unless
+/// [`RunOptions::allow_incomplete_asks`] (or the partial-effect
+/// acknowledgement) is true. Every refusal happens before any host call or
+/// journal append.
 ///
 /// # Errors
 /// Returns workflow errors or persistence errors before any unjournaled effect.
@@ -129,24 +218,74 @@ pub fn run_workflow_persisted(
     crate::sandbox::run_durable(spec, host, sink, options.run_id, durable)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct CallStart {
-    step: WorkflowStep,
-    inputs: Value,
+/// One `engine_step_started` record.
+///
+/// `phase` is the phase marker in effect when the step started. It is additive:
+/// journals written before it existed deserialize with `None`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepStartRecord {
+    /// The step identity and its initial (running) state.
+    pub step: WorkflowStep,
+    /// The call's normalized inputs, used to prove replay identity.
+    pub inputs: Value,
+    /// The current phase name, when the script declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct CallFinish {
-    step: WorkflowStep,
-    value: Value,
-    cost_usd: f64,
-    tokens: u64,
+/// One `engine_step_finished` record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepFinishRecord {
+    /// The completed step identity.
+    pub step: WorkflowStep,
+    /// The step's value (`null` when it produced none).
+    pub value: Value,
+    /// Receipt cost for this step.
+    pub cost_usd: f64,
+    /// Receipt tokens for this step.
+    pub tokens: u64,
+    /// A successful ask's checkpoint, when the host supports one.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_agent_state"
     )]
-    agent_state: Option<Value>,
+    pub agent_state: Option<Value>,
+    /// The current phase name when the step finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+/// One `engine_report_item` record: a `report(item, artifactId?)` that
+/// actually reached the host. A report step that failed before the host call
+/// leaves no record, so history can never claim it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReportItemRecord {
+    /// The report step's identity.
+    pub step_id: u64,
+    /// The phase in effect when the item was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The 1-based report ordinal across the run (the live `report-N` id).
+    pub index: u64,
+    /// The reported JSON item, verbatim.
+    pub item: Value,
+    /// Optional artifact the item belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+}
+
+/// One `engine_artifact` record: an artifact with its full content, written
+/// even when the terminal run report is missing or the step value is `null`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    /// The artifact step's identity.
+    pub step_id: u64,
+    /// The phase in effect when the artifact was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The artifact id, title and markdown/file content.
+    pub artifact: crate::Artifact,
 }
 
 // Preserve an explicitly supplied JSON null so the host can reject malformed
@@ -158,8 +297,8 @@ fn deserialize_agent_state<'de, D: serde::Deserializer<'de>>(
 }
 
 struct SavedCall {
-    start: CallStart,
-    finish: Option<CallFinish>,
+    start: StepStartRecord,
+    finish: Option<StepFinishRecord>,
 }
 
 /// What a durable journal proves once every record has been validated.
@@ -196,7 +335,7 @@ fn scan_journal(
         }
         match entry.kind.as_str() {
             "engine_step_started" => {
-                let start: CallStart =
+                let start: StepStartRecord =
                     serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
                 if let Some(saved) = scan.calls.get(&start.step.index) {
                     if saved.start.inputs != start.inputs || saved.start.step != start.step {
@@ -216,7 +355,7 @@ fn scan_journal(
                 }
             }
             "engine_step_finished" => {
-                let finish: CallFinish =
+                let finish: StepFinishRecord =
                     serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
                 if !finish.cost_usd.is_finite() || finish.cost_usd < 0.0 {
                     return Err(persistence_error("invalid usage delta"));
@@ -278,6 +417,14 @@ fn scan_journal(
                 }
                 scan.confirmed = true;
             }
+            "engine_report_item" => {
+                let _: ReportItemRecord =
+                    serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
+            }
+            "engine_artifact" => {
+                let _: ArtifactRecord =
+                    serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
+            }
             "phase_started" => {}
             _ => {
                 return Err(persistence_error(format!(
@@ -325,6 +472,62 @@ impl JournalScan {
         }
         Ok(asks)
     }
+
+    /// Classify the ledger against this journal's proven step identities.
+    fn partial_effects(&self, records: &[ToolEffectRecord]) -> PartialEffects {
+        use std::collections::BTreeSet;
+
+        let unfinished_asks: BTreeSet<u64> = self
+            .calls
+            .values()
+            .filter(|saved| {
+                saved.start.step.kind == StepKind::Ask
+                    && !saved
+                        .finish
+                        .as_ref()
+                        .is_some_and(|finish| finish.step.status == crate::StepStatus::Ok)
+            })
+            .map(|saved| saved.start.step.index)
+            .collect();
+        let mut finished: BTreeSet<&str> = BTreeSet::new();
+        for record in records {
+            if record.phase == ToolEffectPhase::Finished {
+                finished.insert(record.effect_id.as_str());
+            }
+        }
+        let mut unfinished_effects = BTreeSet::new();
+        let mut unfinished_ask_effects = BTreeSet::new();
+        let mut unattributed_effects = BTreeSet::new();
+        for record in records {
+            if record.phase != ToolEffectPhase::Started {
+                continue;
+            }
+            if !finished.contains(record.effect_id.as_str()) {
+                unfinished_effects.insert(record.effect_id.as_str());
+                continue;
+            }
+            let known = record.step.as_ref().and_then(|step| {
+                step.step_id
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|index| self.calls.contains_key(index))
+            });
+            match known {
+                Some(index) if unfinished_asks.contains(&index) => {
+                    unfinished_ask_effects.insert(record.effect_id.as_str());
+                }
+                Some(_) => {}
+                None => {
+                    unattributed_effects.insert(record.effect_id.as_str());
+                }
+            }
+        }
+        PartialEffects {
+            unfinished_effects: unfinished_effects.len(),
+            unfinished_ask_effects: unfinished_ask_effects.len(),
+            unattributed_effects: unattributed_effects.len(),
+        }
+    }
 }
 
 pub(crate) struct Durable {
@@ -343,14 +546,22 @@ impl Durable {
         options: &RunOptions,
         host: &dyn Host,
     ) -> Result<Self, WorkflowError> {
-        // Fail closed before any host call: a resume that would ask again may
-        // re-run tools whose earlier effects already landed.
-        if options.resume && !options.allow_incomplete_asks {
-            let pending = incomplete_asks(&options.workspace_root, &options.run_id)?;
-            if !pending.is_empty() {
-                return Err(WorkflowError::IncompleteAsks {
-                    count: pending.len(),
+        // Fail closed before any host call: a resume may replay tools whose
+        // earlier effects already landed. The ledger is the durable evidence.
+        if options.resume {
+            let partial = partial_effects(&options.workspace_root, &options.run_id)?;
+            if !partial.is_empty() && !options.acknowledge_partial_effects {
+                return Err(WorkflowError::PartialEffects {
+                    effects: partial.risk_count(),
                 });
+            }
+            if !options.allow_incomplete_asks && !options.acknowledge_partial_effects {
+                let pending = incomplete_asks(&options.workspace_root, &options.run_id)?;
+                if !pending.is_empty() {
+                    return Err(WorkflowError::IncompleteAsks {
+                        count: pending.len(),
+                    });
+                }
             }
         }
         if !host.cost_usd().is_finite() || host.cost_usd() < 0.0 {
@@ -396,6 +607,14 @@ impl Durable {
         let scan = scan_journal(&loaded.entries, spec)?;
         if scan.finished == Some(RunStatus::Completed) {
             return Err(persistence_error("completed run cannot resume"));
+        }
+        if scan.finished == Some(RunStatus::BudgetExceeded) {
+            // The confirmed cap already fired. Resume never raises the grant:
+            // a budget that is exhausted needs a new confirmed run and budget.
+            return Err(WorkflowError::BudgetExceeded {
+                limit: spec.max_cost_usd,
+                spent: scan.spent_usd,
+            });
         }
         let calls = scan.calls;
         if calls.values().any(|call| {
@@ -462,14 +681,35 @@ impl Durable {
         &mut self,
         step: &WorkflowStep,
         inputs: Value,
+        phase: Option<String>,
     ) -> Result<(), WorkflowError> {
-        let start = CallStart {
+        let start = StepStartRecord {
             step: step.clone(),
             inputs,
+            phase,
         };
         self.append(
             "engine_step_started",
             serde_json::to_value(&start).map_err(persistence_error)?,
+        )
+    }
+
+    /// Append one report item that reached the host. Called only after the
+    /// host accepted it, so the journal never claims a report that did not
+    /// happen.
+    pub(crate) fn report_item(&mut self, record: &ReportItemRecord) -> Result<(), WorkflowError> {
+        self.append(
+            "engine_report_item",
+            serde_json::to_value(record).map_err(persistence_error)?,
+        )
+    }
+
+    /// Append one artifact with its full content. Called only after the host
+    /// accepted it.
+    pub(crate) fn artifact(&mut self, record: &ArtifactRecord) -> Result<(), WorkflowError> {
+        self.append(
+            "engine_artifact",
+            serde_json::to_value(record).map_err(persistence_error)?,
         )
     }
 
@@ -490,6 +730,7 @@ impl Durable {
         step: &WorkflowStep,
         value: Option<Value>,
         agent_state: Option<Value>,
+        phase: Option<String>,
         host: &dyn Host,
     ) -> Result<(), WorkflowError> {
         let cost = host.cost_usd();
@@ -499,12 +740,13 @@ impl Durable {
                 "host usage counters must be finite and monotonic",
             ));
         }
-        let finish = CallFinish {
+        let finish = StepFinishRecord {
             step: step.clone(),
             value: value.unwrap_or(Value::Null),
             cost_usd: cost - self.host_cost,
             tokens: tokens - self.host_tokens,
             agent_state,
+            phase,
         };
         self.append(
             "engine_step_finished",

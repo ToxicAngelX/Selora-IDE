@@ -14,6 +14,48 @@ mod workspace;
 
 use tauri::Manager;
 
+/// Native Save / Discard / Cancel prompt for the close path. Lives in the
+/// shell (not the WebView) so the prompt still appears while the editor is
+/// dirty and no IPC is allowed to run.
+fn prompt_close_choice(dirty: &[selora_protocol::BufferSnapshotDto]) -> state::CloseChoice {
+    const MAX_LISTED: usize = 8;
+    let mut description = format!(
+        "{} unsaved {}:\n\n",
+        dirty.len(),
+        if dirty.len() == 1 {
+            "file has"
+        } else {
+            "files have"
+        }
+    );
+    for buffer in dirty.iter().take(MAX_LISTED) {
+        description.push_str("  • ");
+        description.push_str(buffer.path.as_str());
+        description.push('\n');
+    }
+    if dirty.len() > MAX_LISTED {
+        description.push_str(&format!("  … and {} more\n", dirty.len() - MAX_LISTED));
+    }
+    description.push_str("\nSave all changes before closing Selora?");
+
+    match rfd::MessageDialog::new()
+        .set_title("Unsaved changes")
+        .set_description(description)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Save".into(),
+            "Discard".into(),
+            "Cancel".into(),
+        ))
+        .show()
+    {
+        rfd::MessageDialogResult::Custom(label) if label == "Save" => state::CloseChoice::Save,
+        rfd::MessageDialogResult::Custom(label) if label == "Discard" => {
+            state::CloseChoice::Discard
+        }
+        _ => state::CloseChoice::Cancel,
+    }
+}
+
 fn log_boot(msg: &str) {
     let log_path = std::env::temp_dir().join("selora_boot.log");
     let line = format!("[pid {}] {}\n", std::process::id(), msg);
@@ -63,17 +105,33 @@ fn main() {
                 .build(),
         )
         .manage(state)
-        // §3.3 (docs/ui/PHASE_Z2_ARCHITECTURE.md): the close-time save runs
-        // in Rust on `CloseRequested` — an IPC command cannot be guaranteed
-        // to flush during webview teardown (WebView2 `beforeunload` is
-        // unreliable), so the process that owns the file does the write.
-        // The save is synchronous, before the close is allowed; a failure
-        // here has no surface left to toast to, and the last explicit
-        // `SaveLayout` is the fallback.
+        // §3.3 (docs/ui/PHASE_Z2_ARCHITECTURE.md): the close path runs in Rust
+        // on `CloseRequested` — an IPC command cannot be guaranteed to flush
+        // during webview teardown (WebView2 `beforeunload` is unreliable), so
+        // the process that owns the files does the writes. Dirty buffers get a
+        // native Save / Discard / Cancel prompt; cancel and failed saves call
+        // `prevent_close`, so edits are never silently lost. The layout save
+        // stays best-effort after the close is allowed.
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app_state = window.app_handle().state::<state::DesktopState>();
-                let _ = app_state.persist_layout();
+                match app_state.handle_close_request(prompt_close_choice) {
+                    state::CloseOutcome::Close { .. } => {
+                        // Best effort: the layout must never block a close.
+                        let _ = app_state.persist_layout();
+                    }
+                    state::CloseOutcome::Stay => api.prevent_close(),
+                    state::CloseOutcome::SaveFailed { saved, message } => {
+                        api.prevent_close();
+                        let _ = rfd::MessageDialog::new()
+                            .set_title("Could not save")
+                            .set_description(format!(
+                                "{message}\n\n{saved} buffer(s) were already saved. The window stays open."
+                            ))
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                    }
+                }
             }
         })
         .setup(|app| {

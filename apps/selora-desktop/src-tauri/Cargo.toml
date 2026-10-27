@@ -37,8 +37,11 @@ selora-lsp.workspace = true
 # Phase 8 wave 2: the workflow engine (boa sandbox + facade + schema). No
 # commands consume it yet; the wave-2 slices import it from here.
 selora-workflow.workspace = true
-# The native folder picker behind pick_folder (Z4's Open Folder flow).
-rfd = "0.15"
+# The native folder picker behind pick_folder (Z4's Open Folder flow) and the
+# dirty-buffer close prompt. `common-controls-v6` enables TaskDialogIndirect,
+# the only rfd backend that can label the three buttons Save / Discard /
+# Cancel (tauri-build's default manifest already declares the v6 dependency).
+rfd = { version = "0.15", features = ["common-controls-v6"] }
 # External links (the About dialog's repository and release pages): hand a
 # validated http(s) URL to the OS default browser. The plugin's free
 # `open_url` is the spawn path; `main.rs` registers the plugin.

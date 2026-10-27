@@ -1286,7 +1286,8 @@
 }
 
 .settings-select:focus-visible,
-.settings-number-input:focus-visible {
+.settings-number-input:focus-visible,
+.settings-text-input:focus-visible {
   border-color: var(--fg-default);
 }
 
@@ -1296,6 +1297,18 @@
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 4px;
   padding: 3px 6px;
+  font-size: 11px;
+  color: var(--fg-default, #e5e5e5);
+  outline: none;
+}
+
+.settings-text-input {
+  width: 132px;
+  background: var(--ink-canvas, #070709);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-family: var(--font-mono, monospace);
   font-size: 11px;
   color: var(--fg-default, #e5e5e5);
   outline: none;

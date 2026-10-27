@@ -34,7 +34,13 @@ import {
 import { layoutStore } from '../features/layout/layout-store';
 import { requestFileTreeReveal } from '../features/sidebar/file-tree-reveal';
 import { toastStore } from '../features/toasts/toast-store';
-import { openFolderAt, pickFolder, revealInExplorer, type FileTreeNode } from '../bridge/bridge';
+import { getAppSnapshot, subscribeApp } from '../app/app-store';
+import {
+  openFolderAt,
+  pickFolder,
+  revealInExplorer,
+  type FileTreeNode,
+} from '../bridge/bridge';
 import type { TabMenuAction } from '../components/editor/TabContextMenu';
 
 const MINIMAP_MAX_LINES = 2000;
@@ -101,6 +107,8 @@ function minimapLines(text: string): CodeLineData[] {
 
 export function EditorRegion() {
   const editor = useSyncExternalStore(editorStore.subscribe, editorStore.getSnapshot);
+  const app = useSyncExternalStore(subscribeApp, getAppSnapshot);
+  const editorSettings = app.bootstrap?.settings;
   const [scrollGeometry, setScrollGeometry] = useState<ScrollGeometry>({
     scrollTop: 0,
     scrollHeight: 100,
@@ -214,6 +222,7 @@ export function EditorRegion() {
 
   const active = editor.activeBuffer;
   const activeTab = editor.tabs.find((tab) => tab.id === editor.activeBufferId) ?? null;
+  const conflictTab = activeTab?.externallyChanged ? activeTab : null;
   const recentFiles = useMemo(() => topLevelFiles(editor.fileTree), [editor.fileTree]);
   const breadcrumbs = useMemo(
     () => (active ? breadcrumbSegments(editor.workspaceRoot, editor.workspaceName, active.path) : []),
@@ -310,6 +319,35 @@ export function EditorRegion() {
 
       <EditorBreadcrumbs segments={breadcrumbs} />
 
+      {conflictTab ? (
+        <div
+          className="editor-conflict-banner"
+          role="alert"
+          aria-label={`${conflictTab.filename} changed on disk`}
+        >
+          <span className="editor-conflict-message">
+            <strong>{conflictTab.filename}</strong> changed on disk. Your unsaved edits are
+            kept until you choose.
+          </span>
+          <span className="editor-conflict-actions">
+            <button
+              type="button"
+              className="editor-conflict-action is-primary"
+              onClick={() => editorStore.reloadFromDisk(conflictTab.id)}
+            >
+              Reload from disk
+            </button>
+            <button
+              type="button"
+              className="editor-conflict-action"
+              onClick={() => editorStore.keepMyEdits(conflictTab.id)}
+            >
+              Keep my edits
+            </button>
+          </span>
+        </div>
+      ) : null}
+
       <div
         className="editor-body"
         role="tabpanel"
@@ -323,6 +361,7 @@ export function EditorRegion() {
             buffer={active}
             onScroll={handleScroll}
             revealTarget={editor.revealTarget}
+            settings={editorSettings}
           />
         </Suspense>
         <EditorMinimap

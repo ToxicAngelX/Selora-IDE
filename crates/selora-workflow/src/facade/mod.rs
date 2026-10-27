@@ -30,7 +30,7 @@ use boa_engine::{
 };
 
 use crate::budget::Budget;
-use crate::persisted::{persistence_error, Durable};
+use crate::persisted::{persistence_error, ArtifactRecord, Durable, ReportItemRecord};
 use crate::sandbox::Limits;
 use crate::schema::Schema;
 use crate::subagent::{AgentRef, AgentRegistry};
@@ -88,6 +88,12 @@ struct State {
     steps: u64,
     steps_log: Vec<WorkflowStep>,
     phases: Vec<String>,
+    /// The `phase()` marker in effect; stamped onto every journaled record so
+    /// history can group steps, reports and artifacts without guessing.
+    current_phase: Option<String>,
+    /// The step whose body is running; report/artifact records join it back
+    /// to its step identity.
+    current_step: Option<u64>,
     artifacts: Vec<Artifact>,
     report_items: u64,
     spent_usd: f64,
@@ -118,6 +124,8 @@ impl Facade {
                 steps: 0,
                 steps_log: Vec::new(),
                 phases: Vec::new(),
+                current_phase: None,
+                current_step: None,
                 artifacts: Vec::new(),
                 report_items: 0,
                 spent_usd: 0.0,
@@ -313,7 +321,7 @@ impl Facade {
         detail: &str,
         inputs: &serde_json::Value,
     ) -> Result<u64, WorkflowError> {
-        let (index, event) = {
+        let (index, event, started_step) = {
             let mut state = self.inner.borrow_mut();
             if let Some(error) = &state.fatal {
                 return Err(error.clone());
@@ -349,14 +357,22 @@ impl Facade {
                 return Err(error);
             }
             state.steps += 1;
+            let phase = state.current_phase.clone();
             if !replay {
                 if let Some(durable) = &mut state.durable {
-                    durable.start(&step, inputs.clone())?;
+                    durable.start(&step, inputs.clone(), phase)?;
                 }
             }
+            state.current_step = Some(step.index);
             state.steps_log.push(step.clone());
-            (step.index, WorkflowEvent::Step { step })
+            let started_step = (!replay).then(|| step.clone());
+            (step.index, WorkflowEvent::Step { step }, started_step)
         };
+        // Before any body runs: a tool inside this step can now attribute its
+        // ledger records to the durable step/ask identity.
+        if let Some(step) = started_step {
+            self.host().note_step_started(&step);
+        }
         self.emit(event);
         Ok(index)
     }
@@ -378,10 +394,12 @@ impl Facade {
             step.status = status;
             step.error = error;
             let snapshot = step.clone();
+            let phase = state.current_phase.clone();
+            state.current_step = None;
             if !replay {
                 let host = state.host.clone();
                 if let Some(durable) = &mut state.durable {
-                    durable.finish(&snapshot, value, agent_state, host.as_ref())?;
+                    durable.finish(&snapshot, value, agent_state, phase, host.as_ref())?;
                     let spent = durable.spent_usd;
                     let tokens = durable.tokens;
                     state.spent_usd = spent;
@@ -405,6 +423,7 @@ impl Facade {
             if !state.phases.iter().any(|phase| phase == name) {
                 state.phases.push(name.to_owned());
             }
+            state.current_phase = Some(name.to_owned());
         }
         self.emit(WorkflowEvent::Phase {
             name: name.to_owned(),
@@ -439,9 +458,25 @@ impl Facade {
                 artifact_id,
             }
         };
-        if !self.inner.borrow().replaying {
+        let replaying = self.inner.borrow().replaying;
+        if !replaying {
             self.host()
                 .report(&recorded.item, recorded.artifact_id.as_deref())?;
+        }
+        if !replaying {
+            let mut state = self.inner.borrow_mut();
+            if let Some(step_id) = state.current_step {
+                let record = ReportItemRecord {
+                    step_id,
+                    phase: state.current_phase.clone(),
+                    index: recorded.index,
+                    item: recorded.item.clone(),
+                    artifact_id: recorded.artifact_id.clone(),
+                };
+                if let Some(durable) = &mut state.durable {
+                    durable.report_item(&record)?;
+                }
+            }
         }
         self.emit(WorkflowEvent::Report {
             item: recorded.clone(),
@@ -473,13 +508,27 @@ impl Facade {
             }
         }
         let host = self.host();
-        if !self.inner.borrow().replaying {
+        let replaying = self.inner.borrow().replaying;
+        if !replaying {
             match &artifact.content {
                 ArtifactContent::Markdown(content) => {
                     host.artifact_markdown(&artifact.id, artifact.title.as_deref(), content)?;
                 }
                 ArtifactContent::File(path) => {
                     host.artifact_file(&artifact.id, artifact.title.as_deref(), path)?;
+                }
+            }
+        }
+        if !replaying {
+            let mut state = self.inner.borrow_mut();
+            if let Some(step_id) = state.current_step {
+                let record = ArtifactRecord {
+                    step_id,
+                    phase: state.current_phase.clone(),
+                    artifact: artifact.clone(),
+                };
+                if let Some(durable) = &mut state.durable {
+                    durable.artifact(&record)?;
                 }
             }
         }

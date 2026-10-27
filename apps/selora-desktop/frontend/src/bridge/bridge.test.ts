@@ -279,6 +279,39 @@ describe('Z3 command wire shapes (ARCHITECTURE §2.1 & selora-protocol)', () => 
       },
     });
   });
+
+  it('agent_decision carries the additive Phase 9a resolution only when supplied', async () => {
+    await agentDecision('request-1', 'approval-1', 'approve', CONTEXT, {
+      kind: 'question',
+      option_id: 'opt-main',
+      text: 'keep the header',
+    });
+    await agentDecision('request-2', 'approval-2', 'deny', CONTEXT, {
+      kind: 'plan',
+      decision: 'request_changes',
+      feedback: 'Split the step',
+    });
+    const first = invokeMock.mock.calls[0][1] as { envelope: { payload: unknown } };
+    const second = invokeMock.mock.calls[1][1] as { envelope: { payload: unknown } };
+    expect(first.envelope.payload).toEqual({
+      type: 'agent_decision',
+      payload: {
+        request_id: 'request-1',
+        approval_id: 'approval-1',
+        decision: 'approve',
+        resolution: { kind: 'question', option_id: 'opt-main', text: 'keep the header' },
+      },
+    });
+    expect(second.envelope.payload).toEqual({
+      type: 'agent_decision',
+      payload: {
+        request_id: 'request-2',
+        approval_id: 'approval-2',
+        decision: 'deny',
+        resolution: { kind: 'plan', decision: 'request_changes', feedback: 'Split the step' },
+      },
+    });
+  });
 });
 
 describe('Z2 event wire shapes (ARCHITECTURE §2.1)', () => {

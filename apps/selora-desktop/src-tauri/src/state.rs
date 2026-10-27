@@ -1,18 +1,19 @@
 use selora_protocol::{
-    clamp_region_size, ApprovalId, BootstrapState, CoreInstanceId, DecisionDto, EventEnvelope,
-    FileTreeDto, FrontendCommand, FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto,
-    RegionId, RequestEnvelope, RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId,
-    ToastDto, ToastSeverity, WorkflowApprovalNeededDto, WorkflowArtifactDto,
-    WorkflowArtifactEventDto, WorkflowFinishedDto, WorkflowPhaseDto, WorkflowPhaseEventDto,
-    WorkflowReportDto, WorkflowReportEventDto, WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus,
-    WorkflowStepDto, WorkflowStepEventDto, WorkspaceId, PROTOCOL_VERSION,
+    clamp_region_size, ApprovalId, BootstrapState, BufferSnapshotDto, CommandAckDto,
+    CommandResultDto, CoreInstanceId, DecisionDto, EventEnvelope, FileTreeDto, FrontendCommand,
+    FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto, RegionId, RequestEnvelope,
+    RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId, ToastDto, ToastSeverity,
+    WorkflowApprovalNeededDto, WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto,
+    WorkflowPhaseDto, WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto,
+    WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto,
+    WorkspaceId, PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -58,7 +59,9 @@ fn reveal_in_file_explorer(path: &std::path::Path) -> Result<(), ProtocolErrorDt
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let target = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
         std::process::Command::new("xdg-open")
             .arg(target.unwrap_or(path))
             .spawn()
@@ -80,11 +83,12 @@ fn workspace_id_for(root: &std::path::Path) -> WorkspaceId {
     WorkspaceId::new(format!("ws_{hash:016x}")).expect("hex id is valid")
 }
 
-/// The history a durable journal can prove: its terminal run report plus the
-/// report items its step inputs reconstruct.
+/// The history a durable journal can prove: its explicit per-step, report and
+/// artifact records, with the terminal run report filling only the fields the
+/// older format never wrote.
 ///
-/// Every field stays empty when the terminal payload is absent or malformed:
-/// the bootstrap must never fabricate progress the journal did not record.
+/// Every field stays empty when the journal did not record it: the bootstrap
+/// must never fabricate progress the journal did not record.
 #[derive(Default)]
 struct WorkflowRunHistory {
     phases: Vec<String>,
@@ -94,104 +98,309 @@ struct WorkflowRunHistory {
     tokens: u64,
     cost_usd: f64,
     error: Option<String>,
+    /// Non-fabricated explanation when part of the journal could not be read.
+    note: Option<String>,
 }
 
 /// Rebuild a completed (or interrupted) run's history from its journal.
 ///
-/// The terminal `engine_run_finished` record carries the engine's own
-/// [`selora_workflow::WorkflowReport`] (phases, steps, artifacts, tokens, cost,
-/// error). Report items are not in that report, so they come from the
-/// `engine_step_started` inputs of successful `report` steps; a step whose
-/// inputs are missing is skipped rather than invented.
+/// Explicit records are the source of truth:
+///
+/// * `engine_step_started` / `engine_step_finished` Ã¢â‚¬â€ every step, its phase
+///   and its final status;
+/// * `engine_report_item` Ã¢â‚¬â€ every `report(item, artifactId)` that reached the
+///   host, with its run-wide ordinal so `report-N` ids never shift;
+/// * `engine_artifact` Ã¢â‚¬â€ every artifact with its full markdown/file content,
+///   independent of the terminal report or a `null` step value.
+///
+/// A journal written before those records existed still loads: steps come
+/// from the step records (with an unknown phase), reports from the successful
+/// report steps' inputs, and artifacts from the terminal report. Anything the
+/// journal cannot prove is omitted, never invented.
 fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> WorkflowRunHistory {
-    let Some(report) = journal
+    use selora_workflow::{ArtifactContent, ReportItemRecord, StepFinishRecord, StepStartRecord};
+
+    let mut history = WorkflowRunHistory::default();
+    let mut terminal: Option<selora_workflow::WorkflowReport> = None;
+    let mut starts: std::collections::BTreeMap<u64, StepStartRecord> =
+        std::collections::BTreeMap::new();
+    let mut finishes: std::collections::BTreeMap<u64, StepFinishRecord> =
+        std::collections::BTreeMap::new();
+    let mut report_records: std::collections::BTreeMap<u64, ReportItemRecord> =
+        std::collections::BTreeMap::new();
+    let mut artifact_records: Vec<selora_workflow::ArtifactRecord> = Vec::new();
+    let mut seen_artifacts = std::collections::HashSet::new();
+    let mut has_report_records = false;
+    let mut has_artifact_records = false;
+    let mut dropped = false;
+
+    for entry in &journal.entries {
+        match entry.kind.as_str() {
+            "phase_started" => match entry
+                .payload
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(name) if !name.trim().is_empty() => {
+                    if !history.phases.iter().any(|phase| phase == name) {
+                        history.phases.push(name.to_owned());
+                    }
+                }
+                _ => dropped = true,
+            },
+            "engine_step_started" => {
+                match serde_json::from_value::<StepStartRecord>(entry.payload.clone()) {
+                    Ok(start) => {
+                        starts.insert(start.step.index, start);
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_step_finished" => {
+                match serde_json::from_value::<StepFinishRecord>(entry.payload.clone()) {
+                    Ok(finish) => {
+                        finishes.insert(finish.step.index, finish);
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_report_item" => {
+                has_report_records = true;
+                match serde_json::from_value::<ReportItemRecord>(entry.payload.clone()) {
+                    // First record per ordinal wins: a resumed run may append
+                    // again, and the original live id must not move.
+                    Ok(record) => {
+                        report_records.entry(record.index).or_insert(record);
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_artifact" => {
+                has_artifact_records = true;
+                match serde_json::from_value::<selora_workflow::ArtifactRecord>(
+                    entry.payload.clone(),
+                ) {
+                    Ok(record) => {
+                        if seen_artifacts.insert(record.artifact.id.clone()) {
+                            artifact_records.push(record);
+                        }
+                    }
+                    Err(_) => dropped = true,
+                }
+            }
+            "engine_run_finished" => {
+                match serde_json::from_value::<selora_workflow::WorkflowReport>(
+                    entry.payload.clone(),
+                ) {
+                    Ok(report) => terminal = Some(report),
+                    Err(_) => dropped = true,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Steps in engine order. A terminal report covers a journal that predates
+    // the explicit step records; its phase stays unknown (empty).
+    if starts.is_empty() {
+        if let Some(report) = &terminal {
+            history.steps = report
+                .steps
+                .iter()
+                .map(|step| workflow_step_dto(step.clone(), String::new()))
+                .collect();
+        }
+    } else {
+        let mut spent_usd = 0.0;
+        let mut tokens = 0u64;
+        for (index, start) in &starts {
+            let finish = finishes.get(index);
+            if let Some(finish) = finish {
+                spent_usd += finish.cost_usd;
+                tokens = tokens.saturating_add(finish.tokens);
+            }
+            let step = finish.map_or(&start.step, |finish| &finish.step);
+            // Finish phase wins for a `phase()` step: it is the marker that
+            // just opened. Every other step keeps the phase it started in.
+            let phase = finish
+                .and_then(|finish| finish.phase.clone())
+                .or_else(|| start.phase.clone())
+                .unwrap_or_default();
+            if step.kind == selora_workflow::StepKind::Phase
+                && !phase.trim().is_empty()
+                && !history.phases.iter().any(|known| known == &phase)
+            {
+                history.phases.push(phase.clone());
+            }
+            let (status, error) = match finish {
+                Some(finish) => (
+                    workflow_step_status(finish.step.status),
+                    finish.step.error.clone(),
+                ),
+                None => (WorkflowStatus::Running, None),
+            };
+            history.steps.push(selora_protocol::WorkflowStepDto {
+                id: format!("step-{}", index),
+                phase,
+                label: if step.detail.is_empty() {
+                    workflow_step_label(step.kind).to_owned()
+                } else {
+                    step.detail.clone()
+                },
+                status,
+                agent: step.agent.clone(),
+                detail: error,
+            });
+        }
+        history.cost_usd = spent_usd;
+        history.tokens = tokens;
+    }
+
+    // Reports: the explicit ordinal is the live `report-N` id.
+    if has_report_records {
+        for (ordinal, record) in &report_records {
+            history.reports.push(selora_protocol::WorkflowReportDto {
+                id: format!("report-{ordinal}"),
+                item: workflow_report_item_text(&record.item),
+                artifact_id: record.artifact_id.clone(),
+                phase: record.phase.clone(),
+            });
+        }
+    } else if let Some(report) = &terminal {
+        // Pre-explicit journal: only a report step recorded as Ok can prove the
+        // item reached the host. A failed report step is omitted.
+        let mut ordinal = 0u64;
+        for step in &report.steps {
+            if step.kind != selora_workflow::StepKind::Report
+                || step.status != selora_workflow::StepStatus::Ok
+            {
+                continue;
+            }
+            ordinal += 1;
+            let Some(items) = starts
+                .get(&step.index)
+                .and_then(|start| start.inputs.as_array())
+            else {
+                dropped = true;
+                continue;
+            };
+            let Some(item) = items.first() else {
+                dropped = true;
+                continue;
+            };
+            history.reports.push(selora_protocol::WorkflowReportDto {
+                id: format!("report-{ordinal}"),
+                item: workflow_report_item_text(item),
+                artifact_id: items
+                    .get(1)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                phase: starts
+                    .get(&step.index)
+                    .and_then(|start| start.phase.clone()),
+            });
+        }
+    }
+
+    // Artifacts: explicit records carry content and title even when the step
+    // value was null or the terminal report is missing.
+    if has_artifact_records {
+        for record in &artifact_records {
+            let (kind, body) = match &record.artifact.content {
+                ArtifactContent::Markdown(body) => ("markdown".to_owned(), body.clone()),
+                ArtifactContent::File(path) => ("file".to_owned(), path.clone()),
+            };
+            history
+                .artifacts
+                .push(selora_protocol::WorkflowArtifactDto {
+                    id: record.artifact.id.clone(),
+                    title: record.artifact.title.clone().unwrap_or_default(),
+                    kind,
+                    body,
+                    phase: record.phase.clone(),
+                });
+        }
+    } else if let Some(report) = &terminal {
+        history.artifacts = report
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let (kind, body) = match &artifact.content {
+                    ArtifactContent::Markdown(body) => ("markdown".to_owned(), body.clone()),
+                    ArtifactContent::File(path) => ("file".to_owned(), path.clone()),
+                };
+                selora_protocol::WorkflowArtifactDto {
+                    id: artifact.id.clone(),
+                    title: artifact.title.clone().unwrap_or_default(),
+                    kind,
+                    body,
+                    phase: None,
+                }
+            })
+            .collect();
+    }
+
+    if let Some(report) = terminal {
+        history.cost_usd = history.cost_usd.max(report.cost_usd);
+        history.tokens = history.tokens.max(report.tokens);
+        history.error = report.error;
+    }
+    if history.error.is_none() {
+        history.error = finishes
+            .values()
+            .rev()
+            .find(|finish| finish.step.status == selora_workflow::StepStatus::Failed)
+            .and_then(|finish| finish.step.error.clone());
+    }
+    if dropped || journal.is_damaged() {
+        history.note = Some(
+            "Some journal records could not be reconstructed; missing items are omitted.".into(),
+        );
+    }
+    history
+}
+
+/// Read a journal's terminal status, preferring the raw
+/// `engine_run_finished` record over the typed resume plan.
+///
+/// The raw record is authoritative when the engine's report payload cannot be
+/// fully parsed (for example, only `{"status":"budget_exceeded"}` survived):
+/// the shell must still know a cap fired before it offers or accepts a resume.
+fn workflow_terminal_status(
+    journal: &selora_workflow::journal::LoadedJournal,
+) -> Option<selora_workflow::journal::RunStatus> {
+    journal
         .entries
         .iter()
         .rev()
-        .find(|entry| entry.kind == "engine_run_finished")
-        .and_then(|entry| {
-            serde_json::from_value::<selora_workflow::WorkflowReport>(entry.payload.clone()).ok()
-        })
-    else {
-        return WorkflowRunHistory::default();
-    };
-
-    let mut start_inputs = std::collections::BTreeMap::new();
-    for entry in &journal.entries {
-        if entry.kind != "engine_step_started" {
-            continue;
-        }
-        let index = entry
-            .payload
-            .get("step")
-            .and_then(|step| step.get("index"))
-            .and_then(serde_json::Value::as_u64);
-        if let (Some(index), Some(inputs)) = (index, entry.payload.get("inputs")) {
-            start_inputs.insert(index, inputs.clone());
-        }
-    }
-
-    let mut reports = Vec::new();
-    let mut report_ordinal = 0u64;
-    for step in &report.steps {
-        if step.kind != selora_workflow::StepKind::Report
-            || step.status != selora_workflow::StepStatus::Ok
-        {
-            continue;
-        }
-        // The live stream ids report items by their 1-based report ordinal;
-        // advance it even when this item cannot be reconstructed so later ids
-        // still match what the run emitted.
-        report_ordinal += 1;
-        let Some(items) = start_inputs
-            .get(&step.index)
-            .and_then(|inputs| inputs.as_array())
-        else {
-            continue;
-        };
-        let Some(item) = items.first() else {
-            continue;
-        };
-        reports.push(selora_protocol::WorkflowReportDto {
-            id: format!("report-{report_ordinal}"),
-            item: workflow_report_item_text(item),
-            artifact_id: items
-                .get(1)
+        .find_map(|entry| {
+            if entry.kind != "engine_run_finished" {
+                return None;
+            }
+            match entry
+                .payload
+                .get("status")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-        });
-    }
-
-    let artifacts = report
-        .artifacts
-        .into_iter()
-        .map(|artifact| {
-            let (kind, body) = match artifact.content {
-                selora_workflow::ArtifactContent::Markdown(body) => ("markdown".to_owned(), body),
-                selora_workflow::ArtifactContent::File(path) => ("file".to_owned(), path),
-            };
-            selora_protocol::WorkflowArtifactDto {
-                id: artifact.id,
-                title: artifact.title.unwrap_or_default(),
-                kind,
-                body,
+            {
+                Some(status) if status.eq_ignore_ascii_case("completed") => {
+                    Some(selora_workflow::journal::RunStatus::Completed)
+                }
+                Some(status) if status.eq_ignore_ascii_case("failed") => {
+                    Some(selora_workflow::journal::RunStatus::Failed)
+                }
+                Some(status) if status.eq_ignore_ascii_case("stopped") => {
+                    Some(selora_workflow::journal::RunStatus::Stopped)
+                }
+                Some(status)
+                    if status.eq_ignore_ascii_case("budget_exceeded")
+                        || status.eq_ignore_ascii_case("BudgetExceeded") =>
+                {
+                    Some(selora_workflow::journal::RunStatus::BudgetExceeded)
+                }
+                _ => None,
             }
         })
-        .collect();
-
-    WorkflowRunHistory {
-        phases: report.phases,
-        steps: report
-            .steps
-            .into_iter()
-            .map(|step| workflow_step_dto(step, String::new()))
-            .collect(),
-        reports,
-        artifacts,
-        tokens: report.tokens,
-        cost_usd: report.cost_usd,
-        error: report.error,
-    }
+        .or_else(|| journal.resume_plan().run_status())
 }
 
 /// Discover durable runs for the bootstrap. Corrupt or foreign directories are
@@ -220,27 +429,36 @@ fn persisted_workflow_runs(
         let Ok(journal) = selora_workflow::journal::Journal::load(root, id.clone()) else {
             continue;
         };
-        let raw_terminal = journal.entries.iter().rev().find_map(|entry| {
-            if entry.kind != "engine_run_finished" {
-                return None;
-            }
-            match entry
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("completed") => Some(selora_workflow::journal::RunStatus::Completed),
-                Some("failed") => Some(selora_workflow::journal::RunStatus::Failed),
-                Some("stopped") => Some(selora_workflow::journal::RunStatus::Stopped),
-                Some("budget_exceeded") => {
-                    Some(selora_workflow::journal::RunStatus::BudgetExceeded)
-                }
-                _ => None,
-            }
-        });
-        let status = raw_terminal.or_else(|| journal.resume_plan().run_status());
+        let status = workflow_terminal_status(&journal);
         let ambiguous_command = workflow_has_ambiguous_command(&journal);
+        let budget_tripped = status == Some(selora_workflow::journal::RunStatus::BudgetExceeded);
         let completed = status == Some(selora_workflow::journal::RunStatus::Completed);
+        let (partial_effects, ledger_block) = if completed || budget_tripped {
+            (false, None)
+        } else {
+            match selora_workflow::partial_effects(root, &id) {
+                Ok(partial) if !partial.is_empty() => (
+                    true,
+                    Some(
+                        "Earlier tool effects may already exist for this run. Resume needs an explicit acknowledgement."
+                            .to_owned(),
+                    ),
+                ),
+                Ok(_) => (false, None),
+                Err(selora_workflow::WorkflowError::ToolEffectLedger { message }) => (
+                    false,
+                    Some(format!(
+                        "The tool-effect ledger is damaged and cannot be verified: {message}"
+                    )),
+                ),
+                Err(error) => (
+                    false,
+                    Some(format!(
+                        "Partial tool effects cannot be ruled out: {error}"
+                    )),
+                ),
+            }
+        };
         let history = workflow_run_history(&journal);
         let (status, detail) = match status {
             Some(selora_workflow::journal::RunStatus::Completed) => {
@@ -262,18 +480,18 @@ fn persisted_workflow_runs(
             ),
             Some(selora_workflow::journal::RunStatus::BudgetExceeded) => (
                 WorkflowStatus::Failed,
-                history
-                    .error
-                    .clone()
-                    .or_else(|| Some("Stopped at its cost cap; resume under a new run.".into())),
+                history.error.clone().or_else(|| {
+                    Some(
+                        "Stopped at its cost cap; continuing needs a new confirmed run and budget."
+                            .into(),
+                    )
+                }),
             ),
             None => (
                 WorkflowStatus::Pending,
                 Some("Interrupted before completion.".into()),
             ),
         };
-        let budget_tripped =
-            raw_terminal == Some(selora_workflow::journal::RunStatus::BudgetExceeded);
         runs.push(selora_protocol::WorkflowPersistedRunDto {
             run_id: id.to_string(),
             name: spec.name,
@@ -281,13 +499,21 @@ fn persisted_workflow_runs(
             // A completed run is history, never a replay target. A budget trip
             // needs a new consent budget; an interrupted command may already
             // have side effects. Never offer any of them as a silent replay.
-            resumable: !completed && !ambiguous_command && !budget_tripped && !journal.is_damaged(),
+            resumable: !completed
+                && !ambiguous_command
+                && !budget_tripped
+                && !journal.is_damaged()
+                && !partial_effects
+                && ledger_block.is_none(),
+            partial_effects,
             detail: if ambiguous_command {
                 Some("An interrupted command has ambiguous side effects and cannot resume.".into())
             } else if journal.is_damaged() {
                 Some("The run journal is damaged and cannot resume safely.".into())
+            } else if let Some(block) = ledger_block {
+                Some(block)
             } else {
-                detail
+                detail.or_else(|| history.note.clone())
             },
             phases: history.phases,
             steps: history.steps,
@@ -352,15 +578,64 @@ fn settings_view(settings: &selora_settings::Settings) -> SettingsViewDto {
     SettingsViewDto {
         reduced_motion: settings.ui.reduce_motion,
         theme: settings.ui.theme.clone(),
-        // §5.1: the rebindable pair, populated from settings.keybinds so a
+        // Ã‚Â§5.1: the rebindable set, populated from settings.keybinds so a
         // user's egui-side rebind carries into the web shell.
         keybind_command_palette: settings.keybinds.command_palette.clone(),
         keybind_toggle_chat: settings.keybinds.toggle_chat.clone(),
+        keybind_fuzzy_find: settings.keybinds.fuzzy_find.clone(),
+        keybind_save: settings.keybinds.save.clone(),
+        editor_font_size: settings.editor.font_size,
+        editor_tab_size: settings.editor.tab_size,
+        editor_word_wrap: settings.editor.word_wrap,
     }
 }
-/// §3.4 (docs/ui/PHASE_Z2_ARCHITECTURE.md): keep the most recent 1024
+
+/// P1: the `lsp.*` settings as the registry consumes them. Empty path
+/// strings mean "resolve from PATH"; empty arg lists keep the built-in
+/// arguments (TypeScript's `--stdio`).
+fn lsp_server_paths(settings: &selora_settings::Settings) -> selora_lsp::LspServerPaths {
+    fn path(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+    selora_lsp::LspServerPaths {
+        rust_analyzer: path(&settings.lsp.rust_analyzer_path),
+        typescript_language_server: path(&settings.lsp.typescript_server_path),
+        rust_analyzer_args: settings.lsp.rust_analyzer_args.clone(),
+        typescript_language_server_args: settings.lsp.typescript_server_args.clone(),
+        enabled: settings.lsp.enabled,
+    }
+}
+
+/// Validate one keybind patch value and return its canonical spelling.
+/// `None` means the patch did not carry the field. Garbage is rejected with a
+/// typed error before anything touches disk.
+fn validate_keybind_patch(
+    raw: Option<&str>,
+    label: &str,
+) -> Result<Option<String>, ProtocolErrorDto> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    match selora_settings::Keybind::parse(trimmed) {
+        Some(keybind) => Ok(Some(keybind.canonical())),
+        None => Err(ProtocolErrorDto {
+            code: "invalid_settings_keybind".into(),
+            message: format!(
+                "The {label} keybind must be one chord such as Ctrl+S (got \"{trimmed}\")."
+            ),
+            retryable: false,
+        }),
+    }
+}
+
+/// Ã‚Â§3.4 (docs/ui/PHASE_Z2_ARCHITECTURE.md): keep the most recent 1024
 /// events; a replay request older than the oldest retained event simply
-/// yields a gap at the gate and the frontend re-bootstraps — the failure
+/// yields a gap at the gate and the frontend re-bootstraps Ã¢â‚¬â€ the failure
 /// mode is already designed for.
 const EVENT_RETENTION_CAP: usize = 1024;
 
@@ -451,14 +726,14 @@ fn validate_external_url(raw: &str) -> Result<String, ExternalUrlRejection> {
     Ok(parsed.to_string())
 }
 
-/// The one seam all layout reads and writes route through (§4.5), so the
+/// The one seam all layout reads and writes route through (Ã‚Â§4.5), so the
 /// per-workspace map drops in without touching dispatch. Layout lives in
-/// the `layout` section of `settings.json` — not the egui app's
-/// `workspace.json` model (§4.1's decision, with its reasons recorded
+/// the `layout` section of `settings.json` Ã¢â‚¬â€ not the egui app's
+/// `workspace.json` model (Ã‚Â§4.1's decision, with its reasons recorded
 /// there).
 pub(crate) struct LayoutStore {
     /// The `settings.json` this store persists into. Parameterized so tests
-    /// and sandboxed shells point at a tempdir — never the real user profile.
+    /// and sandboxed shells point at a tempdir Ã¢â‚¬â€ never the real user profile.
     settings_path: PathBuf,
 }
 
@@ -469,21 +744,21 @@ impl LayoutStore {
 
     /// Read the settings file (missing file = first-run defaults). Load
     /// errors propagate: `SaveLayout` maps them to `layout_save_failed`
-    /// (§2.3 item 7) and the in-memory layout is unaffected.
+    /// (Ã‚Â§2.3 item 7) and the in-memory layout is unaffected.
     pub(crate) fn load_settings(
         &self,
     ) -> Result<selora_settings::Settings, selora_settings::SeloraError> {
         selora_settings::Settings::load_from(&self.settings_path)
     }
 
-    /// §4.5's `load_layout(&Settings)`: the persisted `layout` section as a
-    /// sanitized `LayoutDto` (§4.3 — a persisted value can never wedge the
+    /// Ã‚Â§4.5's `load_layout(&Settings)`: the persisted `layout` section as a
+    /// sanitized `LayoutDto` (Ã‚Â§4.3 Ã¢â‚¬â€ a persisted value can never wedge the
     /// shell).
     pub(crate) fn load_layout(settings: &selora_settings::Settings) -> LayoutDto {
         LayoutDto::from(settings.layout.clone()).sanitized()
     }
 
-    /// §4.5's `persist_layout(&mut Settings, &LayoutDto)`: writes the layout
+    /// Ã‚Â§4.5's `persist_layout(&mut Settings, &LayoutDto)`: writes the layout
     /// into the settings' `layout` section and saves the whole file through
     /// the existing atomic temp+rename path (`Settings::save_to`), so every
     /// other section survives.
@@ -504,15 +779,22 @@ impl LayoutStore {
     }
 }
 
-/// The monotonic event log behind `selora://event` (§2.4/§3.4): one global
+/// The monotonic event log behind `selora://event` (Ã‚Â§2.4/Ã‚Â§3.4): one global
 /// sequence, the 1024-event replay ring, and the emit path. Extracted in
 /// Z3 so the session relays ([`crate::sessions`]) record through the same
-/// seam the layout commands do — every event, layout or agent, rides one
+/// seam the layout commands do Ã¢â‚¬â€ every event, layout or agent, rides one
 /// monotonic sequence.
 pub(crate) struct EventLog {
     core_instance_id: CoreInstanceId,
     sequence: Mutex<u64>,
     events: Mutex<Vec<EventEnvelope<FrontendEvent>>>,
+    /// Serializes sequence assignment with emission. The sequence is assigned
+    /// while this guard is held and the event is emitted before it is
+    /// released, so two producers can never deliver n+1 before n.
+    emit_lock: Mutex<()>,
+    /// Test-only capture of emission order (the monotonic-delivery test).
+    #[cfg(test)]
+    emitted: Mutex<Vec<u64>>,
 }
 
 impl EventLog {
@@ -521,6 +803,9 @@ impl EventLog {
             core_instance_id,
             sequence: Mutex::new(0),
             events: Mutex::new(Vec::new()),
+            emit_lock: Mutex::new(()),
+            #[cfg(test)]
+            emitted: Mutex::new(Vec::new()),
         }
     }
 
@@ -540,11 +825,10 @@ impl EventLog {
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
     ) {
-        let event = self.push(payload, request_id, None);
-        let _ = app.emit("selora://event", &event);
+        self.emit(app, payload, request_id, None);
     }
 
-    /// Record and emit with the session on the envelope — the Z3 session
+    /// Record and emit with the session on the envelope Ã¢â‚¬â€ the Z3 session
     /// events (`ChatDelta` and the agent stream) name their session so the
     /// frontend can route by it without opening every payload.
     pub fn record_session<R: tauri::Runtime>(
@@ -554,14 +838,44 @@ impl EventLog {
         request_id: Option<selora_protocol::RequestId>,
         session_id: SessionId,
     ) {
-        let event = self.push(payload, request_id, Some(session_id));
+        self.emit(app, payload, request_id, Some(session_id));
+    }
+
+    /// The one emission path: assign the sequence, append to the replay ring,
+    /// and emit before releasing the order guard.
+    fn emit<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: Option<SessionId>,
+    ) {
+        let _order = self.emit_lock.lock().expect("emit lock");
+        let event = self.prepare(payload, request_id, session_id);
+        #[cfg(test)]
+        self.emitted
+            .lock()
+            .expect("emitted lock")
+            .push(event.sequence);
         let _ = app.emit("selora://event", &event);
     }
 
-    /// Record without emitting — the §4.4 boot toast is recorded during
+    /// Record without emitting Ã¢â‚¬â€ the Ã‚Â§4.4 boot toast is recorded during
     /// `DesktopState` construction, before any `AppHandle` exists; the
-    /// replay flow (§3.4) delivers it.
+    /// replay flow (Ã‚Â§3.4) delivers it.
     pub(crate) fn push(
+        &self,
+        payload: FrontendEvent,
+        request_id: Option<selora_protocol::RequestId>,
+        session_id: Option<SessionId>,
+    ) -> EventEnvelope<FrontendEvent> {
+        // A no-emit record still takes the order guard, so it cannot take a
+        // sequence that an in-flight emission is about to deliver.
+        let _order = self.emit_lock.lock().expect("emit lock");
+        self.prepare(payload, request_id, session_id)
+    }
+
+    fn prepare(
         &self,
         payload: FrontendEvent,
         request_id: Option<selora_protocol::RequestId>,
@@ -588,7 +902,13 @@ impl EventLog {
         event
     }
 
-    /// §3.4's replay backing store for the `get_events_after` command.
+    /// The emission order captured by [`EventLog::emit`] (test only).
+    #[cfg(test)]
+    pub(crate) fn emitted_sequences(&self) -> Vec<u64> {
+        self.emitted.lock().expect("emitted lock").clone()
+    }
+
+    /// Ã‚Â§3.4's replay backing store for the `get_events_after` command.
     pub fn events_after(&self, sequence: u64) -> Vec<EventEnvelope<FrontendEvent>> {
         self.events
             .lock()
@@ -601,12 +921,12 @@ impl EventLog {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8 wave 2 — workflow dispatch (ROADMAP 8c, ARCHITECTURE §18).
+// Phase 8 wave 2 Ã¢â‚¬â€ workflow dispatch (ROADMAP 8c, ARCHITECTURE Ã‚Â§18).
 //
 // `state.rs` owns the command/event mapping only: `selora-workflow` runs the
 // script, `workflows_host.rs` implements the blocking `Host`, and the run map
 // here gives `WorkflowStop`/`WorkflowDecision` their address. The engine is a
-// blocking call and always rides `spawn_blocking` (ARCHITECTURE §18.4).
+// blocking call and always rides `spawn_blocking` (ARCHITECTURE Ã‚Â§18.4).
 // ---------------------------------------------------------------------------
 
 /// One run's stop switch: `workflows_host::WorkflowHost::cancel` captured as a
@@ -635,6 +955,8 @@ pub(crate) struct WorkflowHostSettings {
     pub(crate) model_metadata: Option<selora_ai::Model>,
     pub(crate) caps: selora_ai::TurnCaps,
     pub(crate) on_approval: crate::workflows_host::WorkflowApprovalHandler,
+    /// Durable run identity for the per-run tool-effect ledger.
+    pub(crate) durable_run_id: String,
 }
 
 /// Builds one host per run. Production is [`production_workflow_host`]; tests
@@ -646,14 +968,26 @@ pub(crate) type WorkflowHostFactory =
 /// `WorkflowHost::new(root, WorkflowHostConfig) -> Arc<WorkflowHost>`, plus
 /// `impl selora_workflow::Host for WorkflowHost` and `WorkflowHost::cancel`.
 /// `WorkflowHostConfig::new(base_url, api_key, model)` is the shell's entry
-/// point; every cap stays at the host's §18 defaults.
+/// point; every cap stays at the host's §18 defaults. The builder also
+/// attaches the per-run tool-effect ledger with
+/// `with_tool_effect_ledger(path, run_id)`.
 fn production_workflow_host(root: PathBuf, settings: WorkflowHostSettings) -> WorkflowHostBundle {
+    // Match the host's own root canonicalization so the ledger lands in the
+    // same run directory the engine writes its journal to.
+    let ledger_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let mut config = crate::workflows_host::WorkflowHostConfig::new(
         settings.base_url,
         settings.api_key,
         settings.model,
     )
     .with_turn_caps(settings.caps)
+    .with_tool_effect_ledger(
+        selora_workflow::tool_effects_path(
+            &ledger_root,
+            &selora_workflow::RunId::from(settings.durable_run_id.as_str()),
+        ),
+        settings.durable_run_id,
+    )
     .with_approval_handler(settings.on_approval);
     if let Some(model) = settings.model_metadata {
         config = config.with_model(model);
@@ -703,6 +1037,13 @@ struct WorkflowStream<R: tauri::Runtime> {
     /// The shell's one open-workspace slot. The terminal refresh locks it,
     /// reloads clean buffers, then releases it before emitting any event.
     workspace: Arc<Mutex<Option<Workspace>>>,
+    /// The language-server bridge slot. A clean reload sends the new full
+    /// text and retracts stale diagnostics before the next request.
+    lsp: Arc<Mutex<Option<LspBridge>>>,
+    /// The settings-fed LSP paths/args/enabled, used when this run is the
+    /// first thing to start the workspace's bridge. Shared with the shell so
+    /// a settings override is never silently dropped on the workflow path.
+    lsp_paths: selora_lsp::LspServerPaths,
     max_cost_usd: f64,
     name: String,
     started: AtomicBool,
@@ -733,10 +1074,11 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
     /// directly, so open editor tabs must re-read them.
     ///
     /// The refresh only runs when the open workspace is still the one this run
-    /// started in — a workspace switch during the run must never update the
-    /// new workspace's buffers. The workspace lock is taken for the reload
-    /// only: the engine call already finished, and every event is emitted
-    /// after the guard is dropped.
+    /// started in Ã¢â‚¬â€ a workspace switch during the run must never update the
+    /// new workspace's buffers, raise its conflicts, or sync its language
+    /// server. The workspace lock is taken for the reload only: the engine
+    /// call already finished, and every event is emitted after the guard is
+    /// dropped.
     fn refresh_workspace_buffers(&self) {
         let outcome = {
             let guard = self
@@ -756,43 +1098,69 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
         self.publish_refresh(outcome);
     }
 
-    /// Emit one `BufferSnapshot` per changed clean buffer and one warning toast
-    /// naming every buffer the refresh had to leave alone (dirty edits, a
-    /// deleted file, or a file that is no longer editor text).
+    /// Emit one `BufferSnapshot` per changed clean buffer (after syncing its
+    /// language server), one `BufferConflict` per dirty buffer whose disk text
+    /// changed, one `BufferConflictCleared` for a marker that no longer
+    /// applies, and one warning toast naming files the refresh could not read.
+    /// Dirty local text is never replaced here.
     fn publish_refresh(&self, outcome: crate::workspace::BufferRefreshOutcome) {
-        let dirty: Vec<&str> = outcome
-            .dirty
-            .iter()
-            .map(selora_protocol::WorkspacePath::as_str)
-            .collect();
-        if dirty.is_empty() && outcome.skipped.is_empty() && outcome.updated.is_empty() {
-            return;
-        }
         for snapshot in outcome.updated {
+            self.sync_lsp_reload(&snapshot.path, &snapshot.text);
             self.record(FrontendEvent::BufferSnapshot(snapshot));
         }
-        let mut notes = Vec::new();
-        if !dirty.is_empty() {
-            notes.push(format!(
-                "kept unsaved edits in {}",
-                dirty
-                    .iter()
-                    .map(|path| format!("'{path}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        for cleared in outcome.cleared {
+            self.record(FrontendEvent::BufferConflictCleared(cleared));
         }
         for skipped in &outcome.skipped {
-            notes.push(format!("'{}' ({})", skipped.path.as_str(), skipped.message));
+            let absolute = self.workspace_root.join(skipped.path.as_str());
+            self.with_lsp(|bridge| bridge.invalidate_diagnostics(&absolute));
         }
-        if !notes.is_empty() {
-            self.record(FrontendEvent::Toast(ToastDto {
-                severity: ToastSeverity::Warning,
-                message: format!(
-                    "Workflow files changed on disk; the editor {}.",
-                    notes.join("; ")
-                ),
-            }));
+        for conflict in outcome.conflicts {
+            self.record(FrontendEvent::BufferConflict(conflict));
+        }
+        if outcome.skipped.is_empty() {
+            return;
+        }
+        let notes = outcome
+            .skipped
+            .iter()
+            .map(|skipped| format!("'{}' ({})", skipped.path.as_str(), skipped.message))
+            .collect::<Vec<_>>();
+        self.record(FrontendEvent::Toast(ToastDto {
+            severity: ToastSeverity::Warning,
+            message: format!(
+                "Workflow files changed on disk; the editor {}.",
+                notes.join("; ")
+            ),
+        }));
+    }
+
+    /// Send the reloaded text to the language server, then retract this path's
+    /// diagnostics from the old text. A bridge that never started has no open
+    /// document and no diagnostics, so there is nothing to sync.
+    fn sync_lsp_reload(&self, path: &selora_protocol::WorkspacePath, text: &str) {
+        let absolute = self.workspace_root.join(path.as_str());
+        self.with_lsp(|bridge| bridge.reload(absolute, text.to_owned()));
+    }
+
+    /// Run `action` against the run workspace's bridge, starting it if needed.
+    /// Only called after the run's workspace identity matched the open one.
+    fn with_lsp(&self, action: impl FnOnce(&LspBridge)) {
+        let log: Arc<EventLog> = Arc::clone(&self.log);
+        let app = self.app.clone();
+        let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
+            log.record(&app, event, None);
+        });
+        let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            *guard = Some(LspBridge::start_with_paths(
+                self.workspace_root.clone(),
+                emit,
+                self.lsp_paths.clone(),
+            ));
+        }
+        if let Some(bridge) = guard.as_ref() {
+            action(bridge);
         }
     }
 
@@ -873,16 +1241,27 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
                 }));
             }
             WorkflowEvent::Report { item } => {
+                let phase = self
+                    .phase
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
                 self.record(FrontendEvent::WorkflowReport(WorkflowReportEventDto {
                     run_id: self.current_run_id(),
                     report: WorkflowReportDto {
                         id: format!("report-{}", item.index),
                         item: workflow_report_item_text(&item.item),
                         artifact_id: item.artifact_id,
+                        phase: (!phase.trim().is_empty()).then_some(phase),
                     },
                 }));
             }
             WorkflowEvent::Artifact { artifact } => {
+                let phase = self
+                    .phase
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
                 let (kind, body) = match artifact.content {
                     selora_workflow::ArtifactContent::Markdown(body) => {
                         ("markdown".to_owned(), body)
@@ -896,6 +1275,7 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
                         title: artifact.title.unwrap_or_default(),
                         kind,
                         body,
+                        phase: (!phase.trim().is_empty()).then_some(phase),
                     },
                 }));
             }
@@ -1063,6 +1443,24 @@ fn workflow_persistence_error(error: selora_workflow::WorkflowError) -> Protocol
     }
 }
 
+/// A run whose cost cap already fired cannot resume: the confirmed grant is
+/// spent, and resume never raises it silently. Continuing needs a new run with
+/// a newly confirmed budget.
+fn workflow_budget_exhausted_error(max_cost_usd: f64, spent_usd: f64) -> ProtocolErrorDto {
+    let spend = if spent_usd > 0.0 {
+        format!(" (${spent_usd:.2} spent)")
+    } else {
+        String::new()
+    };
+    ProtocolErrorDto {
+        code: "workflow_budget_exhausted".into(),
+        message: format!(
+            "This run reached its ${max_cost_usd:.2} cost cap{spend}. A resume cannot raise the confirmed budget: start a new run and confirm a new budget to continue."
+        ),
+        retryable: false,
+    }
+}
+
 /// The resume refusal that asks for a second confirmation. It names the count,
 /// the first few step/agent labels, and the effect risk in one string (the
 /// protocol error has no structured detail slot).
@@ -1086,6 +1484,34 @@ fn workflow_incomplete_asks_message(asks: &[selora_workflow::IncompleteAsk]) -> 
     format!(
         "Resume would dispatch {} unfinished ask step(s) again: {names}{suffix}. Tools in those steps may already have applied effects. Confirm to resume anyway.",
         asks.len()
+    )
+}
+
+/// The separate partial-effect refusal. Names what the durable ledger proved,
+/// then asks for the separate acknowledgement (never the ordinary Resume).
+fn workflow_partial_effects_message(partial: selora_workflow::PartialEffects) -> String {
+    let mut reasons = Vec::new();
+    if partial.unfinished_effects > 0 {
+        reasons.push(format!(
+            "{} tool call(s) started without a recorded finish",
+            partial.unfinished_effects
+        ));
+    }
+    if partial.unfinished_ask_effects > 0 {
+        reasons.push(format!(
+            "{} side effect(s) belong to an unfinished ask",
+            partial.unfinished_ask_effects
+        ));
+    }
+    if partial.unattributed_effects > 0 {
+        reasons.push(format!(
+            "{} side effect(s) cannot be attributed to a completed step",
+            partial.unattributed_effects
+        ));
+    }
+    format!(
+        "Resume would replay a run whose tools may already have applied effects ({}). Files or commands may already exist; resume does not undo them. Acknowledge partial effects to resume anyway.",
+        reasons.join("; ")
     )
 }
 
@@ -1126,6 +1552,28 @@ fn build_workflow_spec(
     })
 }
 
+/// What the user chose in the native close prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// The result of the testable close seam. `Close` means the window may close;
+/// every other variant must call `api.prevent_close()`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    /// All unsaved edits were saved (or there were none), or the user chose
+    /// discard. `saved` counts the buffers written by this close.
+    Close { saved: usize },
+    /// The user cancelled; nothing was written and the window stays open.
+    Stay,
+    /// A save failed; the window stays open and the message is shown to the
+    /// user. Earlier buffers in `saved` may already be on disk.
+    SaveFailed { saved: usize, message: String },
+}
+
 #[derive(Clone)]
 pub struct DesktopState {
     log: Arc<EventLog>,
@@ -1133,12 +1581,12 @@ pub struct DesktopState {
     /// while an accepted `SettingsUpdate` must change what the next bootstrap
     /// (and its event) reports.
     settings: Arc<Mutex<SettingsViewDto>>,
-    /// §2.4: the authoritative in-memory layout, seeded at startup from
-    /// settings (§4) and mutated only by accepted `ToggleSurface` /
+    /// Ã‚Â§2.4: the authoritative in-memory layout, seeded at startup from
+    /// settings (Ã‚Â§4) and mutated only by accepted `ToggleSurface` /
     /// `ResizeRegion` commands. The frontend applies changes only from the
     /// `WorkspaceLayoutChanged` event.
     layout: Arc<Mutex<LayoutDto>>,
-    /// The persistence seam (§4.5).
+    /// The persistence seam (Ã‚Â§4.5).
     layout_store: Arc<LayoutStore>,
     /// The Z3 session engine (chat + agent turns) behind the agent dock.
     sessions: Arc<SessionEngine>,
@@ -1146,9 +1594,20 @@ pub struct DesktopState {
     /// the folder picker succeeds; every workspace command answers the typed
     /// no_workspace error while it is unset.
     workspace: Arc<Mutex<Option<Workspace>>>,
+    /// Phase 9 session slice: the buffer the user actually selected. The
+    /// bootstrap prefers it over the first buffer in path order. Cleared when
+    /// the buffer closes or a different workspace opens.
+    active_buffer: Arc<Mutex<Option<selora_protocol::BufferId>>>,
     /// Phase Z4b: the language-server bridge for the open workspace, created
     /// lazily on the first editor command (it needs an AppHandle to emit).
     lsp: Arc<Mutex<Option<LspBridge>>>,
+    /// The settings-fed LSP paths/args/enabled read at boot. A workspace
+    /// switch creates a fresh bridge from these, so the overrides are never
+    /// silently ignored.
+    lsp_paths: selora_lsp::LspServerPaths,
+    /// Incremented on every workspace switch/close. An event emitted by the
+    /// previous root's bridge is dropped before it reaches the event log.
+    lsp_epoch: Arc<AtomicU64>,
     /// Phase 8 wave 2: the live workflow runs, keyed by their `WorkflowRun`
     /// request id (the id `WorkflowStop`/`WorkflowDecision` name). One entry
     /// per accepted run; the worker removes its own entry on completion.
@@ -1162,9 +1621,12 @@ pub struct DesktopState {
 enum WorkflowLaunch {
     /// A newly confirmed run.
     New,
-    /// Replay an existing run; the flag is the user's explicit consent to
-    /// re-dispatch unfinished asks.
-    Resume { allow_incomplete_asks: bool },
+    /// Replay an existing run; the flags are the user's explicit consents:
+    /// re-dispatch unfinished asks, and replay effects that may already exist.
+    Resume {
+        allow_incomplete_asks: bool,
+        acknowledge_partial_effects: bool,
+    },
 }
 
 impl DesktopState {
@@ -1175,7 +1637,7 @@ impl DesktopState {
         // Z3's stand-in for the Z4 folder picker: point the agent's tools at
         // a real tree via `SELORA_WORKSPACE_ROOT` (an existing directory).
         // Without it `SendAgent` answers the typed `no_workspace` error.
-        // Z4: attach a real workspace at boot — `SELORA_WORKSPACE_ROOT` when
+        // Z4: attach a real workspace at boot Ã¢â‚¬â€ `SELORA_WORKSPACE_ROOT` when
         // set, otherwise the process working directory. The explorer, editor
         // and the agent's tools all read through this one Workspace.
         let boot_root = std::env::var("SELORA_WORKSPACE_ROOT")
@@ -1189,10 +1651,10 @@ impl DesktopState {
         state
     }
 
-    /// Hermetic constructor: an explicit settings path. The §4.4 boot toast
-    /// (a settings load/wipe error) is recorded *during construction* — no
+    /// Hermetic constructor: an explicit settings path. The Ã‚Â§4.4 boot toast
+    /// (a settings load/wipe error) is recorded *during construction* Ã¢â‚¬â€ no
     /// `AppHandle` exists yet, so it is recorded, not emitted; the replay
-    /// flow (§3.4) delivers it, and its sequence is ≤ the bootstrap's
+    /// flow (Ã‚Â§3.4) delivers it, and its sequence is Ã¢â€°Â¤ the bootstrap's
     /// `snapshot_sequence`.
     pub fn from_settings_path(settings_path: PathBuf) -> Self {
         let layout_store = Arc::new(LayoutStore::new(settings_path.clone()));
@@ -1222,7 +1684,7 @@ impl DesktopState {
     /// [`DesktopState::from_settings_path`] with a tempdir instead. The
     /// session engine gets a fixed test key (and the gateway follows
     /// `settings.selora.base_url`, so a loopback mock gateway is just a
-    /// settings field) — no test ever touches the real Credential Manager.
+    /// settings field) Ã¢â‚¬â€ no test ever touches the real Credential Manager.
     #[cfg(test)]
     pub fn with_settings(settings: selora_settings::Settings) -> Self {
         Self::from_parts(
@@ -1249,10 +1711,11 @@ impl DesktopState {
     ) -> Self {
         let core_instance_id =
             CoreInstanceId::new(Uuid::new_v4().to_string()).expect("uuid is valid");
+        let lsp_paths = lsp_server_paths(&settings);
         Self {
             log: Arc::new(EventLog::new(core_instance_id)),
             settings: Arc::new(Mutex::new(settings_view(&settings))),
-            // §4: the bootstrap reflects the persisted layout; §4.3's
+            // Ã‚Â§4: the bootstrap reflects the persisted layout; Ã‚Â§4.3's
             // sanitization runs on load.
             layout: Arc::new(Mutex::new(LayoutStore::load_layout(&settings))),
             layout_store,
@@ -1263,7 +1726,10 @@ impl DesktopState {
                 key_source,
             })),
             workspace: Arc::new(Mutex::new(None)),
+            active_buffer: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
+            lsp_paths,
+            lsp_epoch: Arc::new(AtomicU64::new(0)),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             workflow_hosts: Arc::new(Mutex::new(
                 Arc::new(production_workflow_host) as WorkflowHostFactory
@@ -1287,13 +1753,60 @@ impl DesktopState {
     /// one thing for the whole app.
     fn attach_workspace(&self, root: PathBuf) -> Result<(), WorkspaceError> {
         let workspace = Workspace::open(root)?;
+        // The old root's servers must die before the new workspace becomes
+        // visible; `reset_lsp` also invalidates any event still in flight.
+        self.reset_lsp();
         self.sessions()
             .set_workspace_root(Some(workspace.root().to_path_buf()));
         *self
             .workspace
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(workspace);
+        *self
+            .active_buffer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
         Ok(())
+    }
+
+    /// Close the open folder: no buffers, no language servers, no
+    /// diagnostics. The bootstrap then reports the no-workspace state.
+    fn detach_workspace(&self) {
+        self.reset_lsp();
+        self.sessions().set_workspace_root(None);
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    /// Invalidate and drop the language-server bridge. The epoch bump makes
+    /// any event the old manager already queued a no-op.
+    fn reset_lsp(&self) {
+        self.lsp_epoch.fetch_add(1, Ordering::SeqCst);
+        let previous = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(bridge) = previous {
+            bridge.shutdown();
+        }
+    }
+
+    /// The live bridge's diagnostics and server states (empty before the
+    /// first editor command started it).
+    fn lsp_snapshot(
+        &self,
+    ) -> (
+        Vec<selora_protocol::DiagnosticDto>,
+        Vec<selora_protocol::LspServerStateDto>,
+    ) {
+        let guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+        match guard.as_ref() {
+            Some(bridge) => (bridge.diagnostics(), bridge.server_states()),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 
     /// Map a workspace-service failure onto the wire error shape.
@@ -1322,6 +1835,36 @@ impl DesktopState {
                 message: "Open a folder first.".into(),
                 retryable: false,
             }),
+        }
+    }
+
+    /// Record a buffer as the user's active one, but only if it is actually
+    /// open. The bootstrap then reports it instead of path order.
+    fn set_active_buffer(&self, buffer_id: &selora_protocol::BufferId) {
+        let open = self
+            .workspace
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|workspace| workspace.buffer(buffer_id).is_ok())
+            .unwrap_or(false);
+        if open {
+            *self
+                .active_buffer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(buffer_id.clone());
+        }
+    }
+
+    /// After a close, drop a stale selection so the next bootstrap falls back
+    /// to the first remaining buffer.
+    fn forget_closed_buffer(&self, buffer_id: &selora_protocol::BufferId) {
+        let mut active = self
+            .active_buffer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if active.as_ref() == Some(buffer_id) {
+            *active = None;
         }
     }
 
@@ -1362,20 +1905,64 @@ impl DesktopState {
         app: &tauri::AppHandle<R>,
         action: impl FnOnce(&LspBridge),
     ) {
-        let Some(root) = self.workspace_root_path() else {
-            return;
-        };
-        let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
-        if guard.is_none() {
-            let log = Arc::clone(&self.log);
-            let app_handle = app.clone();
-            let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
-                log.record(&app_handle, event, None);
-            });
-            *guard = Some(LspBridge::start(root, emit));
+        let _ = self.with_lsp_result(app, action);
+    }
+
+    /// [`Self::with_lsp`] with a value. `None` means no workspace was open.
+    fn with_lsp_result<R: tauri::Runtime, T>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        action: impl FnOnce(&LspBridge) -> T,
+    ) -> Option<T> {
+        // A concurrent OpenFolderAt/CloseFolder can race this lazy start.
+        // Re-check the root and epoch under the bridge lock: once we hold it,
+        // `reset_lsp` cannot run, so a bridge we create here belongs to the
+        // workspace the shell currently reports.
+        for _ in 0..3 {
+            let root = self.workspace_root_path()?;
+            let started_at = self.lsp_epoch.load(Ordering::SeqCst);
+            let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+            if self.workspace_root_path().as_ref() != Some(&root)
+                || self.lsp_epoch.load(Ordering::SeqCst) != started_at
+            {
+                continue;
+            }
+            if guard.is_none() {
+                let log = Arc::clone(&self.log);
+                let app_handle = app.clone();
+                let epoch = Arc::clone(&self.lsp_epoch);
+                let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
+                    // A bridge from a workspace that has since been switched or
+                    // closed must not record anything against the new epoch.
+                    if epoch.load(Ordering::SeqCst) != started_at {
+                        return;
+                    }
+                    log.record(&app_handle, event, None);
+                });
+                *guard = Some(LspBridge::start_with_paths(
+                    root.clone(),
+                    emit,
+                    self.lsp_paths.clone(),
+                ));
+            }
+            return guard.as_ref().map(action);
         }
-        if let Some(bridge) = guard.as_ref() {
-            action(bridge);
+        None
+    }
+
+    /// Restart one language server for the open workspace.
+    fn restart_lsp<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        language: &str,
+    ) -> Result<selora_protocol::LspServerStateDto, ProtocolErrorDto> {
+        match self.with_lsp_result(app, |bridge| bridge.restart(language)) {
+            Some(result) => result,
+            None => Err(ProtocolErrorDto {
+                code: "no_workspace".into(),
+                message: "Open a folder first.".into(),
+                retryable: false,
+            }),
         }
     }
 
@@ -1425,13 +2012,25 @@ impl DesktopState {
     /// `BootstrapState` event so every consumer re-reads.
     ///
     /// Invalid input is rejected before either disk or memory is touched.
+    /// Editor values are range-checked against the selora-settings
+    /// constants, and each keybind must parse with the same grammar the
+    /// frontend's keymap uses; accepted keybinds are stored canonically.
     pub fn apply_settings_update<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         patch: SettingsPatchDto,
         request_id: Option<selora_protocol::RequestId>,
     ) -> Result<BootstrapState, ProtocolErrorDto> {
-        if patch.reduced_motion.is_none() && patch.theme.is_none() {
+        if patch.reduced_motion.is_none()
+            && patch.theme.is_none()
+            && patch.editor_font_size.is_none()
+            && patch.editor_tab_size.is_none()
+            && patch.editor_word_wrap.is_none()
+            && patch.keybind_command_palette.is_none()
+            && patch.keybind_fuzzy_find.is_none()
+            && patch.keybind_toggle_chat.is_none()
+            && patch.keybind_save.is_none()
+        {
             return Err(ProtocolErrorDto {
                 code: "invalid_settings_patch".into(),
                 message: "Settings update must change at least one field.".into(),
@@ -1457,6 +2056,44 @@ impl DesktopState {
             None => None,
         };
 
+        if let Some(font_size) = patch.editor_font_size {
+            if !(selora_settings::EDITOR_FONT_SIZE_MIN..=selora_settings::EDITOR_FONT_SIZE_MAX)
+                .contains(&font_size)
+            {
+                return Err(ProtocolErrorDto {
+                    code: "invalid_settings_editor".into(),
+                    message: format!(
+                        "Editor font size must be between {} and {} px.",
+                        selora_settings::EDITOR_FONT_SIZE_MIN,
+                        selora_settings::EDITOR_FONT_SIZE_MAX
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+        if let Some(tab_size) = patch.editor_tab_size {
+            if !(selora_settings::EDITOR_TAB_SIZE_MIN..=selora_settings::EDITOR_TAB_SIZE_MAX)
+                .contains(&tab_size)
+            {
+                return Err(ProtocolErrorDto {
+                    code: "invalid_settings_editor".into(),
+                    message: format!(
+                        "Editor tab size must be between {} and {}.",
+                        selora_settings::EDITOR_TAB_SIZE_MIN,
+                        selora_settings::EDITOR_TAB_SIZE_MAX
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+
+        let command_palette =
+            validate_keybind_patch(patch.keybind_command_palette.as_deref(), "command palette")?;
+        let fuzzy_find = validate_keybind_patch(patch.keybind_fuzzy_find.as_deref(), "fuzzy find")?;
+        let toggle_chat =
+            validate_keybind_patch(patch.keybind_toggle_chat.as_deref(), "toggle chat")?;
+        let save = validate_keybind_patch(patch.keybind_save.as_deref(), "save")?;
+
         let mut settings = self
             .layout_store
             .load_settings()
@@ -1470,6 +2107,27 @@ impl DesktopState {
         }
         if let Some(theme) = theme {
             settings.ui.theme = theme;
+        }
+        if let Some(font_size) = patch.editor_font_size {
+            settings.editor.font_size = font_size;
+        }
+        if let Some(tab_size) = patch.editor_tab_size {
+            settings.editor.tab_size = tab_size;
+        }
+        if let Some(word_wrap) = patch.editor_word_wrap {
+            settings.editor.word_wrap = word_wrap;
+        }
+        if let Some(binding) = command_palette {
+            settings.keybinds.command_palette = binding;
+        }
+        if let Some(binding) = fuzzy_find {
+            settings.keybinds.fuzzy_find = binding;
+        }
+        if let Some(binding) = toggle_chat {
+            settings.keybinds.toggle_chat = binding;
+        }
+        if let Some(binding) = save {
+            settings.keybinds.save = binding;
         }
         self.layout_store
             .save_settings(&settings)
@@ -1501,7 +2159,22 @@ impl DesktopState {
         let (workspace_dto, buffers, active_buffer_id, file_tree, git) = match workspace.as_ref() {
             Some(open) => {
                 let buffers = open.buffers();
-                let active = buffers.first().map(|buffer| buffer.buffer_id.clone());
+                // The workspace owns the active tab: it follows explicit
+                // switches and the nearest-neighbour rule on close. The
+                // state-level preference is a second source for paths that
+                // set it directly, and path order is the last resort.
+                let preferred = self
+                    .active_buffer
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
+                let active = open
+                    .active_buffer_id()
+                    .filter(|id| buffers.iter().any(|buffer| &buffer.buffer_id == id))
+                    .or_else(|| {
+                        preferred.filter(|id| buffers.iter().any(|buffer| &buffer.buffer_id == id))
+                    })
+                    .or_else(|| buffers.first().map(|buffer| buffer.buffer_id.clone()));
                 let tree = open.tree().unwrap_or(FileTreeDto { root: None });
                 let git = open.git_status().unwrap_or(selora_protocol::GitStatusDto {
                     branch: None,
@@ -1548,6 +2221,8 @@ impl DesktopState {
             .workspace_root_path()
             .map(|root| persisted_workflow_runs(&root))
             .unwrap_or_default();
+        // P1: the live bridge store, never a hard-coded empty vector.
+        let (diagnostics, lsp_servers) = self.lsp_snapshot();
         BootstrapState {
             workflows,
             protocol_version: PROTOCOL_VERSION,
@@ -1566,15 +2241,16 @@ impl DesktopState {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone(),
-            // §1.1: the Z1 stub values (280/220, agent dock open) were
-            // diagnostic placeholders — the layout now comes from the
-            // persisted settings (§4).
+            // Ã‚Â§1.1: the Z1 stub values (280/220, agent dock open) were
+            // diagnostic placeholders Ã¢â‚¬â€ the layout now comes from the
+            // persisted settings (Ã‚Â§4).
             layout: self.layout.lock().expect("layout lock").clone(),
-            // §5.1: the bounds ride the bootstrap so no bound is ever a JS
+            // Ã‚Â§5.1: the bounds ride the bootstrap so no bound is ever a JS
             // literal.
             layout_constraints: LayoutConstraintsDto::from_constants(),
             git,
-            diagnostics: Vec::new(),
+            diagnostics,
+            lsp_servers,
             feature_flags: selora_protocol::FeatureFlagsDto {
                 agent: true,
                 git: true,
@@ -1584,14 +2260,17 @@ impl DesktopState {
             },
         }
     }
-    /// The Z1-era envelope validation (§2.3 steps 1–3), unchanged, then the
-    /// Z2 layout arms and the Z3 session arms. The response remains a full
-    /// `BootstrapState` — used for error inspection, not state (§2.4).
-    pub fn dispatch<R: tauri::Runtime>(
+    /// The Z1-era envelope validation (Ã‚Â§2.3 steps 1Ã¢â‚¬â€œ3), unchanged, then the
+    /// Z2 layout arms and the Z3 session arms. The typed reply is a
+    /// [`CommandResultDto`]: reads/folder opens keep the full bootstrap
+    /// shape, event-backed mutations answer the small ack. See the protocol
+    /// doc comment for the additive contract. [`Self::dispatch`] keeps the
+    /// pre-existing `BootstrapState` signature for internal callers/tests.
+    pub fn dispatch_result<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         envelope: RequestEnvelope<FrontendCommand>,
-    ) -> Result<BootstrapState, ProtocolErrorDto> {
+    ) -> Result<CommandResultDto, ProtocolErrorDto> {
         if envelope.protocol_version != PROTOCOL_VERSION {
             return Err(ProtocolErrorDto {
                 code: "protocol_version_mismatch".into(),
@@ -1616,8 +2295,9 @@ impl DesktopState {
                 | FrontendCommand::StopChat { .. }
                 | FrontendCommand::SendAgent { .. }
                 | FrontendCommand::AgentDecision { .. }
+                | FrontendCommand::RetryMessage { .. }
         );
-        // §2.3: a command may name the workspace it was composed against —
+        // Ã‚Â§2.3: a command may name the workspace it was composed against Ã¢â‚¬â€
         // "no-workspace" before one is open, or the live id after. An
         // unknown id means the frontend is stale and must re-bootstrap.
         let current_workspace = self.current_workspace_id();
@@ -1641,9 +2321,11 @@ impl DesktopState {
         }
         let request_id = envelope.request_id.clone();
         match envelope.payload {
-            FrontendCommand::GetBootstrapState => Ok(self.bootstrap()),
+            FrontendCommand::GetBootstrapState => {
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
+            }
             // The session commands carry their own request identity (the
-            // `request_id` field on the variant — stable across the
+            // `request_id` field on the variant Ã¢â‚¬â€ stable across the
             // request's lifetime, the id `StopChat`/`AgentDecision` name
             // and every stream event echoes). The envelope's request id
             // stays transport-level: it correlates the invoke's rejection.
@@ -1658,14 +2340,14 @@ impl DesktopState {
                     command_request,
                     payload,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::StopChat {
                 request_id: command_request,
             } => {
                 self.sessions
                     .stop_chat(&command_request, envelope.session_id)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SendAgent {
                 request_id: command_request,
@@ -1678,7 +2360,7 @@ impl DesktopState {
                     command_request,
                     payload,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::AgentDecision {
                 request_id: command_request,
@@ -1691,10 +2373,39 @@ impl DesktopState {
                     decision,
                     envelope.session_id,
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            // Phase 9 session slice: real sessions owned by the engine. Each
+            // accepted transition publishes the same full bootstrap snapshot
+            // the boot path hydrates from, then answers the small ack.
+            FrontendCommand::NewSession => {
+                self.sessions.new_session()?;
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::SwitchSession { session_id } => {
+                self.sessions.switch_session(&session_id)?;
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::RetryMessage {
+                session_id,
+                message_id,
+            } => {
+                self.sessions.retry_message(
+                    self.event_log(),
+                    app.clone(),
+                    envelope.session_id,
+                    session_id,
+                    message_id,
+                )?;
+                // The retry minted a new request id inside the engine; the
+                // snapshot is how the frontend learns which stream to route.
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::ToggleSurface { surface } => {
-                // §2.2: the region a surface acts on is determined in Rust,
+                // Ã‚Â§2.2: the region a surface acts on is determined in Rust,
                 // never by the frontend. Every accepted toggle changes state,
                 // so an event always follows.
                 let layout = self.apply_toggle(surface);
@@ -1703,12 +2414,12 @@ impl DesktopState {
                     FrontendEvent::WorkspaceLayoutChanged(layout),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::ResizeRegion { region, size_px } => {
-                // §2.3 item 5: finite out-of-range values are clamped, never
+                // Ã‚Â§2.3 item 5: finite out-of-range values are clamped, never
                 // rejected. The error branch is a Rust-internal invariant
-                // guard — unreachable from the wire.
+                // guard Ã¢â‚¬â€ unreachable from the wire.
                 let clamped = clamp_region_size(region, size_px).map_err(|_| ProtocolErrorDto {
                     code: "invalid_region_size".into(),
                     message: "Region size must be a finite number.".into(),
@@ -1721,18 +2432,18 @@ impl DesktopState {
                         Some(request_id),
                     );
                 }
-                // An idempotent drag end: success, no event (§2.3 item 5).
-                Ok(self.bootstrap())
+                // An idempotent drag end: success, no event (Ã‚Â§2.3 item 5).
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SaveLayout => {
-                // §2.3 item 7: persistence failure → `layout_save_failed`
+                // Ã‚Â§2.3 item 7: persistence failure Ã¢â€ â€™ `layout_save_failed`
                 // (retryable); the in-memory layout is unaffected.
                 self.persist_layout().map_err(|error| ProtocolErrorDto {
                     code: "layout_save_failed".into(),
                     message: format!("Failed to save the layout: {error}"),
                     retryable: true,
                 })?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenExternal { url } => {
                 // The About dialog's repository link and the update toast's
@@ -1748,7 +2459,7 @@ impl DesktopState {
                         retryable: true,
                     }
                 })?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenFolder => {
                 // The keyboard/palette entry: prefer the boot override, and
@@ -1769,7 +2480,7 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::OpenFolderAt { root } => {
                 self.attach_workspace(PathBuf::from(root))
@@ -1782,12 +2493,22 @@ impl DesktopState {
                     FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
+            }
+            FrontendCommand::CloseFolder => {
+                self.detach_workspace();
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Snapshot(Box::new(snapshot)))
             }
             FrontendCommand::RefreshTree => {
                 let tree = self.with_workspace(|workspace| workspace.tree())?;
                 self.record_event(app, FrontendEvent::FileTreeChanged(tree), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::RevealInExplorer { path } => {
                 let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
@@ -1796,10 +2517,11 @@ impl DesktopState {
                     retryable: false,
                 })?;
                 reveal_in_file_explorer(&root.join(path.as_str()))?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::OpenFile { path } => {
                 let buffer = self.with_workspace(|workspace| workspace.open_file(path.as_str()))?;
+                self.set_active_buffer(&buffer.buffer_id);
                 self.record_event(
                     app,
                     FrontendEvent::BufferSnapshot(buffer.clone()),
@@ -1812,12 +2534,13 @@ impl DesktopState {
                         bridge.open(absolute, buffer.text.clone());
                     });
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::CloseBuffer { buffer_id } => {
                 let buffer = self.with_workspace(|workspace| workspace.buffer(&buffer_id))?;
                 let root = self.workspace_root_path();
                 self.with_workspace(|workspace| workspace.close_buffer(&buffer_id))?;
+                self.forget_closed_buffer(&buffer_id);
                 if let Some(root) = root {
                     let absolute = root.join(buffer.path.as_str());
                     self.with_lsp(app, |bridge| {
@@ -1832,23 +2555,73 @@ impl DesktopState {
                 let snapshot = self.bootstrap();
                 self.record_event(
                     app,
-                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    FrontendEvent::BootstrapState(Box::new(snapshot)),
                     Some(request_id),
                 );
-                Ok(snapshot)
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SaveBuffer { buffer_id } => {
                 let buffer = self.with_workspace(|workspace| workspace.save_buffer(&buffer_id))?;
                 self.record_event(
                     app,
                     FrontendEvent::BufferSnapshot(buffer.clone()),
-                    Some(request_id),
+                    Some(request_id.clone()),
                 );
                 if let Some(root) = self.workspace_root_path() {
                     let absolute = root.join(buffer.path.as_str());
                     self.with_lsp(app, |bridge| bridge.save(absolute));
                 }
-                Ok(self.bootstrap())
+                // A save writes the local text, so any external-change marker
+                // is resolved. Clear the banner explicitly.
+                if let Some(cleared) =
+                    self.with_workspace(|workspace| Ok(workspace.take_conflict(&buffer_id)))?
+                {
+                    self.record_event(
+                        app,
+                        FrontendEvent::BufferConflictCleared(cleared),
+                        Some(request_id),
+                    );
+                }
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
+            }
+            FrontendCommand::ReloadBufferFromDisk { buffer_id } => {
+                let buffer =
+                    self.with_workspace(|workspace| workspace.reload_buffer_from_disk(&buffer_id))?;
+                if let Some(root) = self.workspace_root_path() {
+                    let absolute = root.join(buffer.path.as_str());
+                    self.with_lsp(app, |bridge| bridge.reload(absolute, buffer.text.clone()));
+                }
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferSnapshot(buffer.clone()),
+                    Some(request_id.clone()),
+                );
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferConflictCleared(
+                        selora_protocol::BufferConflictClearedDto {
+                            buffer_id: buffer.buffer_id,
+                            path: buffer.path,
+                        },
+                    ),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
+            }
+            FrontendCommand::KeepBufferEdits { buffer_id } => {
+                let buffer =
+                    self.with_workspace(|workspace| workspace.keep_buffer_edits(&buffer_id))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::BufferConflictCleared(
+                        selora_protocol::BufferConflictClearedDto {
+                            buffer_id: buffer.buffer_id,
+                            path: buffer.path,
+                        },
+                    ),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::ApplyEditorChange {
                 buffer_id,
@@ -1858,6 +2631,7 @@ impl DesktopState {
                 let changed = self.with_workspace(|workspace| {
                     workspace.apply_change(&buffer_id, version, &changes)
                 })?;
+                self.set_active_buffer(&buffer_id);
                 self.record_event(app, FrontendEvent::BufferChanged(changed), Some(request_id));
                 if let Ok(snapshot) = self.with_workspace(|workspace| workspace.buffer(&buffer_id))
                 {
@@ -1866,14 +2640,24 @@ impl DesktopState {
                         self.with_lsp(app, |bridge| bridge.change(absolute, snapshot.text.clone()));
                     }
                 }
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SetSelection {
                 buffer_id,
                 selection,
             } => {
                 self.with_workspace(|workspace| workspace.set_selection(&buffer_id, selection))?;
-                Ok(self.bootstrap())
+                self.set_active_buffer(&buffer_id);
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::SetActiveBuffer { buffer_id } => {
+                // Reject unknown/closed buffers instead of recording a
+                // selection the next bootstrap would silently drop. The
+                // workspace keeps the neighbour rule for close; the state
+                // copy backs bootstrap when a path bypasses the workspace.
+                self.with_workspace(|workspace| workspace.set_active_buffer(&buffer_id))?;
+                self.set_active_buffer(&buffer_id);
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::HoverAt {
                 buffer_id,
@@ -1882,7 +2666,7 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.hover(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::DefinitionAt {
                 buffer_id,
@@ -1891,7 +2675,7 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.definition(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::CompletionAt {
                 buffer_id,
@@ -1900,12 +2684,16 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.completion(absolute, position)
                 });
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::LspRestart { language } => {
+                self.restart_lsp(app, &language)?;
+                Ok(CommandResultDto::Snapshot(Box::new(self.bootstrap())))
             }
             FrontendCommand::Search { query } => {
                 let results = self.with_workspace(|workspace| workspace.search(&query))?;
                 self.record_event(app, FrontendEvent::SearchResults(results), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitStage { path } => {
                 let status = self.with_workspace(|workspace| workspace.git_stage(path.as_str()))?;
@@ -1914,7 +2702,7 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitUnstage { path } => {
                 let status =
@@ -1924,7 +2712,7 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::GitCommit { message } => {
                 let status = self.with_workspace(|workspace| workspace.git_commit(&message))?;
@@ -1933,15 +2721,18 @@ impl DesktopState {
                     FrontendEvent::GitStatusChanged(status),
                     Some(request_id),
                 );
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenGitDiff { path } => {
                 let diff = self.with_workspace(|workspace| workspace.git_diff(path.as_str()))?;
                 self.record_event(app, FrontendEvent::GitDiffReady(diff), Some(request_id));
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::SettingsUpdate { patch } => {
-                self.apply_settings_update(app, patch, Some(request_id))
+                // The settings mutation emits its own full bootstrap snapshot;
+                // the command reply is only an ack.
+                self.apply_settings_update(app, patch, Some(request_id))?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             // Phase 8 wave 2: dispatch only. The workflow commands carry
             // their own request id (the lifetime id `WorkflowStop` names and
@@ -1951,18 +2742,19 @@ impl DesktopState {
                 spec,
             } => {
                 self.start_workflow(app, command_request, spec)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowStop {
                 request_id: command_request,
             } => {
                 self.stop_workflow(&command_request)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowResume {
                 request_id,
                 run_id,
                 allow_incomplete_asks,
+                acknowledge_partial_effects,
             } => {
                 let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
                     code: "no_workspace".into(),
@@ -1978,16 +2770,17 @@ impl DesktopState {
                         message: error.to_string(),
                         retryable: false,
                     })?;
-                let completed = journal.resume_plan().run_status()
-                    == Some(selora_workflow::journal::RunStatus::Completed)
-                    || journal.entries.iter().any(|entry| {
-                        entry.kind == "engine_run_finished"
-                            && entry
-                                .payload
-                                .get("status")
-                                .and_then(serde_json::Value::as_str)
-                                == Some("completed")
-                    });
+                // Synchronous preflight: a cap that already fired is a terminal
+                // state. Refuse before any host, worker, or event exists, and
+                // never let a resume raise the confirmed budget silently.
+                let terminal = workflow_terminal_status(&journal);
+                if terminal == Some(selora_workflow::journal::RunStatus::BudgetExceeded) {
+                    return Err(workflow_budget_exhausted_error(
+                        spec.max_cost_usd,
+                        journal.resume_plan().spent_usd(),
+                    ));
+                }
+                let completed = terminal == Some(selora_workflow::journal::RunStatus::Completed);
                 if completed {
                     return Err(ProtocolErrorDto {
                         code: "workflow_already_completed".into(),
@@ -1995,13 +2788,43 @@ impl DesktopState {
                         retryable: false,
                     });
                 }
+                // Durable ledger evidence: an unfinished tool effect, or an
+                // effect owned by an ask the resume would dispatch again.
+                // This is a SEPARATE action from ordinary Resume; the flag
+                // defaults false. A corrupt ledger is a typed refusal.
+                let partial = match selora_workflow::partial_effects(&root, &run_id) {
+                    Ok(partial) => partial,
+                    Err(selora_workflow::WorkflowError::ToolEffectLedger { message }) => {
+                        return Err(ProtocolErrorDto {
+                            code: "workflow_effect_ledger_corrupt".into(),
+                            message: format!(
+                                "The tool-effect ledger cannot be verified, so resume is refused: {message}"
+                            ),
+                            retryable: false,
+                        });
+                    }
+                    Err(error) => return Err(workflow_persistence_error(error)),
+                };
+                if !partial.is_empty() && !acknowledge_partial_effects {
+                    return Err(ProtocolErrorDto {
+                        code: "workflow_partial_effects".into(),
+                        message: workflow_partial_effects_message(partial),
+                        retryable: false,
+                    });
+                }
                 // Fail closed before a worker or event exists: a resume that
                 // would dispatch an unfinished ask again may re-run tools whose
                 // earlier effects already landed. The user's explicit
-                // confirmation is the flag; never infer it.
-                let pending = selora_workflow::incomplete_asks(&root, &run_id)
-                    .map_err(workflow_persistence_error)?;
-                if !pending.is_empty() && !allow_incomplete_asks {
+                // confirmation is the flag; never infer it. A partial-effect
+                // acknowledgement names those same effects, so it covers the
+                // ask re-dispatch too.
+                let pending = if allow_incomplete_asks || acknowledge_partial_effects {
+                    Vec::new()
+                } else {
+                    selora_workflow::incomplete_asks(&root, &run_id)
+                        .map_err(workflow_persistence_error)?
+                };
+                if !pending.is_empty() {
                     return Err(ProtocolErrorDto {
                         code: "workflow_incomplete_asks".into(),
                         message: workflow_incomplete_asks_message(&pending),
@@ -2016,9 +2839,10 @@ impl DesktopState {
                     run_id,
                     WorkflowLaunch::Resume {
                         allow_incomplete_asks,
+                        acknowledge_partial_effects,
                     },
                 )?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::WorkflowDecision {
                 request_id: command_request,
@@ -2026,7 +2850,7 @@ impl DesktopState {
                 decision,
             } => {
                 self.workflow_decision(&command_request, &approval_id, decision)?;
-                Ok(self.bootstrap())
+                Ok(CommandResultDto::Ack(self.command_ack()))
             }
             // Everything outside Z4 keeps the typed unsupported_phase_slice
             // error (the contract's "Explicit non-goals" list; adapter.rs).
@@ -2034,15 +2858,59 @@ impl DesktopState {
         }
     }
 
+    /// The pre-Phase-9 dispatch signature: run the command and materialize a
+    /// full bootstrap for callers (tests, internal seams) that inspect it.
+    /// The IPC path uses [`Self::dispatch_result`] so an event-backed
+    /// mutation does not pay for a tree walk and libgit2 status.
+    #[cfg(test)]
+    pub fn dispatch<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        envelope: RequestEnvelope<FrontendCommand>,
+    ) -> Result<BootstrapState, ProtocolErrorDto> {
+        match self.dispatch_result(app, envelope)? {
+            CommandResultDto::Snapshot(snapshot) => Ok(*snapshot),
+            CommandResultDto::Ack(_) => Ok(self.bootstrap()),
+        }
+    }
+
+    /// The small mutation reply (no tree walk, no Git status, no transcript).
+    fn command_ack(&self) -> CommandAckDto {
+        CommandAckDto {
+            protocol_version: PROTOCOL_VERSION,
+            core_instance_id: self.log.core_instance_id(),
+            snapshot_sequence: self.log.snapshot_sequence(),
+            acknowledged: true,
+            session_id: self.sessions.active_session_id(),
+        }
+    }
+
+    /// Emit the full snapshot a session transition hydrates from, and return
+    /// it for callers that still want the body. The event is the contract:
+    /// the frontend ignores command replies.
+    fn publish_chat_bootstrap<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        request_id: Option<RequestId>,
+    ) -> BootstrapState {
+        let snapshot = self.bootstrap();
+        self.record_event(
+            app,
+            FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+            request_id,
+        );
+        snapshot
+    }
+
     // -----------------------------------------------------------------
-    // Phase 8 wave 2 — WorkflowRun / WorkflowStop / WorkflowDecision
+    // Phase 8 wave 2 Ã¢â‚¬â€ WorkflowRun / WorkflowStop / WorkflowDecision
     // -----------------------------------------------------------------
 
     /// Validate a `WorkflowRun` spec, reserve its request id, and start the
     /// blocking engine on a worker thread.
     ///
-    /// Policy: **concurrent runs are allowed** — every protocol event is
-    /// `run_id`-scoped, so the panel can follow more than one graph — but a
+    /// Policy: **concurrent runs are allowed** Ã¢â‚¬â€ every protocol event is
+    /// `run_id`-scoped, so the panel can follow more than one graph Ã¢â‚¬â€ but a
     /// new run may not reuse a *live* request id. `WorkflowStop` and
     /// `WorkflowDecision` address a run by that id, so it has to stay unique
     /// while the run is active. (The engine's per-run cost cap already bounds
@@ -2056,7 +2924,7 @@ impl DesktopState {
         let spec = build_workflow_spec(spec)?;
         let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
             code: "no_workspace".into(),
-            message: "A workflow needs a workspace root — open a folder first.".into(),
+            message: "A workflow needs a workspace root Ã¢â‚¬â€ open a folder first.".into(),
             retryable: false,
         })?;
         self.launch_workflow(
@@ -2078,11 +2946,12 @@ impl DesktopState {
         durable_run_id: selora_workflow::RunId,
         launch: WorkflowLaunch,
     ) -> Result<(), ProtocolErrorDto> {
-        let (resume, allow_incomplete_asks) = match launch {
-            WorkflowLaunch::New => (false, false),
+        let (resume, allow_incomplete_asks, acknowledge_partial_effects) = match launch {
+            WorkflowLaunch::New => (false, false, false),
             WorkflowLaunch::Resume {
                 allow_incomplete_asks,
-            } => (true, allow_incomplete_asks),
+                acknowledge_partial_effects,
+            } => (true, allow_incomplete_asks, acknowledge_partial_effects),
         };
         let workspace_id = workspace_id_for(&root);
         let run_id = Arc::new(Mutex::new(Some(durable_run_id.to_string())));
@@ -2093,6 +2962,8 @@ impl DesktopState {
             workspace_id: workspace_id.clone(),
             workspace_root: root.clone(),
             workspace: Arc::clone(&self.workspace),
+            lsp: Arc::clone(&self.lsp),
+            lsp_paths: self.lsp_paths.clone(),
             max_cost_usd: spec.max_cost_usd,
             name: spec.name.clone(),
             started: AtomicBool::new(false),
@@ -2128,6 +2999,7 @@ impl DesktopState {
                 model_metadata,
                 caps,
                 on_approval: Arc::new(move |id, card| approval_stream.on_approval(id, card)),
+                durable_run_id: durable_run_id.to_string(),
             },
         );
         let token = Uuid::new_v4();
@@ -2183,8 +3055,10 @@ impl DesktopState {
                         resume,
                         // Only a user-confirmed resume passes `true`; a new
                         // run and an unconfirmed resume keep the fail-closed
-                        // default for unfinished asks.
+                        // default for unfinished asks. The partial-effect
+                        // acknowledgement is its own explicit action.
                         allow_incomplete_asks,
+                        acknowledge_partial_effects,
                     },
                 )
             }));
@@ -2235,7 +3109,7 @@ impl DesktopState {
     /// `WorkflowStop`: flip the active host's cancel switch. The engine then
     /// ends the script and emits its one `WorkflowFinished(stopped)`; the
     /// worker removes the entry. A finished/unknown run is a typed error, not
-    /// silent success — the protocol's stop names a live run.
+    /// silent success Ã¢â‚¬â€ the protocol's stop names a live run.
     fn stop_workflow(&self, request_id: &RequestId) -> Result<(), ProtocolErrorDto> {
         let cancel = {
             let runs = self
@@ -2308,7 +3182,7 @@ impl DesktopState {
         })
     }
 
-    /// §2.2's routing table.
+    /// Ã‚Â§2.2's routing table.
     fn apply_toggle(&self, surface: SurfaceId) -> LayoutDto {
         let mut layout = self.layout.lock().expect("layout lock");
         match surface {
@@ -2318,7 +3192,7 @@ impl DesktopState {
             | SurfaceId::Workflows
             | SurfaceId::Settings => {
                 if layout.primary_sidebar_open && layout.activity_view == surface {
-                    // Open and already showing this view → close the sidebar.
+                    // Open and already showing this view Ã¢â€ â€™ close the sidebar.
                     layout.primary_sidebar_open = false;
                 } else {
                     layout.primary_sidebar_open = true;
@@ -2330,7 +3204,7 @@ impl DesktopState {
             }
             SurfaceId::Problems | SurfaceId::Output | SurfaceId::TerminalPlaceholder => {
                 if layout.bottom_dock_open && layout.bottom_view == surface {
-                    // Open and already showing this view → close the dock.
+                    // Open and already showing this view Ã¢â€ â€™ close the dock.
                     layout.bottom_dock_open = false;
                 } else {
                     layout.bottom_dock_open = true;
@@ -2342,17 +3216,17 @@ impl DesktopState {
     }
 
     /// Applies an accepted (already clamped) resize and returns the new
-    /// layout, or `None` when the clamped value equals the stored value — an
-    /// idempotent drag end that succeeds with no event (§2.3 item 5).
+    /// layout, or `None` when the clamped value equals the stored value Ã¢â‚¬â€ an
+    /// idempotent drag end that succeeds with no event (Ã‚Â§2.3 item 5).
     /// Resizing a closed region is allowed: the size applies when it next
-    /// opens. Sanitization runs after every accepted resize (§4.3) — with a
+    /// opens. Sanitization runs after every accepted resize (Ã‚Â§4.3) Ã¢â‚¬â€ with a
     /// clamped input and an already-sanitized stored layout it is
     /// idempotent, but it stands so a stale stored value can never survive
     /// an accepted resize.
     fn apply_resize(&self, region: RegionId, size_px: f32) -> Option<LayoutDto> {
         let mut layout = self.layout.lock().expect("layout lock");
-        // §2.3 item 5: the no-op rule compares the clamped value against the
-        // STORED value — before the mutation, not after it.
+        // Ã‚Â§2.3 item 5: the no-op rule compares the clamped value against the
+        // STORED value Ã¢â‚¬â€ before the mutation, not after it.
         let stored = match region {
             RegionId::PrimarySidebar => layout.primary_sidebar_width_px,
             RegionId::AgentDock => layout.agent_dock_width_px,
@@ -2371,16 +3245,68 @@ impl DesktopState {
     }
 
     /// The one save path, shared by `SaveLayout` and the close-time save
-    /// (§3.3): read-modify-write `settings.json` through the `LayoutStore`
-    /// seam so every other section survives (§10), then the atomic
-    /// temp+rename write (§4.1).
+    /// (Ã‚Â§3.3): read-modify-write `settings.json` through the `LayoutStore`
+    /// seam so every other section survives (Ã‚Â§10), then the atomic
+    /// temp+rename write (Ã‚Â§4.1).
     pub fn persist_layout(&self) -> Result<(), selora_settings::SeloraError> {
         let layout = self.layout.lock().expect("layout lock").clone();
         let mut settings = self.layout_store.load_settings()?;
         self.layout_store.persist_layout(&mut settings, &layout)
     }
 
-    /// The §2.4 emitter, now a delegation to the shared [`EventLog`] (Z3:
+    /// Every open buffer with unsaved edits, path-sorted. The close prompt
+    /// uses this snapshot and then drops the workspace lock before showing a
+    /// native dialog.
+    pub fn dirty_buffers(&self) -> Vec<BufferSnapshotDto> {
+        self.with_workspace(|workspace| {
+            Ok(workspace
+                .buffers()
+                .into_iter()
+                .filter(|buffer| buffer.dirty)
+                .collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// The testable close seam: prompt, then save/discard/cancel. No lock is
+    /// held across `prompt`; each save re-locks the workspace. `main.rs`
+    /// supplies the real rfd dialog, tests supply a closure that returns the
+    /// choice without touching a window.
+    pub fn handle_close_request<F>(&self, prompt: F) -> CloseOutcome
+    where
+        F: FnOnce(&[BufferSnapshotDto]) -> CloseChoice,
+    {
+        let dirty = self.dirty_buffers();
+        if dirty.is_empty() {
+            return CloseOutcome::Close { saved: 0 };
+        }
+
+        match prompt(&dirty) {
+            CloseChoice::Cancel => CloseOutcome::Stay,
+            CloseChoice::Discard => CloseOutcome::Close { saved: 0 },
+            CloseChoice::Save => {
+                let mut saved = 0;
+                for buffer in &dirty {
+                    if let Err(error) =
+                        self.with_workspace(|workspace| workspace.save_buffer(&buffer.buffer_id))
+                    {
+                        return CloseOutcome::SaveFailed {
+                            saved,
+                            message: format!(
+                                "Could not save '{}': {}",
+                                buffer.path.as_str(),
+                                error.message
+                            ),
+                        };
+                    }
+                    saved += 1;
+                }
+                CloseOutcome::Close { saved }
+            }
+        }
+    }
+
+    /// The Ã‚Â§2.4 emitter, now a delegation to the shared [`EventLog`] (Z3:
     /// the session relays record through the same seam). Runtime-generic
     /// so hermetic tests can drive it with `tauri::test`'s mock runtime
     /// while the Tauri command passes the real `AppHandle`.
@@ -2393,7 +3319,7 @@ impl DesktopState {
         self.log.record(app, payload, request_id);
     }
 
-    /// Record without emitting — the Z2 state tests' seam (the §4.4 boot
+    /// Record without emitting Ã¢â‚¬â€ the Z2 state tests' seam (the Ã‚Â§4.4 boot
     /// toast path; the log's own `push` carries the session id).
     #[cfg(test)]
     fn push_event(
@@ -2404,7 +3330,7 @@ impl DesktopState {
         self.log.push(payload, request_id, None)
     }
 
-    /// §3.4's replay backing store for the `get_events_after` command.
+    /// Ã‚Â§3.4's replay backing store for the `get_events_after` command.
     pub fn events_after(&self, sequence: u64) -> Vec<EventEnvelope<FrontendEvent>> {
         self.log.events_after(sequence)
     }
@@ -2414,14 +3340,14 @@ impl DesktopState {
 mod tests {
     use super::*;
     use selora_protocol::{
-        BufferSnapshotDto, EventEnvelope, FrontendCommand, RequestId, WorkflowSpecDto, WorkspaceId,
-        WorkspacePath,
+        BufferSnapshotDto, CommandResultDto, EventEnvelope, FrontendCommand, RequestId,
+        WorkflowSpecDto, WorkspaceId, WorkspacePath,
     };
     use selora_workflow::{CommandOutput, GitCommit, GrepMatch, Host, HostError};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    /// A unique temp settings file per test — hermetic, never the real
+    /// A unique temp settings file per test Ã¢â‚¬â€ hermetic, never the real
     /// `%APPDATA%` profile (the settings crate's own test pattern).
     fn temp_settings_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2467,7 +3393,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // §2.2's toggle routing table.
+    // Ã‚Â§2.2's toggle routing table.
     // ------------------------------------------------------------------
 
     #[test]
@@ -2500,29 +3426,29 @@ mod tests {
                 );
             };
             if surface == SurfaceId::Files {
-                // (a) open + same view → closed.
-                step(&state, false, "same-view open → closed");
-                // (c) closed → open.
-                step(&state, true, "closed → open");
+                // (a) open + same view Ã¢â€ â€™ closed.
+                step(&state, false, "same-view open Ã¢â€ â€™ closed");
+                // (c) closed Ã¢â€ â€™ open.
+                step(&state, true, "closed Ã¢â€ â€™ open");
                 // (a) again.
-                step(&state, false, "same-view open → closed (second lap)");
+                step(&state, false, "same-view open Ã¢â€ â€™ closed (second lap)");
             } else {
-                // (b) open + different view → switched.
-                step(&state, true, "different view → switched");
-                // (a) open + same view → closed.
-                step(&state, false, "same-view open → closed");
-                // (c) closed → open.
-                step(&state, true, "closed → open");
+                // (b) open + different view Ã¢â€ â€™ switched.
+                step(&state, true, "different view Ã¢â€ â€™ switched");
+                // (a) open + same view Ã¢â€ â€™ closed.
+                step(&state, false, "same-view open Ã¢â€ â€™ closed");
+                // (c) closed Ã¢â€ â€™ open.
+                step(&state, true, "closed Ã¢â€ â€™ open");
             }
         }
 
-        // Agent: flips the dock — from closed (the default) it opens, and
+        // Agent: flips the dock Ã¢â‚¬â€ from closed (the default) it opens, and
         // from open it closes.
         let state = DesktopState::with_settings(selora_settings::Settings::default());
         state
             .dispatch(&app, envelope(&state, toggle(SurfaceId::Agent)))
             .expect("toggle succeeds");
-        assert!(layout(&state).agent_dock_open, "closed → open");
+        assert!(layout(&state).agent_dock_open, "closed Ã¢â€ â€™ open");
 
         let mut settings = selora_settings::Settings::default();
         settings.layout.agent_dock_open = true;
@@ -2530,7 +3456,7 @@ mod tests {
         state
             .dispatch(&app, envelope(&state, toggle(SurfaceId::Agent)))
             .expect("toggle succeeds");
-        assert!(!layout(&state).agent_dock_open, "open → closed");
+        assert!(!layout(&state).agent_dock_open, "open Ã¢â€ â€™ closed");
 
         // Bottom-dock surfaces, from the default (closed, bottom_view =
         // Output): the same three cases.
@@ -2551,14 +3477,14 @@ mod tests {
                     "{surface:?}: {note} keeps the view"
                 );
             };
-            // (c) closed → open on this view.
-            step(&state, true, "closed → open");
-            // (a) open + same view → closed.
-            step(&state, false, "same-view open → closed");
-            // (c) closed → open.
-            step(&state, true, "closed → open (second lap)");
+            // (c) closed Ã¢â€ â€™ open on this view.
+            step(&state, true, "closed Ã¢â€ â€™ open");
+            // (a) open + same view Ã¢â€ â€™ closed.
+            step(&state, false, "same-view open Ã¢â€ â€™ closed");
+            // (c) closed Ã¢â€ â€™ open.
+            step(&state, true, "closed Ã¢â€ â€™ open (second lap)");
         }
-        // (b) open + different view → switched.
+        // (b) open + different view Ã¢â€ â€™ switched.
         let state = DesktopState::with_settings(selora_settings::Settings::default());
         state
             .dispatch(&app, envelope(&state, toggle(SurfaceId::Problems)))
@@ -2681,7 +3607,7 @@ mod tests {
             "the changing resize emitted exactly one event"
         );
 
-        // Same value → success, no event (idempotent drag end).
+        // Same value Ã¢â€ â€™ success, no event (idempotent drag end).
         state
             .dispatch(
                 &app,
@@ -2741,7 +3667,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Envelope rejection (§2.3 steps 1–3) for the three Z2 commands.
+    // Envelope rejection (Ã‚Â§2.3 steps 1Ã¢â‚¬â€œ3) for the three Z2 commands.
     // ------------------------------------------------------------------
 
     #[test]
@@ -2835,6 +3761,7 @@ mod tests {
                         patch: SettingsPatchDto {
                             reduced_motion: Some(true),
                             theme: Some("light".into()),
+                            ..Default::default()
                         },
                     },
                 ),
@@ -2881,6 +3808,7 @@ mod tests {
                         patch: SettingsPatchDto {
                             reduced_motion: Some(true),
                             theme: Some("not-a-theme".into()),
+                            ..Default::default()
                         },
                     },
                 ),
@@ -2889,6 +3817,144 @@ mod tests {
 
         assert_eq!(error.code, "invalid_settings_theme");
         assert!(!error.retryable);
+        assert_eq!(state.bootstrap().settings, before, "memory is unchanged");
+        assert!(state.events_after(0).is_empty(), "no event is published");
+        assert!(!path.exists(), "invalid input never writes settings.json");
+    }
+
+    #[test]
+    fn settings_update_persists_editor_preferences_and_all_four_keybinds() {
+        let app = mock_app_handle();
+        let path = temp_settings_path("settings-editor-keybinds");
+        let _ = std::fs::remove_file(&path);
+        let state = DesktopState::from_settings_path(path.clone());
+
+        let returned = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SettingsUpdate {
+                        patch: SettingsPatchDto {
+                            editor_font_size: Some(18),
+                            editor_tab_size: Some(2),
+                            editor_word_wrap: Some(true),
+                            keybind_command_palette: Some("f2".into()),
+                            keybind_fuzzy_find: Some("ctrl + shift + f".into()),
+                            keybind_toggle_chat: Some("Alt+L".into()),
+                            keybind_save: Some("Ctrl+Alt+S".into()),
+                            ..Default::default()
+                        },
+                    },
+                ),
+            )
+            .expect("editor settings update succeeds");
+
+        // The view carries the persisted values and canonical keybinds.
+        assert_eq!(returned.settings.editor_font_size, 18);
+        assert_eq!(returned.settings.editor_tab_size, 2);
+        assert!(returned.settings.editor_word_wrap);
+        assert_eq!(returned.settings.keybind_command_palette, "F2");
+        assert_eq!(returned.settings.keybind_fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(returned.settings.keybind_toggle_chat, "Alt+L");
+        assert_eq!(returned.settings.keybind_save, "Ctrl+Alt+S");
+
+        let persisted = selora_settings::Settings::load_from(&path).expect("reload settings");
+        assert_eq!(persisted.editor.font_size, 18);
+        assert_eq!(persisted.editor.tab_size, 2);
+        assert!(persisted.editor.word_wrap);
+        assert_eq!(persisted.keybinds.command_palette, "F2");
+        assert_eq!(persisted.keybinds.fuzzy_find, "Ctrl+Shift+F");
+        assert_eq!(persisted.keybinds.toggle_chat, "Alt+L");
+        assert_eq!(persisted.keybinds.save, "Ctrl+Alt+S");
+        // A save preserves the unrelated sections.
+        assert_eq!(persisted.ui.theme, "selora-dark");
+        assert_eq!(persisted.agent.max_iterations, 25);
+
+        // A fresh state over the same file boots with the saved values.
+        let reopened = DesktopState::from_settings_path(path.clone());
+        assert_eq!(reopened.bootstrap().settings, returned.settings);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_update_rejects_editor_ranges_and_bad_keybinds_without_mutation() {
+        let app = mock_app_handle();
+        let path = temp_settings_path("settings-editor-ranges");
+        let _ = std::fs::remove_file(&path);
+        let state = DesktopState::from_settings_path(path.clone());
+        let before = state.bootstrap().settings;
+
+        let patches = [
+            (
+                SettingsPatchDto {
+                    editor_font_size: Some(selora_settings::EDITOR_FONT_SIZE_MIN - 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_font_size: Some(selora_settings::EDITOR_FONT_SIZE_MAX + 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_tab_size: Some(0),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    editor_tab_size: Some(selora_settings::EDITOR_TAB_SIZE_MAX + 1),
+                    ..Default::default()
+                },
+                "invalid_settings_editor",
+            ),
+            (
+                SettingsPatchDto {
+                    keybind_save: Some("Ctrl+Shift+P+L".into()),
+                    ..Default::default()
+                },
+                "invalid_settings_keybind",
+            ),
+            (
+                SettingsPatchDto {
+                    keybind_fuzzy_find: Some("   ".into()),
+                    ..Default::default()
+                },
+                "invalid_settings_keybind",
+            ),
+        ];
+
+        for (patch, code) in patches {
+            let error = state
+                .dispatch(
+                    &app,
+                    envelope(&state, FrontendCommand::SettingsUpdate { patch }),
+                )
+                .expect_err("invalid patch is rejected");
+            assert_eq!(error.code, code);
+            assert!(!error.retryable);
+        }
+
+        let empty = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SettingsUpdate {
+                        patch: SettingsPatchDto::default(),
+                    },
+                ),
+            )
+            .expect_err("an empty patch is rejected");
+        assert_eq!(empty.code, "invalid_settings_patch");
+
         assert_eq!(state.bootstrap().settings, before, "memory is unchanged");
         assert!(state.events_after(0).is_empty(), "no event is published");
         assert!(!path.exists(), "invalid input never writes settings.json");
@@ -2987,7 +4053,7 @@ mod tests {
         let path = temp_settings_path("round-trip");
         let _ = std::fs::remove_file(&path);
 
-        // First run: defaults on disk absent → bootstrap carries §1.1 defaults.
+        // First run: defaults on disk absent Ã¢â€ â€™ bootstrap carries Ã‚Â§1.1 defaults.
         let state = DesktopState::from_settings_path(path.clone());
         assert_eq!(
             state.bootstrap().layout,
@@ -3041,7 +4107,7 @@ mod tests {
         state
             .dispatch(&app, envelope(&state, toggle(SurfaceId::Agent)))
             .expect("toggle succeeds");
-        // No SaveLayout — the close-time save (§3.3) owns this write.
+        // No SaveLayout Ã¢â‚¬â€ the close-time save (Ã‚Â§3.3) owns this write.
         state.persist_layout().expect("close-time persist");
 
         let reopened = DesktopState::from_settings_path(path.clone());
@@ -3076,7 +4142,7 @@ mod tests {
             error.retryable,
             "the caller may retry after fixing the cause"
         );
-        // §2.3 item 7: the in-memory layout is unaffected.
+        // Ã‚Â§2.3 item 7: the in-memory layout is unaffected.
         assert_eq!(layout(&state), before);
         assert!(!settings_path.exists(), "nothing was written");
 
@@ -3147,7 +4213,7 @@ mod tests {
             "sequences are monotonic in dispatch order"
         );
         // Every dispatch here emits, and each event carries the request_id of
-        // the command that caused it (§2.4).
+        // the command that caused it (Ã‚Â§2.4).
         for event in &events {
             assert_eq!(
                 event.request_id,
@@ -3158,8 +4224,8 @@ mod tests {
                 FrontendEvent::WorkspaceLayoutChanged(_)
             ));
         }
-        // The final recorded layout is the last event's layout — rapid
-        // successive commands converge on the last one (§3.2).
+        // The final recorded layout is the last event's layout Ã¢â‚¬â€ rapid
+        // successive commands converge on the last one (Ã‚Â§3.2).
         match &events.last().expect("three events").payload {
             FrontendEvent::WorkspaceLayoutChanged(payload) => {
                 assert_eq!(payload.bottom_view, SurfaceId::Output);
@@ -3217,8 +4283,8 @@ mod tests {
             }
             other => panic!("expected a toast, got {other:?}"),
         }
-        // §3.4: recorded during construction, so its sequence is ≤ the
-        // bootstrap's snapshot_sequence — the replay flow delivers it.
+        // Ã‚Â§3.4: recorded during construction, so its sequence is Ã¢â€°Â¤ the
+        // bootstrap's snapshot_sequence Ã¢â‚¬â€ the replay flow delivers it.
         assert_eq!(events[0].sequence, 1);
         assert!(state.bootstrap().snapshot_sequence >= events[0].sequence);
         assert_eq!(events[0].request_id, None);
@@ -3246,7 +4312,7 @@ mod tests {
         );
         assert_eq!(boot.settings.keybind_command_palette, "Ctrl+Shift+P");
         assert_eq!(boot.settings.keybind_toggle_chat, "Ctrl+L");
-        // A user's egui-side rebind carries into the shell (§5.1).
+        // A user's egui-side rebind carries into the shell (Ã‚Â§5.1).
         let mut settings = selora_settings::Settings::default();
         settings.keybinds.toggle_chat = "Ctrl+K".into();
         let state = DesktopState::with_settings(settings);
@@ -3301,6 +4367,409 @@ mod tests {
             )
             .expect("open folder");
         dir
+    }
+
+    #[test]
+    fn bootstrap_prefers_the_users_active_buffer_over_path_order() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+
+        // `hello.rs` sorts before `src/lib.rs`; opening both would report
+        // `hello.rs` under the old first-alphabetical rule.
+        let hello = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: WorkspacePath::new("hello.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open hello");
+        let lib = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: WorkspacePath::new("src/lib.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open lib");
+        let hello_id = hello
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "hello.rs")
+            .expect("hello buffer")
+            .buffer_id
+            .clone();
+        let lib_id = lib
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "src/lib.rs")
+            .expect("lib buffer")
+            .buffer_id
+            .clone();
+
+        // OpenFile records the opened buffer as active.
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+
+        // The user clicking the other tab records it explicitly.
+        let reply = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: hello_id.clone(),
+                    },
+                ),
+            )
+            .expect("set active");
+        assert!(matches!(reply, CommandResultDto::Ack(_)));
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&hello_id));
+
+        // Closing the active buffer falls back to the remaining one.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: hello_id.clone(),
+                    },
+                ),
+            )
+            .expect("close hello");
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+
+        // An unknown buffer is refused, not stored.
+        let error = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: selora_protocol::BufferId::new("no-such-buffer").expect("id"),
+                    },
+                ),
+            )
+            .expect_err("unknown buffer");
+        assert_eq!(error.code, "unknown_buffer");
+        assert_eq!(state.bootstrap().active_buffer_id.as_ref(), Some(&lib_id));
+    }
+
+    /// Open `path`, insert `insert` at the start, and return the dirty buffer id.
+    fn open_and_dirty(
+        state: &DesktopState,
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        path: &str,
+        insert: &str,
+    ) -> selora_protocol::BufferId {
+        let opened = state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::OpenFile {
+                        path: selora_protocol::WorkspacePath::new(path).expect("path"),
+                    },
+                ),
+            )
+            .expect("open file");
+        let buffer = opened
+            .buffers
+            .iter()
+            .find(|candidate| candidate.path.as_str() == path)
+            .expect("buffer present")
+            .clone();
+        state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: buffer.buffer_id.clone(),
+                        version: buffer.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            replacement: insert.into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("apply edit");
+        buffer.buffer_id
+    }
+
+    #[test]
+    fn z4_close_prompt_cancel_keeps_edits_and_stays_open() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let id = open_and_dirty(&state, &app, "hello.rs", "// cancel\n");
+        let prompted = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = prompted.clone();
+
+        let outcome = state.handle_close_request(|dirty| {
+            seen.store(true, Ordering::SeqCst);
+            assert_eq!(dirty.len(), 1);
+            assert_eq!(dirty[0].path.as_str(), "hello.rs");
+            CloseChoice::Cancel
+        });
+
+        assert_eq!(outcome, CloseOutcome::Stay);
+        assert!(prompted.load(Ordering::SeqCst), "the prompt ran");
+        assert!(state
+            .bootstrap()
+            .buffers
+            .iter()
+            .any(|buffer| buffer.buffer_id == id && buffer.dirty));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).expect("read"),
+            "fn main() {}\n",
+            "cancel never writes"
+        );
+    }
+
+    #[test]
+    fn z4_close_prompt_discard_closes_without_saving() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        open_and_dirty(&state, &app, "hello.rs", "// discard\n");
+
+        let outcome = state.handle_close_request(|_| CloseChoice::Discard);
+
+        assert_eq!(outcome, CloseOutcome::Close { saved: 0 });
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).expect("read"),
+            "fn main() {}\n",
+            "discard never writes"
+        );
+    }
+
+    #[test]
+    fn z4_close_prompt_save_writes_every_dirty_buffer_then_closes() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        open_and_dirty(&state, &app, "hello.rs", "// save hello\n");
+        open_and_dirty(&state, &app, "src/lib.rs", "// save lib\n");
+        assert_eq!(state.dirty_buffers().len(), 2);
+
+        let outcome = state.handle_close_request(|dirty| {
+            assert_eq!(dirty.len(), 2);
+            CloseChoice::Save
+        });
+
+        assert_eq!(outcome, CloseOutcome::Close { saved: 2 });
+        assert!(state.dirty_buffers().is_empty(), "every save cleared dirty");
+        assert!(std::fs::read_to_string(dir.path().join("hello.rs"))
+            .expect("read")
+            .starts_with("// save hello\n"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("src").join("lib.rs"))
+                .expect("read")
+                .starts_with("// save lib\n")
+        );
+    }
+
+    #[test]
+    fn z4_close_with_no_dirty_buffers_skips_the_prompt() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFile {
+                        path: selora_protocol::WorkspacePath::new("hello.rs").expect("path"),
+                    },
+                ),
+            )
+            .expect("open clean file");
+
+        let outcome = state.handle_close_request(|_| panic!("no prompt for clean buffers"));
+        assert_eq!(outcome, CloseOutcome::Close { saved: 0 });
+    }
+
+    #[test]
+    fn z4_bootstrap_reports_switched_and_neighbor_active_buffer() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        std::fs::write(dir.path().join("aaa.txt"), "a\n").expect("seed aaa");
+        std::fs::write(dir.path().join("zzz.txt"), "z\n").expect("seed zzz");
+
+        let open = |path: &str| {
+            state
+                .dispatch(
+                    &app,
+                    envelope(
+                        &state,
+                        FrontendCommand::OpenFile {
+                            path: selora_protocol::WorkspacePath::new(path).expect("path"),
+                        },
+                    ),
+                )
+                .expect("open file")
+        };
+
+        let aaa = open("aaa.txt");
+        let aaa_id = aaa
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "aaa.txt")
+            .expect("aaa")
+            .buffer_id
+            .clone();
+        let zzz = open("zzz.txt");
+        let zzz_id = zzz
+            .buffers
+            .iter()
+            .find(|buffer| buffer.path.as_str() == "zzz.txt")
+            .expect("zzz")
+            .buffer_id
+            .clone();
+        // The last opened buffer is active.
+        assert_eq!(zzz.active_buffer_id, Some(zzz_id.clone()));
+
+        // A tab switch is recorded and the next bootstrap reports it.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::SetActiveBuffer {
+                        buffer_id: aaa_id.clone(),
+                    },
+                ),
+            )
+            .expect("switch tab");
+        assert_eq!(state.bootstrap().active_buffer_id, Some(aaa_id.clone()));
+
+        // Close the non-active zzz; active stays aaa.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: zzz_id.clone(),
+                    },
+                ),
+            )
+            .expect("close zzz");
+        assert_eq!(state.bootstrap().active_buffer_id, Some(aaa_id.clone()));
+
+        // Closing the active tab reports a real neighbor, never a stale id.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::CloseBuffer {
+                        buffer_id: aaa_id.clone(),
+                    },
+                ),
+            )
+            .expect("close aaa");
+        let after = state.bootstrap();
+        assert_ne!(after.active_buffer_id, Some(aaa_id));
+        assert!(after
+            .active_buffer_id
+            .as_ref()
+            .is_none_or(|id| after.buffers.iter().any(|buffer| &buffer.buffer_id == id)));
+    }
+
+    #[test]
+    fn dispatch_result_returns_a_small_ack_for_event_backed_mutations() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+
+        let reply = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ToggleSurface {
+                        surface: SurfaceId::Agent,
+                    },
+                ),
+            )
+            .expect("toggle");
+        match reply {
+            CommandResultDto::Ack(ack) => {
+                assert!(ack.acknowledged);
+                assert_eq!(ack.core_instance_id, state.core_instance_id());
+                assert_eq!(ack.snapshot_sequence, state.bootstrap().snapshot_sequence);
+            }
+            CommandResultDto::Snapshot(_) => panic!("a toggle answers the small ack"),
+        }
+
+        // The read path still answers the full bootstrap shape unchanged.
+        let reply = state
+            .dispatch_result(&app, envelope(&state, FrontendCommand::GetBootstrapState))
+            .expect("bootstrap");
+        assert!(matches!(reply, CommandResultDto::Snapshot(_)));
+    }
+
+    #[test]
+    fn concurrent_emitters_deliver_in_assigned_sequence_order() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = state.event_log();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for worker in 0..8u32 {
+            let log = std::sync::Arc::clone(&log);
+            let app = mock_app_handle();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for index in 0..25u32 {
+                    log.record(
+                        &app,
+                        FrontendEvent::Toast(ToastDto {
+                            severity: ToastSeverity::Info,
+                            message: format!("worker {worker} event {index}"),
+                        }),
+                        None,
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("producer thread");
+        }
+
+        let emitted = log.emitted_sequences();
+        assert_eq!(emitted.len(), 200);
+        assert!(
+            emitted.windows(2).all(|pair| pair[0] < pair[1]),
+            "emission order must be strictly increasing: {emitted:?}"
+        );
+        assert_eq!(emitted, (1..=200).collect::<Vec<u64>>());
+
+        // The replay ring carries the same order.
+        let logged: Vec<u64> = state
+            .events_after(0)
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(logged, emitted);
     }
 
     #[test]
@@ -3648,7 +5117,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase 8 wave 2 — workflow dispatch and event mapping.
+    // Phase 8 wave 2 Ã¢â‚¬â€ workflow dispatch and event mapping.
     //
     // The engine/facade contract is `selora-workflow`'s own test suite; these
     // tests prove the desktop seam: validation before spawn, the event mapping
@@ -3698,10 +5167,19 @@ mod tests {
         /// Make `ask` fail so a durable run can end with an unfinished ask
         /// (`incomplete_asks` then sees it).
         ask_fails: bool,
+        /// The 1-based `report` call that fails; 0 never fails.
+        report_fails_at: u64,
+        report_calls: std::sync::atomic::AtomicU64,
         /// Disk edits the fake performs when `world.run` starts: `Some` writes,
         /// `None` deletes. This is how a test makes a "workflow edits disk"
         /// happen while the tab is open.
         writes: Vec<(PathBuf, Option<Vec<u8>>)>,
+        /// Extra dollars charged per host call after the baseline 0.25. Zero
+        /// keeps the historical constant-spend fake; a positive value lets a
+        /// test cross a workflow cost cap between steps.
+        cost_per_call: f64,
+        /// Host calls billed so far (`cost_per_call` multiplier).
+        charged: std::sync::atomic::AtomicU64,
     }
 
     impl FakeWorkflowHost {
@@ -3719,9 +5197,23 @@ mod tests {
             }
         }
 
+        fn with_report_failure(at: u64) -> Self {
+            Self {
+                report_fails_at: at,
+                ..Self::default()
+            }
+        }
+
         fn with_writes(writes: Vec<(PathBuf, Option<Vec<u8>>)>) -> Self {
             Self {
                 writes,
+                ..Self::default()
+            }
+        }
+
+        fn with_cost_per_call(cost_per_call: f64) -> Self {
+            Self {
+                cost_per_call,
                 ..Self::default()
             }
         }
@@ -3745,6 +5237,7 @@ mod tests {
             _persona: Option<&str>,
             _instructions: &str,
         ) -> Result<serde_json::Value, HostError> {
+            self.charged.fetch_add(1, Ordering::SeqCst);
             if self.ask_fails {
                 return Err(HostError::new("workflow ask failed"));
             }
@@ -3758,6 +5251,7 @@ mod tests {
             _timeout_ms: Option<u64>,
         ) -> Result<CommandOutput, HostError> {
             self.world_calls.fetch_add(1, Ordering::SeqCst);
+            self.charged.fetch_add(1, Ordering::SeqCst);
             for (path, contents) in &self.writes {
                 match contents {
                     Some(bytes) => {
@@ -3815,6 +5309,10 @@ mod tests {
             _item: &serde_json::Value,
             _artifact_id: Option<&str>,
         ) -> Result<(), HostError> {
+            let call = self.report_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.report_fails_at == call {
+                return Err(HostError::new("workflow report failed"));
+            }
             Ok(())
         }
 
@@ -3844,7 +5342,7 @@ mod tests {
         }
 
         fn cost_usd(&self) -> f64 {
-            0.25
+            0.25 + self.cost_per_call * self.charged.load(Ordering::SeqCst) as f64
         }
 
         fn tokens(&self) -> u64 {
@@ -3933,13 +5431,22 @@ mod tests {
     }
 
     fn workflow_run(id: &str, script: &str, commands: Vec<String>) -> FrontendCommand {
+        workflow_run_with_cap(id, script, commands, 3.5)
+    }
+
+    fn workflow_run_with_cap(
+        id: &str,
+        script: &str,
+        commands: Vec<String>,
+        max_cost_usd: f64,
+    ) -> FrontendCommand {
         FrontendCommand::WorkflowRun {
             request_id: RequestId::new(id).expect("valid id"),
             spec: WorkflowSpecDto {
                 name: "review".into(),
                 script: script.into(),
                 commands,
-                max_cost_usd: 3.5,
+                max_cost_usd,
             },
         }
     }
@@ -3966,6 +5473,38 @@ mod tests {
             .into_iter()
             .find(|buffer| buffer.path.as_str() == path)
             .expect("the opened buffer is in the bootstrap")
+    }
+
+    /// Replace the first line through the real edit command.
+    fn apply_local_edit(
+        state: &DesktopState,
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        buffer: &BufferSnapshotDto,
+        replacement: &str,
+    ) {
+        state
+            .dispatch(
+                app,
+                envelope(
+                    state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: buffer.buffer_id.clone(),
+                        version: buffer.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: replacement.into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
     }
 
     /// Poll until the fake workflow's disk write is visible, so a stop or a
@@ -4244,6 +5783,7 @@ mod tests {
                         request_id: RequestId::new("wf-resume").expect("valid id"),
                         run_id: "run-1".into(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4558,6 +6098,7 @@ mod tests {
                     request_id: RequestId::new("wf-completed-resume").unwrap(),
                     run_id: summary.run_id.clone(),
                     allow_incomplete_asks: false,
+                    acknowledge_partial_effects: false,
                 },
             ),
         );
@@ -4578,6 +6119,347 @@ mod tests {
         assert_eq!(recovered.reports[0].item, "done");
         assert_eq!(recovered.tokens, summary.tokens);
         assert_eq!(recovered.cost_usd, summary.cost_usd);
+    }
+
+    #[test]
+    fn p9_workflow_budget_exhausted_resume_is_refused_before_worker() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        let host = Arc::new(FakeWorkflowHost::with_cost_per_call(1.0));
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::clone(&host)));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run_with_cap(
+                        "wf-budget",
+                        r#"phase("one"); agent("reviewer").ask("spend"); phase("two");"#,
+                        vec![],
+                        0.1,
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        assert_eq!(finished_count(&events), 1);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == "wf-budget" || run.name == "review")
+            .expect("the budget run is listed as history");
+        assert_eq!(saved.status, WorkflowStatus::Failed);
+        assert!(!saved.resumable, "a cap trip is never offered for resume");
+        let detail = saved.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("budget") && detail.contains("0.10"),
+            "the cap reason rides `detail`: {detail}"
+        );
+
+        let before = state.log.snapshot_sequence();
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-budget-resume").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
+                    },
+                ),
+            )
+            .expect_err("a budget-exhausted run cannot resume");
+        assert_eq!(refused.code, "workflow_budget_exhausted");
+        assert!(!refused.retryable);
+        assert!(
+            refused.message.contains("cost cap")
+                && refused.message.contains("new run")
+                && refused.message.contains("budget"),
+            "the refusal explains the cap and the only continuation: {}",
+            refused.message
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a refused budget resume starts no worker"
+        );
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "a refused budget resume emits no event"
+        );
+        assert_eq!(finished_count(&state.events_after(0)), 1);
+    }
+
+    #[test]
+    fn p9_workflow_budget_raw_terminal_is_refused_and_listed_with_cap_reason() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let run_id = selora_workflow::RunId::from("budget-raw");
+        let run_dir = selora_workflow::journal::run_dir(dir.path(), &run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = selora_workflow::prepare("raw-budget", r#"phase("one");"#, 2.0)
+            .unwrap()
+            .spec();
+        std::fs::write(
+            run_dir.join("spec.json"),
+            serde_json::to_vec(&spec).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(run_dir.join("run.lock"), b"").unwrap();
+        // A raw terminal record with no parseable report payload still proves
+        // the cap fired; the preflight must not wait for the typed plan.
+        std::fs::write(
+            selora_workflow::journal::journal_path(dir.path(), &run_id),
+            b"{\"seq\":1,\"kind\":\"engine_run_finished\",\"payload\":{\"status\":\"budget_exceeded\"}}\n",
+        )
+        .unwrap();
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == "budget-raw")
+            .expect("the raw budget run is listed");
+        assert_eq!(saved.status, WorkflowStatus::Failed);
+        assert!(!saved.resumable);
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cost cap"),
+            "the listing carries the cap reason: {:?}",
+            saved.detail
+        );
+
+        // The listing itself must not move the event log.
+        let before = state.log.snapshot_sequence();
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-budget-raw-resume").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
+                    },
+                ),
+            )
+            .expect_err("a raw budget terminal cannot resume");
+        assert_eq!(refused.code, "workflow_budget_exhausted");
+        assert!(!refused.retryable);
+        assert!(refused.message.contains("2.00"), "{}", refused.message);
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "the refusal happens before any event"
+        );
+        assert!(state
+            .workflow_runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn p9_workflow_budget_preflight_only_flags_a_budget_terminal() {
+        use selora_workflow::journal::{JournalEntry, LoadedJournal, RunStatus};
+
+        let journal_with = |status: &str| LoadedJournal {
+            path: PathBuf::new(),
+            entries: vec![JournalEntry {
+                seq: 1,
+                kind: "engine_run_finished".into(),
+                payload: serde_json::json!({ "status": status }),
+            }],
+            corrupt: Vec::new(),
+        };
+        assert_eq!(
+            workflow_terminal_status(&journal_with("completed")),
+            Some(RunStatus::Completed)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("failed")),
+            Some(RunStatus::Failed)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("stopped")),
+            Some(RunStatus::Stopped)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("budget_exceeded")),
+            Some(RunStatus::BudgetExceeded)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("BudgetExceeded")),
+            Some(RunStatus::BudgetExceeded),
+            "raw legacy spelling is still a cap trip"
+        );
+        assert_eq!(workflow_terminal_status(&journal_with("unknown")), None);
+    }
+
+    #[test]
+    fn p9_workflow_budget_preflight_keeps_corrupt_and_missing_journals_typed() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run("wf-corrupt", r#"phase("scan"); report("kept");"#, vec![]),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let id = selora_workflow::RunId::from(summary.run_id.as_str());
+        let path = selora_workflow::journal::journal_path(dir.path(), &id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        *lines.last_mut().expect("a terminal record") = "{not json";
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let before = state.log.snapshot_sequence();
+        for (request_id, run_id) in [
+            ("wf-corrupt-resume", summary.run_id.clone()),
+            ("wf-missing-resume", "missing-run".to_owned()),
+        ] {
+            let refused = state
+                .dispatch(
+                    &app,
+                    envelope(
+                        &state,
+                        FrontendCommand::WorkflowResume {
+                            request_id: RequestId::new(request_id).unwrap(),
+                            run_id,
+                            allow_incomplete_asks: false,
+                            acknowledge_partial_effects: false,
+                        },
+                    ),
+                )
+                .expect_err("an unprovable journal cannot resume");
+            assert_eq!(
+                refused.code, "workflow_resume_rejected",
+                "corruption is not misreported as a budget trip"
+            );
+            assert!(!refused.retryable);
+        }
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "refusals emit no event"
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "refusals start no worker"
+        );
+        // The damaged run stays listed but is not offered as resumable.
+        let damaged = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("a damaged journal stays listed");
+        assert!(!damaged.resumable);
+    }
+
+    #[test]
+    fn p9_workflow_stopped_run_still_resumes_without_the_budget_refusal() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate(Arc::clone(&gate)),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-stopped-resume",
+                        r#"world.run("sleep", []);"#,
+                        vec!["sleep".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_workflow(&state, |payload| {
+            matches!(payload, FrontendEvent::WorkflowStarted(_))
+        });
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowStop {
+                        request_id: RequestId::new("wf-stopped-resume").unwrap(),
+                    },
+                ),
+            )
+            .expect("stop accepted");
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.name == "review")
+            .expect("the stopped run is listed");
+        assert_eq!(saved.status, WorkflowStatus::Stopped);
+        assert!(saved.resumable, "a stopped run keeps its resume contract");
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-stopped-resume-again").unwrap(),
+                        run_id: saved.run_id,
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
+                    },
+                ),
+            )
+            .expect("a stopped run is not budget-exhausted");
+        let events = wait_for_finished_runs(&state, 2);
+        wait_for_no_active_runs(&state);
+        assert!(events.iter().any(|event| matches!(&event.payload,
+            FrontendEvent::WorkflowFinished(done)
+                if done.request_id.as_str() == "wf-stopped-resume-again")));
     }
 
     #[test]
@@ -4619,6 +6501,7 @@ mod tests {
                         request_id: RequestId::new("wf-interrupted-resume").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4676,6 +6559,7 @@ mod tests {
                         request_id: RequestId::new("wf-ask-unconfirmed").unwrap(),
                         run_id: saved.run_id.clone(),
                         allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4724,6 +6608,7 @@ mod tests {
                         request_id: RequestId::new("wf-ask-confirmed").unwrap(),
                         run_id: saved.run_id,
                         allow_incomplete_asks: true,
+                        acknowledge_partial_effects: false,
                     },
                 ),
             )
@@ -4733,6 +6618,158 @@ mod tests {
         assert!(events.iter().any(|event| matches!(&event.payload,
             FrontendEvent::WorkflowFinished(done)
                 if done.request_id.as_str() == "wf-ask-confirmed")));
+    }
+
+    #[test]
+    fn p8_workflow_partial_effects_block_resume_until_acknowledged() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_failing_ask(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-effects",
+                        r#"agent("reviewer").ask("inspect src/lib.rs");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        assert_eq!(finished_count(&events), 1);
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.name == "review")
+            .expect("the failed run is listed");
+        let run_id = selora_workflow::RunId::from(saved.run_id.as_str());
+        // Durable evidence: a tool effect started for the unfinished ask and
+        // the process died before its finish line.
+        let ledger = selora_workflow::ToolEffectLedger::open_for_run(dir.path(), &run_id).unwrap();
+        ledger
+            .record_started(
+                Some(&selora_workflow::ToolEffectStep {
+                    step_id: "1".into(),
+                    agent: Some("reviewer".into()),
+                }),
+                "call-1",
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs", "content_bytes": 12}),
+            )
+            .unwrap();
+        drop(ledger);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == run_id.as_str())
+            .expect("the partial-effect run is still listed");
+        assert!(
+            !saved.resumable,
+            "partial effects make the run non-resumable"
+        );
+        assert!(saved.partial_effects);
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Earlier tool effects")),
+            "the detail names the risk: {:?}",
+            saved.detail
+        );
+
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-unacked").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: false,
+                    },
+                ),
+            )
+            .expect_err("ordinary Resume refuses partial effects");
+        assert_eq!(refused.code, "workflow_partial_effects");
+        assert!(!refused.retryable);
+        assert!(
+            refused.message.contains("may already have applied effects")
+                && refused.message.contains("does not undo"),
+            "the refusal states the effect risk: {}",
+            refused.message
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a refused resume starts no worker"
+        );
+        assert_eq!(finished_count(&state.events_after(0)), 1);
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-acked").unwrap(),
+                        run_id: saved.run_id,
+                        // The separate action: ack alone covers the ask
+                        // re-dispatch, because it names the same effects.
+                        allow_incomplete_asks: false,
+                        acknowledge_partial_effects: true,
+                    },
+                ),
+            )
+            .expect("the explicit partial-effect acknowledgement resumes");
+        let events = wait_for_finished_runs(&state, 2);
+        wait_for_no_active_runs(&state);
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.payload,
+                FrontendEvent::WorkflowFinished(done)
+                    if done.request_id.as_str() == "wf-effects-acked"))
+                .count()
+                == 1,
+            "the acknowledgement starts exactly once"
+        );
+
+        // Corrupt evidence is a typed refusal even for a further explicit
+        // acknowledgement: it can never be read as an empty ledger.
+        let path = selora_workflow::tool_effects_path(dir.path(), &run_id);
+        let mut bytes = std::fs::read(&path).expect("ledger");
+        bytes.extend_from_slice(b"not json\n");
+        std::fs::write(&path, bytes).expect("corrupt ledger");
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-effects-corrupt").unwrap(),
+                        run_id: run_id.to_string(),
+                        allow_incomplete_asks: true,
+                        acknowledge_partial_effects: true,
+                    },
+                ),
+            )
+            .expect_err("corrupt ledger is never empty evidence");
+        assert_eq!(refused.code, "workflow_effect_ledger_corrupt");
+        assert!(!refused.retryable);
     }
 
     #[test]
@@ -4840,13 +6877,257 @@ mod tests {
             .find(|run| run.run_id == summary.run_id)
             .expect("a damaged journal stays listed");
         assert!(!saved.resumable);
-        assert!(saved.detail.is_some(), "the damage is explained");
-        assert!(saved.phases.is_empty(), "no phase is invented");
-        assert!(saved.steps.is_empty(), "no step is invented");
-        assert!(saved.reports.is_empty(), "no report is invented");
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("damaged")),
+            "the damage is explained: {:?}",
+            saved.detail
+        );
+        // Only the corrupt terminal record is omitted: the explicit step,
+        // phase and report records still reconstruct what actually happened.
+        assert_eq!(saved.phases, vec!["scan".to_string()]);
+        assert_eq!(saved.steps.len(), 2, "phase step and report step");
+        assert_eq!(saved.steps[1].phase, "scan");
+        assert_eq!(saved.steps[1].status, WorkflowStatus::Completed);
+        assert_eq!(saved.reports.len(), 1, "the report that happened is kept");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        assert_eq!(saved.reports[0].phase.as_deref(), Some("scan"));
         assert!(saved.artifacts.is_empty(), "no artifact is invented");
-        assert_eq!(saved.tokens, 0);
+        assert_eq!(saved.tokens, 0, "the fake host pre-charges before the run");
         assert_eq!(saved.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn p8_workflow_multi_phase_history_keeps_reports_phases_and_artifact_content() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-multi-phase-history",
+                        r#"
+                            report("pre");
+                            phase("scan");
+                            files.read("a");
+                            report("scan item", "summary");
+                            artifact.markdown("summary", "Body without title");
+                            phase("fix");
+                            files.read("b");
+                            report({ stage: "fix" });
+                            phase("verify");
+                            report("final");
+                        "#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary.status, WorkflowStatus::Completed);
+
+        // A fresh bootstrap is the reload path: everything comes from the journal.
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("the completed run reloads as history");
+        assert_eq!(saved.status, WorkflowStatus::Completed);
+        assert!(saved.detail.is_none(), "{:?}", saved.detail);
+        assert_eq!(
+            saved.phases,
+            vec!["scan".to_string(), "fix".to_string(), "verify".to_string()]
+        );
+        assert_eq!(saved.steps.len(), 10);
+        assert_eq!(saved.steps[0].phase, "", "the first report has no phase");
+        assert_eq!(
+            saved.steps[1].phase, "scan",
+            "a phase step lands in its phase"
+        );
+        assert_eq!(saved.steps[3].phase, "scan");
+        assert_eq!(saved.steps[4].phase, "scan", "artifact phase");
+        assert_eq!(saved.steps[6].phase, "fix");
+        assert_eq!(saved.steps[9].phase, "verify");
+        assert_eq!(saved.reports.len(), 4);
+        assert_eq!(
+            saved
+                .reports
+                .iter()
+                .map(|report| (report.id.as_str(), report.phase.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("report-1", None),
+                ("report-2", Some("scan")),
+                ("report-3", Some("fix")),
+                ("report-4", Some("verify")),
+            ]
+        );
+        assert_eq!(saved.reports[1].item, "scan item");
+        assert_eq!(saved.reports[1].artifact_id.as_deref(), Some("summary"));
+        assert_eq!(saved.reports[2].item, r#"{"stage":"fix"}"#);
+        assert_eq!(saved.artifacts.len(), 1);
+        assert_eq!(saved.artifacts[0].id, "summary");
+        assert_eq!(
+            saved.artifacts[0].title, "",
+            "an empty title is not invented"
+        );
+        assert_eq!(saved.artifacts[0].kind, "markdown");
+        assert_eq!(saved.artifacts[0].body, "Body without title");
+        assert_eq!(saved.artifacts[0].phase.as_deref(), Some("scan"));
+        assert_eq!(saved.tokens, summary.tokens);
+        assert_eq!(saved.cost_usd, summary.cost_usd);
+    }
+
+    #[test]
+    fn p8_workflow_failed_report_step_never_appears_as_reported() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_report_failure(2),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-failed-report",
+                        r#"phase("scan"); report("kept"); report("lost");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary.status, WorkflowStatus::Failed);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("the failed run reloads as history");
+        assert_eq!(saved.reports.len(), 1, "the failed report is not claimed");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        let failed = saved
+            .steps
+            .iter()
+            .find(|step| step.status == WorkflowStatus::Failed)
+            .expect("the failed report step is in history");
+        assert_eq!(failed.detail.as_deref(), Some("workflow report failed"));
+        assert_eq!(failed.phase, "scan");
+    }
+
+    #[test]
+    fn p8_workflow_old_format_journal_still_loads_with_unknown_phase() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-old-format",
+                        r#"phase("scan"); artifact.markdown("summary", "Body", { title: "T" }); report("kept", "summary");"#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let id = selora_workflow::RunId::from(summary.run_id.as_str());
+        let path = selora_workflow::journal::journal_path(dir.path(), &id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Strip the additive history records and every phase field, leaving the
+        // pre-history vocabulary (step records + terminal report).
+        let mut kept = Vec::new();
+        for line in text.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if matches!(
+                value["kind"].as_str(),
+                Some("engine_report_item" | "engine_artifact")
+            ) {
+                continue;
+            }
+            if matches!(
+                value["kind"].as_str(),
+                Some(
+                    "engine_step_started"
+                        | "engine_step_finished"
+                        | "engine_report_item"
+                        | "engine_artifact"
+                )
+            ) {
+                if let Some(payload) = value.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    payload.remove("phase");
+                }
+            }
+            value["seq"] = serde_json::json!(kept.len() as u64 + 1);
+            kept.push(value.to_string());
+        }
+        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("an old-format journal still loads");
+        assert_eq!(saved.status, WorkflowStatus::Completed);
+        assert_eq!(saved.phases, vec!["scan".to_string()]);
+        assert!(
+            saved.steps.iter().all(|step| step.phase.is_empty()),
+            "the old format has no per-step phase"
+        );
+        assert_eq!(saved.reports.len(), 1, "reports come from step inputs");
+        assert_eq!(saved.reports[0].id, "report-1");
+        assert_eq!(saved.reports[0].item, "kept");
+        assert_eq!(saved.reports[0].artifact_id.as_deref(), Some("summary"));
+        assert_eq!(saved.artifacts.len(), 1, "artifacts come from the terminal");
+        assert_eq!(saved.artifacts[0].title, "T");
+        assert_eq!(saved.artifacts[0].body, "Body");
+        assert!(saved.detail.is_none(), "{:?}", saved.detail);
     }
 
     #[test]
@@ -4884,7 +7165,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase 8 gap 3 — the post-run disk refresh.
+    // Phase 8 gap 3 Ã¢â‚¬â€ the post-run disk refresh.
     //
     // A workflow edits files behind the editor's back; the terminal event must
     // reload clean tabs (one version bump each), never overwrite a dirty tab,
@@ -4964,7 +7245,7 @@ mod tests {
     }
 
     #[test]
-    fn p8_workflow_dirty_buffer_keeps_local_text_with_a_toast() {
+    fn p8_workflow_dirty_conflict_keeps_local_text_and_offers_a_choice() {
         let app = mock_app_handle();
         let state = DesktopState::with_settings(selora_settings::Settings::default());
         let dir = open_workspace(&state, &app);
@@ -5015,16 +7296,30 @@ mod tests {
         let events = state.events_after(baseline);
         assert!(
             snapshots_for(&events, &opened.buffer_id).is_empty(),
-            "a dirty buffer is never reloaded: {events:#?}"
+            "a dirty buffer is never auto-reloaded: {events:#?}"
         );
-        let toasts = toast_messages(&events);
-        assert_eq!(
-            toasts.len(),
-            1,
-            "one toast for the skipped dirty tab: {events:#?}"
+        let conflicts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                FrontendEvent::BufferConflict(conflict) => Some(conflict),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conflicts.len(), 1, "one conflict banner: {events:#?}");
+        assert_eq!(conflicts[0].buffer_id, opened.buffer_id);
+        assert_eq!(conflicts[0].path.as_str(), "hello.rs");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.payload, FrontendEvent::BufferConflictCleared(_))),
+            "the conflict stays until the user chooses: {events:#?}"
         );
-        assert!(toasts[0].contains("hello.rs"), "{}", toasts[0]);
-        assert!(toasts[0].contains("unsaved"), "{}", toasts[0]);
+        assert!(
+            !toast_messages(&events)
+                .iter()
+                .any(|message| message.contains("unsaved")),
+            "the conflict is a banner, not a silent toast: {events:#?}"
+        );
 
         let stored = state
             .bootstrap()
@@ -5035,6 +7330,239 @@ mod tests {
         assert_eq!(stored.text, "fn local() {}\n", "local text survives");
         assert_eq!(stored.version, 2, "the local edit's version is kept");
         assert!(stored.dirty);
+    }
+
+    #[test]
+    fn p8_workflow_reload_from_disk_resolves_the_conflict_and_syncs_lsp() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        let absolute = dir.path().join("hello.rs");
+        {
+            let guard = state
+                .lsp
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let bridge = guard.as_ref().expect("OpenFile starts the bridge");
+            bridge.seed_error_diagnostic_for_test(&absolute, "stale diagnostic");
+        }
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: opened.buffer_id.clone(),
+                        version: opened.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: "fn local() {}".into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
+        let edited = "fn main() { /* workflow text */ }\n";
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate_and_writes(
+                Arc::clone(&gate),
+                vec![(absolute.clone(), Some(edited.as_bytes().to_vec()))],
+            ),
+        )));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-reload",
+                        r#"world.run("edit", []);"#,
+                        vec!["edit".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_disk_text(&absolute, edited);
+        let baseline = state.log.snapshot_sequence();
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let before_choice = state.events_after(baseline);
+        assert!(
+            before_choice.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflict(conflict)
+                    if conflict.buffer_id == opened.buffer_id
+            )),
+            "the conflict is raised before the choice: {before_choice:#?}"
+        );
+        assert!(
+            snapshots_for(&before_choice, &opened.buffer_id).is_empty(),
+            "the refresh alone never overwrites: {before_choice:#?}"
+        );
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ReloadBufferFromDisk {
+                        buffer_id: opened.buffer_id.clone(),
+                    },
+                ),
+            )
+            .expect("reload from disk");
+
+        let events = state.events_after(baseline);
+        let snapshots = snapshots_for(&events, &opened.buffer_id);
+        assert_eq!(snapshots.len(), 1, "one reload snapshot: {events:#?}");
+        assert_eq!(snapshots[0].text, edited);
+        assert_eq!(
+            snapshots[0].version,
+            opened.version + 2,
+            "local edit + reload"
+        );
+        assert!(!snapshots[0].dirty);
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflictCleared(cleared)
+                    if cleared.buffer_id == opened.buffer_id
+            )),
+            "the marker is cleared: {events:#?}"
+        );
+
+        let stored = state
+            .bootstrap()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.buffer_id == opened.buffer_id)
+            .expect("tab still open");
+        assert_eq!(stored.text, edited);
+        assert_eq!(stored.version, opened.version + 2);
+        assert!(!stored.dirty);
+
+        {
+            let guard = state
+                .lsp
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let bridge = guard.as_ref().expect("bridge");
+            assert_eq!(
+                bridge.text_for_test(&absolute).as_deref(),
+                Some(edited),
+                "the language server got the reloaded full text"
+            );
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::DiagnosticsChanged(diagnostics)
+                    if diagnostics.iter().all(|diagnostic| diagnostic.path.as_str() != "hello.rs")
+            )),
+            "the reload retracted the stale diagnostics: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn p8_workflow_keep_my_edits_clears_the_conflict_without_touching_text() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::ApplyEditorChange {
+                        buffer_id: opened.buffer_id.clone(),
+                        version: opened.version,
+                        changes: vec![selora_protocol::TextChange {
+                            start: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 0,
+                            },
+                            end: selora_protocol::TextPosition {
+                                line: 0,
+                                utf16_column: 12,
+                            },
+                            replacement: "fn local() {}".into(),
+                        }],
+                    },
+                ),
+            )
+            .expect("local edit");
+        let edited = "fn main() { /* workflow text */ }\n";
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_writes(vec![(
+                dir.path().join("hello.rs"),
+                Some(edited.as_bytes().to_vec()),
+            )]),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run("wf-keep", r#"world.run("edit", []);"#, vec!["edit".into()]),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let baseline = state.log.snapshot_sequence();
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::KeepBufferEdits {
+                        buffer_id: opened.buffer_id.clone(),
+                    },
+                ),
+            )
+            .expect("keep my edits");
+
+        let events = state.events_after(baseline);
+        assert!(
+            snapshots_for(&events, &opened.buffer_id).is_empty(),
+            "keep never replaces the local text: {events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflictCleared(cleared)
+                    if cleared.buffer_id == opened.buffer_id
+            )),
+            "the marker is cleared: {events:#?}"
+        );
+        let stored = state
+            .bootstrap()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.buffer_id == opened.buffer_id)
+            .expect("tab still open");
+        assert_eq!(stored.text, "fn local() {}\n");
+        assert_eq!(stored.version, opened.version + 1);
+        assert!(stored.dirty);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.rs")).unwrap(),
+            edited,
+            "keep never writes over the workflow's disk text"
+        );
     }
 
     #[test]
@@ -5142,6 +7670,13 @@ mod tests {
                 .any(|event| matches!(&event.payload, FrontendEvent::BufferSnapshot(_))),
             "no snapshot at all belongs to the switched workspace: {after_switch:#?}"
         );
+        assert!(
+            !after_switch.iter().any(|event| matches!(
+                &event.payload,
+                FrontendEvent::BufferConflict(_) | FrontendEvent::BufferConflictCleared(_)
+            )),
+            "the run must not raise a conflict in the new workspace: {after_switch:#?}"
+        );
         let stored = state
             .bootstrap()
             .buffers
@@ -5244,14 +7779,299 @@ mod tests {
         assert_eq!(snapshots[0].version, 2);
     }
 
+    #[test]
+    fn p8_workflow_failure_raises_the_dirty_conflict_too() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        apply_local_edit(&state, &app, &opened, "fn local() {}");
+        let baseline = state.log.snapshot_sequence();
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_writes(vec![(
+                dir.path().join("hello.rs"),
+                Some(b"fn main() { /* before failure */ }\n".to_vec()),
+            )]),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-failed-conflict",
+                        r#"world.run("edit", []); throw new Error("boom");"#,
+                        vec!["edit".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let events = state.events_after(baseline);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BufferConflict(conflict) if conflict.buffer_id == opened.buffer_id
+        )));
+        assert!(snapshots_for(&events, &opened.buffer_id).is_empty());
+        assert_eq!(
+            state
+                .bootstrap()
+                .buffers
+                .into_iter()
+                .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                .unwrap()
+                .text,
+            "fn local() {}\n"
+        );
+    }
+
+    #[test]
+    fn p8_workflow_stop_raises_the_dirty_conflict_too() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let opened = open_state_buffer(&state, &app, "hello.rs");
+        let edited = "fn main() { /* before stop */ }\n";
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate_and_writes(
+                Arc::clone(&gate),
+                vec![(
+                    dir.path().join("hello.rs"),
+                    Some(edited.as_bytes().to_vec()),
+                )],
+            ),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-stopped-conflict",
+                        r#"world.run("sleep", []);"#,
+                        vec!["sleep".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_disk_text(&dir.path().join("hello.rs"), edited);
+        apply_local_edit(&state, &app, &opened, "fn local() {}");
+        let baseline = state.log.snapshot_sequence();
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowStop {
+                        request_id: RequestId::new("wf-stopped-conflict").expect("valid id"),
+                    },
+                ),
+            )
+            .expect("stop accepted");
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let events = state.events_after(baseline);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::BufferConflict(conflict) if conflict.buffer_id == opened.buffer_id
+        )));
+        assert!(snapshots_for(&events, &opened.buffer_id).is_empty());
+        assert_eq!(
+            state
+                .bootstrap()
+                .buffers
+                .into_iter()
+                .find(|buffer| buffer.buffer_id == opened.buffer_id)
+                .unwrap()
+                .text,
+            "fn local() {}\n"
+        );
+    }
+
     /// P1 hardening: the Tauri commands clone `DesktopState` into
     /// `tauri::async_runtime::spawn_blocking`, which only accepts a
     /// `Send + 'static` closure. This is the compile-time proof that the
-    /// state (and the `AppHandle` it is paired with) can cross threads —
+    /// state (and the `AppHandle` it is paired with) can cross threads Ã¢â‚¬â€
     /// every field is an `Arc`, so the clone shares the one instance.
     #[test]
     fn desktop_state_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<DesktopState>();
+    }
+
+    // -- P1 LSP lifecycle --------------------------------------------------
+
+    fn lsp_diagnostic(message: &str) -> selora_lsp::LspDiagnostic {
+        let position = selora_lsp::LspPosition {
+            line: 1,
+            character: 2,
+        };
+        selora_lsp::LspDiagnostic {
+            range: selora_lsp::LspRange {
+                start: position,
+                end: position,
+            },
+            severity: selora_lsp::LspSeverity::Error,
+            source: Some("rust-analyzer".into()),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn lsp_settings_paths_args_and_enabled_are_applied() {
+        let mut settings = selora_settings::Settings::default();
+        settings.lsp.rust_analyzer_path = Some("  C:/tools/rust-analyzer.exe  ".into());
+        settings.lsp.typescript_server_path = Some("   ".into());
+        settings.lsp.rust_analyzer_args = vec!["--log-file".into(), "ra.log".into()];
+        settings.lsp.typescript_server_args = vec!["--stdio".into()];
+        settings.lsp.enabled = false;
+
+        let paths = lsp_server_paths(&settings);
+        assert_eq!(
+            paths.rust_analyzer.as_deref(),
+            Some("C:/tools/rust-analyzer.exe"),
+            "path overrides are trimmed and applied"
+        );
+        assert_eq!(paths.typescript_language_server, None, "blank means PATH");
+        assert_eq!(
+            paths.rust_analyzer_args,
+            vec!["--log-file".to_owned(), "ra.log".to_owned()]
+        );
+        assert_eq!(
+            paths.typescript_language_server_args,
+            vec!["--stdio".to_owned()]
+        );
+        assert!(!paths.enabled, "the master switch is carried through");
+    }
+
+    #[test]
+    fn workspace_switch_drops_the_bridge_and_bumps_the_epoch() {
+        let app = mock_app_handle();
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(first.path().to_path_buf())
+            .expect("open first");
+        state.with_lsp(&app, |_bridge| {});
+        assert!(
+            state.lsp.lock().expect("lsp lock").is_some(),
+            "first workspace started a bridge"
+        );
+        let epoch = state.lsp_epoch.load(Ordering::SeqCst);
+
+        state
+            .attach_workspace(second.path().to_path_buf())
+            .expect("switch workspace");
+        assert!(
+            state.lsp.lock().expect("lsp lock").is_none(),
+            "the old root's bridge is dropped, not reused"
+        );
+        assert_eq!(
+            state.lsp_epoch.load(Ordering::SeqCst),
+            epoch + 1,
+            "stale events from the old root are invalidated"
+        );
+        let second_root = std::fs::canonicalize(second.path())
+            .expect("canonicalize second")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            state.bootstrap().workspace.root.as_deref(),
+            Some(second_root.as_str())
+        );
+    }
+
+    #[test]
+    fn close_folder_clears_the_workspace_lsp_and_diagnostics() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+        state.with_lsp(&app, |bridge| {
+            bridge.inject_diagnostics(
+                dir.path().join("src").join("main.rs"),
+                vec![lsp_diagnostic("live finding")],
+            );
+        });
+        assert_eq!(state.bootstrap().diagnostics.len(), 1);
+
+        let snapshot = state
+            .dispatch(&app, envelope(&state, FrontendCommand::CloseFolder))
+            .expect("close folder");
+        assert_eq!(snapshot.workspace.root, None);
+        assert!(snapshot.diagnostics.is_empty(), "diagnostics are retracted");
+        assert!(snapshot.lsp_servers.is_empty());
+        assert!(state.lsp.lock().expect("lsp lock").is_none());
+        assert_eq!(
+            state.bootstrap().workspace.display_name,
+            "No workspace open"
+        );
+    }
+
+    #[test]
+    fn bootstrap_diagnostics_come_from_the_live_bridge_store() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+        state.with_lsp(&app, |bridge| {
+            bridge.inject_diagnostics(
+                dir.path().join("src").join("main.rs"),
+                vec![lsp_diagnostic("live finding")],
+            );
+        });
+
+        let snapshot = state.bootstrap();
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].path.as_str(), "src/main.rs");
+        assert!(snapshot.diagnostics[0].message.contains("live finding"));
+    }
+
+    #[test]
+    fn lsp_restart_is_a_typed_error_when_settings_disable_servers() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut settings = selora_settings::Settings::default();
+        settings.lsp.enabled = false;
+        let state = DesktopState::with_settings(settings);
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+
+        let error = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::LspRestart {
+                        language: "rust".into(),
+                    },
+                ),
+            )
+            .expect_err("disabled servers cannot restart");
+        assert_eq!(error.code, "lsp_disabled");
+        assert!(!error.retryable);
+
+        let snapshot = state.bootstrap();
+        assert_eq!(snapshot.lsp_servers.len(), 1);
+        assert_eq!(
+            snapshot.lsp_servers[0].state,
+            selora_protocol::LspServerHealth::Failed
+        );
+        assert!(snapshot.lsp_servers[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("disabled"));
     }
 }

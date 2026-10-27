@@ -22,11 +22,12 @@ mod types;
 mod updates;
 
 pub use agent::{
-    denied_result, execute_approved, execute_tool, run_agent_turn, spawn_agent_turn, tool_manifest,
-    AgentDecision, AgentEvent, AgentSummary, AgentToolSettings, AgentTurn, AgentTurnReport,
-    AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle, ChatStream, ClientChatStream,
-    RouterToolRunner, ToolContext, ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd,
-    TurnInput, DENIED_MESSAGE,
+    denied_result, execute_approved, execute_tool, parse_todos, run_agent_turn, spawn_agent_turn,
+    stored_result, tool_manifest, AgentDecision, AgentEvent, AgentSummary, AgentToolSettings,
+    AgentTurn, AgentTurnReport, AgentTurnState, ApprovalCard, ApprovalId, BashAbortHandle,
+    ChatStream, ClientChatStream, RouterToolRunner, TodoItem, TodoSink, TodoStatus, ToolContext,
+    ToolOutcome, ToolRunner, TurnCaps, TurnDecision, TurnEnd, TurnInput, DENIED_MESSAGE, MAX_TODOS,
+    MAX_TODO_ID_CHARS, MAX_TODO_TEXT_CHARS,
 };
 pub use chat_types::{ToolCall, ToolCallAccumulator, ToolCallId, ToolResult, ToolSpec};
 pub use client::SeloraClient;

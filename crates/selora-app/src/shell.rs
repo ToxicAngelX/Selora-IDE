@@ -528,6 +528,9 @@ impl SeloraApp {
         let registry = selora_lsp::LspRegistry::new(selora_lsp::LspServerPaths {
             rust_analyzer: self.state.settings.lsp.rust_analyzer_path.clone(),
             typescript_language_server: self.state.settings.lsp.typescript_server_path.clone(),
+            rust_analyzer_args: self.state.settings.lsp.rust_analyzer_args.clone(),
+            typescript_language_server_args: self.state.settings.lsp.typescript_server_args.clone(),
+            enabled: self.state.settings.lsp.enabled,
         });
         let config = selora_lsp::LspManagerConfig::new(registry).with_root(Some(root));
         let effect_rx = self
