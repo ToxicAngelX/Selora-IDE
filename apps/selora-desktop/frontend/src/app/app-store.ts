@@ -53,6 +53,12 @@ export type AppState = {
   hoverResult: HoverResult | null;
   completionResult: CompletionResult | null;
   definitionResult: DefinitionResult | null;
+  /**
+   * P2 gap 3: buffer id → path for dirty tabs whose file also changed on disk.
+   * In-memory only; `buffer_conflict` adds and `buffer_conflict_cleared`
+   * removes (the Rust workspace owns the authoritative marker).
+   */
+  bufferConflicts: Record<string, string>;
 };
 
 type Listener = () => void;
@@ -67,6 +73,7 @@ let state: AppState = {
   hoverResult: null,
   completionResult: null,
   definitionResult: null,
+  bufferConflicts: {},
 };
 let snapshot = state;
 let lastSequence: number | null = null;
@@ -94,6 +101,7 @@ function notify(): void {
     hoverResult: state.hoverResult,
     completionResult: state.completionResult,
     definitionResult: state.definitionResult,
+    bufferConflicts: state.bufferConflicts,
   };
   for (const listener of listeners) listener();
 }
@@ -294,14 +302,25 @@ function applyEvent(event: EventEnvelope, gen: number): void {
 function reduceEvent(event: EventEnvelope): void {
   const payload = event.payload;
   switch (payload.type) {
-    case 'bootstrap_state':
+    case 'bootstrap_state': {
       // Z4 — a workspace opened: the id, buffers and tree all move at once.
-      state = { ...state, bootstrap: payload.payload, phase: 'ready' };
+      // A new workspace id invalidates every in-memory conflict marker; a
+      // same-workspace rebootstrap keeps its still-live banners.
+      const previousWorkspaceId = state.bootstrap?.workspace.id;
+      const nextWorkspaceId = payload.payload.workspace.id;
+      state = {
+        ...state,
+        bootstrap: payload.payload,
+        phase: 'ready',
+        bufferConflicts:
+          previousWorkspaceId === nextWorkspaceId ? state.bufferConflicts : {},
+      };
       applyReducedMotion(payload.payload.settings.reduced_motion);
       layoutStore.hydrate(payload.payload);
       agentStore.hydrate(payload.payload);
       notify();
       return;
+    }
     case 'workspace_layout_changed':
       layoutStore.applyLayoutEvent(payload.payload);
       return;
@@ -368,6 +387,24 @@ function reduceEvent(event: EventEnvelope): void {
     case 'buffer_snapshot':
       upsertBuffer(payload.payload);
       return;
+    case 'buffer_conflict': {
+      state = {
+        ...state,
+        bufferConflicts: {
+          ...state.bufferConflicts,
+          [payload.payload.buffer_id]: payload.payload.path,
+        },
+      };
+      notify();
+      return;
+    }
+    case 'buffer_conflict_cleared': {
+      const next = { ...state.bufferConflicts };
+      delete next[payload.payload.buffer_id];
+      state = { ...state, bufferConflicts: next };
+      notify();
+      return;
+    }
     case 'buffer_changed': {
       if (!state.bootstrap) return;
       const changed = payload.payload;
@@ -443,6 +480,7 @@ function emptyState(): AppState {
     hoverResult: null,
     completionResult: null,
     definitionResult: null,
+    bufferConflicts: {},
   };
 }
 

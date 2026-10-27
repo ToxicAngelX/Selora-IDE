@@ -179,6 +179,33 @@ impl LspBridge {
         });
     }
 
+    /// P2 gap 3: the buffer was reloaded from disk. The server must receive
+    /// the new full text (not a delta against the discarded local document)
+    /// and the old text's diagnostics must be retracted now, so the Problems
+    /// panel never shows squiggles for text that is no longer open.
+    pub fn reload(&self, path: PathBuf, text: String) {
+        let path = plain_path(&path);
+        lock(&self.texts).insert(path.clone(), text.clone());
+        self.send(LspEffect::Change {
+            path: path.clone(),
+            text,
+        });
+        self.invalidate_diagnostics(&path);
+    }
+
+    /// Drop one path's diagnostics and push the pruned list. Used when a file
+    /// disappeared or was reloaded behind the open document: diagnostics from
+    /// the old text are stale immediately.
+    pub fn invalidate_diagnostics(&self, path: &Path) {
+        let pruned = {
+            let mut store = lock(&self.diagnostics);
+            prune_path(&mut store, &self.root, path)
+        };
+        if let Some(diagnostics) = pruned {
+            (self.emit)(FrontendEvent::DiagnosticsChanged(diagnostics));
+        }
+    }
+
     /// The buffer's tab closed.
     pub fn close(&self, path: PathBuf) {
         let path = plain_path(&path);
@@ -227,6 +254,55 @@ impl LspBridge {
     /// Forward one effect, ignoring a manager that already ended.
     fn send(&self, effect: LspEffect) {
         let _ = self.effects.send(effect);
+    }
+
+    /// A bridge with a caller-owned effect channel: tests assert the exact
+    /// `LspEffect` a reload sends without spawning a real language server.
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        root: PathBuf,
+        emit: Emit,
+    ) -> (Self, UnboundedReceiver<LspEffect>) {
+        let root = plain_path(&root);
+        let (effects, received) = unbounded_channel();
+        (
+            Self {
+                effects,
+                buffers: Arc::new(Mutex::new(HashMap::new())),
+                texts: Arc::new(Mutex::new(HashMap::new())),
+                diagnostics: Arc::new(Mutex::new(BTreeMap::new())),
+                root,
+                emit,
+            },
+            received,
+        )
+    }
+
+    /// The text this bridge last handed the server for `path`.
+    #[cfg(test)]
+    pub(crate) fn text_for_test(&self, path: &Path) -> Option<String> {
+        lock(&self.texts).get(&plain_path(path)).cloned()
+    }
+
+    /// Seed a stale diagnostic so a reload's retraction is observable.
+    #[cfg(test)]
+    pub(crate) fn seed_error_diagnostic_for_test(&self, path: &Path, message: &str) {
+        let position = selora_lsp::LspPosition {
+            line: 0,
+            character: 0,
+        };
+        lock(&self.diagnostics).insert(
+            plain_path(path),
+            vec![LspDiagnostic {
+                range: selora_lsp::LspRange {
+                    start: position,
+                    end: position,
+                },
+                severity: LspSeverity::Error,
+                source: Some("test".into()),
+                message: message.into(),
+            }],
+        );
     }
 }
 
@@ -662,6 +738,80 @@ mod tests {
             prune_path(&mut by_path, &root, &opened).is_none(),
             "a second close emits nothing"
         );
+    }
+
+    #[test]
+    fn reload_sends_the_full_text_and_retracts_stale_diagnostics() {
+        let root = repo();
+        let path = root.join("src").join("main.rs");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&emitted);
+        let emit: Emit = Arc::new(move |event| lock(&capture).push(event));
+        let (bridge, mut effects) = LspBridge::start_for_test(root.clone(), emit);
+
+        bridge.open(path.clone(), "fn main() { broken() }\n".into());
+        let opened = effects.try_recv().expect("open effect");
+        assert!(matches!(opened, LspEffect::Open { .. }));
+        bridge.seed_error_diagnostic_for_test(&path, "cannot find function `broken`");
+        assert!(bridge.text_for_test(&path).is_some());
+
+        bridge.reload(path.clone(), "fn main() {}\n".into());
+
+        // The reload's didChange carries the complete new document, so the
+        // manager never patches its old (discarded) text.
+        let effect = effects.try_recv().expect("reload effect");
+        match effect {
+            LspEffect::Change { path: sent, text } => {
+                assert_eq!(sent, plain_path(&path));
+                assert_eq!(text, "fn main() {}\n");
+            }
+            other => panic!("expected a full-text change, got {other:?}"),
+        }
+        assert_eq!(
+            bridge.text_for_test(&path).as_deref(),
+            Some("fn main() {}\n"),
+            "later position requests convert against the reloaded text"
+        );
+
+        // The old text's diagnostic is retracted in the same call, before any
+        // later publish can repaint squiggles for it.
+        let events = lock(&emitted);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                FrontendEvent::DiagnosticsChanged(diagnostics) if diagnostics.is_empty()
+            )),
+            "stale diagnostics are retracted: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_diagnostics_drops_only_the_deleted_path() {
+        let root = repo();
+        let deleted = root.join("src").join("a.rs");
+        let kept = root.join("src").join("b.rs");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&emitted);
+        let emit: Emit = Arc::new(move |event| lock(&capture).push(event));
+        let (bridge, _effects) = LspBridge::start_for_test(root, emit);
+
+        bridge.seed_error_diagnostic_for_test(&deleted, "gone");
+        bridge.seed_error_diagnostic_for_test(&kept, "still here");
+        bridge.invalidate_diagnostics(&deleted);
+
+        let events = lock(&emitted);
+        match events.last() {
+            Some(FrontendEvent::DiagnosticsChanged(diagnostics)) => {
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].path.as_str(), "src/b.rs");
+            }
+            other => panic!("expected pruned diagnostics, got {other:?}"),
+        }
+        drop(events);
+        // A path with nothing stored emits nothing: reopen cannot resurrect it.
+        let before = lock(&emitted).len();
+        bridge.invalidate_diagnostics(&deleted);
+        assert_eq!(lock(&emitted).len(), before);
     }
 
     #[test]

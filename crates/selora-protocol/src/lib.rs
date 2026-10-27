@@ -399,6 +399,15 @@ pub enum FrontendCommand {
     SaveBuffer {
         buffer_id: BufferId,
     },
+    /// P2 gap 3: a dirty buffer changed on disk. Reload it from disk,
+    /// discarding the local edits, and sync the language server.
+    ReloadBufferFromDisk {
+        buffer_id: BufferId,
+    },
+    /// P2 gap 3: keep the local edits and clear the external-change marker.
+    KeepBufferEdits {
+        buffer_id: BufferId,
+    },
     ApplyEditorChange {
         buffer_id: BufferId,
         version: u64,
@@ -533,6 +542,19 @@ pub struct BufferSnapshotDto {
     pub version: u64,
     pub dirty: bool,
     pub selection: Option<Selection>,
+}
+/// P2 gap 3: an open dirty buffer also changed on disk. The local text is
+/// still the buffer's text; the banner offers Reload or Keep.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BufferConflictDto {
+    pub buffer_id: BufferId,
+    pub path: WorkspacePath,
+}
+/// P2 gap 3: the conflict for this buffer was resolved (reload or keep).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BufferConflictClearedDto {
+    pub buffer_id: BufferId,
+    pub path: WorkspacePath,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileTreeDto {
@@ -1379,6 +1401,10 @@ pub enum FrontendEvent {
     FileTreeChanged(FileTreeDto),
     BufferSnapshot(BufferSnapshotDto),
     BufferChanged(BufferChangedDto),
+    /// P2 gap 3: a dirty tab's file changed on disk; local text is untouched.
+    BufferConflict(BufferConflictDto),
+    /// P2 gap 3: the tab's external-change marker is cleared.
+    BufferConflictCleared(BufferConflictClearedDto),
     SearchResults(SearchResultsDto),
     GitStatusChanged(GitStatusDto),
     GitDiffReady(GitDiffDto),
@@ -2605,5 +2631,43 @@ mod tests {
             validate_event_order(&event, PROTOCOL_VERSION, &cid("core-1"), Some(9)),
             Err(EventValidationError::StaleSequence { .. })
         ));
+    }
+
+    #[test]
+    fn p2_buffer_conflict_events_and_commands_keep_their_wire_names() {
+        let conflict = FrontendEvent::BufferConflict(BufferConflictDto {
+            buffer_id: bid("buffer-1"),
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        });
+        let json = serde_json::to_value(&conflict).unwrap();
+        assert_eq!(json["type"], "buffer_conflict");
+        assert_eq!(json["payload"]["buffer_id"], "buffer-1");
+        assert_eq!(json["payload"]["path"], "src/main.rs");
+
+        let cleared = FrontendEvent::BufferConflictCleared(BufferConflictClearedDto {
+            buffer_id: bid("buffer-1"),
+            path: WorkspacePath::new("src/main.rs").unwrap(),
+        });
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "buffer_conflict_cleared");
+
+        for (command, name) in [
+            (
+                FrontendCommand::ReloadBufferFromDisk {
+                    buffer_id: bid("buffer-1"),
+                },
+                "reload_buffer_from_disk",
+            ),
+            (
+                FrontendCommand::KeepBufferEdits {
+                    buffer_id: bid("buffer-1"),
+                },
+                "keep_buffer_edits",
+            ),
+        ] {
+            let json = serde_json::to_value(&command).unwrap();
+            assert_eq!(json["type"], name);
+            assert_eq!(json["payload"]["buffer_id"], "buffer-1");
+        }
     }
 }

@@ -33,6 +33,8 @@ const harness = vi.hoisted(() => {
       openFile: vi.fn(() => Promise.resolve(undefined)),
       closeBuffer: vi.fn(() => Promise.resolve(undefined)),
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
+      reloadBufferFromDisk: vi.fn(() => Promise.resolve(undefined)),
+      keepBufferEdits: vi.fn(() => Promise.resolve(undefined)),
       applyEditorChange: vi.fn(() => Promise.resolve(undefined)),
       setSelection: vi.fn(() => Promise.resolve(undefined)),
     },
@@ -51,6 +53,8 @@ vi.mock('../bridge/bridge', () => ({
   openFile: harness.bridge.openFile,
   closeBuffer: harness.bridge.closeBuffer,
   saveBuffer: harness.bridge.saveBuffer,
+  reloadBufferFromDisk: harness.bridge.reloadBufferFromDisk,
+  keepBufferEdits: harness.bridge.keepBufferEdits,
   applyEditorChange: harness.bridge.applyEditorChange,
   setSelection: harness.bridge.setSelection,
 }));
@@ -122,6 +126,8 @@ describe('EditorRegion', () => {
     harness.bridge.openFile.mockClear();
     harness.bridge.closeBuffer.mockClear();
     harness.bridge.saveBuffer.mockClear();
+    harness.bridge.reloadBufferFromDisk.mockClear();
+    harness.bridge.keepBufferEdits.mockClear();
     toastStore.clearAll();
     harness.app.setSnapshot(readyApp());
     editorStore.reset();
@@ -269,6 +275,37 @@ describe('EditorRegion', () => {
     fireEvent.click(getByRole('button', { name: 'Close main.rs' }));
 
     expect(harness.bridge.closeBuffer).toHaveBeenCalledWith(
+      'b1',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
+  });
+
+  it('shows a conflict banner with Reload and Keep actions for an externally changed tab', () => {
+    harness.app.setSnapshot({
+      ...readyApp({
+        buffers: [dirtyBuffer('b1', 'C:/workspace/src/main.rs')],
+        active_buffer_id: 'b1',
+      }),
+      bufferConflicts: { b1: 'C:/workspace/src/main.rs' },
+    });
+    editorStore.reset();
+
+    const { getByRole, getByText } = render(<EditorRegion />);
+    const tab = getByRole('tab', { name: 'main.rs, changed on disk' });
+    expect(tab.className).toContain('is-externally-changed');
+    expect(tab.className).toContain('is-dirty');
+
+    const banner = getByRole('alert', { name: 'main.rs changed on disk' });
+    expect(within(banner).getByText('changed on disk', { exact: false })).toBeTruthy();
+
+    fireEvent.click(within(banner).getByRole('button', { name: 'Reload from disk' }));
+    expect(harness.bridge.reloadBufferFromDisk).toHaveBeenCalledWith(
+      'b1',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
+
+    fireEvent.click(getByText('Keep my edits'));
+    expect(harness.bridge.keepBufferEdits).toHaveBeenCalledWith(
       'b1',
       { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
     );
