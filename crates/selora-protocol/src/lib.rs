@@ -1255,6 +1255,12 @@ pub struct WorkflowPersistedRunDto {
     /// report on an older journal), with their full content.
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifactDto>,
+    /// Per-phase usage from `engine_phase_usage` deltas (or, on a journal that
+    /// predates them, the step records grouped by phase). A run with no
+    /// phase-attributed spend leaves this empty; a phase with no billed step
+    /// is present with 0 tokens and $0.
+    #[serde(default)]
+    pub phase_usage: Vec<WorkflowPhaseUsageDto>,
     /// Receipt tokens: the terminal report's total, or the step records' sum.
     #[serde(default = "default_tokens")]
     pub tokens: u64,
@@ -1538,6 +1544,20 @@ pub struct WorkflowArtifactDto {
     pub phase: Option<String>,
 }
 
+/// Per-phase usage for the run's phase summary: receipt tokens and USD that
+/// the engine attributed to one `phase()` marker.
+///
+/// Tokens and cost default to 0 so an older payload (or a phase with no billed
+/// step) loads as an explicit zero, never a missing row the panel must guess.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowPhaseUsageDto {
+    pub phase: String,
+    #[serde(default = "default_tokens")]
+    pub tokens: u64,
+    #[serde(default = "default_cost_usd")]
+    pub cost_usd: f64,
+}
+
 /// The ARCHITECTURE §18.1 workflow-level cost cap default ($5).
 fn default_workflow_max_cost_usd() -> f64 {
     5.0
@@ -1558,6 +1578,10 @@ pub struct WorkflowRunDto {
     pub reports: Vec<WorkflowReportDto>,
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifactDto>,
+    /// Per-phase usage, aligned with `phases`. Empty when the producer has no
+    /// phase-attributed usage; each entry's numbers are receipt facts only.
+    #[serde(default)]
+    pub phase_usage: Vec<WorkflowPhaseUsageDto>,
     #[serde(default = "default_tokens")]
     pub tokens: u64,
     #[serde(default = "default_cost_usd")]
@@ -3170,6 +3194,7 @@ mod tests {
         assert!(run.steps.is_empty());
         assert!(run.reports.is_empty());
         assert!(run.artifacts.is_empty());
+        assert!(run.phase_usage.is_empty());
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert_eq!(run.max_cost_usd, 5.0);
@@ -3225,10 +3250,55 @@ mod tests {
         assert!(run.steps.is_empty());
         assert!(run.reports.is_empty());
         assert!(run.artifacts.is_empty());
+        assert!(run.phase_usage.is_empty());
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
         assert!(!run.partial_effects);
+    }
+
+    #[test]
+    fn p8_workflow_phase_usage_round_trips_and_defaults_to_zero() {
+        // A phase with no billed step is an explicit zero row, not a missing
+        // one the panel would have to guess.
+        let usage = WorkflowPhaseUsageDto {
+            phase: "scan".into(),
+            tokens: 1200,
+            cost_usd: 0.12,
+        };
+        let encoded = serde_json::to_value(&usage).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"phase": "scan", "tokens": 1200, "cost_usd": 0.12})
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkflowPhaseUsageDto>(encoded).unwrap(),
+            usage
+        );
+        let quiet: WorkflowPhaseUsageDto = serde_json::from_str(r#"{"phase":"verify"}"#).unwrap();
+        assert_eq!(quiet.tokens, 0);
+        assert_eq!(quiet.cost_usd, 0.0);
+
+        // The run snapshot and the durable-run history both carry the list
+        // additively: an older payload omits it and still loads.
+        let run: WorkflowRunDto = serde_json::from_str(
+            r#"{"run_id":"run-1","name":"review","status":"completed","phase_usage":[{"phase":"scan","tokens":1200,"cost_usd":0.12}]}"#,
+        )
+        .unwrap();
+        assert_eq!(run.phase_usage.len(), 1);
+        assert_eq!(run.phase_usage[0].phase, "scan");
+        let encoded = serde_json::to_value(&run).unwrap();
+        assert_eq!(encoded["phase_usage"][0]["tokens"], 1200);
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunDto>(encoded).unwrap(),
+            run
+        );
+        let persisted: WorkflowPersistedRunDto = serde_json::from_str(
+            r#"{"run_id":"run-1","name":"review","status":"completed","resumable":false,"phase_usage":[{"phase":"scan"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(persisted.phase_usage[0].phase, "scan");
+        assert_eq!(persisted.phase_usage[0].tokens, 0);
     }
 
     #[test]

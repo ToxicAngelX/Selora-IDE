@@ -215,6 +215,8 @@ export type WorkflowPersistedRun = {
   steps?: WorkflowStep[];
   reports?: WorkflowReport[];
   artifacts?: WorkflowArtifact[];
+  /** Additive per-phase usage from the run journal. */
+  phase_usage?: WorkflowPhaseUsage[];
   tokens?: number;
   cost_usd?: number;
 };
@@ -441,6 +443,13 @@ export type WorkflowArtifact = {
   phase?: string;
 };
 
+/** Receipt usage attributed to one phase (workflows panel summary row). */
+export type WorkflowPhaseUsage = {
+  phase: string;
+  tokens: number;
+  cost_usd: number;
+};
+
 /** The full run snapshot (WorkflowRunDto) — the panel's resume/start state. */
 export type WorkflowRun = {
   run_id: Id;
@@ -450,6 +459,7 @@ export type WorkflowRun = {
   steps: WorkflowStep[];
   reports: WorkflowReport[];
   artifacts: WorkflowArtifact[];
+  phase_usage?: WorkflowPhaseUsage[];
   tokens: number;
   cost_usd: number;
   max_cost_usd: number;

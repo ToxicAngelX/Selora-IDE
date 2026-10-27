@@ -64,7 +64,8 @@ pub use effects::{
 };
 pub use persisted::{
     incomplete_asks, load_workflow_spec, partial_effects, run_workflow_persisted, ArtifactRecord,
-    IncompleteAsk, PartialEffects, ReportItemRecord, RunOptions, StepFinishRecord, StepStartRecord,
+    IncompleteAsk, PartialEffects, PhaseUsageRecord, ReportItemRecord, RunOptions,
+    StepFinishRecord, StepStartRecord,
 };
 pub use sandbox::{
     prepare, Confirmation, Limits, DEFAULT_MAX_COST_USD, MAX_SCRIPT_BYTES, MAX_STEPS,

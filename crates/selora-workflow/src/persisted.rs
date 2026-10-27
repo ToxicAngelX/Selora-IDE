@@ -25,6 +25,8 @@
 //! `engine_step_finished` (with the phase in effect at completion),
 //! `engine_report_item` (one per `report` that reached the host, carrying its
 //! run-wide ordinal), `engine_artifact` (full markdown/file content),
+//! `engine_phase_usage` (one additive usage delta per billed step, tagged with
+//! the phase in effect; summing the deltas per phase is the phase total),
 //! `engine_run_finished`, and `phase_started`.
 
 use std::collections::BTreeMap;
@@ -298,6 +300,30 @@ pub struct ArtifactRecord {
     pub artifact: crate::Artifact,
 }
 
+/// One `engine_phase_usage` record: the usage a single billed step added while
+/// `phase` was in effect.
+///
+/// The record is an additive **delta**, not a running total: a resumed run
+/// appends a new delta only for the steps it actually pays for again, so
+/// summing every record per phase yields the true per-phase spend with no
+/// double count. `step_id` names the step whose finish it mirrors, so a reader
+/// can prefer the explicit delta over that step's record instead of adding
+/// both. Phases with no billed step simply have no record; callers report them
+/// as 0 rather than inventing one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PhaseUsageRecord {
+    /// The durable step identity whose finish this delta mirrors.
+    pub step_id: u64,
+    /// The phase marker in effect when the step was billed.
+    pub phase: String,
+    /// Receipt tokens this step added.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Receipt USD this step added.
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
 // Preserve an explicitly supplied JSON null so the host can reject malformed
 // checkpoints. A missing field alone means the older host had no checkpoint.
 fn deserialize_agent_state<'de, D: serde::Deserializer<'de>>(
@@ -434,6 +460,22 @@ fn scan_journal(
             "engine_artifact" => {
                 let _: ArtifactRecord =
                     serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
+            }
+            "engine_phase_usage" => {
+                let usage: PhaseUsageRecord =
+                    serde_json::from_value(entry.payload.clone()).map_err(persistence_error)?;
+                if usage.phase.trim().is_empty() {
+                    return Err(persistence_error("phase usage without a phase name"));
+                }
+                if !scan.calls.contains_key(&usage.step_id) {
+                    return Err(persistence_error("phase usage without a step"));
+                }
+                // Phase usage is display evidence only: it never feeds the run
+                // total (that is the step records' sum) or the cap. A malformed
+                // value still fails the scan rather than rendering a lie.
+                if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
+                    return Err(persistence_error("invalid phase usage delta"));
+                }
             }
             "phase_started" => {}
             _ => {
@@ -766,6 +808,27 @@ impl Durable {
             "engine_step_finished",
             serde_json::to_value(&finish).map_err(persistence_error)?,
         )?;
+        // The phase delta mirrors this step's own usage delta. A replayed step
+        // never reaches `finish`, so resume cannot double count it; a phase
+        // with no billed step gets no record (the panel reports 0).
+        if let Some(phase) = finish
+            .phase
+            .as_deref()
+            .filter(|phase| !phase.trim().is_empty())
+        {
+            if finish.tokens > 0 || finish.cost_usd > 0.0 {
+                self.append(
+                    "engine_phase_usage",
+                    serde_json::to_value(PhaseUsageRecord {
+                        step_id: step.index,
+                        phase: phase.to_owned(),
+                        tokens: finish.tokens,
+                        cost_usd: finish.cost_usd,
+                    })
+                    .map_err(persistence_error)?,
+                )?;
+            }
+        }
         self.spent_usd += finish.cost_usd;
         self.tokens = self.tokens.saturating_add(finish.tokens);
         self.host_cost = cost;
