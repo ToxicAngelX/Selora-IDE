@@ -50,8 +50,9 @@ use selora_protocol::{
     validate_and_consume_approval, AgentModeDto, AgentPhase, AgentStateDto, AgentTurnDoneDto,
     ApprovalDto, ApprovalId, ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto,
     ChatRequestDto, ChatStateDto, ConnectionStatus, DecisionDto, FrontendEvent, MessageDto,
-    MessageId, MessageRole, ModelDto, ModelsDto, ProtocolErrorDto, RequestId, SeloraStatusDto,
-    SessionDto, SessionId, ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
+    MessageId, MessageRole, ModelDto, ModelsDto, PlanApprovalDto, PlanPhaseDto, PlanStateDto,
+    ProtocolErrorDto, RequestId, SeloraStatusDto, SessionDto, SessionId, TodoDto, TodoStatusDto,
+    TodosDto, ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -59,14 +60,17 @@ use uuid::Uuid;
 use crate::state::EventLog;
 
 /// The read-only half of the §17.1 manifest — `explore` mode arms exactly
-/// these (the model cannot request a side effect).
-const EXPLORE_TOOLS: [&str; 7] = [
+/// these (the model cannot request a side effect). Phase 9b's todo tools
+/// are session state, not workspace writes, so they stay available.
+const EXPLORE_TOOLS: [&str; 9] = [
     "read_file",
     "list_dir",
     "fuzzy_find",
     "search_files",
     "web_search",
     "web_fetch",
+    "todo_read",
+    "todo_write",
     "manage_todo",
 ];
 
@@ -184,6 +188,10 @@ struct ChatSession {
     /// The turn's parked approval (§17.4) — `None` while none is pending.
     /// Consumed exactly once by a matching `AgentDecision`.
     pending_approval: Option<ApprovalDto>,
+    /// Phase 9b: session-scoped plan mode + todos. Shared with the turn's
+    /// `ToolContext`, so tool writes land here and the bootstrap hydrates
+    /// them after a reload.
+    plan: selora_ai::PlanStore,
     /// Monotonic recency stamp (bootstrap's `active_session_id` = the most
     /// recently touched session).
     last_activity: u64,
@@ -313,6 +321,7 @@ impl SessionEngine {
         let mut ordered: Vec<(&SessionId, &ChatSession)> = inner.sessions.iter().collect();
         ordered.sort_by_key(|(_, session)| session.last_activity);
         for (session_id, session) in ordered {
+            let plan = selora_ai::plan::snapshot(&session.plan);
             sessions.push(SessionDto {
                 session_id: session_id.clone(),
                 title: session.title.clone(),
@@ -322,6 +331,9 @@ impl SessionEngine {
                     .map(|message| message.message_id.clone())
                     .collect(),
                 active: session.active_request.is_some(),
+                plan_phase: plan_phase_dto(plan.phase),
+                plan: plan.plan.as_ref().map(plan_approval_dto),
+                todos: plan.todos.iter().map(todo_dto).collect(),
             });
             for message in &session.messages {
                 messages.push(MessageDto {
@@ -450,6 +462,7 @@ impl SessionEngine {
         let sys_prompt = system_prompt(&payload, &root);
         let mut conversation: Vec<ChatMessage> = vec![ChatMessage::system(sys_prompt)];
         conversation.extend(conversation_tail(session));
+        let plan_store = session.plan.clone();
         drop(inner);
 
         // The turn: 5c's loop over 5a's client and 5b's router, rooted and
@@ -471,7 +484,8 @@ impl SessionEngine {
             input = input.with_reasoning_effort(effort.clone());
         }
         let tool_settings = agent_tool_settings(&self.config.agent, self.brave_key());
-        let tools = RouterToolRunner::new(ToolContext::new(root, tool_settings));
+        let tools =
+            RouterToolRunner::new(ToolContext::new(root, tool_settings).with_plan(plan_store));
         let chat = selora_ai::ClientChatStream::new(selora_ai::SeloraClient::new(
             &self.base_url(),
             &api_key,
@@ -1121,6 +1135,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                     .map(|call| call.name.clone())
                     .unwrap_or_else(|| fallback_tool_name(&card));
                 let (path_or_command, diff_or_input, workflow) = approval_body(&card);
+                let plan = approval_plan(&card);
                 // Park before announcing: the single-use slot exists before
                 // the frontend can possibly answer.
                 engine.set_pending_approval(
@@ -1132,7 +1147,8 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         turn_id: turn_id.clone(),
                         session_id: session_id.clone(),
                         summary: format!("{tool_name} {path_or_command}"),
-                        can_approve_all_this_turn: true,
+                        can_approve_all_this_turn: !matches!(&card, ApprovalCard::Plan { .. }),
+                        plan,
                     },
                 );
                 log.record_session(
@@ -1147,6 +1163,30 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         path_or_command,
                         diff_or_input,
                         workflow,
+                        plan: approval_plan(&card),
+                    }),
+                    Some(request_id.clone()),
+                    session_id.clone(),
+                );
+            }
+            selora_ai::AgentEvent::PlanChanged { phase, plan } => {
+                log.record_session(
+                    &app,
+                    FrontendEvent::PlanStateChanged(PlanStateDto {
+                        session_id: session_id.clone(),
+                        phase: plan_phase_dto(phase),
+                        plan: plan.as_ref().map(plan_approval_dto),
+                    }),
+                    Some(request_id.clone()),
+                    session_id.clone(),
+                );
+            }
+            selora_ai::AgentEvent::TodosChanged(todos) => {
+                log.record_session(
+                    &app,
+                    FrontendEvent::TodosChanged(TodosDto {
+                        session_id: session_id.clone(),
+                        todos: todos.iter().map(todo_dto).collect(),
                     }),
                     Some(request_id.clone()),
                     session_id.clone(),
@@ -1324,13 +1364,14 @@ fn system_prompt(payload: &selora_protocol::AgentRequestDto, root: &Path) -> Str
         "You are Selora, an autonomous coding agent in Selora IDE.\n\
          Operating System: Windows. Shell: PowerShell.\n\
          Workspace Root: {}\n\
-         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, manage_todo.\n\
+         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
          Instructions:\n\
          1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
          2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
          3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
-         4. Break complex work into clear steps and maintain progress in your answer or with `manage_todo`.\n\
-         5. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}{}",
+         4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
+         5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
+         6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}{}",
         root.display(),
         approval_note,
         depth_instructions,
@@ -1390,6 +1431,7 @@ fn begin_turn<'a>(
             messages: Vec::new(),
             active_request: None,
             pending_approval: None,
+            plan: selora_ai::new_store(),
             last_activity: activity,
         });
     session.last_activity = activity;
@@ -1464,28 +1506,13 @@ pub(crate) fn model_dto(model: &Model) -> ModelDto {
 }
 
 fn manifest_for(mode: AgentModeDto) -> Vec<ToolSpec> {
-    let mut manifest: Vec<ToolSpec> = match mode {
+    match mode {
         AgentModeDto::Execute | AgentModeDto::Auto => selora_ai::tool_manifest(),
         AgentModeDto::Explore => selora_ai::tool_manifest()
             .into_iter()
             .filter(|spec| EXPLORE_TOOLS.contains(&spec.name.as_str()))
             .collect(),
-    };
-    manifest.push(ToolSpec::new(
-        "manage_todo",
-        "Create, update, or reorganize progress and to-do list tasks for tracking your work. Provide `todos` (JSON array or string description of tasks with title and status: 'pending', 'in_progress', 'completed').",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "todos": {
-                    "type": "string",
-                    "description": "Tasks list or update description"
-                }
-            },
-            "required": ["todos"]
-        }),
-    ));
-    manifest
+    }
 }
 
 fn map_state(state: &AgentTurnState) -> (AgentPhase, Option<String>) {
@@ -1523,6 +1550,51 @@ fn approval_body(card: &ApprovalCard) -> (String, Option<String>, Option<Workflo
                 max_cost_usd: *max_cost_usd,
             }),
         ),
+        ApprovalCard::Plan { summary, steps } => (
+            summary
+                .clone()
+                .unwrap_or_else(|| format!("plan with {} step(s)", steps.len())),
+            None,
+            None,
+        ),
+    }
+}
+
+/// The plan payload for the wire card (and the parked approval slot), when
+/// the card is a plan.
+fn approval_plan(card: &ApprovalCard) -> Option<PlanApprovalDto> {
+    match card {
+        ApprovalCard::Plan { summary, steps } => Some(PlanApprovalDto {
+            summary: summary.clone(),
+            steps: steps.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn plan_phase_dto(phase: selora_ai::PlanPhase) -> PlanPhaseDto {
+    match phase {
+        selora_ai::PlanPhase::Planning => PlanPhaseDto::Planning,
+        selora_ai::PlanPhase::Executing => PlanPhaseDto::Executing,
+    }
+}
+
+fn plan_approval_dto(plan: &selora_ai::PlanDraft) -> PlanApprovalDto {
+    PlanApprovalDto {
+        summary: plan.summary.clone(),
+        steps: plan.steps.clone(),
+    }
+}
+
+fn todo_dto(todo: &selora_ai::TodoItem) -> TodoDto {
+    TodoDto {
+        id: todo.id.clone(),
+        title: todo.title.clone(),
+        status: match todo.status {
+            selora_ai::TodoStatus::Pending => TodoStatusDto::Pending,
+            selora_ai::TodoStatus::InProgress => TodoStatusDto::InProgress,
+            selora_ai::TodoStatus::Completed => TodoStatusDto::Completed,
+        },
     }
 }
 
@@ -1532,6 +1604,7 @@ fn fallback_tool_name(card: &ApprovalCard) -> String {
         ApprovalCard::Delete { .. } => "delete_file".into(),
         ApprovalCard::Command { .. } => "bash".into(),
         ApprovalCard::Workflow { .. } => "run_workflow".into(),
+        ApprovalCard::Plan { .. } => "exit_plan_mode".into(),
     }
 }
 
@@ -1540,6 +1613,7 @@ fn map_decision(decision: DecisionDto) -> selora_ai::AgentDecision {
         DecisionDto::Approve => selora_ai::AgentDecision::Approve,
         DecisionDto::Deny => selora_ai::AgentDecision::Deny,
         DecisionDto::ApproveAllThisTurn => selora_ai::AgentDecision::ApproveAllThisTurn,
+        DecisionDto::Revise => selora_ai::AgentDecision::Revise,
         DecisionDto::Stop => selora_ai::AgentDecision::Stop,
     }
 }
@@ -1735,6 +1809,43 @@ mod tests {
         }
         body.push_str("data: [DONE]\n\n");
         body
+    }
+
+    /// One streaming round that calls tools: a content marker (the mock
+    /// gateway's body matcher), one fragment per call, then `tool_calls`.
+    fn tool_round_sse(calls: &[(&str, &str, &str)], marker: &str, cost: f64) -> String {
+        let mut chunks = vec![content_chunk(marker)];
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            chunks.push(fragment_chunk(index, id, name, arguments));
+        }
+        chunks.push(usage_chunk("tool_calls", 100, 50, cost));
+        sse(&chunks)
+    }
+
+    /// One streaming round that is the final answer.
+    fn answer_round_sse(text: &str, cost: f64) -> String {
+        sse(&[content_chunk(text), usage_chunk("stop", 100, 50, cost)])
+    }
+
+    /// Wait until a parked approval differs from `previous` (a decision
+    /// unparks the turn, which then parks again on the next card).
+    fn wait_for_new_approval(
+        state: &DesktopState,
+        previous: Option<&str>,
+    ) -> selora_protocol::ApprovalDto {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        loop {
+            if let Some(pending) = state.bootstrap().chat.pending_approval {
+                if previous != Some(pending.approval_id.as_str()) {
+                    return pending;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a new parked approval"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// A mock gateway: one SSE round per `(body marker, response)`, mounted
@@ -2391,6 +2502,225 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_and_todos_ride_the_agent_stream_and_the_chat_snapshot() {
+        let app = mock_app_handle();
+        let root = temp_workspace("plan-hydrate");
+        let server = mock_gateway(
+            vec![
+                // Mounted most specific first: the next request is
+                // identified by the previous round's tool result / prompt.
+                (
+                    "Stored 2 todo(s)",
+                    answer_round_sse("Planning is ready.", 0.01),
+                ),
+                (
+                    "PLAN_HYDRATE_PROMPT",
+                    tool_round_sse(
+                        &[
+                            ("call_enter", "enter_plan_mode", "{}"),
+                            (
+                                "call_todo",
+                                "todo_write",
+                                r#"{"todos":[{"title":"Audit the router","status":"completed"},{"title":"Write the plan"}]}"#,
+                            ),
+                        ],
+                        "Reading the workspace first.",
+                        0.01,
+                    ),
+                ),
+            ],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_agent("plan-h1", "session-plan", "PLAN_HYDRATE_PROMPT"),
+                ),
+            )
+            .expect("send_agent accepted");
+
+        let events = wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+        // The live events are additive and carry the stored state.
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            FrontendEvent::PlanStateChanged(dto) if dto.phase == PlanPhaseDto::Planning
+        )));
+        let todos = find_payload(&events, |payload| match payload {
+            FrontendEvent::TodosChanged(dto) => Some(dto.todos.clone()),
+            _ => None,
+        });
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].title, "Audit the router");
+        assert_eq!(todos[0].status, TodoStatusDto::Completed);
+
+        // Hydration: the bootstrap snapshot is the source of truth after a
+        // reload — the session carries the phase and the same stored list.
+        let chat = state.bootstrap().chat;
+        let session = chat.sessions.first().expect("the session exists");
+        assert_eq!(session.plan_phase, PlanPhaseDto::Planning);
+        assert_eq!(session.todos.len(), 2);
+        assert_eq!(session.todos[1].title, "Write the plan");
+        assert_eq!(session.todos[1].status, TodoStatusDto::Pending);
+        assert!(session.plan.is_none(), "no plan was approved yet");
+        // The tool results are real: entering plan mode and storing todos
+        // succeeded, and the write tools were never called.
+        let final_state = state.bootstrap().chat;
+        assert!(final_state.pending_approval.is_none());
+
+        tauri::async_runtime::block_on(async {
+            server.verify().await;
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_card_revise_keeps_planning_then_approval_flips_and_writes_still_card() {
+        let app = mock_app_handle();
+        let root = temp_workspace("plan-revise-approve");
+        let plan_args = r#"{"summary":"Make the file","plan":["Inspect","Write","Verify"]}"#;
+        let server = mock_gateway(
+            vec![
+                ("wrote 8 bytes", answer_round_sse("Done.", 0.01)),
+                (
+                    "plan approved",
+                    tool_round_sse(
+                        &[(
+                            "call_write",
+                            "write_file",
+                            r#"{"path":"made.txt","content":"approved"}"#,
+                        )],
+                        "Executing the approved plan.",
+                        0.01,
+                    ),
+                ),
+                (
+                    "asked to revise the plan",
+                    tool_round_sse(
+                        &[("call_exit_2", "exit_plan_mode", plan_args)],
+                        "Revising the plan.",
+                        0.01,
+                    ),
+                ),
+                (
+                    "PLAN_FLOW_PROMPT",
+                    tool_round_sse(
+                        &[
+                            ("call_enter", "enter_plan_mode", "{}"),
+                            ("call_exit", "exit_plan_mode", plan_args),
+                        ],
+                        "Planning first.",
+                        0.01,
+                    ),
+                ),
+            ],
+            true,
+        );
+        let state = DesktopState::with_settings(gateway_settings(server.uri()));
+        state.sessions().set_workspace_root(Some(root.clone()));
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    send_agent("plan-a", "session-approve", "PLAN_FLOW_PROMPT"),
+                ),
+            )
+            .expect("send_agent accepted");
+
+        // First card: the plan, with its steps on the parked approval slot
+        // (so a reload can rebuild the same card).
+        let first = wait_for_new_approval(&state, None);
+        assert_eq!(first.summary, "exit_plan_mode Make the file");
+        let plan = first.plan.expect("the parked card carries the plan");
+        assert_eq!(plan.steps, ["Inspect", "Write", "Verify"]);
+        assert!(!first.can_approve_all_this_turn);
+
+        // Revise: the turn continues in plan mode and proposes again.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", first.approval_id.as_str(), DecisionDto::Revise),
+                ),
+            )
+            .expect("revise resolves the card");
+        let second = wait_for_new_approval(&state, Some(first.approval_id.as_str()));
+        assert_eq!(
+            plan_phase(&state, "session-approve"),
+            PlanPhaseDto::Planning
+        );
+
+        // Approve: execution, with the approved plan stored and its steps
+        // seeded as todos.
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", second.approval_id.as_str(), DecisionDto::Approve),
+                ),
+            )
+            .expect("approve resolves the plan");
+        let third = wait_for_new_approval(&state, Some(second.approval_id.as_str()));
+        assert_eq!(third.summary, "write_file made.txt");
+        let session = state
+            .bootstrap()
+            .chat
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id.as_str() == "session-approve")
+            .expect("session");
+        assert_eq!(session.plan_phase, PlanPhaseDto::Executing);
+        assert_eq!(session.plan.expect("approved plan").steps.len(), 3);
+        assert_eq!(session.todos.len(), 3);
+        // The plan approval never wrote the file; its own card is the save.
+        assert!(!root.join("made.txt").exists());
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    agent_decision("plan-a", third.approval_id.as_str(), DecisionDto::Approve),
+                ),
+            )
+            .expect("approve the write");
+
+        wait_for(&state, |event| {
+            matches!(event.payload, FrontendEvent::AgentTurnDone(_))
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("made.txt")).expect("written file"),
+            "approved"
+        );
+
+        tauri::async_runtime::block_on(async {
+            server.verify().await;
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn plan_phase(state: &DesktopState, session_id: &str) -> PlanPhaseDto {
+        state
+            .bootstrap()
+            .chat
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id.as_str() == session_id)
+            .expect("session")
+            .plan_phase
+    }
+
+    #[test]
     fn auto_mode_applies_file_writes_without_an_approval_card() {
         let app = mock_app_handle();
         let root = temp_workspace("auto-mode");
@@ -2793,13 +3123,14 @@ mod tests {
             "You are Selora, an autonomous coding agent in Selora IDE.\n\
              Operating System: Windows. Shell: PowerShell.\n\
              Workspace Root: {}\n\
-             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, manage_todo.\n\
+             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
              Instructions:\n\
              1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
              2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
              3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
-             4. Break complex work into clear steps and maintain progress in your answer or with `manage_todo`.\n\
-             5. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}",
+             4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
+             5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
+             6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}",
             "C:/repo",
             "Writes, deletes, and non-allowlisted commands pause for the user's approval card; explain what you are doing while the card is pending.",
             "\nReasoning depth: Standard. Balanced reasoning with clear explanations and thorough verification.",

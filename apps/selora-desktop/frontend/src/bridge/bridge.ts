@@ -16,7 +16,16 @@ export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected';
 export type TextPosition = { line: number; utf16_column: number };
 export type Selection = { anchor: TextPosition; active: TextPosition; version: number };
 export type FileTreeNode = { path: string; name: string; kind: 'directory' | 'file'; children: FileTreeNode[] };
-export type Approval = { approval_id: Id; request_id: Id; turn_id: Id; session_id: Id; summary: string; can_approve_all_this_turn: boolean };
+export type Approval = {
+  approval_id: Id;
+  request_id: Id;
+  turn_id: Id;
+  session_id: Id;
+  summary: string;
+  can_approve_all_this_turn: boolean;
+  /** Phase 9b: present only when the parked card is a plan. */
+  plan?: PlanApproval | null;
+};
 export type Diagnostic = { path: string; line: number; column: number; severity: 'error' | 'warning' | 'info' | 'hint'; message: string };
 
 // --- Z2 additions (ARCHITECTURE §2.5) ---------------------------------------
@@ -89,8 +98,22 @@ export type EditorContextDto = {
 export type Model = { id: string; display_name: string; available: boolean };
 export type SearchQuery = { query: string; case_sensitive: boolean; whole_word: boolean; use_regex: boolean };
 export type SearchHit = { path: string; line: number; column: number; preview: string };
-export type ChatSession = { session_id: Id; title: string; message_ids: Id[]; active: boolean };
+export type SessionDto = {
+  session_id: Id;
+  title: string;
+  message_ids: Id[];
+  active: boolean;
+  plan_phase?: PlanPhase;
+  plan?: PlanApproval;
+  todos?: TodoItem[];
+};
+export type ChatSession = SessionDto;
 export type ChatMessage = { message_id: Id; session_id: Id; role: 'user' | 'assistant' | 'tool' | 'system'; text: string };
+/** Phase 9b: the session's plan phase. `executing` is the pre-9b default. */
+export type PlanPhase = 'planning' | 'executing';
+export type PlanApproval = { summary?: string | null; steps: string[] };
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+export type TodoItem = { id: string; title: string; status: TodoStatus };
 export type TextRange = { start: TextPosition; end: TextPosition };
 export type HoverResult = { buffer_id: Id; contents: string | null; range: TextRange | null };
 export type CompletionItem = { label: string; detail: string | null; insert_text: string | null; kind: string | null };
@@ -164,7 +187,7 @@ export type ApiKeyStatus = {
   active_model_id: string | null;
 };
 
-export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'stop';
+export type Decision = 'approve' | 'deny' | 'approve_all_this_turn' | 'revise' | 'stop';
 export type AgentMode = 'execute' | 'explore' | 'auto';
 export type AgentPhase = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
 
@@ -199,6 +222,22 @@ export type ApprovalNeededPayload = {
    * a workflow card; absent on every other card and on pre-8 payloads.
    */
   workflow?: WorkflowApproval;
+  /**
+   * Phase 9b: the `exit_plan_mode` card — the ordered steps and optional
+   * summary. Present only on a plan card.
+   */
+  plan?: PlanApproval;
+};
+
+export type PlanStateChangedPayload = {
+  session_id: Id;
+  phase: PlanPhase;
+  plan?: PlanApproval | null;
+};
+
+export type TodosChangedPayload = {
+  session_id: Id;
+  todos: TodoItem[];
 };
 
 export type AgentStateChangedPayload = {
@@ -409,6 +448,8 @@ export type FrontendEvent =
   | { type: 'workflow_artifact'; payload: WorkflowArtifactPayload }
   | { type: 'workflow_approval_needed'; payload: WorkflowApprovalNeededPayload }
   | { type: 'workflow_finished'; payload: WorkflowFinishedPayload }
+  | { type: 'plan_state_changed'; payload: PlanStateChangedPayload }
+  | { type: 'todos_changed'; payload: TodosChangedPayload }
   | { type: 'toast'; payload: { severity: ToastSeverity; message: string } }
   | { type: 'error'; payload: ProtocolError };
 

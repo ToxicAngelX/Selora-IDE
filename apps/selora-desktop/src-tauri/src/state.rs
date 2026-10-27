@@ -58,7 +58,9 @@ fn reveal_in_file_explorer(path: &std::path::Path) -> Result<(), ProtocolErrorDt
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let target = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let target = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
         std::process::Command::new("xdg-open")
             .arg(target.unwrap_or(path))
             .spawn()
@@ -823,6 +825,9 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
             // Nested workflow tools are not armed by WorkflowHost. Do not
             // turn an unexpected nested grant into a generic write card.
             selora_ai::ApprovalCard::Workflow { .. } => return,
+            // Phase 9b plan cards belong to a chat session, not a workflow
+            // subagent; an unexpected one is never rendered as a write.
+            selora_ai::ApprovalCard::Plan { .. } => return,
         };
         self.record(FrontendEvent::WorkflowApprovalNeeded(
             WorkflowApprovalNeededDto {
@@ -2300,6 +2305,13 @@ impl DesktopState {
                 })
             }
             DecisionDto::Stop => unreachable!("handled before approval lookup"),
+            DecisionDto::Revise => {
+                return Err(ProtocolErrorDto {
+                    code: "workflow_approval_not_revisable".into(),
+                    message: "Workflow approvals cannot be revised.".into(),
+                    retryable: false,
+                })
+            }
         };
         decide(id, decision).map_err(|error| ProtocolErrorDto {
             code: "workflow_approval_not_found".into(),

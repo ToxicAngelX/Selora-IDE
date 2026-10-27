@@ -18,6 +18,7 @@
 //! guard, and the approval split. 5c's loop controller and 5e's web
 //! implementations build on these seams.
 
+pub mod plan;
 pub mod router;
 pub mod tools;
 pub mod turn;
@@ -25,9 +26,12 @@ pub mod turn;
 // Re-exports of the Phase 5 surfaces (5c/5d consume these): the router
 // (5b), the loop (5c), the bash abort handle. The shared types' shapes
 // are unchanged from the prep commit — these are additive.
+pub use plan::{
+    new_store, PlanDraft, PlanPhase, PlanSession, PlanSnapshot, PlanStore, TodoItem, TodoStatus,
+};
 pub use router::{
-    denied_result, execute_approved, execute_tool, tool_manifest, AgentToolSettings, ToolContext,
-    ToolOutcome,
+    denied_result, execute_approved, execute_tool, plan_approved_result, revise_plan_result,
+    tool_manifest, AgentToolSettings, ToolContext, ToolOutcome,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{
@@ -55,6 +59,10 @@ pub enum AgentDecision {
     Approve,
     ApproveAllThisTurn,
     Deny,
+    /// Phase 9b: reject the *shape* of a proposed plan while keeping the
+    /// session in plan mode. The model sees a "revise the plan" tool result
+    /// and calls `exit_plan_mode` again. Never a grant.
+    Revise,
     Stop,
 }
 
@@ -83,6 +91,17 @@ pub enum ApprovalCard {
     /// `bash` — the command about to run (auto-approved allowlisted
     /// commands never build a card).
     Command { command: String },
+    /// `exit_plan_mode` (Phase 9b): the plan approval card. Approving flips
+    /// the session to execution (writes still card) and seeds the step list
+    /// as todos when the session has none; Revise/Deny keeps planning.
+    Plan {
+        /// Optional one-line context the model supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// The ordered plan steps, validated and bounded by
+        /// [`plan::MAX_PLAN_STEPS`].
+        steps: Vec<String>,
+    },
     /// `run_workflow` (§18.1): the confirmation moment for a workflow
     /// script. Shows the full script body, the extracted `world.run`
     /// command set, and the workflow-level cost cap. Approving it starts
