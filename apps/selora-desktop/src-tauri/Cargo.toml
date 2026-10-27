@@ -49,6 +49,9 @@ tauri-plugin-opener = "2"
 # `OpenExternal` parses with the `url` crate the workspace already pins,
 # instead of hand-rolling scheme/host splitting.
 url.workspace = true
+# The embedded terminal: ConPTY through portable-pty; the session's tree kill
+# rides the existing Job Object helper in `workflows_process.rs`.
+portable-pty.workspace = true
 
 # Phase 8 gap 1: `world.run` must kill grandchildren, not just the direct
 # PowerShell child. `workflows_process.rs` creates the process suspended and

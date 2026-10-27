@@ -60,6 +60,13 @@ pub use windows::WorldProcess;
 #[cfg(not(windows))]
 pub use fallback::WorldProcess;
 
+#[cfg(windows)]
+pub(crate) use windows::ProcessTree;
+
+#[cfg(not(windows))]
+#[allow(unused_imports)] // the terminal stub needs no job object
+pub(crate) use fallback::ProcessTree;
+
 /// A non-Windows host cannot provide a Job Object, so `world.run` is refused.
 #[cfg(not(windows))]
 mod fallback {
@@ -103,6 +110,30 @@ mod fallback {
         }
 
         pub fn kill_and_reap(&mut self) {}
+    }
+
+    /// No Job Object exists on this host, so the terminal backend refuses to
+    /// start a session it cannot contain.
+    #[allow(dead_code)] // constructed only by the Windows path
+    pub(crate) struct ProcessTree(());
+
+    impl ProcessTree {
+        pub(crate) fn create() -> Result<Self, HostError> {
+            Err(HostError::new(
+                "terminal process containment needs a Windows Job Object; this host cannot \
+                 guarantee that descendant processes are killed, so no session was started",
+            ))
+        }
+
+        pub(crate) fn assign(&self, _process: *mut std::ffi::c_void) -> Result<(), HostError> {
+            Err(HostError::new(
+                "terminal process containment needs a Windows Job Object",
+            ))
+        }
+
+        pub(crate) fn terminate(&self) -> Result<(), HostError> {
+            Ok(())
+        }
     }
 }
 
@@ -283,6 +314,48 @@ mod windows {
             ok != 0 && member != 0
         }
     }
+
+    /// One standalone kill-on-close Job Object for a child another module
+    /// spawned (the ConPTY terminal). It owns only the job, not the child
+    /// handle: the terminal keeps its own `portable-pty` child handle for
+    /// waiting, and the job is what makes a close a *tree* kill.
+    ///
+    /// `assign` must run immediately after the spawn so the shell is a member
+    /// before it can start a descendant. A failed assignment fails the whole
+    /// create: the terminal backend kills the child instead of running it
+    /// uncontained, the same fail-closed rule `WorldProcess::spawn` follows.
+    pub(crate) struct ProcessTree {
+        job: JobHandle,
+    }
+
+    impl ProcessTree {
+        /// A fresh unnamed job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set.
+        pub(crate) fn create() -> Result<Self, HostError> {
+            Ok(Self {
+                job: JobHandle::create()?,
+            })
+        }
+
+        /// Add a live child process (its process handle) to the job.
+        pub(crate) fn assign(&self, process: RawHandle) -> Result<(), HostError> {
+            JobHandle::assign_raw(self.job.raw(), process as HANDLE)
+        }
+
+        /// Terminate every process still in the job; an empty job succeeds.
+        pub(crate) fn terminate(&self) -> Result<(), HostError> {
+            self.job.terminate()
+        }
+    }
+
+    // SAFETY: a Job Object handle is a kernel object handle, not thread-bound
+    // state. `AssignProcessToJobObject`, `TerminateJobObject` and `CloseHandle`
+    // are valid from any thread, the job is immutable after `create`, and the
+    // only mutable access is the handle release in `JobHandle::drop` (which
+    // runs exactly once, when the last owner is dropped). Sharing `&self`
+    // across threads only ever issues those documented, serialize-in-the-OS
+    // calls.
+    unsafe impl Send for ProcessTree {}
+    unsafe impl Sync for ProcessTree {}
 
     /// The real spawn path; `assign` exists so a test can force the assignment
     /// step to fail without weakening the production call.
@@ -469,7 +542,7 @@ mod windows {
             let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
             if !valid(handle) {
                 return Err(job_error(
-                    "cannot create the `world.run` Job Object",
+                    "cannot create the process Job Object",
                     io::Error::last_os_error(),
                 ));
             }
@@ -501,7 +574,7 @@ mod windows {
             };
             if ok == 0 {
                 return Err(job_error(
-                    "cannot set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE on the `world.run` Job Object",
+                    "cannot set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE on the process Job Object",
                     io::Error::last_os_error(),
                 ));
             }
@@ -519,16 +592,15 @@ mod windows {
                 let error = io::Error::last_os_error();
                 return Err(if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
                     HostError::new(format!(
-                        "`world.run` cannot contain its PowerShell child: Windows refused the \
-                         Job Object assignment ({error}). Selora is itself running inside a \
-                         restrictive Job Object that does not allow nested jobs, so descendant \
-                         processes would survive the run. The child was terminated before it ran"
+                        "cannot contain the child process: Windows refused the Job Object \
+                         assignment ({error}). Selora is itself running inside a restrictive \
+                         Job Object that does not allow nested jobs, so descendant processes \
+                         would survive"
                     ))
                 } else {
                     HostError::new(format!(
-                        "`world.run` cannot add its suspended PowerShell child to the Job Object \
-                         ({error}); descendant processes could not be contained, so the child \
-                         was terminated before it ran"
+                        "cannot add the child process to the Job Object ({error}); descendant \
+                         processes could not be contained"
                     ))
                 });
             }
@@ -540,7 +612,7 @@ mod windows {
             // the exit code is passed by value.
             if unsafe { TerminateJobObject(self.0, JOB_EXIT_CODE) } == 0 {
                 return Err(job_error(
-                    "cannot terminate the `world.run` Job Object; a descendant process may survive",
+                    "cannot terminate the process Job Object; a descendant process may survive",
                     io::Error::last_os_error(),
                 ));
             }
