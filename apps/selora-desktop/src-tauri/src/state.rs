@@ -150,6 +150,49 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
     }
 }
 
+/// Read a journal's terminal status, preferring the raw
+/// `engine_run_finished` record over the typed resume plan.
+///
+/// The raw record is authoritative when the engine's report payload cannot be
+/// fully parsed (for example, only `{"status":"budget_exceeded"}` survived):
+/// the shell must still know a cap fired before it offers or accepts a resume.
+fn workflow_terminal_status(
+    journal: &selora_workflow::journal::LoadedJournal,
+) -> Option<selora_workflow::journal::RunStatus> {
+    journal
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            if entry.kind != "engine_run_finished" {
+                return None;
+            }
+            match entry
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(status) if status.eq_ignore_ascii_case("completed") => {
+                    Some(selora_workflow::journal::RunStatus::Completed)
+                }
+                Some(status) if status.eq_ignore_ascii_case("failed") => {
+                    Some(selora_workflow::journal::RunStatus::Failed)
+                }
+                Some(status) if status.eq_ignore_ascii_case("stopped") => {
+                    Some(selora_workflow::journal::RunStatus::Stopped)
+                }
+                Some(status)
+                    if status.eq_ignore_ascii_case("budget_exceeded")
+                        || status.eq_ignore_ascii_case("BudgetExceeded") =>
+                {
+                    Some(selora_workflow::journal::RunStatus::BudgetExceeded)
+                }
+                _ => None,
+            }
+        })
+        .or_else(|| journal.resume_plan().run_status())
+}
+
 /// Discover durable runs for the bootstrap. Corrupt or foreign directories are
 /// omitted: the panel must never offer to resume something the engine cannot
 /// prove it owns.
@@ -176,26 +219,9 @@ fn persisted_workflow_runs(
         let Ok(journal) = selora_workflow::journal::Journal::load(root, id.clone()) else {
             continue;
         };
-        let raw_terminal = journal.entries.iter().rev().find_map(|entry| {
-            if entry.kind != "engine_run_finished" {
-                return None;
-            }
-            match entry
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("completed") => Some(selora_workflow::journal::RunStatus::Completed),
-                Some("failed") => Some(selora_workflow::journal::RunStatus::Failed),
-                Some("stopped") => Some(selora_workflow::journal::RunStatus::Stopped),
-                Some("budget_exceeded") => {
-                    Some(selora_workflow::journal::RunStatus::BudgetExceeded)
-                }
-                _ => None,
-            }
-        });
-        let status = raw_terminal.or_else(|| journal.resume_plan().run_status());
+        let status = workflow_terminal_status(&journal);
         let ambiguous_command = workflow_has_ambiguous_command(&journal);
+        let budget_tripped = status == Some(selora_workflow::journal::RunStatus::BudgetExceeded);
         let completed = status == Some(selora_workflow::journal::RunStatus::Completed);
         let history = workflow_run_history(&journal);
         let (status, detail) = match status {
@@ -218,18 +244,18 @@ fn persisted_workflow_runs(
             ),
             Some(selora_workflow::journal::RunStatus::BudgetExceeded) => (
                 WorkflowStatus::Failed,
-                history
-                    .error
-                    .clone()
-                    .or_else(|| Some("Stopped at its cost cap; resume under a new run.".into())),
+                history.error.clone().or_else(|| {
+                    Some(
+                        "Stopped at its cost cap; continuing needs a new confirmed run and budget."
+                            .into(),
+                    )
+                }),
             ),
             None => (
                 WorkflowStatus::Pending,
                 Some("Interrupted before completion.".into()),
             ),
         };
-        let budget_tripped =
-            raw_terminal == Some(selora_workflow::journal::RunStatus::BudgetExceeded);
         runs.push(selora_protocol::WorkflowPersistedRunDto {
             run_id: id.to_string(),
             name: spec.name,
@@ -1015,6 +1041,24 @@ fn workflow_persistence_error(error: selora_workflow::WorkflowError) -> Protocol
     ProtocolErrorDto {
         code: "workflow_resume_rejected".into(),
         message: error.to_string(),
+        retryable: false,
+    }
+}
+
+/// A run whose cost cap already fired cannot resume: the confirmed grant is
+/// spent, and resume never raises it silently. Continuing needs a new run with
+/// a newly confirmed budget.
+fn workflow_budget_exhausted_error(max_cost_usd: f64, spent_usd: f64) -> ProtocolErrorDto {
+    let spend = if spent_usd > 0.0 {
+        format!(" (${spent_usd:.2} spent)")
+    } else {
+        String::new()
+    };
+    ProtocolErrorDto {
+        code: "workflow_budget_exhausted".into(),
+        message: format!(
+            "This run reached its ${max_cost_usd:.2} cost cap{spend}. A resume cannot raise the confirmed budget: start a new run and confirm a new budget to continue."
+        ),
         retryable: false,
     }
 }
@@ -1925,16 +1969,17 @@ impl DesktopState {
                         message: error.to_string(),
                         retryable: false,
                     })?;
-                let completed = journal.resume_plan().run_status()
-                    == Some(selora_workflow::journal::RunStatus::Completed)
-                    || journal.entries.iter().any(|entry| {
-                        entry.kind == "engine_run_finished"
-                            && entry
-                                .payload
-                                .get("status")
-                                .and_then(serde_json::Value::as_str)
-                                == Some("completed")
-                    });
+                // Synchronous preflight: a cap that already fired is a terminal
+                // state. Refuse before any host, worker, or event exists, and
+                // never let a resume raise the confirmed budget silently.
+                let terminal = workflow_terminal_status(&journal);
+                if terminal == Some(selora_workflow::journal::RunStatus::BudgetExceeded) {
+                    return Err(workflow_budget_exhausted_error(
+                        spec.max_cost_usd,
+                        journal.resume_plan().spent_usd(),
+                    ));
+                }
+                let completed = terminal == Some(selora_workflow::journal::RunStatus::Completed);
                 if completed {
                     return Err(ProtocolErrorDto {
                         code: "workflow_already_completed".into(),
@@ -3649,6 +3694,12 @@ mod tests {
         /// `None` deletes. This is how a test makes a "workflow edits disk"
         /// happen while the tab is open.
         writes: Vec<(PathBuf, Option<Vec<u8>>)>,
+        /// Extra dollars charged per host call after the baseline 0.25. Zero
+        /// keeps the historical constant-spend fake; a positive value lets a
+        /// test cross a workflow cost cap between steps.
+        cost_per_call: f64,
+        /// Host calls billed so far (`cost_per_call` multiplier).
+        charged: std::sync::atomic::AtomicU64,
     }
 
     impl FakeWorkflowHost {
@@ -3673,6 +3724,13 @@ mod tests {
             }
         }
 
+        fn with_cost_per_call(cost_per_call: f64) -> Self {
+            Self {
+                cost_per_call,
+                ..Self::default()
+            }
+        }
+
         fn with_gate_and_writes(
             gate: Arc<TestGate>,
             writes: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -3692,6 +3750,7 @@ mod tests {
             _persona: Option<&str>,
             _instructions: &str,
         ) -> Result<serde_json::Value, HostError> {
+            self.charged.fetch_add(1, Ordering::SeqCst);
             if self.ask_fails {
                 return Err(HostError::new("workflow ask failed"));
             }
@@ -3705,6 +3764,7 @@ mod tests {
             _timeout_ms: Option<u64>,
         ) -> Result<CommandOutput, HostError> {
             self.world_calls.fetch_add(1, Ordering::SeqCst);
+            self.charged.fetch_add(1, Ordering::SeqCst);
             for (path, contents) in &self.writes {
                 match contents {
                     Some(bytes) => {
@@ -3791,7 +3851,7 @@ mod tests {
         }
 
         fn cost_usd(&self) -> f64 {
-            0.25
+            0.25 + self.cost_per_call * self.charged.load(Ordering::SeqCst) as f64
         }
 
         fn tokens(&self) -> u64 {
@@ -3880,13 +3940,22 @@ mod tests {
     }
 
     fn workflow_run(id: &str, script: &str, commands: Vec<String>) -> FrontendCommand {
+        workflow_run_with_cap(id, script, commands, 3.5)
+    }
+
+    fn workflow_run_with_cap(
+        id: &str,
+        script: &str,
+        commands: Vec<String>,
+        max_cost_usd: f64,
+    ) -> FrontendCommand {
         FrontendCommand::WorkflowRun {
             request_id: RequestId::new(id).expect("valid id"),
             spec: WorkflowSpecDto {
                 name: "review".into(),
                 script: script.into(),
                 commands,
-                max_cost_usd: 3.5,
+                max_cost_usd,
             },
         }
     }
@@ -4525,6 +4594,343 @@ mod tests {
         assert_eq!(recovered.reports[0].item, "done");
         assert_eq!(recovered.tokens, summary.tokens);
         assert_eq!(recovered.cost_usd, summary.cost_usd);
+    }
+
+    #[test]
+    fn p9_workflow_budget_exhausted_resume_is_refused_before_worker() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        let host = Arc::new(FakeWorkflowHost::with_cost_per_call(1.0));
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::clone(&host)));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run_with_cap(
+                        "wf-budget",
+                        r#"phase("one"); agent("reviewer").ask("spend"); phase("two");"#,
+                        vec![],
+                        0.1,
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        assert_eq!(finished_count(&events), 1);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == "wf-budget" || run.name == "review")
+            .expect("the budget run is listed as history");
+        assert_eq!(saved.status, WorkflowStatus::Failed);
+        assert!(!saved.resumable, "a cap trip is never offered for resume");
+        let detail = saved.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("budget") && detail.contains("0.10"),
+            "the cap reason rides `detail`: {detail}"
+        );
+
+        let before = state.log.snapshot_sequence();
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-budget-resume").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                    },
+                ),
+            )
+            .expect_err("a budget-exhausted run cannot resume");
+        assert_eq!(refused.code, "workflow_budget_exhausted");
+        assert!(!refused.retryable);
+        assert!(
+            refused.message.contains("cost cap")
+                && refused.message.contains("new run")
+                && refused.message.contains("budget"),
+            "the refusal explains the cap and the only continuation: {}",
+            refused.message
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a refused budget resume starts no worker"
+        );
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "a refused budget resume emits no event"
+        );
+        assert_eq!(finished_count(&state.events_after(0)), 1);
+    }
+
+    #[test]
+    fn p9_workflow_budget_raw_terminal_is_refused_and_listed_with_cap_reason() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        let run_id = selora_workflow::RunId::from("budget-raw");
+        let run_dir = selora_workflow::journal::run_dir(dir.path(), &run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = selora_workflow::prepare("raw-budget", r#"phase("one");"#, 2.0)
+            .unwrap()
+            .spec();
+        std::fs::write(
+            run_dir.join("spec.json"),
+            serde_json::to_vec(&spec).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(run_dir.join("run.lock"), b"").unwrap();
+        // A raw terminal record with no parseable report payload still proves
+        // the cap fired; the preflight must not wait for the typed plan.
+        std::fs::write(
+            selora_workflow::journal::journal_path(dir.path(), &run_id),
+            b"{\"seq\":1,\"kind\":\"engine_run_finished\",\"payload\":{\"status\":\"budget_exceeded\"}}\n",
+        )
+        .unwrap();
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == "budget-raw")
+            .expect("the raw budget run is listed");
+        assert_eq!(saved.status, WorkflowStatus::Failed);
+        assert!(!saved.resumable);
+        assert!(
+            saved
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cost cap"),
+            "the listing carries the cap reason: {:?}",
+            saved.detail
+        );
+
+        // The listing itself must not move the event log.
+        let before = state.log.snapshot_sequence();
+        let refused = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-budget-raw-resume").unwrap(),
+                        run_id: saved.run_id.clone(),
+                        allow_incomplete_asks: false,
+                    },
+                ),
+            )
+            .expect_err("a raw budget terminal cannot resume");
+        assert_eq!(refused.code, "workflow_budget_exhausted");
+        assert!(!refused.retryable);
+        assert!(refused.message.contains("2.00"), "{}", refused.message);
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "the refusal happens before any event"
+        );
+        assert!(state
+            .workflow_runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn p9_workflow_budget_preflight_only_flags_a_budget_terminal() {
+        use selora_workflow::journal::{JournalEntry, LoadedJournal, RunStatus};
+
+        let journal_with = |status: &str| LoadedJournal {
+            path: PathBuf::new(),
+            entries: vec![JournalEntry {
+                seq: 1,
+                kind: "engine_run_finished".into(),
+                payload: serde_json::json!({ "status": status }),
+            }],
+            corrupt: Vec::new(),
+        };
+        assert_eq!(
+            workflow_terminal_status(&journal_with("completed")),
+            Some(RunStatus::Completed)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("failed")),
+            Some(RunStatus::Failed)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("stopped")),
+            Some(RunStatus::Stopped)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("budget_exceeded")),
+            Some(RunStatus::BudgetExceeded)
+        );
+        assert_eq!(
+            workflow_terminal_status(&journal_with("BudgetExceeded")),
+            Some(RunStatus::BudgetExceeded),
+            "raw legacy spelling is still a cap trip"
+        );
+        assert_eq!(workflow_terminal_status(&journal_with("unknown")), None);
+    }
+
+    #[test]
+    fn p9_workflow_budget_preflight_keeps_corrupt_and_missing_journals_typed() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::default(),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run("wf-corrupt", r#"phase("scan"); report("kept");"#, vec![]),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let id = selora_workflow::RunId::from(summary.run_id.as_str());
+        let path = selora_workflow::journal::journal_path(dir.path(), &id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        *lines.last_mut().expect("a terminal record") = "{not json";
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let before = state.log.snapshot_sequence();
+        for (request_id, run_id) in [
+            ("wf-corrupt-resume", summary.run_id.clone()),
+            ("wf-missing-resume", "missing-run".to_owned()),
+        ] {
+            let refused = state
+                .dispatch(
+                    &app,
+                    envelope(
+                        &state,
+                        FrontendCommand::WorkflowResume {
+                            request_id: RequestId::new(request_id).unwrap(),
+                            run_id,
+                            allow_incomplete_asks: false,
+                        },
+                    ),
+                )
+                .expect_err("an unprovable journal cannot resume");
+            assert_eq!(
+                refused.code, "workflow_resume_rejected",
+                "corruption is not misreported as a budget trip"
+            );
+            assert!(!refused.retryable);
+        }
+        assert_eq!(
+            state.log.snapshot_sequence(),
+            before,
+            "refusals emit no event"
+        );
+        assert!(
+            state
+                .workflow_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "refusals start no worker"
+        );
+        // The damaged run stays listed but is not offered as resumable.
+        let damaged = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("a damaged journal stays listed");
+        assert!(!damaged.resumable);
+    }
+
+    #[test]
+    fn p9_workflow_stopped_run_still_resumes_without_the_budget_refusal() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        let gate = Arc::new(TestGate::default());
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_gate(Arc::clone(&gate)),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-stopped-resume",
+                        r#"world.run("sleep", []);"#,
+                        vec!["sleep".into()],
+                    ),
+                ),
+            )
+            .expect("run accepted");
+        wait_for_workflow(&state, |payload| {
+            matches!(payload, FrontendEvent::WorkflowStarted(_))
+        });
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowStop {
+                        request_id: RequestId::new("wf-stopped-resume").unwrap(),
+                    },
+                ),
+            )
+            .expect("stop accepted");
+        gate.open();
+        wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.name == "review")
+            .expect("the stopped run is listed");
+        assert_eq!(saved.status, WorkflowStatus::Stopped);
+        assert!(saved.resumable, "a stopped run keeps its resume contract");
+
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::WorkflowResume {
+                        request_id: RequestId::new("wf-stopped-resume-again").unwrap(),
+                        run_id: saved.run_id,
+                        allow_incomplete_asks: false,
+                    },
+                ),
+            )
+            .expect("a stopped run is not budget-exhausted");
+        let events = wait_for_finished_runs(&state, 2);
+        wait_for_no_active_runs(&state);
+        assert!(events.iter().any(|event| matches!(&event.payload,
+            FrontendEvent::WorkflowFinished(done)
+                if done.request_id.as_str() == "wf-stopped-resume-again")));
     }
 
     #[test]
