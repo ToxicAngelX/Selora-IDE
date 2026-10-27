@@ -73,46 +73,22 @@ jobs:
           fi
           echo "Tag $GITHUB_REF_NAME ($GITHUB_SHA) is contained in origin/main."
 
+      # Single source of truth: scripts/check-release-metadata.ps1. It requires
+      # a numeric vX.Y.Z tag, equality across Cargo.toml [workspace.package],
+      # tauri.conf.json, and frontend/package.json, a CHANGELOG.md section for
+      # the version, and one consistent repository slug across the manifests,
+      # installer, and docs.
       - name: Resolve and validate the version
         id: version
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Tag '$env:GITHUB_REF_NAME' is not numeric vX.Y.Z (Inno Setup's AppVersion must be numeric)."
+          & .\scripts\check-release-metadata.ps1 -Tag $env:GITHUB_REF_NAME
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release metadata is not taggable; see the failures above."
           }
-
-          $cargoRaw = & (Join-Path $PWD 'installer\read-version.ps1')
-          $cargo = if ($null -eq $cargoRaw) { '' } else { ("$cargoRaw").Trim() }
-          if (-not $cargo) {
-            throw 'Could not read [workspace.package].version from Cargo.toml.'
-          }
-          if ($cargo -ne $version) {
-            throw "Tag is v$version but Cargo.toml [workspace.package] version is $cargo. Bump the version before tagging."
-          }
-
-          $tauri = (Get-Content -LiteralPath 'apps\selora-desktop\src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
-          if ($tauri -ne $version) {
-            throw "Tag is v$version but tauri.conf.json version is $tauri. Keep the two in sync."
-          }
-
-          # The About dialog reports the frontend package version, so it is
-          # user-visible metadata even though Cargo.toml stays authoritative.
-          $frontend = (Get-Content -LiteralPath 'apps\selora-desktop\frontend\package.json' -Raw | ConvertFrom-Json).version
-          if ($frontend -ne $version) {
-            throw "Tag is v$version but apps/selora-desktop/frontend/package.json version is $frontend. Keep it in sync (the About dialog reads it)."
-          }
-
-          # RELEASE.md section 4.3 step 2: the Unreleased entries move into a
-          # versioned section before tagging.
-          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw
-          $heading = '(?m)^##\s*\[' + [regex]::Escape($version) + '\]'
-          if ($changelog -notmatch $heading) {
-            throw "CHANGELOG.md has no '## [$version]' section. Move the Unreleased entries into a versioned section before tagging."
-          }
-
           "VERSION=$version" >> $env:GITHUB_OUTPUT
-          "Validated version $version (Cargo.toml + tauri.conf.json + frontend package.json + CHANGELOG.md)."
+          "Validated version $version against the three manifests and CHANGELOG.md."
 
       # Optional signing: no secrets means unsigned builds, and that stays a
       # warning. SIGNING_REQUIRED=true makes it a hard failure instead.
@@ -189,7 +165,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # cargo-deny-action is a container action, which GitHub cannot run on
       # windows-latest. Install it natively, pinned so a new cargo-deny release
@@ -374,15 +350,21 @@ jobs:
       # Pinned to a known Inno Setup 6.x build so a future 7.x package in
       # Chocolatey cannot silently change the compiler under a release.
       - name: Install Inno Setup 6
+        id: iscc
         shell: pwsh
         run: |
           choco install innosetup --version=6.7.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with $LASTEXITCODE" }
-          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path -LiteralPath $iscc)) {
-            throw "Inno Setup installed but ISCC.exe is not at $iscc."
+
+          # Do not assume Chocolatey's install directory. find-iscc.ps1 checks
+          # SELORA_ISCC, PATH, the standard 6/7 directories, and the uninstall
+          # registry, and prints the absolute compiler path.
+          $iscc = (& .\installer\find-iscc.ps1 | Out-String).Trim()
+          if (-not $iscc -or -not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw 'Inno Setup installed but ISCC.exe could not be located.'
           }
-          "ISCC version $((Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion)"
+          "ISCC=$iscc" >> $env:GITHUB_OUTPUT
+          "ISCC: $iscc"
 
       - name: Sign application binary (optional)
         if: env.SIGNING_CERT_BASE64 != ''
@@ -402,7 +384,7 @@ jobs:
             $target = 'target\release\selora-desktop.exe'
             & $signtool.FullName sign /f $pfx /p $env:SIGNING_CERT_PASSWORD `
               /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 `
-              /d 'Selora IDE' /du 'https://github.com/ToxicAngelX/Selora-IDE' `
+              /d 'Selora IDE' /du "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY" `
               $target
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with $LASTEXITCODE" }
 
@@ -421,19 +403,36 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
           CRT_DLLS: ${{ steps.crt.outputs.DLLS }}
+          ISCC: ${{ steps.iscc.outputs.ISCC }}
         run: |
           if (-not $env:CRT_DLLS) {
             throw 'The CRT staging step produced no DLL list; refusing to compile an installer without the runtime.'
           }
-          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
-          & $iscc "/DMyAppVersion=$env:VERSION" "/DMyCrtDlls=$env:CRT_DLLS" 'installer\selora-ide.iss'
+          if (-not $env:ISCC -or -not (Test-Path -LiteralPath $env:ISCC -PathType Leaf)) {
+            throw "ISCC.exe was not resolved (got '$env:ISCC')."
+          }
+
+          # Pin the output directory. The .iss default resolves against the
+          # script's own directory, but an inherited /O or a different cwd
+          # must not be able to move the artifact out of installer\output.
+          $out = Join-Path $env:GITHUB_WORKSPACE 'installer\output'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $installer = Join-Path $out "Selora-IDE-Setup-$env:VERSION.exe"
+
+          # A stale setup for this version must not survive a failed compile.
+          Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+
+          & $env:ISCC "/DMyAppVersion=$env:VERSION" "/DMyCrtDlls=$env:CRT_DLLS" "/O$out" (Join-Path $env:GITHUB_WORKSPACE 'installer\selora-ide.iss')
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
 
-          $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
-          if (-not (Test-Path -LiteralPath $installer)) {
-            throw "Installer not found at $installer."
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "ISCC reported success but $installer is missing; check /O and OutputBaseFilename."
           }
-          "Installer: $installer ($([math]::Round((Get-Item -LiteralPath $installer).Length / 1MB, 1)) MiB)"
+          $size = (Get-Item -LiteralPath $installer).Length
+          if ($size -lt 5MB) {
+            throw "Installer is only $size bytes; the compile produced a truncated artifact."
+          }
+          "Installer: $installer ($([math]::Round($size / 1MB, 1)) MiB)"
 
       - name: Sign installer (optional)
         if: env.SIGNING_CERT_BASE64 != ''
@@ -455,7 +454,7 @@ jobs:
             $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
             & $signtool.FullName sign /f $pfx /p $env:SIGNING_CERT_PASSWORD `
               /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 `
-              /d 'Selora IDE Installer' /du 'https://github.com/ToxicAngelX/Selora-IDE' `
+              /d 'Selora IDE Installer' /du "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY" `
               $installer
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with $LASTEXITCODE" }
 
@@ -467,16 +466,76 @@ jobs:
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Generate SHA256 checksum
+      - name: Verify installer artifact
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          $installer = "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+          $installer = Join-Path $env:GITHUB_WORKSPACE "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer not found at $installer."
+          }
+          $file = Get-Item -LiteralPath $installer
+          "Installer: $($file.FullName) ($([math]::Round($file.Length / 1MB, 1)) MiB)"
+          "Product version: $($file.VersionInfo.ProductVersion)"
+          "File version: $($file.VersionInfo.FileVersion)"
+
+          # Prove /DMyAppVersion reached the setup's version resource. Inno
+          # pads ProductVersion with trailing spaces, so trim before comparing.
+          $productVersion = [string]$file.VersionInfo.ProductVersion
+          if ($productVersion.Trim() -ne $env:VERSION) {
+            throw "Installer ProductVersion is '$($productVersion.Trim())' but the tag version is '$env:VERSION'."
+          }
+
+          # The signature must match the configuration: Valid when the owner
+          # supplied a certificate, NotSigned when signing is off. A
+          # half-signed or invalid artifact must never reach the draft.
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($env:SIGNING_CERT_BASE64) {
+            if ($signature.Status -ne 'Valid') {
+              throw "Signing is enabled but the installer signature is $($signature.Status)."
+            }
+            "Authenticode: Valid ($($signature.SignerCertificate.Subject))"
+          }
+          else {
+            if ($signature.Status -ne 'NotSigned') {
+              throw "Signing is disabled but the installer signature is $($signature.Status); expected NotSigned."
+            }
+            'Authenticode: NotSigned (unsigned release, as configured)'
+          }
+
+      - name: Generate and verify SHA256 checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $installer = Join-Path $env:GITHUB_WORKSPACE "installer\output\Selora-IDE-Setup-$env:VERSION.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Installer not found at $installer."
+          }
+
           $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           $name = Split-Path -Leaf $installer
+          $line = "$hash  $name"
           $checksum = "$installer.sha256"
-          Set-Content -LiteralPath $checksum -Value "$hash  $name" -Encoding ascii
+          Set-Content -LiteralPath $checksum -Value $line -Encoding ascii
+
+          # Verify what was written: one lowercase hash, two spaces, the exact
+          # file name. `sha256sum -c` and Get-FileHash readers both parse this.
+          $written = (Get-Content -LiteralPath $checksum -Raw).Trim()
+          if ($written -ne $line) {
+            throw "Checksum file does not contain the expected line: $written"
+          }
+          if ($written -notmatch '^[0-9a-f]{64}  Selora-IDE-Setup-\d+\.\d+\.\d+\.exe$') {
+            throw "Checksum line has an unexpected shape: $written"
+          }
+
+          # Hash the file again: if it changed between the two reads, the
+          # artifact is not stable and must not be published.
+          $again = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($again -ne $hash) {
+            throw 'The installer changed while the checksum was generated.'
+          }
           Get-Content -LiteralPath $checksum
 
       - name: Upload build artifacts
@@ -489,6 +548,25 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # A re-run must never attach assets to a published release: publishing is
+      # the owner's manual step after the clean-VM smoke test.
+      - name: Refuse to update a published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $existing = & gh release view $env:GITHUB_REF_NAME --json isDraft,name 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $release = $existing | ConvertFrom-Json
+            if (-not $release.isDraft) {
+              throw "Release $env:GITHUB_REF_NAME is already published. This workflow only creates or updates drafts; publish manually, or delete the release before re-running."
+            }
+            "Existing draft release found ($($release.name)); its assets will be replaced."
+          }
+          else {
+            "No existing release for $env:GITHUB_REF_NAME; the draft step will create one."
+          }
+
       - name: Draft GitHub release
         uses: softprops/action-gh-release@v2.2.0
         with:
@@ -500,3 +578,55 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           draft: true
+
+      # The draft (not CI logs) is what the owner downloads. Prove it holds
+      # exactly the expected two assets, that it is still a draft, and that a
+      # round-trip download hashes to the local artifact.
+      - name: Verify draft release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $json = & gh release view $env:GITHUB_REF_NAME --json isDraft,name,assets
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release view failed with $LASTEXITCODE; the draft release is missing."
+          }
+          $release = $json | ConvertFrom-Json
+          if (-not $release.isDraft) {
+            throw "Release $env:GITHUB_REF_NAME is not a draft. This workflow must never publish."
+          }
+
+          $installerName = "Selora-IDE-Setup-$env:VERSION.exe"
+          $checksumName = "$installerName.sha256"
+          $names = @($release.assets | ForEach-Object { $_.name })
+          foreach ($expected in @($installerName, $checksumName)) {
+            if ($names -notcontains $expected) {
+              throw "Draft release is missing '$expected' (assets: $($names -join ', '))."
+            }
+          }
+
+          $localInstaller = Join-Path $env:GITHUB_WORKSPACE "installer\output\$installerName"
+          $localSize = (Get-Item -LiteralPath $localInstaller).Length
+          $installerAsset = $release.assets | Where-Object { $_.name -eq $installerName }
+          if ($installerAsset.size -ne $localSize) {
+            throw "Uploaded installer is $($installerAsset.size) bytes but the local artifact is $localSize bytes."
+          }
+          $checksumAsset = $release.assets | Where-Object { $_.name -eq $checksumName }
+          if ($checksumAsset.size -le 0 -or $checksumAsset.size -gt 200) {
+            throw "Checksum asset size is $($checksumAsset.size); expected one SHA256 line."
+          }
+
+          # Round-trip: download what the owner will download and re-hash it.
+          $verifyDir = Join-Path $env:RUNNER_TEMP 'selora-draft-verify'
+          New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+          & gh release download $env:GITHUB_REF_NAME --pattern $installerName --dir $verifyDir --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed with $LASTEXITCODE" }
+          $downloaded = Join-Path $verifyDir $installerName
+          $localHash = (Get-FileHash -LiteralPath $localInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+          $remoteHash = (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($localHash -ne $remoteHash) {
+            throw "Draft asset hash $remoteHash does not match the local installer hash $localHash."
+          }
+
+          "Verified draft '$($release.name)': draft=true, $installerName ($([math]::Round($localSize / 1MB, 1)) MiB, sha256 $localHash), $checksumName."

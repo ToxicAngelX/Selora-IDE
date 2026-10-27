@@ -56,7 +56,11 @@ The script reads the version from the root `Cargo.toml`, stages the MSVC
 runtime DLLs beside `target\release\selora-desktop.exe`, downloads Microsoft's
 WebView2 Evergreen bootstrapper when it is not cached, and invokes Inno Setup.
 It requires Inno Setup 6.3 or newer (or 7.x) and the Visual Studio C++ x64
-toolset. The output is:
+toolset. `installer/find-iscc.ps1` locates the compiler through
+`%SELORA_ISCC%`, `PATH`, the standard install directories, or the uninstall
+registry, and the script passes an absolute `/O`, so the setup always lands in
+the repository even when Inno Setup is installed elsewhere (for example a
+portable copy under `%TEMP%`). The output is:
 
 ```text
 installer\output\Selora-IDE-Setup-<version>.exe
@@ -72,7 +76,10 @@ at a commit already on `main` and must equal the version in `Cargo.toml`,
 `tauri.conf.json`, and `frontend/package.json`; `CHANGELOG.md` must contain a
 `## [<version>]` section. The workflow re-runs fmt, clippy, cargo-deny, the
 frontend and Rust tests, builds the release binary and Inno installer, writes
-a SHA256 checksum, and creates a draft GitHub Release. Signing runs only when
+a SHA256 checksum, and creates a draft GitHub Release. It refuses to touch an
+already-published release, verifies the installer signature (signed only with
+the secrets below, otherwise `NotSigned`), and round-trip hashes the draft
+assets. Signing runs only when
 the `SIGNING_CERT_BASE64` and `SIGNING_CERT_PASSWORD` repository secrets are
 set; otherwise the artifacts are unsigned.
 
@@ -155,7 +162,10 @@ element (`features/keymap/use-shortcuts.ts`).
 - **The update check needs the GitHub repository published.** The About
   dialog fetches
   `https://api.github.com/repos/ToxicAngelX/Selora-IDE/releases/latest`; an
-  unpublished repository or a missing release makes the check fail.
+  unpublished repository or a missing release makes the check fail. The
+  endpoint is derived from `Cargo.toml` / `package.json` `repository`, not
+  hard-coded; `scripts/check-release-metadata.ps1` keeps the two manifests and
+  the docs on one slug.
 - **Artifacts are unsigned until signing secrets exist.** The release
   workflow signs the executable and installer only when
   `SIGNING_CERT_BASE64` and `SIGNING_CERT_PASSWORD` are configured; otherwise
