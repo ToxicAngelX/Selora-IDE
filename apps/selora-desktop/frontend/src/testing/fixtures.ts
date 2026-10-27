@@ -61,6 +61,7 @@ export function makeBootstrap(overrides: Partial<BootstrapState> = {}): Bootstra
     layout_constraints: FIXTURE_CONSTRAINTS,
     git: { branch: null, changed_paths: [], staged_paths: [] },
     diagnostics: [],
+    lsp_servers: [],
     feature_flags: { agent: false, git: false, search: false, editor: false, later_slices: [] },
     ...overrides,
   };

@@ -174,13 +174,43 @@ pub struct UiSettings {
 }
 
 /// `lsp.*` (ARCHITECTURE.md §8.1) — `None` means "resolve from PATH".
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `*_args` replace the registry's built-in arguments only when non-empty
+/// (an empty list keeps the default, e.g. TypeScript's `--stdio`). `enabled`
+/// is the master switch: false starts no language server and makes an LSP
+/// restart answer the typed `lsp_disabled` error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LspSettings {
     #[serde(default)]
     pub rust_analyzer_path: Option<String>,
 
     #[serde(default)]
     pub typescript_server_path: Option<String>,
+
+    #[serde(default)]
+    pub rust_analyzer_args: Vec<String>,
+
+    #[serde(default)]
+    pub typescript_server_args: Vec<String>,
+
+    #[serde(default = "default_lsp_enabled")]
+    pub enabled: bool,
+}
+
+fn default_lsp_enabled() -> bool {
+    true
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self {
+            rust_analyzer_path: None,
+            typescript_server_path: None,
+            rust_analyzer_args: Vec::new(),
+            typescript_server_args: Vec::new(),
+            enabled: default_lsp_enabled(),
+        }
+    }
 }
 
 /// `selora.*` (ARCHITECTURE.md §8.1). The API key is NOT here — it lives in
@@ -683,6 +713,9 @@ pub(crate) mod tests {
         assert_eq!(s.ui.chat_sidebar_width, 360);
         assert_eq!(s.lsp.rust_analyzer_path, None);
         assert_eq!(s.lsp.typescript_server_path, None);
+        assert!(s.lsp.rust_analyzer_args.is_empty());
+        assert!(s.lsp.typescript_server_args.is_empty());
+        assert!(s.lsp.enabled, "language servers default on");
         assert_eq!(s.selora.base_url, "https://api.selora.lol");
         assert_eq!(s.selora.active_model, None);
         assert_eq!(s.keybinds.command_palette, "Ctrl+Shift+P");
@@ -700,6 +733,9 @@ pub(crate) mod tests {
         let mut settings = Settings::default();
         settings.editor.font_size = 18;
         settings.lsp.rust_analyzer_path = Some("C:/tools/rust-analyzer.exe".into());
+        settings.lsp.rust_analyzer_args = vec!["--log-file".into(), "ra.log".into()];
+        settings.lsp.typescript_server_args = vec!["--stdio".into()];
+        settings.lsp.enabled = false;
         settings.selora.active_model = Some("glm-5.3".into());
         // Phase 5d: the agent Brave key and the reduced-motion flag.
         settings.agent.brave_search_api_key = Some("brave-test-key".into());

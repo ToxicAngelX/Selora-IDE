@@ -42,6 +42,7 @@ function makeBootstrap(overrides: Partial<BootstrapState> = {}): BootstrapState 
     layout_constraints: {} as BootstrapState['layout_constraints'],
     git: { branch: 'main', changed_paths: [], staged_paths: [] },
     diagnostics: [],
+    lsp_servers: [],
     feature_flags: { agent: true, git: true, search: true, editor: true, later_slices: [] },
     ...overrides,
   };

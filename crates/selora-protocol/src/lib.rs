@@ -387,6 +387,10 @@ pub enum FrontendCommand {
     OpenFolderAt {
         root: String,
     },
+    /// P1: close the open folder. Drops every buffer, stops the language
+    /// servers and clears their diagnostics; the shell returns to the
+    /// no-workspace state.
+    CloseFolder,
     /// Phase Z4: rebuild the file tree from disk and emit
     /// FileTreeChanged (the explorer's refresh affordance).
     RefreshTree,
@@ -423,6 +427,12 @@ pub enum FrontendCommand {
     CompletionAt {
         buffer_id: BufferId,
         position: TextPosition,
+    },
+    /// P1: restart one language server (truthful status follows as
+    /// `LspServerStateChanged` events). `language` is a wire language id
+    /// (`rust`, `typescript`, `javascript`) or a server name.
+    LspRestart {
+        language: String,
     },
     SendChat {
         request_id: RequestId,
@@ -814,6 +824,31 @@ pub struct TextRangeDto {
     pub start: TextPosition,
     pub end: TextPosition,
 }
+/// The lifecycle of one language server as the bridge observes it.
+///
+/// `failed` carries the truthful reason in [`LspServerStateDto::error`] (a
+/// spawn failure, a dead process, or an unresolvable command). There is no
+/// "unknown" state: a server that has not started yet is absent from the
+/// bootstrap list rather than reported healthy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspServerHealth {
+    Starting,
+    Ready,
+    Failed,
+}
+/// One language server's live state (bootstrap and `LspServerStateChanged`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LspServerStateDto {
+    /// Wire language id (`rust`, `typescript`, `javascript`).
+    pub language: String,
+    /// Display/server name (`rust-analyzer`, `typescript-language-server`).
+    pub server: String,
+    pub state: LspServerHealth,
+    /// Why the server failed; `None` for starting/ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 /// The answer to `HoverAt`; `contents: None` means the server had nothing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HoverResultDto {
@@ -885,6 +920,10 @@ pub struct BootstrapState {
     pub layout_constraints: LayoutConstraintsDto,
     pub git: GitStatusDto,
     pub diagnostics: Vec<DiagnosticDto>,
+    /// P1: live language-server state from the bridge store. Additive and
+    /// defaulted so pre-P1 payloads still deserialize.
+    #[serde(default)]
+    pub lsp_servers: Vec<LspServerStateDto>,
     pub feature_flags: FeatureFlagsDto,
     /// Phase 8: unmounted durable runs found in the open workspace. Live runs
     /// arrive as `workflow_*` events instead.
@@ -1371,6 +1410,9 @@ pub enum FrontendEvent {
     AgentStateChanged(AgentStateDto),
     AgentTurnDone(AgentTurnDoneDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
+    /// P1: one language server changed lifecycle (starting/ready/failed).
+    /// `failed` carries a truthful, typed reason for the UI.
+    LspServerStateChanged(LspServerStateDto),
     // Phase Z4b — the LSP request answers (each echoes the buffer so the
     // editor can drop a result for a tab that closed mid-flight).
     HoverResult(HoverResultDto),
@@ -1635,6 +1677,7 @@ mod tests {
                 files: vec![],
             },
             diagnostics: vec![],
+            lsp_servers: vec![],
             feature_flags: FeatureFlagsDto {
                 agent: false,
                 git: false,
@@ -1695,6 +1738,17 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FrontendCommand::RefreshTree).unwrap(),
             r#"{"type":"refresh_tree"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::CloseFolder).unwrap(),
+            r#"{"type":"close_folder"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::LspRestart {
+                language: "rust".into()
+            })
+            .unwrap(),
+            r#"{"type":"lsp_restart","payload":{"language":"rust"}}"#
         );
         assert_eq!(
             serde_json::to_string(&FrontendCommand::OpenFile {

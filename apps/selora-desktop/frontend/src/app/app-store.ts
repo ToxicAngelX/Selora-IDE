@@ -395,6 +395,21 @@ function reduceEvent(event: EventEnvelope): void {
         notify();
       }
       return;
+    case 'lsp_server_state_changed':
+      if (state.bootstrap) {
+        const next = payload.payload;
+        const servers = state.bootstrap.lsp_servers ?? [];
+        const index = servers.findIndex((server) => server.language === next.language);
+        state.bootstrap = {
+          ...state.bootstrap,
+          lsp_servers:
+            index >= 0
+              ? servers.map((server, at) => (at === index ? next : server))
+              : [...servers, next],
+        };
+        notify();
+      }
+      return;
     case 'git_status_changed':
       if (state.bootstrap) {
         state.bootstrap = { ...state.bootstrap, git: payload.payload };

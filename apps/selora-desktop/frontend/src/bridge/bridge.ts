@@ -97,6 +97,15 @@ export type CompletionItem = { label: string; detail: string | null; insert_text
 export type CompletionResult = { buffer_id: Id; items: CompletionItem[] };
 export type DefinitionLocation = { path: string; line: number; utf16_column: number };
 export type DefinitionResult = { buffer_id: Id; locations: DefinitionLocation[] };
+/** P1 — one language server's live lifecycle. */
+export type LspServerHealth = 'starting' | 'ready' | 'failed';
+export type LspServerState = {
+  language: string;
+  server: string;
+  state: LspServerHealth;
+  /** The truthful failure reason; only present when state is `failed`. */
+  error?: string | null;
+};
 
 export type BootstrapState = {
   protocol_version: number;
@@ -127,6 +136,9 @@ export type BootstrapState = {
     files?: { path: string; staged: boolean; worktree: boolean }[];
   };
   diagnostics: Diagnostic[];
+  /** P1: live language-server state (empty until the first file of a
+   * supported language opens). */
+  lsp_servers: LspServerState[];
   feature_flags: { agent: boolean; git: boolean; search: boolean; editor: boolean; later_slices: string[] };
   workflows?: WorkflowPersistedRun[];
 };
@@ -338,6 +350,7 @@ export type FrontendCommand =
   | { type: 'switch_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
   | { type: 'open_folder_at'; payload: { root: string } }
+  | { type: 'close_folder' }
   | { type: 'refresh_tree' }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
   | { type: 'save_buffer'; payload: { buffer_id: Id } }
@@ -346,6 +359,7 @@ export type FrontendCommand =
   | { type: 'hover_at'; payload: { buffer_id: Id; position: TextPosition } }
   | { type: 'definition_at'; payload: { buffer_id: Id; position: TextPosition } }
   | { type: 'completion_at'; payload: { buffer_id: Id; position: TextPosition } }
+  | { type: 'lsp_restart'; payload: { language: string } }
   | { type: 'search'; payload: { query: SearchQuery } }
   | { type: 'git_stage'; payload: { path: string } }
   | { type: 'git_unstage'; payload: { path: string } }
@@ -381,6 +395,7 @@ export type FrontendEvent =
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
+  | { type: 'lsp_server_state_changed'; payload: LspServerState }
   | { type: 'hover_result'; payload: HoverResult }
   | { type: 'completion_result'; payload: CompletionResult }
   | { type: 'definition_result'; payload: DefinitionResult }
@@ -535,6 +550,14 @@ export const pickFolder = (): Promise<string | null> => invoke<string | null>('p
 
 export const openFolderAt = (root: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'open_folder_at', payload: { root } }, ctx);
+
+/** P1: close the open folder (stops every language server). */
+export const closeFolder = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'close_folder' }, ctx);
+
+/** P1: restart one language server; status follows as an event. */
+export const restartLsp = (language: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'lsp_restart', payload: { language } }, ctx);
 
 export const openExternal = (url: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'open_external', payload: { url } }, ctx);

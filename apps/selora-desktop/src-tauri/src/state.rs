@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -312,6 +312,26 @@ fn settings_view(settings: &selora_settings::Settings) -> SettingsViewDto {
         // user's egui-side rebind carries into the web shell.
         keybind_command_palette: settings.keybinds.command_palette.clone(),
         keybind_toggle_chat: settings.keybinds.toggle_chat.clone(),
+    }
+}
+
+/// P1: the `lsp.*` settings as the registry consumes them. Empty path
+/// strings mean "resolve from PATH"; empty arg lists keep the built-in
+/// arguments (TypeScript's `--stdio`).
+fn lsp_server_paths(settings: &selora_settings::Settings) -> selora_lsp::LspServerPaths {
+    fn path(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+    selora_lsp::LspServerPaths {
+        rust_analyzer: path(&settings.lsp.rust_analyzer_path),
+        typescript_language_server: path(&settings.lsp.typescript_server_path),
+        rust_analyzer_args: settings.lsp.rust_analyzer_args.clone(),
+        typescript_language_server_args: settings.lsp.typescript_server_args.clone(),
+        enabled: settings.lsp.enabled,
     }
 }
 /// §3.4 (docs/ui/PHASE_Z2_ARCHITECTURE.md): keep the most recent 1024
@@ -1105,6 +1125,13 @@ pub struct DesktopState {
     /// Phase Z4b: the language-server bridge for the open workspace, created
     /// lazily on the first editor command (it needs an AppHandle to emit).
     lsp: Arc<Mutex<Option<LspBridge>>>,
+    /// The settings-fed LSP paths/args/enabled read at boot. A workspace
+    /// switch creates a fresh bridge from these, so the overrides are never
+    /// silently ignored.
+    lsp_paths: selora_lsp::LspServerPaths,
+    /// Incremented on every workspace switch/close. An event emitted by the
+    /// previous root's bridge is dropped before it reaches the event log.
+    lsp_epoch: Arc<AtomicU64>,
     /// Phase 8 wave 2: the live workflow runs, keyed by their `WorkflowRun`
     /// request id (the id `WorkflowStop`/`WorkflowDecision` name). One entry
     /// per accepted run; the worker removes its own entry on completion.
@@ -1205,6 +1232,7 @@ impl DesktopState {
     ) -> Self {
         let core_instance_id =
             CoreInstanceId::new(Uuid::new_v4().to_string()).expect("uuid is valid");
+        let lsp_paths = lsp_server_paths(&settings);
         Self {
             log: Arc::new(EventLog::new(core_instance_id)),
             settings: Arc::new(Mutex::new(settings_view(&settings))),
@@ -1220,6 +1248,8 @@ impl DesktopState {
             })),
             workspace: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
+            lsp_paths,
+            lsp_epoch: Arc::new(AtomicU64::new(0)),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             workflow_hosts: Arc::new(Mutex::new(
                 Arc::new(production_workflow_host) as WorkflowHostFactory
@@ -1243,6 +1273,9 @@ impl DesktopState {
     /// one thing for the whole app.
     fn attach_workspace(&self, root: PathBuf) -> Result<(), WorkspaceError> {
         let workspace = Workspace::open(root)?;
+        // The old root's servers must die before the new workspace becomes
+        // visible; `reset_lsp` also invalidates any event still in flight.
+        self.reset_lsp();
         self.sessions()
             .set_workspace_root(Some(workspace.root().to_path_buf()));
         *self
@@ -1250,6 +1283,46 @@ impl DesktopState {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(workspace);
         Ok(())
+    }
+
+    /// Close the open folder: no buffers, no language servers, no
+    /// diagnostics. The bootstrap then reports the no-workspace state.
+    fn detach_workspace(&self) {
+        self.reset_lsp();
+        self.sessions().set_workspace_root(None);
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    /// Invalidate and drop the language-server bridge. The epoch bump makes
+    /// any event the old manager already queued a no-op.
+    fn reset_lsp(&self) {
+        self.lsp_epoch.fetch_add(1, Ordering::SeqCst);
+        let previous = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(bridge) = previous {
+            bridge.shutdown();
+        }
+    }
+
+    /// The live bridge's diagnostics and server states (empty before the
+    /// first editor command started it).
+    fn lsp_snapshot(
+        &self,
+    ) -> (
+        Vec<selora_protocol::DiagnosticDto>,
+        Vec<selora_protocol::LspServerStateDto>,
+    ) {
+        let guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+        match guard.as_ref() {
+            Some(bridge) => (bridge.diagnostics(), bridge.server_states()),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 
     /// Map a workspace-service failure onto the wire error shape.
@@ -1318,20 +1391,64 @@ impl DesktopState {
         app: &tauri::AppHandle<R>,
         action: impl FnOnce(&LspBridge),
     ) {
-        let Some(root) = self.workspace_root_path() else {
-            return;
-        };
-        let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
-        if guard.is_none() {
-            let log = Arc::clone(&self.log);
-            let app_handle = app.clone();
-            let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
-                log.record(&app_handle, event, None);
-            });
-            *guard = Some(LspBridge::start(root, emit));
+        let _ = self.with_lsp_result(app, action);
+    }
+
+    /// [`Self::with_lsp`] with a value. `None` means no workspace was open.
+    fn with_lsp_result<R: tauri::Runtime, T>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        action: impl FnOnce(&LspBridge) -> T,
+    ) -> Option<T> {
+        // A concurrent OpenFolderAt/CloseFolder can race this lazy start.
+        // Re-check the root and epoch under the bridge lock: once we hold it,
+        // `reset_lsp` cannot run, so a bridge we create here belongs to the
+        // workspace the shell currently reports.
+        for _ in 0..3 {
+            let root = self.workspace_root_path()?;
+            let started_at = self.lsp_epoch.load(Ordering::SeqCst);
+            let mut guard = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
+            if self.workspace_root_path().as_ref() != Some(&root)
+                || self.lsp_epoch.load(Ordering::SeqCst) != started_at
+            {
+                continue;
+            }
+            if guard.is_none() {
+                let log = Arc::clone(&self.log);
+                let app_handle = app.clone();
+                let epoch = Arc::clone(&self.lsp_epoch);
+                let emit: crate::lsp_bridge::Emit = Arc::new(move |event| {
+                    // A bridge from a workspace that has since been switched or
+                    // closed must not record anything against the new epoch.
+                    if epoch.load(Ordering::SeqCst) != started_at {
+                        return;
+                    }
+                    log.record(&app_handle, event, None);
+                });
+                *guard = Some(LspBridge::start_with_paths(
+                    root.clone(),
+                    emit,
+                    self.lsp_paths.clone(),
+                ));
+            }
+            return guard.as_ref().map(action);
         }
-        if let Some(bridge) = guard.as_ref() {
-            action(bridge);
+        None
+    }
+
+    /// Restart one language server for the open workspace.
+    fn restart_lsp<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        language: &str,
+    ) -> Result<selora_protocol::LspServerStateDto, ProtocolErrorDto> {
+        match self.with_lsp_result(app, |bridge| bridge.restart(language)) {
+            Some(result) => result,
+            None => Err(ProtocolErrorDto {
+                code: "no_workspace".into(),
+                message: "Open a folder first.".into(),
+                retryable: false,
+            }),
         }
     }
 
@@ -1504,6 +1621,8 @@ impl DesktopState {
             .workspace_root_path()
             .map(|root| persisted_workflow_runs(&root))
             .unwrap_or_default();
+        // P1: the live bridge store, never a hard-coded empty vector.
+        let (diagnostics, lsp_servers) = self.lsp_snapshot();
         BootstrapState {
             workflows,
             protocol_version: PROTOCOL_VERSION,
@@ -1530,7 +1649,8 @@ impl DesktopState {
             // literal.
             layout_constraints: LayoutConstraintsDto::from_constants(),
             git,
-            diagnostics: Vec::new(),
+            diagnostics,
+            lsp_servers,
             feature_flags: selora_protocol::FeatureFlagsDto {
                 agent: true,
                 git: true,
@@ -1740,6 +1860,16 @@ impl DesktopState {
                 );
                 Ok(snapshot)
             }
+            FrontendCommand::CloseFolder => {
+                self.detach_workspace();
+                let snapshot = self.bootstrap();
+                self.record_event(
+                    app,
+                    FrontendEvent::BootstrapState(Box::new(snapshot.clone())),
+                    Some(request_id),
+                );
+                Ok(snapshot)
+            }
             FrontendCommand::RefreshTree => {
                 let tree = self.with_workspace(|workspace| workspace.tree())?;
                 self.record_event(app, FrontendEvent::FileTreeChanged(tree), Some(request_id));
@@ -1847,6 +1977,10 @@ impl DesktopState {
                 self.request_lsp(app, &buffer_id, |bridge, absolute| {
                     bridge.completion(absolute, position)
                 });
+                Ok(self.bootstrap())
+            }
+            FrontendCommand::LspRestart { language } => {
+                self.restart_lsp(app, &language)?;
                 Ok(self.bootstrap())
             }
             FrontendCommand::Search { query } => {
@@ -5200,5 +5334,176 @@ mod tests {
     fn desktop_state_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<DesktopState>();
+    }
+
+    // -- P1 LSP lifecycle --------------------------------------------------
+
+    fn lsp_diagnostic(message: &str) -> selora_lsp::LspDiagnostic {
+        let position = selora_lsp::LspPosition {
+            line: 1,
+            character: 2,
+        };
+        selora_lsp::LspDiagnostic {
+            range: selora_lsp::LspRange {
+                start: position,
+                end: position,
+            },
+            severity: selora_lsp::LspSeverity::Error,
+            source: Some("rust-analyzer".into()),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn lsp_settings_paths_args_and_enabled_are_applied() {
+        let mut settings = selora_settings::Settings::default();
+        settings.lsp.rust_analyzer_path = Some("  C:/tools/rust-analyzer.exe  ".into());
+        settings.lsp.typescript_server_path = Some("   ".into());
+        settings.lsp.rust_analyzer_args = vec!["--log-file".into(), "ra.log".into()];
+        settings.lsp.typescript_server_args = vec!["--stdio".into()];
+        settings.lsp.enabled = false;
+
+        let paths = lsp_server_paths(&settings);
+        assert_eq!(
+            paths.rust_analyzer.as_deref(),
+            Some("C:/tools/rust-analyzer.exe"),
+            "path overrides are trimmed and applied"
+        );
+        assert_eq!(paths.typescript_language_server, None, "blank means PATH");
+        assert_eq!(
+            paths.rust_analyzer_args,
+            vec!["--log-file".to_owned(), "ra.log".to_owned()]
+        );
+        assert_eq!(
+            paths.typescript_language_server_args,
+            vec!["--stdio".to_owned()]
+        );
+        assert!(!paths.enabled, "the master switch is carried through");
+    }
+
+    #[test]
+    fn workspace_switch_drops_the_bridge_and_bumps_the_epoch() {
+        let app = mock_app_handle();
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(first.path().to_path_buf())
+            .expect("open first");
+        state.with_lsp(&app, |_bridge| {});
+        assert!(
+            state.lsp.lock().expect("lsp lock").is_some(),
+            "first workspace started a bridge"
+        );
+        let epoch = state.lsp_epoch.load(Ordering::SeqCst);
+
+        state
+            .attach_workspace(second.path().to_path_buf())
+            .expect("switch workspace");
+        assert!(
+            state.lsp.lock().expect("lsp lock").is_none(),
+            "the old root's bridge is dropped, not reused"
+        );
+        assert_eq!(
+            state.lsp_epoch.load(Ordering::SeqCst),
+            epoch + 1,
+            "stale events from the old root are invalidated"
+        );
+        let second_root = std::fs::canonicalize(second.path())
+            .expect("canonicalize second")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            state.bootstrap().workspace.root.as_deref(),
+            Some(second_root.as_str())
+        );
+    }
+
+    #[test]
+    fn close_folder_clears_the_workspace_lsp_and_diagnostics() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+        state.with_lsp(&app, |bridge| {
+            bridge.inject_diagnostics(
+                dir.path().join("src").join("main.rs"),
+                vec![lsp_diagnostic("live finding")],
+            );
+        });
+        assert_eq!(state.bootstrap().diagnostics.len(), 1);
+
+        let snapshot = state
+            .dispatch(&app, envelope(&state, FrontendCommand::CloseFolder))
+            .expect("close folder");
+        assert_eq!(snapshot.workspace.root, None);
+        assert!(snapshot.diagnostics.is_empty(), "diagnostics are retracted");
+        assert!(snapshot.lsp_servers.is_empty());
+        assert!(state.lsp.lock().expect("lsp lock").is_none());
+        assert_eq!(
+            state.bootstrap().workspace.display_name,
+            "No workspace open"
+        );
+    }
+
+    #[test]
+    fn bootstrap_diagnostics_come_from_the_live_bridge_store() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+        state.with_lsp(&app, |bridge| {
+            bridge.inject_diagnostics(
+                dir.path().join("src").join("main.rs"),
+                vec![lsp_diagnostic("live finding")],
+            );
+        });
+
+        let snapshot = state.bootstrap();
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].path.as_str(), "src/main.rs");
+        assert!(snapshot.diagnostics[0].message.contains("live finding"));
+    }
+
+    #[test]
+    fn lsp_restart_is_a_typed_error_when_settings_disable_servers() {
+        let app = mock_app_handle();
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut settings = selora_settings::Settings::default();
+        settings.lsp.enabled = false;
+        let state = DesktopState::with_settings(settings);
+        state
+            .attach_workspace(dir.path().to_path_buf())
+            .expect("open");
+
+        let error = state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::LspRestart {
+                        language: "rust".into(),
+                    },
+                ),
+            )
+            .expect_err("disabled servers cannot restart");
+        assert_eq!(error.code, "lsp_disabled");
+        assert!(!error.retryable);
+
+        let snapshot = state.bootstrap();
+        assert_eq!(snapshot.lsp_servers.len(), 1);
+        assert_eq!(
+            snapshot.lsp_servers[0].state,
+            selora_protocol::LspServerHealth::Failed
+        );
+        assert!(snapshot.lsp_servers[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("disabled"));
     }
 }

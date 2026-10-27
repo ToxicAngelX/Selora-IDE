@@ -67,11 +67,27 @@ pub struct ServerSpec {
 }
 
 /// The settings-fed overrides (`lsp.*`): `None` means "resolve the default
-/// binary name from PATH".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// binary name from PATH". A non-empty `*_args` list replaces the built-in
+/// arguments; `enabled == false` disables every language server.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspServerPaths {
     pub rust_analyzer: Option<String>,
     pub typescript_language_server: Option<String>,
+    pub rust_analyzer_args: Vec<String>,
+    pub typescript_language_server_args: Vec<String>,
+    pub enabled: bool,
+}
+
+impl Default for LspServerPaths {
+    fn default() -> Self {
+        Self {
+            rust_analyzer: None,
+            typescript_language_server: None,
+            rust_analyzer_args: Vec::new(),
+            typescript_language_server_args: Vec::new(),
+            enabled: true,
+        }
+    }
 }
 
 /// Language → server resolution.
@@ -106,10 +122,20 @@ impl LspRegistry {
         self.custom.insert(language, spec);
     }
 
+    /// Whether the settings master switch allows language servers at all.
+    /// A disabled registry resolves nothing, and the manager must not emit a
+    /// misleading "server missing" toast for that case.
+    pub fn enabled(&self) -> bool {
+        self.paths.enabled
+    }
+
     /// The server command for a language, or `None` when no executable was
     /// found (the app shows "install it or set the path in settings",
     /// ARCHITECTURE.md §5.3).
     pub fn resolve(&self, language: LanguageId) -> Option<ServerSpec> {
+        if !self.paths.enabled {
+            return None;
+        }
         if let Some(spec) = self.custom.get(&language) {
             return Some(spec.clone());
         }
@@ -118,12 +144,14 @@ impl LspRegistry {
                 "rust-analyzer",
                 &[],
                 self.paths.rust_analyzer.as_deref(),
+                &self.paths.rust_analyzer_args,
                 self,
             ),
             LanguageId::TypeScript | LanguageId::JavaScript => resolve_server(
                 "typescript-language-server",
                 &["--stdio"],
                 self.paths.typescript_language_server.as_deref(),
+                &self.paths.typescript_language_server_args,
                 self,
             ),
         }
@@ -139,8 +167,9 @@ impl LspRegistry {
 
 fn resolve_server(
     default_name: &str,
-    args: &[&str],
+    default_args: &[&str],
     override_path: Option<&str>,
+    override_args: &[String],
     registry: &LspRegistry,
 ) -> Option<ServerSpec> {
     let program = match override_path {
@@ -148,10 +177,15 @@ fn resolve_server(
         // Default: PATH lookup (ARCHITECTURE.md §5.3).
         None => registry.find(default_name)?,
     };
+    let args = if override_args.is_empty() {
+        default_args.iter().map(|arg| (*arg).to_owned()).collect()
+    } else {
+        override_args.to_vec()
+    };
     Some(ServerSpec {
         name: default_name.to_owned(),
         program,
-        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        args,
     })
 }
 
@@ -294,6 +328,7 @@ mod tests {
         let registry = LspRegistry::new(LspServerPaths {
             rust_analyzer: Some("C:/tools/rust-analyzer.exe".into()),
             typescript_language_server: None,
+            ..LspServerPaths::default()
         })
         .with_search_dirs(vec![]);
         let spec = registry.resolve(LanguageId::Rust).expect("resolved");
@@ -302,6 +337,46 @@ mod tests {
         assert!(spec.args.is_empty());
         // TS with no override and no PATH dirs: not found.
         assert_eq!(registry.resolve(LanguageId::TypeScript), None);
+    }
+
+    #[test]
+    fn settings_args_replace_defaults_and_the_master_switch_disables() {
+        let registry = LspRegistry::new(LspServerPaths {
+            rust_analyzer: Some("C:/tools/rust-analyzer.exe".into()),
+            typescript_language_server: Some("C:/tools/tsserver.cmd".into()),
+            rust_analyzer_args: vec!["--log-file".into(), "ra.log".into()],
+            typescript_language_server_args: vec![
+                "--stdio".into(),
+                "--log-level".into(),
+                "4".into(),
+            ],
+            enabled: true,
+        })
+        .with_search_dirs(vec![]);
+        let rust = registry.resolve(LanguageId::Rust).expect("rust");
+        assert_eq!(
+            rust.args,
+            vec!["--log-file".to_owned(), "ra.log".to_owned()]
+        );
+        let ts = registry.resolve(LanguageId::TypeScript).expect("ts");
+        assert_eq!(
+            ts.args,
+            vec![
+                "--stdio".to_owned(),
+                "--log-level".to_owned(),
+                "4".to_owned()
+            ]
+        );
+
+        let disabled = LspRegistry::new(LspServerPaths {
+            rust_analyzer: Some("C:/tools/rust-analyzer.exe".into()),
+            enabled: false,
+            ..LspServerPaths::default()
+        })
+        .with_search_dirs(vec![]);
+        assert!(!disabled.enabled());
+        assert_eq!(disabled.resolve(LanguageId::Rust), None);
+        assert_eq!(disabled.resolve(LanguageId::TypeScript), None);
     }
 
     #[test]

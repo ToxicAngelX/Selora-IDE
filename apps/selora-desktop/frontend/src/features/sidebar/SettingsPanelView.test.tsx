@@ -4,10 +4,12 @@ import { makeBootstrap } from '../../testing/fixtures';
 
 const harness = vi.hoisted(() => ({
   updateSettings: vi.fn(),
+  restartLsp: vi.fn(),
 }));
 
 vi.mock('../../bridge/bridge', () => ({
   updateSettings: harness.updateSettings,
+  restartLsp: harness.restartLsp,
 }));
 
 import { SettingsPanelView } from './SettingsPanelView';
@@ -16,6 +18,7 @@ describe('SettingsPanelView persistence wiring', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     harness.updateSettings.mockResolvedValue(undefined);
+    harness.restartLsp.mockResolvedValue(undefined);
   });
 
   it('sends supported toggle changes through the bridge with the bootstrap context', async () => {
@@ -187,5 +190,34 @@ describe('SettingsPanelView persistence wiring', () => {
     expect(Array.from(accent.options).map((option) => option.value)).toEqual(['']);
     expect(screen.queryByText(/emerald/i)).toBeNull();
     expect(screen.queryByText(/22c55e/i)).toBeNull();
+  });
+
+  it('shows the truthful LSP state and restarts a server through the bridge', async () => {
+    const bootstrap = makeBootstrap({
+      lsp_servers: [
+        { language: 'rust', server: 'rust-analyzer', state: 'ready' },
+        {
+          language: 'typescript',
+          server: 'typescript-language-server',
+          state: 'failed',
+          error: 'spawn failed: not found',
+        },
+      ],
+    });
+    render(<SettingsPanelView bootstrap={bootstrap} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Editor' }));
+
+    expect(screen.getByTestId('lsp-state-rust').textContent).toContain('ready');
+    expect(screen.getByTestId('lsp-state-typescript').textContent).toContain(
+      'failed: spawn failed: not found',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restart rust-analyzer' }));
+    await waitFor(() =>
+      expect(harness.restartLsp).toHaveBeenCalledWith(
+        'rust',
+        expect.objectContaining({ core_instance_id: 'core-0001' }),
+      ),
+    );
   });
 });
