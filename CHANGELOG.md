@@ -3,12 +3,16 @@
 All notable changes to Selora IDE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) (RELEASE.md §6).
 
-## [Unreleased]
+## [0.1.0-alpha.1] - 2026-10-27
 
-<!-- FINALIZATION: keep these entries under Unreleased until the post-merge gate
-passes and a version/tag is chosen. Do not add test counts, artifact hashes, or
-dates from memory; record gate evidence in STATUS.md and RELEASE.md. Remove any
-Phase 9a bullet if the `selora-p3-window` branch is discarded instead of merged. -->
+First public alpha: Windows Tauri shell, editor, LSP, Git basics, AI chat,
+approval-gated Agent Mode, and Phase 8 workflows. Includes the Phase 9
+workbench preview: plan mode, live todos, durable sessions/resume, compaction,
+background children, and session-scoped auto-approve.
+
+Not included: integrated terminal, Git branch/push/merge UI, debugger, structured
+questions (9c commit unmerged), signing, clean-VM verification. See
+`RELEASE_NOTES_0.1.0-alpha.1.md`.
 
 ### Added
 

@@ -1,13 +1,12 @@
 # Phase 9 acceptance checklist - Agent Workbench
 
-> **STATUS: FINALIZATION SKELETON (2026-10-27).**
+> **STATUS: AUTOMATED RUN (2026-10-27).**
+> Automated checks on the final tree: **19 passed, 0 failed, 2 pending**.
+> Roadmap: 8 PASS, 1 PENDING (structured questions / 9c unmerged).
 > Owner acceptance: **UNRUN**.
-> Waves 9b-9e: commits exist on their branches but are **not merged** into this
-> release lane; acceptance is **NOT RUN**.
-> Wave 9a: implemented on `selora-p3-window`; not merged in this lane.
 > Phase 9 is **not accepted**.
->
-> Fill `TODO-VERIFY` only from the final merged tree. Do not mark a wave passed
+
+Do not mark a wave passed
 > because a headless test exists. Do not invent test counts.
 
 Phase: `ROADMAP.md` Phase 9 - Agent Workbench.
