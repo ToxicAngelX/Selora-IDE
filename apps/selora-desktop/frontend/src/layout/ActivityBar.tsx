@@ -137,11 +137,17 @@ export function ActivityBar({ viewMode, onSelectViewMode, bootstrap: initialBoot
 
   const handleActivityClick = (surface: SurfaceId) => {
     if (surface === 'agent') {
-      // Phase 9a: the Agent activity opens the dedicated full-height workbench,
-      // not the narrow split dock. The editor/split switch lives in the dock
-      // header (and the title bar), so leaving is always one explicit click.
-      onSelectViewMode?.('agent');
-      if (!layout.agent_dock_open) void layoutStore.toggle('agent');
+      // One click opens or focuses the Agent workbench; it never closes the
+      // dock. The shell's view-mode handler opens a closed dock and selects
+      // the agent view, so asking it first and toggling again here would
+      // close the dock in the same click (the old split-then-toggle bug).
+      // Without a handler (an isolated bar), only a closed dock is opened —
+      // closing stays with the title-bar and status pills.
+      if (onSelectViewMode) {
+        onSelectViewMode('agent');
+      } else if (!layout.agent_dock_open) {
+        void layoutStore.toggle('agent');
+      }
     } else if (surface === 'settings') {
       void layoutStore.toggle('settings');
     } else {

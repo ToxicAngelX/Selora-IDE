@@ -263,6 +263,40 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
     await act(async () => {});
   });
 
+  it('one Agent activity click opens and selects the agent view without closing it', async () => {
+    const { container } = renderShell(makeLayout({ agent_dock_open: false }));
+    // The agent composer has its own mode buttons named "Agent"; scope the
+    // activity query to the bar so the dock's controls cannot shadow it.
+    const bar = container.querySelector<HTMLElement>('.activitybar')!;
+    const agentActivity = () => within(bar).getByRole('button', { name: 'Agent' });
+    expect(agentActivity().getAttribute('aria-pressed')).toBe('false');
+
+    const toggle = vi.spyOn(layoutStore, 'toggle');
+    fireEvent.click(agentActivity());
+
+    // Exactly one toggle, not the old split-then-close pair.
+    expect(toggle).toHaveBeenCalledTimes(1);
+    expect(toggle).toHaveBeenCalledWith('agent');
+    toggle.mockRestore();
+
+    act(() => {
+      layoutStore.applyLayoutEvent(makeLayout({ agent_dock_open: true }));
+    });
+    await waitFor(() => expect(container.querySelector('.agent-dock-slot')).not.toBeNull());
+    const workbench = container.querySelector<HTMLElement>('.workbench');
+    expect(workbench!.getAttribute('data-agent-open')).toBe('true');
+    expect(workbench!.getAttribute('data-view-mode')).toBe('agent');
+    expect(agentActivity().getAttribute('aria-pressed')).toBe('true');
+
+    // Clicking the already-open activity focuses the agent view; it never
+    // sends the close toggle that the status pill owns.
+    const again = vi.spyOn(layoutStore, 'toggle');
+    fireEvent.click(agentActivity());
+    expect(again).not.toHaveBeenCalled();
+    again.mockRestore();
+    await act(async () => {});
+  });
+
   it('workbench carries data attributes for open states and responds to agent view mode', async () => {
     const { container, getByRole } = renderShell(
       makeLayout({ primary_sidebar_open: false, agent_dock_open: true, bottom_dock_open: false })

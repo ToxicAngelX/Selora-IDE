@@ -16,6 +16,7 @@ import {
 } from '../../components/icons';
 import { buildCommandList, commandCategory } from '../keymap/commands';
 import { canonicalKeybind, parseKeybind } from '../keymap/keybind';
+import { THEME_OPTIONS, normalizeThemeValue } from '../theme/theme';
 
 export interface SettingsPanelViewProps {
   bootstrap: BootstrapState;
@@ -56,6 +57,10 @@ const KEYBIND_FIELDS: Array<{ key: KeybindDraftKey; label: string; command: stri
   { key: 'keybind_command_palette', label: 'Command Palette', command: 'Open Command Palette' },
   { key: 'keybind_toggle_chat', label: 'Toggle Agent Dock', command: 'Toggle Agent Dock' },
 ];
+
+/** For values that do persist in settings.json but have no settings-wire exposure. */
+const unexposedTitle = (label: string): string =>
+  `${label} is stored in settings.json, but this build's settings protocol does not expose it. This value is read-only; changes are not saved.`;
 
 function formatError(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -175,9 +180,7 @@ const restartServer = (language: string): void => {
     );
   }, [keybindingList, keybindQuery]);
 
-  const themeValue = (THEME_VALUES as readonly string[]).includes(settings.theme)
-    ? settings.theme
-    : 'selora-dark';
+  const themeValue = normalizeThemeValue(settings.theme);
 
   // The active model is the only model fact the bridge exposes. When the
   // bootstrap has one, show it read-only; never substitute a placeholder id.
@@ -297,7 +300,7 @@ const restartServer = (language: string): void => {
                 title={
                   activeModel
                     ? 'The active model is reported by the connected gateway and cannot be changed in this build.'
-                    : unsupportedTitle('Model selection')
+                    : 'No active model is reported by the gateway. This build has no model-selection control, so changes are not saved.'
                 }
               >
                 <option value="">—</option>
@@ -500,10 +503,11 @@ const restartServer = (language: string): void => {
                 value={themeValue}
                 onChange={(e) => persist({ theme: e.target.value })}
               >
-                <option value="selora-dark">Selora Cosmic Dark</option>
-                <option value="dark">Dark (alias)</option>
-                <option value="space-black">True Black (OLED)</option>
-                <option value="light">Selora Moonlight (Light)</option>
+                {THEME_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </div>
 

@@ -76,6 +76,8 @@ const BOOTSTRAP = makeBootstrap({ snapshot_sequence: 2 });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  delete document.documentElement.dataset.theme;
+  delete document.documentElement.dataset.reducedMotion;
   getBootstrapStateMock.mockResolvedValue(BOOTSTRAP);
   getEventsAfterMock.mockResolvedValue([]);
 });
@@ -89,6 +91,47 @@ describe('bootstrap and replay (ARCHITECTURE §3.4)', () => {
     expect(h.layoutStore.getSnapshot().hydrated).toBe(true);
     expect(h.layoutStore.getSnapshot().layout).toEqual(makeLayout());
     expect(getEventsAfterMock).toHaveBeenCalledWith(0);
+  });
+
+  it('applies the persisted theme and reduced-motion flag at bootstrap', async () => {
+    getBootstrapStateMock.mockResolvedValue(
+      makeBootstrap({
+        settings: {
+          reduced_motion: true,
+          theme: 'light',
+          keybind_command_palette: 'Ctrl+Shift+P',
+          keybind_toggle_chat: 'Ctrl+L',
+        },
+      }),
+    );
+    const h = await freshHarness();
+    await h.startApp();
+
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(document.documentElement.dataset.reducedMotion).toBe('true');
+  });
+
+  it('switches theme live when a bootstrap_state event lands', async () => {
+    const h = await freshHarness();
+    await h.startApp();
+    expect(document.documentElement.dataset.theme).toBe('dark');
+
+    h.emit(
+      makeEvent(1, {
+        type: 'bootstrap_state',
+        payload: makeBootstrap({
+          settings: {
+            reduced_motion: false,
+            theme: 'light',
+            keybind_command_palette: 'Ctrl+Shift+P',
+            keybind_toggle_chat: 'Ctrl+L',
+          },
+        }),
+      }),
+    );
+
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(document.documentElement.dataset.reducedMotion).toBeUndefined();
   });
 
   it('replays the boot toast through the null-seeded gate', async () => {

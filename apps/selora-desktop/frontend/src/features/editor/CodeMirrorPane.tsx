@@ -5,7 +5,7 @@
 // converted into protocol TextChange records and sent with a monotonically
 // increasing local version; protocol echoes are applied without being sent
 // back, and selection changes are debounced before leaving the webview.
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import {
   Annotation,
   Compartment,
@@ -57,6 +57,7 @@ import {
 import { getAppSnapshot, subscribeApp } from '../../app/app-store';
 import { keybindMatches, parseKeybind } from '../keymap/keybind';
 import { createSeloraTheme } from './cm-theme';
+import { createSeloraTheme, currentTheme } from './cm-theme';
 import {
   currentEditorContext,
   editorStore,
@@ -287,8 +288,8 @@ export function CodeMirrorPane({
   const diagnosticsCompartment = useRef(new Compartment());
   const editorPreferencesCompartment = useRef(new Compartment());
   const saveKeymapCompartment = useRef(new Compartment());
+  const themeCompartment = useRef(new Compartment());
   const diagnosticsRef = useRef<readonly Diagnostic[]>(EMPTY_DIAGNOSTICS);
-  const cmTheme = useMemo(() => createSeloraTheme(), []);
 
   bufferRef.current = buffer;
   onScrollRef.current = onScroll;
@@ -547,6 +548,7 @@ export function CodeMirrorPane({
         editorPreferencesExtension(settingsRef.current),
       ),
       saveKeymapCompartment.current.of(saveKeymapExtension(settingsRef.current)),
+      themeCompartment.current.of(createSeloraTheme()),
       EditorView.updateListener.of(handleUpdate),
     ];
 
@@ -595,7 +597,7 @@ export function CodeMirrorPane({
       view.destroy();
       viewRef.current = null;
     };
-  }, [cmTheme]);
+  }, []);
 
   useEffect(
     () =>
@@ -607,6 +609,29 @@ export function CodeMirrorPane({
       }),
     [],
   );
+
+  // A theme switch is a live reconfiguration, not an editor rebuild: the CSS
+  // variables repaint the chrome, and this swaps CodeMirror's `dark` flag so
+  // its built-in affordances match the selected palette.
+  useEffect(() => {
+    if (typeof MutationObserver === 'undefined') return;
+    let theme = currentTheme();
+    const observer = new MutationObserver(() => {
+      const next = currentTheme();
+      if (next === theme) return;
+      theme = next;
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({
+        effects: themeCompartment.current.reconfigure(createSeloraTheme(next)),
+      });
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme'],
+    });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const readDiagnostics = (): readonly Diagnostic[] =>

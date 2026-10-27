@@ -1,81 +1,31 @@
 // Selora IDE — Phase Z4 CodeMirror theme.
 //
-// Every color is read from the design-token layer at runtime (`tokens.css`),
-// with the same values mirrored in a fallback map for tests and for the first
-// paint before the stylesheet resolves. Syntax colors use the existing
-// monochrome `--syn-*` ramp; this file introduces no palette of its own.
+// The editor reads the design-token layer at paint time by referencing CSS
+// custom properties directly. That makes the theme a real token remap: when
+// the root flips to `data-theme="light"`, CodeMirror repaints from the light
+// palette with no duplicated color table and no filter.
 import type { Extension } from '@codemirror/state';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { EditorView } from '@codemirror/view';
 import { tags } from '@lezer/highlight';
+import { resolveTheme, type ResolvedTheme } from '../theme/theme';
 
-export const TOKEN_FALLBACKS: Readonly<Record<string, string>> = {
-  '--ink-canvas': '#000000',
-  '--ink-faint': '#0a0a0a',
-  '--ink-low': '#141414',
-  '--ink-mid': '#1f1f1f',
-  '--ink-hi': '#2a2a2a',
-  '--ink-rule': '#3a3a3a',
-  '--fg-default': '#e5e5e5',
-  '--fg-muted': '#8a8a8a',
-  '--fg-faint': '#5a5a5a',
-  '--fg-disabled': '#3a3a3a',
-  '--syn-default': '#e5e5e5',
-  '--syn-keyword': '#cfcfcf',
-  '--syn-fn': '#ffffff',
-  '--syn-type': '#b8b8b8',
-  '--syn-string': '#9a9a9a',
-  '--syn-number': '#d0d0d0',
-  '--syn-comment': '#5a5a5a',
-  '--syn-punct': '#8a8a8a',
-  '--syn-var': '#e5e5e5',
-  '--syn-attr': '#a8a8a8',
-  '--err': '#dc2626',
-  '--hairline-faint': 'rgba(255, 255, 255, 0.07)',
-  '--hairline-active': 'rgba(255, 255, 255, 0.16)',
-  '--glow-accent': 'rgba(255, 255, 255, 0.08)',
-  '--surface-hover': '#1d1d27',
-};
+const token = (name: string): string => `var(${name})`;
 
-export function tokenValue(name: string): string {
-  const fallback = TOKEN_FALLBACKS[name] ?? '';
-  if (typeof document === 'undefined') return fallback;
-  const computed = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return computed || fallback;
+/** The palette currently reflected on the document root. */
+export function currentTheme(): ResolvedTheme {
+  if (typeof document === 'undefined') return 'dark';
+  return resolveTheme(document.documentElement.dataset.theme);
 }
 
-export function createSeloraTheme(): Extension {
-  const inkCanvas = tokenValue('--ink-canvas');
-  const inkFaint = tokenValue('--ink-faint');
-  const inkLow = tokenValue('--ink-low');
-  const inkMid = tokenValue('--ink-mid');
-  const inkHi = tokenValue('--ink-hi');
-  const inkRule = tokenValue('--ink-rule');
-  const fgDefault = tokenValue('--fg-default');
-  const fgMuted = tokenValue('--fg-muted');
-  const fgFaint = tokenValue('--fg-faint');
-  const synDefault = tokenValue('--syn-default');
-  const synKeyword = tokenValue('--syn-keyword');
-  const synFn = tokenValue('--syn-fn');
-  const synType = tokenValue('--syn-type');
-  const synString = tokenValue('--syn-string');
-  const synNumber = tokenValue('--syn-number');
-  const synComment = tokenValue('--syn-comment');
-  const synPunct = tokenValue('--syn-punct');
-  const synAttr = tokenValue('--syn-attr');
-  const synVar = tokenValue('--syn-var');
-  const err = tokenValue('--err');
-  const hairlineFaint = tokenValue('--hairline-faint');
-  const hairlineActive = tokenValue('--hairline-active');
-  const glowAccent = tokenValue('--glow-accent');
-
+export function createSeloraTheme(theme: ResolvedTheme = currentTheme()): Extension {
   const baseTheme = EditorView.theme(
     {
       '&': {
         height: '100%',
         minWidth: '0',
-        backgroundColor: inkCanvas,
-        color: fgDefault,
+        backgroundColor: token('--ink-canvas'),
+        color: token('--fg-default'),
       },
       '&.cm-focused': {
         outline: 'none',
@@ -87,51 +37,51 @@ export function createSeloraTheme(): Extension {
         overflow: 'auto',
       },
       '.cm-content': {
-        caretColor: fgDefault,
+        caretColor: token('--fg-default'),
         padding: '12px 0 60px',
       },
       '.cm-line': {
         paddingLeft: '8px',
       },
       '.cm-gutters': {
-        backgroundColor: inkCanvas,
-        color: fgFaint,
+        backgroundColor: token('--ink-canvas'),
+        color: token('--fg-faint'),
         border: 'none',
-        borderRight: `1px solid ${inkHi}`,
+        borderRight: `1px solid ${token('--ink-hi')}`,
       },
       '.cm-lineNumbers .cm-gutterElement': {
         padding: '0 12px 0 8px',
         minWidth: '42px',
       },
       '.cm-activeLine': {
-        backgroundColor: hairlineFaint,
+        backgroundColor: token('--hairline-faint'),
       },
       '.cm-activeLineGutter': {
         backgroundColor: 'transparent',
-        color: fgDefault,
+        color: token('--fg-default'),
       },
       '.cm-foldGutter .cm-gutterElement': {
-        color: fgFaint,
+        color: token('--fg-faint'),
         padding: '0 2px',
       },
       '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
-        backgroundColor: hairlineActive,
+        backgroundColor: token('--hairline-active'),
       },
       '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': {
-        backgroundColor: hairlineActive,
+        backgroundColor: token('--hairline-active'),
       },
       '.cm-cursor, .cm-dropCursor': {
-        borderLeftColor: fgDefault,
+        borderLeftColor: token('--fg-default'),
         borderLeftWidth: '2px',
       },
       '.cm-panels': {
-        backgroundColor: inkLow,
-        color: fgDefault,
-        borderTop: `1px solid ${inkHi}`,
+        backgroundColor: token('--ink-low'),
+        color: token('--fg-default'),
+        borderTop: `1px solid ${token('--ink-hi')}`,
       },
       '.cm-panels.cm-panels-top': {
         borderTop: 'none',
-        borderBottom: `1px solid ${inkHi}`,
+        borderBottom: `1px solid ${token('--ink-hi')}`,
       },
       '.cm-panel.cm-search': {
         fontFamily: 'var(--font-sans)',
@@ -141,61 +91,61 @@ export function createSeloraTheme(): Extension {
       '.cm-panel.cm-search input, .cm-panel.cm-search button, .cm-panel.cm-search label': {
         fontFamily: 'var(--font-sans)',
         fontSize: 'var(--type-sm)',
-        color: fgDefault,
+        color: token('--fg-default'),
       },
       '.cm-textfield': {
-        backgroundColor: inkMid,
-        border: `1px solid ${inkHi}`,
+        backgroundColor: token('--ink-mid'),
+        border: `1px solid ${token('--ink-hi')}`,
         borderRadius: 'var(--radius-1)',
-        color: fgDefault,
+        color: token('--fg-default'),
         padding: '3px 6px',
       },
       '.cm-button': {
-        backgroundColor: inkMid,
+        backgroundColor: token('--ink-mid'),
         backgroundImage: 'none',
-        border: `1px solid ${inkHi}`,
+        border: `1px solid ${token('--ink-hi')}`,
         borderRadius: 'var(--radius-1)',
-        color: fgDefault,
+        color: token('--fg-default'),
         padding: '3px 8px',
       },
       '.cm-button:hover': {
-        backgroundColor: inkHi,
+        backgroundColor: token('--ink-hi'),
       },
       '.cm-searchMatch': {
-        backgroundColor: glowAccent,
-        outline: `1px solid ${inkRule}`,
+        backgroundColor: token('--glow-accent'),
+        outline: `1px solid ${token('--ink-rule')}`,
       },
       '.cm-searchMatch.cm-searchMatch-selected': {
-        backgroundColor: hairlineActive,
-        outline: `1px solid ${fgFaint}`,
+        backgroundColor: token('--hairline-active'),
+        outline: `1px solid ${token('--fg-faint')}`,
       },
       '.cm-tooltip': {
-        backgroundColor: inkMid,
-        border: `1px solid ${inkHi}`,
+        backgroundColor: token('--ink-mid'),
+        border: `1px solid ${token('--ink-hi')}`,
         borderRadius: 'var(--radius-2)',
-        color: fgDefault,
+        color: token('--fg-default'),
       },
       '.cm-tooltip-autocomplete > ul': {
         fontFamily: 'var(--font-mono)',
       },
       '.cm-tooltip-autocomplete > ul > li[aria-selected]': {
-        backgroundColor: inkHi,
-        color: fgDefault,
+        backgroundColor: token('--ink-hi'),
+        color: token('--fg-default'),
       },
       '.cm-foldPlaceholder': {
-        backgroundColor: inkMid,
-        border: `1px solid ${inkHi}`,
-        color: fgMuted,
+        backgroundColor: token('--ink-mid'),
+        border: `1px solid ${token('--ink-hi')}`,
+        color: token('--fg-muted'),
       },
       '.cm-matchingBracket, &.cm-focused .cm-matchingBracket': {
-        backgroundColor: hairlineActive,
-        outline: `1px solid ${inkRule}`,
+        backgroundColor: token('--hairline-active'),
+        outline: `1px solid ${token('--ink-rule')}`,
       },
       '.cm-nonmatchingBracket': {
-        color: err,
+        color: token('--err'),
       },
       '.cm-placeholder': {
-        color: fgFaint,
+        color: token('--fg-faint'),
       },
       '.cm-gutterElement': {
         fontFamily: 'var(--font-mono)',
@@ -205,73 +155,79 @@ export function createSeloraTheme(): Extension {
         height: '10px',
       },
       '.cm-scroller::-webkit-scrollbar-track': {
-        background: inkFaint,
+        background: token('--ink-faint'),
       },
       '.cm-scroller::-webkit-scrollbar-thumb': {
-        background: inkHi,
-        border: `2px solid ${inkCanvas}`,
+        background: token('--ink-hi'),
+        border: `2px solid ${token('--ink-canvas')}`,
       },
     },
-    { dark: true },
+    { dark: theme === 'dark' },
   );
 
   const highlightStyle = HighlightStyle.define([
     {
-      tag: [tags.keyword, tags.modifier, tags.controlKeyword, tags.operatorKeyword, tags.definitionKeyword],
-      color: synKeyword,
+      tag: [
+        tags.keyword,
+        tags.modifier,
+        tags.controlKeyword,
+        tags.operatorKeyword,
+        tags.definitionKeyword,
+      ],
+      color: token('--syn-keyword'),
       fontWeight: '500',
     },
     {
       tag: [tags.function(tags.variableName), tags.function(tags.propertyName), tags.macroName],
-      color: synFn,
+      color: token('--syn-fn'),
       fontWeight: '500',
     },
     {
       tag: [tags.typeName, tags.className, tags.namespace, tags.standard(tags.name)],
-      color: synType,
+      color: token('--syn-type'),
     },
     {
       tag: [tags.string, tags.special(tags.string), tags.regexp, tags.character, tags.escape],
-      color: synString,
+      color: token('--syn-string'),
     },
     {
       tag: [tags.number, tags.bool, tags.null, tags.integer, tags.float],
-      color: synNumber,
+      color: token('--syn-number'),
     },
     {
       tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment],
-      color: synComment,
+      color: token('--syn-comment'),
       fontStyle: 'italic',
     },
     {
       tag: [tags.operator, tags.punctuation, tags.bracket, tags.separator],
-      color: synPunct,
+      color: token('--syn-punct'),
     },
     {
       tag: [tags.attributeName, tags.annotation, tags.meta],
-      color: synAttr,
+      color: token('--syn-attr'),
     },
     {
       tag: tags.variableName,
-      color: synVar,
+      color: token('--syn-var'),
     },
     {
       tag: tags.propertyName,
-      color: synDefault,
+      color: token('--syn-default'),
     },
     {
       tag: tags.heading,
-      color: synKeyword,
+      color: token('--syn-keyword'),
       fontWeight: '600',
     },
     {
       tag: tags.link,
-      color: synString,
+      color: token('--syn-string'),
       textDecoration: 'underline',
     },
     {
       tag: tags.invalid,
-      color: err,
+      color: token('--err'),
       textDecoration: 'underline wavy',
     },
   ]);

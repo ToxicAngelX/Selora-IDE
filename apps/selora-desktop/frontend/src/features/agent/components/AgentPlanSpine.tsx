@@ -42,10 +42,10 @@ export function ZCodeCheckRing() {
       style={{ flexShrink: 0, marginTop: '2px' }}
       aria-hidden="true"
     >
-      <circle cx="8" cy="8" r="6.5" stroke="#22c55e" strokeWidth="1.2" className="check-ring-circle" />
+      <circle cx="8" cy="8" r="6.5" stroke="var(--ok)" strokeWidth="1.2" className="check-ring-circle" />
       <path
         d="M5 8.2L7 10.2L11 5.8"
-        stroke="#22c55e"
+        stroke="var(--ok)"
         strokeWidth="1.4"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -68,10 +68,10 @@ export function ZCodeActiveArrow() {
       style={{ flexShrink: 0, marginTop: '2px' }}
       aria-hidden="true"
     >
-      <circle cx="8" cy="8" r="7.5" fill="rgba(59, 130, 246, 0.12)" className="active-arrow-halo" />
+      <circle cx="8" cy="8" r="7.5" fill="var(--c-rgba-59-130-246-0p12)" className="active-arrow-halo" />
       <path
         d="M3 8H13M13 8L9 4M13 8L9 12"
-        stroke="#60a5fa"
+        stroke="var(--c-60a5fa)"
         strokeWidth="1.6"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -93,7 +93,7 @@ export function ZCodePendingRing() {
       style={{ flexShrink: 0, marginTop: '2px' }}
       aria-hidden="true"
     >
-      <circle cx="8" cy="8" r="6.5" stroke="#52525b" strokeWidth="1.2" strokeDasharray="3 3" />
+      <circle cx="8" cy="8" r="6.5" stroke="var(--c-52525b)" strokeWidth="1.2" strokeDasharray="3 3" />
     </svg>
   );
 }
@@ -353,10 +353,10 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
               <div className="zcode-dashboard-card zcode-active-task-hero-card is-active-shimmer">
                 <div className="zcode-card-header">
                   <div className="zcode-card-title">
-                    <span className="zcode-pulse-dot" style={{ background: '#3b82f6' }} />
+                    <span className="zcode-pulse-dot" style={{ background: 'var(--c-3b82f6)' }} />
                     <span>CURRENT OBJECTIVE</span>
                   </div>
-                  <span className="zcode-card-badge" style={{ color: '#60a5fa' }}>Active Step</span>
+                  <span className="zcode-card-badge" style={{ color: 'var(--c-60a5fa)' }}>Active Step</span>
                 </div>
                 <div className="zcode-hero-body">
                   <div className="zcode-hero-title-row">
@@ -373,7 +373,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                 </div>
               </div>
             ) : nextPendingTodo ? (
-              <div className="zcode-dashboard-card" style={{ borderColor: 'rgba(255, 255, 255, 0.1)' }}>
+              <div className="zcode-dashboard-card" style={{ borderColor: 'var(--c-rgba-255-255-255-0p1)' }}>
                 <div className="zcode-card-header">
                   <div className="zcode-card-title">
                     <ZCodePendingRing />
@@ -395,13 +395,13 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
                 </div>
               </div>
             ) : todos.length > 0 && completedCount === todos.length ? (
-              <div className="zcode-dashboard-card" style={{ borderColor: 'rgba(34, 197, 94, 0.25)' }}>
+              <div className="zcode-dashboard-card" style={{ borderColor: 'var(--c-rgba-34-197-94-0p25)' }}>
                 <div className="zcode-card-header">
-                  <div className="zcode-card-title" style={{ color: '#4ade80' }}>
+                  <div className="zcode-card-title" style={{ color: 'var(--c-4ade80)' }}>
                     <ZCodeCheckRing />
                     <span>PLAN COMPLETED</span>
                   </div>
-                  <span className="zcode-card-badge" style={{ color: '#4ade80' }}>100%</span>
+                  <span className="zcode-card-badge" style={{ color: 'var(--c-4ade80)' }}>100%</span>
                 </div>
                 <div className="zcode-hero-body">
                   <div style={{ color: 'var(--fg-muted)', fontSize: '13px' }}>
@@ -414,7 +414,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-tasks-breakdown-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <FileText size={15} style={{ color: '#71717a' }} />
+                  <FileText size={15} style={{ color: 'var(--c-71717a)' }} />
                   <span>Tasks &amp; Execution Breakdown</span>
                 </div>
                 <span className="zcode-card-badge">
@@ -466,7 +466,7 @@ export const AgentPlanSpine: React.FC<AgentPlanSpineProps> = ({
             <div className="zcode-dashboard-card zcode-git-card">
               <div className="zcode-card-header">
                 <div className="zcode-card-title">
-                  <GitBranch size={15} style={{ color: '#71717a' }} />
+                  <GitBranch size={15} style={{ color: 'var(--c-71717a)' }} />
                   <span>Git Workspace</span>
                 </div>
               </div>

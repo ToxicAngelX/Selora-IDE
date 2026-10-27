@@ -202,6 +202,29 @@ describe('Chrome Bars Polish (Agent 2: TitleBar, ActivityBar, StatusBar)', () =>
       expect(getByText('3')).toBeTruthy();
     });
 
+    it('Agent selects the agent view and never sends a closing toggle itself', () => {
+      const bootstrap = makeBootstrap();
+      layoutStore.hydrate(bootstrap);
+      const onSelectViewMode = vi.fn();
+      const toggle = vi.spyOn(layoutStore, 'toggle');
+
+      const { getByRole } = render(
+        <ActivityBar
+          bootstrap={bootstrap}
+          viewMode="editor"
+          onSelectViewMode={onSelectViewMode}
+        />,
+      );
+      fireEvent.click(getByRole('button', { name: 'Agent' }));
+
+      // The shell's view-mode handler owns the open; a second toggle here
+      // would close the dock in the same click.
+      expect(onSelectViewMode).toHaveBeenCalledTimes(1);
+      expect(onSelectViewMode).toHaveBeenCalledWith('agent');
+      expect(toggle).not.toHaveBeenCalled();
+      toggle.mockRestore();
+    });
+
     it('has a motion/calm mode toggle switch that toggles data-reduced-motion', () => {
       const bootstrap = makeBootstrap();
       layoutStore.hydrate(bootstrap);

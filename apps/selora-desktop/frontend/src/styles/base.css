@@ -9,6 +9,7 @@
    @import below so the variables always precede their first use.
    ========================================================================== */
 
+@import "./palette.css";
 @import "./tokens.css";
 @import "./animations.css";
 
@@ -107,9 +108,8 @@ svg {
 }
 
 /* --- Root defaults -------------------------------------------------------- */
-:root {
-  color-scheme: dark;
-}
+/* color-scheme is owned by palette.css: dark by default, light for
+   <html data-theme="light">. */
 
 body {
   background: var(--ink-canvas); /* UI_SPEC.md §1.3 — the true-black canvas */
@@ -136,7 +136,7 @@ samp {
 }
 
 ::selection {
-  background: var(--ink-mid); /* UI_SPEC.md §3.2 — one ink-step lift */
+  background: var(--selection-bg); /* one ink-step lift, theme-aware */
   color: var(--fg-default);
 }
 

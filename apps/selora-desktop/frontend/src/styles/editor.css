@@ -351,7 +351,7 @@
   border: 1px solid var(--ink-hi);
   border-radius: var(--radius-2);
   padding: 4px 0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 8px 24px var(--c-rgba-0-0-0-0p6);
   z-index: 100;
   font-family: var(--font-mono);
 }
@@ -384,7 +384,7 @@
 
 .breadcrumb-dropdown-item.is-selected {
   color: var(--fg-default);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--c-rgba-255-255-255-0p05);
 }
 
 /* --- 4. Editor Workspace Body (Canvas + Minimap) ------------------------ */
@@ -427,11 +427,11 @@
 }
 
 .code-line-row:hover {
-  background: rgba(255, 255, 255, 0.015);
+  background: var(--c-rgba-255-255-255-0p02);
 }
 
 .code-line-row.is-active-line {
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--c-rgba-255-255-255-0p04);
 }
 
 /* Gutter */
@@ -456,7 +456,7 @@
   background: var(--ok);
 }
 .diff-marker.diff-modified {
-  background: #3b82f6;
+  background: var(--c-3b82f6);
 }
 .diff-marker.diff-deleted {
   background: var(--err);
@@ -629,7 +629,7 @@
   border: 1px solid var(--ink-hi);
   border-radius: var(--radius-2);
   padding: 8px 12px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
+  box-shadow: 0 10px 30px var(--c-rgba-0-0-0-0p7);
   z-index: 1000;
   max-width: 380px;
   pointer-events: auto;
@@ -655,11 +655,11 @@
   border-radius: var(--radius-1);
 }
 .diagnostic-badge-warning {
-  background: rgba(212, 160, 23, 0.15);
+  background: var(--c-rgba-212-160-23-0p15);
   color: var(--warn);
 }
 .diagnostic-badge-error {
-  background: rgba(220, 38, 38, 0.15);
+  background: var(--c-rgba-220-38-38-0p15);
   color: var(--err);
 }
 
@@ -694,7 +694,7 @@
   transition: background 120ms ease;
 }
 .diagnostic-quick-fix-btn:hover {
-  background: rgba(34, 197, 94, 0.12);
+  background: var(--c-rgba-34-197-94-0p12);
 }
 
 /* --- 8. Minimap --------------------------------------------------------- */
@@ -703,7 +703,7 @@
   width: 72px;
   flex-shrink: 0;
   background: var(--ink-canvas);
-  border-left: 1px solid rgba(255, 255, 255, 0.04);
+  border-left: 1px solid var(--c-rgba-255-255-255-0p04);
   position: relative;
   user-select: none;
   cursor: pointer;
@@ -763,14 +763,14 @@
   position: absolute;
   left: 0;
   right: 0;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--c-rgba-255-255-255-0p04);
+  border: 1px solid var(--c-rgba-255-255-255-0p12);
   border-left: 2px solid var(--fg-default);
   pointer-events: none;
   transition: top 80ms ease-out;
 }
 .editor-minimap:hover .minimap-viewport-slider {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--c-rgba-255-255-255-0p07);
 }
 
 /* --- 9. Fallback Enhanced Empty State ----------------------------------- */
@@ -789,16 +789,16 @@
 
 .glowing-selora-mark {
   color: var(--fg-default);
-  filter: drop-shadow(0 0 12px rgba(255, 255, 255, 0.12));
+  filter: drop-shadow(0 0 12px var(--c-rgba-255-255-255-0p12));
   animation: selora-mark-pulse 4s infinite ease-in-out;
 }
 
 @keyframes selora-mark-pulse {
   0%, 100% {
-    filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.08));
+    filter: drop-shadow(0 0 8px var(--c-rgba-255-255-255-0p08));
   }
   50% {
-    filter: drop-shadow(0 0 16px rgba(255, 255, 255, 0.22));
+    filter: drop-shadow(0 0 16px var(--c-rgba-255-255-255-0p22));
   }
 }
 
