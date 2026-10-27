@@ -296,6 +296,12 @@ export const editorStore = {
     localActiveId = id;
     recordActiveBuffer(id);
     rebuild();
+    // Tell Rust which tab is active so a later bootstrap reports this one
+    // instead of the path-sorted first buffer.
+    const context = currentEditorContext();
+    if (context) {
+      void setActiveBufferCommand(id, context).catch(() => undefined);
+    }
   },
 
   async openPath(path: string): Promise<void> {

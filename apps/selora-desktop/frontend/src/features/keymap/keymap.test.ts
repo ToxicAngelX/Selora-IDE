@@ -74,15 +74,25 @@ describe('resolveKeymap (ARCHITECTURE §7.1)', () => {
     expect(shortcutOf('selora.showProblems')).toBe('Ctrl+Shift+M');
     expect(shortcutOf('selora.showSettings')).toBe('Ctrl+Comma');
     expect(shortcutOf('selora.openCommandPalette')).toBe('Ctrl+Shift+P');
+    expect(shortcutOf('selora.fileSave')).toBe('Ctrl+S');
+    expect(shortcutOf('selora.editFindInFiles')).toBe('Ctrl+P');
     expect(keymap.has('selora.showOutput')).toBe(false);
     expect(keymap.has('selora.showTerminal')).toBe(false);
     expect(keymap.has('selora.saveLayout')).toBe(false);
   });
 
-  it('uses a stored rebind for the rebindable pair', () => {
-    const keymap = resolveKeymap({ ...SETTINGS, keybind_toggle_chat: 'Alt+Q', keybind_command_palette: 'F2' });
+  it('uses a stored rebind for all four settings keybinds', () => {
+    const keymap = resolveKeymap({
+      ...SETTINGS,
+      keybind_toggle_chat: 'Alt+Q',
+      keybind_command_palette: 'F2',
+      keybind_save: 'Ctrl+Alt+S',
+      keybind_fuzzy_find: 'Ctrl+Shift+O',
+    });
     expect(canonicalKeybind(keymap.get('selora.toggleAgentDock')!)).toBe('Alt+Q');
     expect(canonicalKeybind(keymap.get('selora.openCommandPalette')!)).toBe('F2');
+    expect(canonicalKeybind(keymap.get('selora.fileSave')!)).toBe('Ctrl+Alt+S');
+    expect(canonicalKeybind(keymap.get('selora.editFindInFiles')!)).toBe('Ctrl+Shift+O');
   });
 
   it('falls back to the default with a console warning on an unparseable stored string', () => {
@@ -126,6 +136,8 @@ describe('palette registry (ARCHITECTURE §7.2/§10)', () => {
     expect(byId.get('selora.toggleAgentDock')?.shortcut).toBe('Ctrl+L');
     expect(byId.get('selora.toggleBottomDock')?.shortcut).toBe('Ctrl+J');
     expect(byId.get('selora.showSettings')?.shortcut).toBe('Ctrl+Comma');
+    expect(byId.get('selora.fileSave')?.shortcut).toBe('Ctrl+S');
+    expect(byId.get('selora.editFindInFiles')?.shortcut).toBe('Ctrl+P');
     expect(byId.get('selora.showOutput')?.shortcut).toBeNull();
     expect(byId.get('selora.showTerminal')?.shortcut).toBeNull();
     expect(byId.get('selora.showKeyboardShortcuts')?.shortcut).toBe('Ctrl+Slash');

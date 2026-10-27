@@ -1,5 +1,5 @@
 // Selora IDE — Interactive Settings Panel (DESIGN §3.3)
-import { useState, useMemo, type FC } from 'react';
+import { useEffect, useState, useMemo, type FC } from 'react';
 import {
   updateSettings,
   restartLsp,
@@ -15,6 +15,7 @@ import {
   Search,
 } from '../../components/icons';
 import { buildCommandList, commandCategory } from '../keymap/commands';
+import { canonicalKeybind, parseKeybind } from '../keymap/keybind';
 
 export interface SettingsPanelViewProps {
   bootstrap: BootstrapState;
@@ -37,12 +38,32 @@ interface KeybindingEntry {
  */
 const THEME_VALUES = ['selora-dark', 'dark', 'space-black', 'light'] as const;
 
-const unsupportedTitle = (label: string): string =>
-  `${label} has no backend settings field in this build. This control is read-only; changes are not saved.`;
+/** Mirrors selora-settings' EDITOR_* range constants. */
+const FONT_SIZE_MIN = 8;
+const FONT_SIZE_MAX = 32;
+const TAB_SIZE_MIN = 1;
+const TAB_SIZE_MAX = 8;
+
+type KeybindDraftKey =
+  | 'keybind_command_palette'
+  | 'keybind_fuzzy_find'
+  | 'keybind_toggle_chat'
+  | 'keybind_save';
+
+const KEYBIND_FIELDS: Array<{ key: KeybindDraftKey; label: string; command: string }> = [
+  { key: 'keybind_save', label: 'Save', command: 'Save' },
+  { key: 'keybind_fuzzy_find', label: 'Find in Files', command: 'Find in Files' },
+  { key: 'keybind_command_palette', label: 'Command Palette', command: 'Open Command Palette' },
+  { key: 'keybind_toggle_chat', label: 'Toggle Agent Dock', command: 'Toggle Agent Dock' },
+];
 
 function formatError(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
+
+/** Only for values with genuinely no writable backend field. */
+const unsupportedTitle = (label: string): string =>
+  `${label} has no writable backend settings field in this build. This control is disabled; changes are not saved.`;
 
 export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpenConnect }) => {
   const settings = bootstrap.settings;
@@ -52,6 +73,35 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
   const [keybindQuery, setKeybindQuery] = useState('');
   const [saving, setSaving] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  const [fontSizeDraft, setFontSizeDraft] = useState(String(settings.editor_font_size));
+  const [tabSizeDraft, setTabSizeDraft] = useState(String(settings.editor_tab_size));
+  const [keybindDrafts, setKeybindDrafts] = useState<Record<KeybindDraftKey, string>>({
+    keybind_command_palette: settings.keybind_command_palette,
+    keybind_fuzzy_find: settings.keybind_fuzzy_find,
+    keybind_toggle_chat: settings.keybind_toggle_chat,
+    keybind_save: settings.keybind_save,
+  });
+
+  // The backend event is the source of truth: after a save (or an external
+  // settings change) the fields show the persisted value, not a stale draft.
+  useEffect(() => {
+    setFontSizeDraft(String(settings.editor_font_size));
+    setTabSizeDraft(String(settings.editor_tab_size));
+    setKeybindDrafts({
+      keybind_command_palette: settings.keybind_command_palette,
+      keybind_fuzzy_find: settings.keybind_fuzzy_find,
+      keybind_toggle_chat: settings.keybind_toggle_chat,
+      keybind_save: settings.keybind_save,
+    });
+  }, [
+    settings.editor_font_size,
+    settings.editor_tab_size,
+    settings.keybind_command_palette,
+    settings.keybind_fuzzy_find,
+    settings.keybind_toggle_chat,
+    settings.keybind_save,
+  ]);
 
   // settings_update is not session-scoped: Rust dispatch rejects any
   // envelope `session_id` on it, so settings always send null.
@@ -63,13 +113,14 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
 
   const persist = (patch: SettingsPatch): void => {
     setSettingsError(null);
+    setFieldError(null);
     setSaving(true);
     void updateSettings(patch, context)
       .catch((cause: unknown) => setSettingsError(formatError(cause)))
       .finally(() => setSaving(false));
   };
 
-  const restartServer = (language: string): void => {
+const restartServer = (language: string): void => {
     setSettingsError(null);
     void restartLsp(language, context).catch((cause: unknown) =>
       setSettingsError(formatError(cause)),
@@ -77,6 +128,29 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
   };
 
   const lspServers = bootstrap.lsp_servers ?? [];
+
+  const commitFontSize = (): void => {
+    const value = Number(fontSizeDraft);
+    if (!Number.isInteger(value) || value < FONT_SIZE_MIN || value > FONT_SIZE_MAX) {
+      setFieldError(`Font size must be a whole number from ${FONT_SIZE_MIN} to ${FONT_SIZE_MAX}.`);
+      return;
+    }
+    if (value === settings.editor_font_size) return;
+    persist({ editor_font_size: value });
+  };
+
+  const commitKeybind = (key: KeybindDraftKey): void => {
+    const label = KEYBIND_FIELDS.find((field) => field.key === key)?.label ?? key;
+    const raw = keybindDrafts[key].trim();
+    const parsed = parseKeybind(raw);
+    if (!parsed) {
+      setFieldError(`${label} must be one chord such as Ctrl+S. "${raw}" is not valid.`);
+      return;
+    }
+    const canonical = canonicalKeybind(parsed);
+    if (canonical === settings[key]) return;
+    persist({ [key]: canonical } as SettingsPatch);
+  };
 
   // The cheat sheet is built from the real command registry, so it can never
   // advertise a command the shell does not dispatch. Commands without a
@@ -159,6 +233,11 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
       {settingsError ? (
         <p className="settings-card-hint" role="alert">
           Settings update failed: {settingsError}
+        </p>
+      ) : null}
+      {fieldError ? (
+        <p className="settings-card-hint" role="alert">
+          {fieldError}
         </p>
       ) : null}
 
@@ -324,30 +403,85 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
             )}
           </div>
           <p className="settings-card-hint">
-            Editor preferences exist in settings.json but are not exposed by this build&apos;s
-            settings protocol, so every value shows —.
+            These values save to settings.json and apply to the editor immediately.
           </p>
           <div className="settings-group">
-            {[
-              { label: 'Font Family', name: 'Font family' },
-              { label: 'Font Size (px)', name: 'Font size' },
-              { label: 'Tab Size', name: 'Tab size' },
-              { label: 'Word Wrap', name: 'Word wrap' },
-              { label: 'Format On Save', name: 'Format on save' },
-              { label: 'Minimap', name: 'Minimap' },
-              { label: 'Line Numbers', name: 'Line numbers' },
-            ].map((row) => (
-              <div className="settings-row" key={row.name}>
-                <span className="settings-label">{row.label}</span>
-                <span
-                  className="settings-card-hint"
-                  aria-label={`${row.name} value`}
-                  title={unsupportedTitle(row.name)}
-                >
-                  —
-                </span>
-              </div>
-            ))}
+            <div className="settings-row">
+              <label className="settings-label" htmlFor="settings-font-size">
+                Font Size (px)
+              </label>
+              <input
+                id="settings-font-size"
+                className="settings-number-input"
+                type="number"
+                min={FONT_SIZE_MIN}
+                max={FONT_SIZE_MAX}
+                step={1}
+                value={fontSizeDraft}
+                disabled={saving}
+                aria-busy={saving}
+                onChange={(e) => setFontSizeDraft(e.target.value)}
+                onBlur={commitFontSize}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitFontSize();
+                }}
+                title={`Editor font size, ${FONT_SIZE_MIN}–${FONT_SIZE_MAX} px.`}
+              />
+            </div>
+
+            <div className="settings-row">
+              <label className="settings-label" htmlFor="settings-tab-size">
+                Tab Size
+              </label>
+              <select
+                id="settings-tab-size"
+                className="settings-select"
+                value={tabSizeDraft}
+                disabled={saving}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  setTabSizeDraft(e.target.value);
+                  if (value !== settings.editor_tab_size) persist({ editor_tab_size: value });
+                }}
+              >
+                {Array.from(
+                  { length: TAB_SIZE_MAX - TAB_SIZE_MIN + 1 },
+                  (_, index) => TAB_SIZE_MIN + index,
+                ).map((size) => (
+                  <option key={size} value={size}>
+                    {size} {size === 1 ? 'space' : 'spaces'}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="settings-row">
+              <span className="settings-label" id="settings-word-wrap-label">
+                Word Wrap
+              </span>
+              <label className="settings-switch">
+                <input
+                  type="checkbox"
+                  checked={settings.editor_word_wrap}
+                  disabled={saving}
+                  aria-busy={saving}
+                  aria-labelledby="settings-word-wrap-label"
+                  onChange={(e) => persist({ editor_word_wrap: e.target.checked })}
+                />
+                <span className="switch-slider" />
+              </label>
+            </div>
+
+            <div className="settings-row">
+              <span className="settings-label">Font Family</span>
+              <span
+                className="settings-card-hint"
+                aria-label="Font family value"
+                title={unsupportedTitle('Font family')}
+              >
+                JetBrains Mono
+              </span>
+            </div>
           </div>
         </div>
       )}
@@ -407,12 +541,44 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
         </div>
       )}
 
-      {/* Tab 4: Keybindings Table */}
+      {/* Tab 4: Keybindings */}
       {activeTab === 'keybindings' && (
-        <div
-          className="settings-section-content keybindings-section"
-          title="Commands come from the shell's command registry. Keybinding editing has no backend field in this build, so this table is read-only."
-        >
+        <div className="settings-section-content keybindings-section">
+          <p className="settings-card-hint">
+            Edit a chord, then press Enter or leave the field. Invalid chords are not saved.
+          </p>
+          <div className="settings-group">
+            {KEYBIND_FIELDS.map((field) => (
+              <div className="settings-row" key={field.key}>
+                <label
+                  className="settings-label"
+                  htmlFor={`settings-keybind-${field.key}`}
+                >
+                  {field.label}
+                </label>
+                <input
+                  id={`settings-keybind-${field.key}`}
+                  className="settings-text-input"
+                  type="text"
+                  value={keybindDrafts[field.key]}
+                  disabled={saving}
+                  aria-busy={saving}
+                  spellCheck={false}
+                  onChange={(e) =>
+                    setKeybindDrafts((current) => ({
+                      ...current,
+                      [field.key]: e.target.value,
+                    }))
+                  }
+                  onBlur={() => commitKeybind(field.key)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitKeybind(field.key);
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+
           {/* Filter Input */}
           <div className="keybind-search-wrapper">
             <Search size={12} className="keybind-search-icon" />
@@ -464,15 +630,21 @@ export const SettingsPanelView: FC<SettingsPanelViewProps> = ({ bootstrap, onOpe
             <dt>Toggle agent dock</dt>
             <dd>{settings.keybind_toggle_chat}</dd>
           </div>
+          <div className="settings-echo-row">
+            <dt>Save</dt>
+            <dd>{settings.keybind_save}</dd>
+          </div>
         </dl>
       )}
 
-      {/* Honest persistence scope: only the two SettingsPatch fields write. */}
       <div className="settings-footer-info">
         <p className="settings-later">
-          Theme and reduced motion save automatically through Rust.
+          Theme, reduced motion, editor preferences, and the four keybinds save automatically
+          through Rust.
         </p>
-        <p className="settings-later">The other controls are read-only in this build.</p>
+        <p className="settings-later">
+          Disabled fields have no backend setting in this build.
+        </p>
       </div>
     </div>
   );

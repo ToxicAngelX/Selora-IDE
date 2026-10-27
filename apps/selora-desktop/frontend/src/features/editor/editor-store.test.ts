@@ -31,7 +31,7 @@ const harness = vi.hoisted(() => {
       openFile: vi.fn(() => Promise.resolve(undefined)),
       closeBuffer: vi.fn(() => Promise.resolve(undefined)),
       saveBuffer: vi.fn(() => Promise.resolve(undefined)),
-      reloadBufferFromDisk: vi.fn(() => Promise.resolve(undefined)),
+reloadBufferFromDisk: vi.fn(() => Promise.resolve(undefined)),
       keepBufferEdits: vi.fn(() => Promise.resolve(undefined)),
       setActiveBuffer: vi.fn(() => Promise.resolve(undefined)),
     },
@@ -48,7 +48,7 @@ vi.mock('../../bridge/bridge', () => ({
   openFile: harness.bridge.openFile,
   closeBuffer: harness.bridge.closeBuffer,
   saveBuffer: harness.bridge.saveBuffer,
-  reloadBufferFromDisk: harness.bridge.reloadBufferFromDisk,
+reloadBufferFromDisk: harness.bridge.reloadBufferFromDisk,
   keepBufferEdits: harness.bridge.keepBufferEdits,
   setActiveBuffer: harness.bridge.setActiveBuffer,
 }));
@@ -108,8 +108,9 @@ describe('editor store', () => {
     harness.bridge.openFile.mockClear();
     harness.bridge.closeBuffer.mockClear();
     harness.bridge.saveBuffer.mockClear();
-    harness.bridge.reloadBufferFromDisk.mockClear();
+harness.bridge.reloadBufferFromDisk.mockClear();
     harness.bridge.keepBufferEdits.mockClear();
+    harness.bridge.setActiveBuffer.mockClear();
     harness.app.setSnapshot(appWith([], null));
     editorStore.reset();
   });
@@ -152,7 +153,7 @@ describe('editor store', () => {
     expect(state.workspaceRoot).toBe('C:/workspace');
   });
 
-  it('marks a tab externally changed and dispatches the chosen resolution', () => {
+it('marks a tab externally changed and dispatches the chosen resolution', () => {
     harness.app.setSnapshot({
       ...appWith([buffer('b1', 'C:/workspace/src/main.rs')], 'b1'),
       bufferConflicts: { b1: 'C:/workspace/src/main.rs' },
@@ -188,6 +189,54 @@ describe('editor store', () => {
 
     harness.app.setSnapshot(appWith([buffer('b1', 'C:/workspace/src/main.rs')], 'b2'));
     expect(editorStore.getSnapshot().activeBufferId).toBe('b1');
+  });
+
+  it('follows the bootstrap active buffer after a close instead of the first tab', () => {
+    harness.app.setSnapshot(
+      appWith(
+        [
+          buffer('b1', 'C:/workspace/src/aaa.rs'),
+          buffer('b2', 'C:/workspace/src/mmm.rs'),
+          buffer('b3', 'C:/workspace/src/zzz.rs'),
+        ],
+        'b2',
+      ),
+    );
+    editorStore.reset();
+    expect(editorStore.getSnapshot().activeBufferId).toBe('b2');
+
+    // Rust closed b2 and reported its neighbor b3; the store must not jump to
+    // the alphabetically first b1.
+    harness.app.setSnapshot(
+      appWith(
+        [
+          buffer('b1', 'C:/workspace/src/aaa.rs'),
+          buffer('b3', 'C:/workspace/src/zzz.rs'),
+        ],
+        'b3',
+      ),
+    );
+    expect(editorStore.getSnapshot().activeBufferId).toBe('b3');
+  });
+
+  it('recording a tab switch tells Rust which buffer is active', () => {
+    harness.app.setSnapshot(
+      appWith(
+        [
+          buffer('b1', 'C:/workspace/src/aaa.rs'),
+          buffer('b2', 'C:/workspace/src/mmm.rs'),
+        ],
+        'b1',
+      ),
+    );
+    editorStore.reset();
+
+    editorStore.setActive('b2');
+    expect(editorStore.getSnapshot().activeBufferId).toBe('b2');
+    expect(harness.bridge.setActiveBuffer).toHaveBeenCalledWith(
+      'b2',
+      { core_instance_id: 'core-0001', workspace_id: 'ws-1', session_id: null },
+    );
   });
 
   it('dispatches openFile for a path that is not already open', async () => {

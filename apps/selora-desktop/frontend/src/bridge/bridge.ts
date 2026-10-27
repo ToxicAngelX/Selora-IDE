@@ -63,12 +63,24 @@ export type SettingsView = {
   theme: string;
   keybind_command_palette: string;
   keybind_toggle_chat: string;
+  keybind_fuzzy_find: string;
+  keybind_save: string;
+  editor_font_size: number;
+  editor_tab_size: number;
+  editor_word_wrap: boolean;
 };
 
 /** The backend-supported writable subset of `SettingsView` (SettingsPatchDto). */
 export type SettingsPatch = {
   reduced_motion?: boolean;
   theme?: string;
+  editor_font_size?: number;
+  editor_tab_size?: number;
+  editor_word_wrap?: boolean;
+  keybind_command_palette?: string;
+  keybind_fuzzy_find?: string;
+  keybind_toggle_chat?: string;
+  keybind_save?: string;
 };
 
 // --- DTOs referenced by the full FrontendEvent union ------------------------
@@ -376,6 +388,7 @@ export type FrontendCommand =
   | { type: 'refresh_tree' }
   | { type: 'reveal_in_explorer'; payload: { path: string } }
   | { type: 'close_buffer'; payload: { buffer_id: Id } }
+  | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'save_buffer'; payload: { buffer_id: Id } }
   | { type: 'reload_buffer_from_disk'; payload: { buffer_id: Id } }
   | { type: 'keep_buffer_edits'; payload: { buffer_id: Id } }
@@ -598,6 +611,10 @@ export const openFile = (path: string, ctx: EnvelopeContext): Promise<unknown> =
 
 export const closeBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'close_buffer', payload: { buffer_id: bufferId } }, ctx);
+
+/** Record the active tab so the next bootstrap reports the real selection. */
+export const setActiveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'set_active_buffer', payload: { buffer_id: bufferId } }, ctx);
 
 export const saveBuffer = (bufferId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'save_buffer', payload: { buffer_id: bufferId } }, ctx);
