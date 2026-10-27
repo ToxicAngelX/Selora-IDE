@@ -404,7 +404,15 @@ export type FrontendCommand =
   | { type: 'git_commit'; payload: { message: string } }
   | { type: 'open_git_diff'; payload: { path: string } }
   | { type: 'workflow_run'; payload: { request_id: Id; spec: WorkflowSpec } }
-  | { type: 'workflow_resume'; payload: { request_id: Id; run_id: Id; allow_incomplete_asks?: boolean } }
+  | {
+      type: 'workflow_resume';
+      payload: {
+        request_id: Id;
+        run_id: Id;
+        allow_incomplete_asks?: boolean;
+        acknowledge_partial_effects?: boolean;
+      };
+    }
   | { type: 'workflow_stop'; payload: { request_id: Id } }
   | { type: 'workflow_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision } }
   | { type: 'open_external'; payload: { url: string } };
@@ -825,12 +833,15 @@ export const runWorkflow = (
 /**
  * Resume a journaled run. `allowIncompleteAsks` is the user's explicit
  * confirmation that unfinished asks may re-dispatch tools whose earlier
- * effects already landed; omitting it keeps the backend's fail-closed default.
+ * effects already landed; `acknowledgePartialEffects` is the separate,
+ * stronger confirmation that the ledger proved effects may already exist.
+ * Omitting both keeps the backend's fail-closed default.
  */
 export const resumeWorkflow = (
   runId: Id,
   ctx: EnvelopeContext,
   allowIncompleteAsks = false,
+  acknowledgePartialEffects = false,
 ): { requestId: string; promise: Promise<unknown> } => {
   const requestId = newRequestId();
   return {
@@ -842,6 +853,7 @@ export const resumeWorkflow = (
           request_id: requestId,
           run_id: runId,
           allow_incomplete_asks: allowIncompleteAsks,
+          acknowledge_partial_effects: acknowledgePartialEffects,
         },
       },
       ctx,

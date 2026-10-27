@@ -321,7 +321,7 @@ impl Facade {
         detail: &str,
         inputs: &serde_json::Value,
     ) -> Result<u64, WorkflowError> {
-        let (index, event) = {
+        let (index, event, started_step) = {
             let mut state = self.inner.borrow_mut();
             if let Some(error) = &state.fatal {
                 return Err(error.clone());
@@ -365,8 +365,14 @@ impl Facade {
             }
             state.current_step = Some(step.index);
             state.steps_log.push(step.clone());
-            (step.index, WorkflowEvent::Step { step })
+            let started_step = (!replay).then(|| step.clone());
+            (step.index, WorkflowEvent::Step { step }, started_step)
         };
+        // Before any body runs: a tool inside this step can now attribute its
+        // ledger records to the durable step/ask identity.
+        if let Some(step) = started_step {
+            self.host().note_step_started(&step);
+        }
         self.emit(event);
         Ok(index)
     }

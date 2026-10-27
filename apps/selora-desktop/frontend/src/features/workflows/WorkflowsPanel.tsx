@@ -281,17 +281,38 @@ export function WorkflowsPanel({ store = workflowsStore }: WorkflowsPanelProps) 
         </button>
       </header>
 
+      {run.partial_effects && !run.resume_confirmation ? (
+        <div className="wf-resume-warning" role="alert" data-testid="wf-partial-effects">
+          <p className="wf-resume-warning-title">Earlier tool effects may already exist</p>
+          <p className="wf-resume-warning-text">
+            The run&apos;s tool-effect ledger recorded a file write, edit, delete, or bash
+            command that did not prove completion. Those effects are not undone by resume.
+          </p>
+          <div className="wf-resume-warning-actions">
+            <button
+              type="button"
+              className="wf-btn wf-btn-approve"
+              disabled={!state.resume_wired || run.resume_requested}
+              onClick={() => store.acknowledgePartialEffects(run.id)}
+            >
+              {run.resume_requested ? 'Resuming' : 'Acknowledge and resume anyway'}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {run.resume_error ? (
         <p className="wf-step-error" role="alert">{run.resume_error}</p>
       ) : null}
       {run.resume_confirmation ? (
         <div className="wf-resume-warning" role="alert" data-testid="wf-resume-warning">
           <p className="wf-resume-warning-title">
-            {run.resume_confirmation.count > 0
-              ? `${run.resume_confirmation.count} unfinished ${
-                  run.resume_confirmation.count === 1 ? 'step' : 'steps'
-                } may run again`
-              : 'Unfinished steps may run again'}
+            {run.resume_confirmation.kind === 'partial_effects'
+              ? 'Earlier tool effects may already exist'
+              : run.resume_confirmation.count > 0
+                ? `${run.resume_confirmation.count} unfinished ${
+                    run.resume_confirmation.count === 1 ? 'step' : 'steps'
+                  } may run again`
+                : 'Unfinished steps may run again'}
           </p>
           <p className="wf-resume-warning-text">{run.resume_confirmation.summary}</p>
           <div className="wf-resume-warning-actions">
@@ -301,7 +322,9 @@ export function WorkflowsPanel({ store = workflowsStore }: WorkflowsPanelProps) 
               disabled={!state.resume_wired || run.resume_requested}
               onClick={() => store.confirmResume(run.id)}
             >
-              Resume anyway
+              {run.resume_confirmation.kind === 'partial_effects'
+                ? 'Acknowledge and resume anyway'
+                : 'Resume anyway'}
             </button>
             <button
               type="button"

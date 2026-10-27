@@ -562,10 +562,16 @@ pub enum FrontendCommand {
         /// pre-flag payload resumes fail-closed.
         #[serde(default)]
         allow_incomplete_asks: bool,
-        // No `max_cost_usd` here on purpose: resume replays the confirmed
+// No `max_cost_usd` here on purpose: resume replays the confirmed
         // grant and never raises it. A run that exhausted its cap is refused
         // with `workflow_budget_exhausted`; continuing needs a new run and a
         // newly confirmed budget.
+        /// Whether the user has accepted durable evidence that tool effects
+        /// may already exist for this run (an unfinished `started` record, or
+        /// an effect owned by an unfinished ask). This is a separate action
+        /// from ordinary Resume; false by default so old payloads refuse.
+        #[serde(default)]
+        acknowledge_partial_effects: bool,
     },
     WorkflowStop {
         request_id: RequestId,
@@ -1088,8 +1094,14 @@ pub struct WorkflowPersistedRunDto {
     pub name: String,
     pub status: WorkflowStatus,
     /// False when the journal proved the run ambiguous (an interrupted command)
-    /// and replay would be unsafe, or when the run already completed.
+    /// and replay would be unsafe, when the tool-effect ledger proves a partial
+    /// effect, or when the run already completed.
     pub resumable: bool,
+    /// True when durable ledger evidence says a side effect may already have
+    /// applied. Resume stays unavailable; a separate explicit
+    /// `acknowledge_partial_effects` action is required.
+    #[serde(default)]
+    pub partial_effects: bool,
     /// Why resume is unavailable, or the terminal journal's error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -2745,16 +2757,18 @@ mod tests {
                 request_id: rid("request-2"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: false,
+                acknowledge_partial_effects: false,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-2","run_id":"run-1","allow_incomplete_asks":false,"acknowledge_partial_effects":false}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowResume {
                 request_id: rid("request-5"),
                 run_id: "run-1".into(),
                 allow_incomplete_asks: true,
+                acknowledge_partial_effects: true,
             },
-            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true}}"#,
+            r#"{"type":"workflow_resume","payload":{"request_id":"request-5","run_id":"run-1","allow_incomplete_asks":true,"acknowledge_partial_effects":true}}"#,
         );
         assert_command_wire(
             FrontendCommand::WorkflowStop {
@@ -2912,11 +2926,14 @@ mod tests {
             allow_incomplete_asks,
             request_id,
             run_id,
+            acknowledge_partial_effects,
+            ..
         } = legacy
         else {
             panic!("expected a resume command");
         };
         assert!(!allow_incomplete_asks);
+        assert!(!acknowledge_partial_effects);
 
         // Resume carries no budget field: the confirmed grant is replayed, and
         // a budget-exhausted run needs a new run, never a silent raise.
@@ -2924,6 +2941,7 @@ mod tests {
             request_id,
             run_id,
             allow_incomplete_asks,
+            acknowledge_partial_effects,
         })
         .unwrap();
         assert!(
@@ -2944,6 +2962,7 @@ mod tests {
         assert_eq!(run.tokens, 0);
         assert_eq!(run.cost_usd, 0.0);
         assert!(run.detail.is_none());
+        assert!(!run.partial_effects);
     }
 
     #[test]

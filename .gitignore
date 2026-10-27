@@ -23,4 +23,6 @@ nul
 /New Text Document.txt
 service.json
 /.selora/
+# Per-run workflow ledger (journal + tool-effect evidence) is local state.
+**/.selora/workflow-runs/
 crates/selora-workflow/target/
