@@ -19,7 +19,7 @@ mod chat_types;
 mod client;
 mod sse;
 mod types;
-mod updates;
+pub mod updates;
 
 pub use agent::{
     bound_summary, compact_conversation, compacted_conversation, denied_result, execute_approved,

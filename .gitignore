@@ -1,4 +1,4 @@
-# Build output
+﻿# Build output
 /target
 
 # Rust backup files
@@ -23,6 +23,17 @@ nul
 /New Text Document.txt
 service.json
 /.selora/
+
+# Local secrets and generated state
+.env
+.env.*
+*.secret
+*.key
+*.pem
+*.pfx
+*.log
+.vite/
+promo/
 # Per-run workflow ledger (journal + tool-effect evidence) is local state.
 **/.selora/workflow-runs/
 crates/selora-workflow/target/
