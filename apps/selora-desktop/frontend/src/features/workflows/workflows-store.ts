@@ -47,6 +47,17 @@ export type WorkflowPhase = {
   status: WorkflowPhaseStatus;
 };
 
+/**
+ * Receipt usage the engine attributed to one phase. Tokens and USD are
+ * additive facts from the journal; a phase the engine reported as quiet is an
+ * explicit 0, never an estimate.
+ */
+export type WorkflowPhaseUsage = {
+  phase: string;
+  tokens: number;
+  cost_usd: number;
+};
+
 export type WorkflowStep = {
   id: string;
   /** Phase marker the step belongs to; null when the engine reported none. */
@@ -113,6 +124,11 @@ export type WorkflowRun = {
   steps: WorkflowStep[];
   reports: WorkflowReport[];
   artifacts: WorkflowArtifact[];
+  /**
+   * Per-phase receipt usage. Empty when the engine reported no
+   * phase-attributed spend; the panel then shows no per-phase numbers.
+   */
+  phase_usage: WorkflowPhaseUsage[];
   approvals: WorkflowApproval[];
   log: WorkflowLogEntry[];
   /** Tokens billed across every ask in the run. */
@@ -181,6 +197,8 @@ export type PersistedWorkflowRun = {
     body: string;
     phase?: string | null;
   }>;
+  /** Additive per-phase usage; absent on pre-phase-usage bootstraps. */
+  phase_usage?: Array<{ phase: string; tokens?: number; cost_usd?: number }>;
   tokens?: number;
   cost_usd?: number;
 };
@@ -417,6 +435,32 @@ function planPhases(names: string[] | undefined): WorkflowPhase[] {
     phases.push({ name, status: 'pending' });
   }
   return phases;
+}
+
+/**
+ * Sanitise persisted per-phase usage. Only a non-empty phase name and
+ * non-negative finite numbers are facts; anything else reads as 0 rather than
+ * inventing spend or a phase.
+ */
+function phaseUsageRows(rows: PersistedWorkflowRun['phase_usage']): WorkflowPhaseUsage[] {
+  const usage: WorkflowPhaseUsage[] = [];
+  const seen = new Set<string>();
+  for (const row of rows ?? []) {
+    if (!row || typeof row.phase !== 'string') continue;
+    const phase = row.phase.trim();
+    if (!phase || seen.has(phase)) continue;
+    seen.add(phase);
+    const tokens =
+      typeof row.tokens === 'number' && Number.isFinite(row.tokens) && row.tokens > 0
+        ? Math.trunc(row.tokens)
+        : 0;
+    const cost_usd =
+      typeof row.cost_usd === 'number' && Number.isFinite(row.cost_usd) && row.cost_usd > 0
+        ? row.cost_usd
+        : 0;
+    usage.push({ phase, tokens, cost_usd });
+  }
+  return usage;
 }
 
 /** Protocol phase status → phase graph status (mirrors workflows-bridge). */
@@ -736,6 +780,7 @@ export const workflowsStore: WorkflowsStore = {
             steps,
             reports,
             artifacts,
+            phase_usage: phaseUsageRows(run.phase_usage),
             approvals: [],
             log: [],
             tokens: run.tokens ?? 0,
@@ -857,6 +902,7 @@ export const workflowsStore: WorkflowsStore = {
             steps: [],
             reports: [],
             artifacts: [],
+            phase_usage: [],
             approvals: [],
             log: [],
             tokens: 0,

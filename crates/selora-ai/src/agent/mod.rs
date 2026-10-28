@@ -22,6 +22,7 @@ pub mod plan;
 pub mod router;
 pub mod session;
 pub mod subagent;
+pub mod subagent_turn;
 pub mod tools;
 pub mod turn;
 
@@ -46,9 +47,13 @@ pub use session::{
 #[allow(unused_imports)]
 pub use subagent::{
     wait_tool_result, wait_tool_spec, ArtifactRef, CancelToken, ChildId, ChildOutcome, ChildState,
-    CompletionDisposition, SpawnError, SpawnRequest, SubagentCompletion, SubagentEvent,
-    SubagentHandle, SubagentPolicy, SubagentRuntime, WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT,
-    MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
+    CompletionDisposition, SpawnError, SpawnRequest, SubagentCard, SubagentCompletion,
+    SubagentControlError, SubagentEvent, SubagentHandle, SubagentPolicy, SubagentRuntime,
+    WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
+};
+pub use subagent_turn::{
+    format_subagent_completion, question_answer_result, run_subagent_turn,
+    run_subagent_turn_blocking, spawn_child_turn, SubagentBackend, SubagentSession,
 };
 pub use tools::bash::BashAbortHandle;
 pub use turn::{
@@ -83,6 +88,38 @@ pub enum AgentDecision {
     /// and calls `exit_plan_mode` again. Never a grant.
     Revise,
     Stop,
+}
+
+/// One option on a §19.4 escalation question. The description is shown under
+/// the label so the options are decide-able without extra prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One question on a §19.4 escalation card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentQuestion {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// Free text is available unless the model explicitly disables it.
+    #[serde(default = "default_allow_free_text")]
+    pub allow_free_text: bool,
+}
+
+fn default_allow_free_text() -> bool {
+    true
+}
+
+/// The question card's payload. It rides [`ApprovalCard::Question`] and is
+/// answered through the same single-use `AgentDecision` route as an approval
+/// (`AgentDecision::Answer`); an answer is model input, never an effect grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionCard {
+    pub questions: Vec<AgentQuestion>,
 }
 
 /// What a side-effecting tool needs the user to approve before the
@@ -138,4 +175,8 @@ pub enum ApprovalCard {
         /// checked between every step.
         max_cost_usd: f64,
     },
+    /// `ask_user_question` (§19.4): a structured escalation. It parks on the
+    /// same §17.4 channel as an approval; the user's answer comes back as this
+    /// tool call's result (never an approval).
+    Question(QuestionCard),
 }

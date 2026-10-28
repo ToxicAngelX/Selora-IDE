@@ -1927,6 +1927,9 @@ const activeSessionId =
     const target = state.messages.flatMap((message) => message.toolCalls ?? [])
       .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
     const planCard = Boolean(target?.plan) || target?.toolName === 'exit_plan_mode';
+    // A question is never approved or denied generically: it needs text or
+    // one of the offered options (the answerQuestion route).
+    if (target?.decisionPrompt?.kind === 'question') return;
     // A plan card only offers Approve/Revise: a blanket approval is a
     // different grant and must never skip the plan decision.
     if (planCard && decision === 'approve_all') return;
@@ -2141,7 +2144,12 @@ const activeSessionId =
   },
 
   handleApprovalNeeded(payload: ApprovalNeededPayload) {
-    if (!isActiveEvent(payload)) return;
+    // A background child can ask after its parent turn ended. Its card is
+    // still bound to the same session and is safe to render there.
+    const backgroundChild =
+      Boolean(payload.subagent_id) &&
+      (!payload.session_id || payload.session_id === state.activeSessionId);
+    if (!isActiveEvent(payload) && !backgroundChild) return;
     if (payload.tool_name === 'run_workflow' && !state.inFlight && activeRequestId === payload.request_id) return;
     const existingConfirmation = workflowConfirmations.get(payload.approval_id);
     if (existingConfirmation && (
@@ -2173,8 +2181,9 @@ const activeSessionId =
     // and its script is never counted as a diff hunk.
     const workflow = payload.workflow;
     const plan = payload.plan;
+    const questionPrompt = payload.prompt?.kind === 'question';
     const diffHunks =
-      !workflow && !plan && payload.diff_or_input ? [payload.diff_or_input] : undefined;
+      !workflow && !plan && !questionPrompt && payload.diff_or_input ? [payload.diff_or_input] : undefined;
     const approvalCall: WorkflowToolCall = {
       id: `call_appr_${payload.approval_id}`,
       toolName: payload.tool_name,

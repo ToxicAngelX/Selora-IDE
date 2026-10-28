@@ -1134,3 +1134,93 @@ fn a_failed_report_step_is_never_journaled_as_reported() {
         .expect("the oversized report step failed");
     assert_eq!(failed.payload["phase"], "scan");
 }
+
+#[test]
+fn phase_usage_deltas_cover_a_failed_ask_and_never_double_count_replay() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = prepare(
+        "phase usage",
+        r#"
+        const worker = agent("worker");
+        phase("scan");
+        worker.ask("one");
+        phase("apply");
+        worker.ask("two");
+    "#,
+        5.0,
+    )
+    .unwrap()
+    .spec();
+
+    fn usage_totals(workspace: &Workspace, id: &RunId) -> Vec<(String, u64, f64)> {
+        let loaded = Journal::load(workspace.path(), id.clone()).unwrap();
+        let mut totals: Vec<(String, u64, f64)> = Vec::new();
+        for entry in loaded
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "engine_phase_usage")
+        {
+            assert!(
+                entry.payload["step_id"].as_u64().is_some(),
+                "every delta names the step it mirrors"
+            );
+            let phase = entry.payload["phase"].as_str().unwrap().to_owned();
+            let tokens = entry.payload["tokens"].as_u64().unwrap();
+            let cost = entry.payload["cost_usd"].as_f64().unwrap();
+            match totals.iter_mut().find(|(name, _, _)| *name == phase) {
+                Some((_, total_tokens, total_cost)) => {
+                    *total_tokens += tokens;
+                    *total_cost += cost;
+                }
+                None => totals.push((phase, tokens, cost)),
+            }
+        }
+        totals
+    }
+
+    // The second ask fails after the host has metered it: failed turns are
+    // paid, so their usage belongs to the phase that ran them.
+    let failing = Arc::new(TestHost {
+        fail_ask: 2,
+        ..TestHost::default()
+    });
+    let (result, events) = execute(&workspace, &id, &spec, failing, false);
+    assert!(result.is_err());
+    assert_eq!(terminal(&events).status, RunStatus::Failed);
+    assert_eq!(
+        usage_totals(&workspace, &id),
+        vec![
+            ("scan".to_owned(), 100, 1.0),
+            ("apply".to_owned(), 100, 1.0),
+        ]
+    );
+
+    // Resume replays the finished scan ask without charging it again and
+    // retries the failed apply ask; only the retry adds a delta.
+    let resumed = Arc::new(TestHost::default());
+    let (result, events) = execute(&workspace, &id, &spec, resumed.clone(), true);
+    let outcome = result.unwrap();
+    assert_eq!(resumed.asks.load(Ordering::SeqCst), 1, "only the retry");
+    assert_eq!(outcome.report.cost_usd, 3.0);
+    assert_eq!(outcome.report.tokens, 300);
+    let totals = usage_totals(&workspace, &id);
+    assert_eq!(
+        totals,
+        vec![
+            ("scan".to_owned(), 100, 1.0),
+            ("apply".to_owned(), 200, 2.0),
+        ],
+        "the replayed ask adds nothing; the retried ask adds its own delta"
+    );
+    let phase_tokens: u64 = totals.iter().map(|(_, tokens, _)| *tokens).sum();
+    let phase_cost: f64 = totals.iter().map(|(_, _, cost)| *cost).sum();
+    assert_eq!(phase_tokens, outcome.report.tokens);
+    assert!((phase_cost - outcome.report.cost_usd).abs() < 1e-9);
+    assert_eq!(
+        events
+            .last()
+            .map(|event| matches!(event, WorkflowEvent::Finished { .. })),
+        Some(true)
+    );
+}

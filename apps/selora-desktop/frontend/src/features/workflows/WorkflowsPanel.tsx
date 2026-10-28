@@ -19,6 +19,7 @@ import {
   type WorkflowArtifact,
   type WorkflowPhase,
   type WorkflowPhaseStatus,
+  type WorkflowPhaseUsage,
   type WorkflowRun,
   type WorkflowRunStatus,
   type WorkflowStep,
@@ -70,10 +71,12 @@ function runStatusLabel(run: WorkflowRun): string {
 function PhaseNode({
   phase,
   steps,
+  usage,
   current,
 }: {
   phase: WorkflowPhase;
   steps: WorkflowStep[];
+  usage: WorkflowPhaseUsage | null;
   current: boolean;
 }) {
   const phaseSteps = steps.filter((step) => step.phase === phase.name);
@@ -86,12 +89,17 @@ function PhaseNode({
     : phaseSteps.length > 0
       ? `${done}/${phaseSteps.length} steps complete`
       : 'No steps reported yet';
+  const usageText = usage
+    ? `${NUMBER_FORMAT.format(usage.tokens)} tokens, ${USD_FORMAT.format(usage.cost_usd)}`
+    : null;
   return (
     <li
       className="wf-graph-node"
       data-status={phase.status}
       aria-current={current ? 'step' : undefined}
-      aria-label={`${phase.name}: ${PHASE_STATUS_LABEL[phase.status]}. ${detail}.`}
+      aria-label={`${phase.name}: ${PHASE_STATUS_LABEL[phase.status]}. ${detail}.${
+        usageText ? ` ${usageText}.` : ''
+      }`}
     >
       <span className="wf-graph-dot" aria-hidden="true" />
       <div className="wf-graph-card">
@@ -100,6 +108,11 @@ function PhaseNode({
           <span className="wf-graph-status">{PHASE_STATUS_LABEL[phase.status]}</span>
         </div>
         <span className="wf-graph-detail">{detail}</span>
+        {usage ? (
+          <span className="wf-graph-usage" data-testid={`wf-phase-usage-${phase.name}`}>
+            {NUMBER_FORMAT.format(usage.tokens)} tokens · {USD_FORMAT.format(usage.cost_usd)}
+          </span>
+        ) : null}
       </div>
     </li>
   );
@@ -241,6 +254,12 @@ export function WorkflowsPanel({ store = workflowsStore }: WorkflowsPanelProps) 
   const canDecide = state.approval_wired && !terminal;
   const currentPhase =
     [...run.phases].reverse().find((phase) => phase.status === 'running')?.name ?? null;
+  // Usage rows exist only when the engine reported phase-attributed spend. A
+  // reported phase with no row is an explicit 0; a run with no rows at all
+  // (still live, or no billed step) shows no per-phase numbers.
+  const usageByPhase = new Map<string, WorkflowPhaseUsage>(
+    run.phase_usage.map((usage) => [usage.phase, usage]),
+  );
   const budgetRatio =
     run.max_cost_usd !== null && run.max_cost_usd > 0
       ? Math.min(1, run.cost_usd / run.max_cost_usd)
@@ -415,6 +434,15 @@ export function WorkflowsPanel({ store = workflowsStore }: WorkflowsPanelProps) 
                   key={phase.name}
                   phase={phase}
                   steps={run.steps}
+                  usage={
+                    run.phase_usage.length > 0
+                      ? usageByPhase.get(phase.name) ?? {
+                          phase: phase.name,
+                          tokens: 0,
+                          cost_usd: 0,
+                        }
+                      : null
+                  }
                   current={phase.name === currentPhase}
                 />
               ))}

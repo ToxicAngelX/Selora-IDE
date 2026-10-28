@@ -59,12 +59,14 @@ use serde::{Deserialize, Serialize};
 
 pub use budget::Budget;
 pub use effects::{
-    is_side_effecting_tool, load_tool_effects, redacted_tool_arguments, tool_effects_path,
-    ToolEffectLedger, ToolEffectPhase, ToolEffectRecord, ToolEffectStep,
+    effect_states, is_side_effecting_tool, load_tool_effects, redacted_tool_arguments,
+    stable_effect_id, tool_effects_path, EffectBegin, EffectOutcome, EffectState, ToolEffectLedger,
+    ToolEffectPhase, ToolEffectRecord, ToolEffectStep,
 };
 pub use persisted::{
-    incomplete_asks, load_workflow_spec, partial_effects, run_workflow_persisted, ArtifactRecord,
-    IncompleteAsk, PartialEffects, ReportItemRecord, RunOptions, StepFinishRecord, StepStartRecord,
+    acknowledge_partial_effects, incomplete_asks, load_workflow_spec, partial_effects,
+    run_workflow_persisted, ArtifactRecord, IncompleteAsk, PartialEffects, PhaseUsageRecord,
+    ReportItemRecord, RunOptions, StepFinishRecord, StepStartRecord,
 };
 pub use sandbox::{
     prepare, Confirmation, Limits, DEFAULT_MAX_COST_USD, MAX_SCRIPT_BYTES, MAX_STEPS,

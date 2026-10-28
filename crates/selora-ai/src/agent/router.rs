@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 use crate::chat_types::{ToolCall, ToolResult, ToolSpec};
 
 use super::tools::{bash, fs, web};
-use super::{plan, ApprovalCard};
+use super::{plan, AgentQuestion, ApprovalCard, QuestionCard, QuestionOption};
 
 /// What the router produced for one tool call: a finished result, or a
 /// card the user must approve before execution proceeds.
@@ -157,6 +157,17 @@ pub struct ToolContext {
     /// Phase 9e: the parent session `wait` scopes to. Required with
     /// `subagents`.
     pub parent_session: Option<String>,
+    /// §19.3: structural tool policy. `None` is the ordinary parent Agent Mode
+    /// context; `Some(policy)` is a child, whose calls are rejected on **both**
+    /// router entry points when the policy does not allow them.
+    pub policy: Option<crate::agent::SubagentPolicy>,
+    /// §19.3: the backend that runs a spawned child's turns. `None` keeps
+    /// `spawn_subagent` a model-visible error instead of a silent no-op.
+    pub subagent_backend: Option<std::sync::Arc<dyn crate::agent::SubagentBackend>>,
+    /// The model and caps a spawned child turn uses. Set with
+    /// [`Self::with_subagent_backend`]; absent means `spawn_subagent` errors.
+    pub subagent_model: Option<crate::types::Model>,
+    pub subagent_caps: Option<crate::agent::TurnCaps>,
 }
 
 impl ToolContext {
@@ -174,7 +185,33 @@ impl ToolContext {
             plan: plan::new_store(),
             subagents: None,
             parent_session: None,
+            policy: None,
+            subagent_backend: None,
+            subagent_model: None,
+            subagent_caps: None,
         }
+    }
+
+    /// Scope this context to a subagent policy. A read-only context has no
+    /// write/bash route on either `execute_tool` or `execute_approved`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: crate::agent::SubagentPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Give this parent turn the backend that runs spawned child turns.
+    #[must_use]
+    pub fn with_subagent_backend(
+        mut self,
+        backend: std::sync::Arc<dyn crate::agent::SubagentBackend>,
+        model: crate::types::Model,
+        caps: crate::agent::TurnCaps,
+    ) -> Self {
+        self.subagent_backend = Some(backend);
+        self.subagent_model = Some(model);
+        self.subagent_caps = Some(caps);
+        self
     }
 
     /// Attach a session's shared plan/todo store (Phase 9b).
@@ -435,6 +472,97 @@ pub fn tool_manifest() -> Vec<ToolSpec> {
         ),
         // -- Phase 9e: background subagent completion wait ------------------
         crate::agent::subagent::wait_tool_spec(),
+        // -- §19.3/§19.4: subagents and structured escalations -------------
+        ToolSpec::new(
+            "spawn_subagent",
+            "Spawn a child agent with its own conversation and §17.3 turn caps. \
+             `policy` is `read-only` (read tools only; no write/bash tool exists) \
+             or `full` (the §17.1 tools; writes and non-allowlisted bash still \
+             park on approval cards in this session). `background` defaults to \
+             false: the call waits for the child's result. A background child \
+             returns its id immediately and reports completion later; use \
+             `wait` to collect it. Children cannot spawn further children.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "policy": {
+                        "type": "string",
+                        "enum": ["read-only", "full"],
+                        "description": "Structural tool policy (`read-only` or `full`)."
+                    },
+                    "mission": {
+                        "type": "string",
+                        "description": "What the child must accomplish. Include the evidence it should return."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in the background and return immediately (default false)."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional stable child name for the transcript."
+                    }
+                },
+                "required": ["policy", "mission"]
+            }),
+        ),
+        ToolSpec::new(
+            "send_message",
+            "Steer a running spawned subagent. The text is delivered as the \
+             child's next user turn in FIFO order; a child that already \
+             finished cannot be resumed. The child keeps its own conversation \
+             and policy.",
+            json_schema(
+                [("subagent_id", "string"), ("message", "string")],
+                ["subagent_id", "message"],
+            ),
+        ),
+        ToolSpec::new(
+            "ask_user_question",
+            "Ask the user one or more structured questions and wait for the answer. \
+             Each question carries 0-4 options with descriptions; free text is \
+             available unless `allow_free_text` is false. The turn parks on the \
+             normal approval channel and resumes with the user's answer as this \
+             tool's result. Prefer one focused question over a batch.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The question text."
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 0,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "allow_free_text": {
+                                    "type": "boolean",
+                                    "description": "Whether the user may type a free-text answer (default true)."
+                                }
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        ),
     ];
     let mut alias = manifest
         .iter()
@@ -485,6 +613,15 @@ pub async fn execute_tool(ctx: &ToolContext, call: ToolCall) -> ToolOutcome {
 }
 
 async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String> {
+    // §19.3: a child policy is structural on both router entry points.
+    if let Some(policy) = ctx.policy {
+        if !policy.allows(&call.name) {
+            return Ok(ToolOutcome::Ready(ToolResult::error(
+                &call.id,
+                disabled_by_policy(&call.name, policy),
+            )));
+        }
+    }
     // Phase 9b's structural gate. It sits before dispatch, so a planning
     // session cannot reach a write/delete/bash/workflow implementation at
     // all — allowlisted commands and pre-approvals included. Reads, web and
@@ -723,6 +860,95 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
             ))),
         },
 
+        // -- §19.3: spawn / steer a child turn -----------------------------
+        "spawn_subagent" => {
+            let policy_raw = req_str(&args, &call.name, "policy")?;
+            let policy = crate::agent::SubagentPolicy::parse(&policy_raw).ok_or_else(|| {
+                format!(
+                    "`spawn_subagent` policy `{policy_raw}` is not one of `read-only` or `full`"
+                )
+            })?;
+            let mission = req_str(&args, &call.name, "mission")?;
+            if mission.trim().is_empty() {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "`spawn_subagent` needs a non-empty `mission`",
+                )));
+            }
+            let background = opt_bool(&args, &call.name, "background")?.unwrap_or(false);
+            let name = opt_str(&args, &call.name, "name")?;
+            let (Some(runtime), Some(parent), Some(backend), Some(model), Some(caps)) = (
+                ctx.subagents.clone(),
+                ctx.parent_session.clone(),
+                ctx.subagent_backend.clone(),
+                ctx.subagent_model.clone(),
+                ctx.subagent_caps.clone(),
+            ) else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "subagents are not available in this turn",
+                )));
+            };
+            let child_id = uuid::Uuid::new_v4().to_string();
+            let mut request =
+                crate::agent::subagent::SpawnRequest::new(&parent, &child_id, policy, mission);
+            request = request.background(background);
+            if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+                request = request.with_name(name);
+            }
+            match crate::agent::subagent_turn::spawn_child_turn(
+                &runtime, request, backend, model, caps,
+            ) {
+                Ok(handle) if background => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    format!(
+                        "subagent `{}` started in the background (policy `{}`). Use `wait` with \
+                         that id to collect its result.",
+                        handle.child_id,
+                        handle.policy.as_str()
+                    ),
+                ))),
+                Ok(handle) => match runtime.wait_for_child(&handle.child_id).await {
+                    Some(completion) => Ok(ToolOutcome::Ready(ToolResult::success(
+                        &call.id,
+                        crate::agent::subagent_turn::format_subagent_completion(&completion),
+                    ))),
+                    None => Ok(ToolOutcome::Ready(ToolResult::error(
+                        &call.id,
+                        format!("subagent `{}` ended without a result", handle.child_id),
+                    ))),
+                },
+                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    error.to_string(),
+                ))),
+            }
+        }
+        "send_message" => {
+            let raw_id = req_str(&args, &call.name, "subagent_id")?;
+            let message = req_str(&args, &call.name, "message")?;
+            let Some(runtime) = ctx.subagents.as_ref() else {
+                return Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    "subagents are not available in this turn",
+                )));
+            };
+            match runtime.send_message(&raw_id, message) {
+                Ok(()) => Ok(ToolOutcome::Ready(ToolResult::success(
+                    &call.id,
+                    format!("message queued for subagent `{raw_id}`"),
+                ))),
+                Err(error) => Ok(ToolOutcome::Ready(ToolResult::error(
+                    &call.id,
+                    error.to_string(),
+                ))),
+            }
+        }
+        "ask_user_question" => {
+            let card = parse_question_card(&args, &call.name)?;
+            Ok(ToolOutcome::NeedsApproval(ApprovalCard::Question(card)))
+        }
+
         unknown => Err(format!(
             "unknown tool `{unknown}` — the tool manifest (§17.1) is fixed"
         )),
@@ -749,6 +975,12 @@ async fn route(ctx: &ToolContext, call: &ToolCall) -> Result<ToolOutcome, String
 /// else is an error result (read tools already ran, and a card was never
 /// built for them).
 pub async fn execute_approved(ctx: &ToolContext, call: ToolCall) -> ToolResult {
+    // §19.3: a child policy is structural on both router entry points.
+    if let Some(policy) = ctx.policy {
+        if !policy.allows(&call.name) {
+            return ToolResult::error(&call.id, disabled_by_policy(&call.name, policy));
+        }
+    }
     // Phase 9b: a stale or pre-plan approval cannot bypass plan mode. The
     // gate runs before argument parsing for the same structural reason as
     // `route`.
@@ -997,6 +1229,110 @@ fn req_str_array(args: &Map<String, Value>, tool: &str, key: &str) -> Result<Vec
 /// Both the routing path (card) and [`execute_approved`] validate the original
 /// call payload here. This does not parse JavaScript or extract commands;
 /// the desktop and engine check the script against the supplied grant.
+/// A policy rejection the parent model can read and adapt to. It names the
+/// policy rather than pretending the tool does not exist.
+fn disabled_by_policy(tool: &str, policy: crate::agent::SubagentPolicy) -> String {
+    format!(
+        "tool `{tool}` is disabled by the `{}` subagent policy",
+        policy.as_str()
+    )
+}
+
+/// Validate one `ask_user_question` payload into the card the UI renders.
+/// Up to four questions and up to four options each; free text is on by
+/// default. An unanswerable question (no options, free text off) is a
+/// model-visible error, never an empty card.
+fn parse_question_card(args: &Map<String, Value>, tool: &str) -> Result<QuestionCard, String> {
+    let Some(Value::Array(raw_questions)) = args.get("questions") else {
+        return Err(format!("`{tool}` requires an array parameter `questions`"));
+    };
+    if raw_questions.is_empty() {
+        return Err(format!("`{tool}` needs at least one question"));
+    }
+    if raw_questions.len() > 1 {
+        return Err(format!(
+            "`{tool}` asks one question per card (received {}); call it again for the next question",
+            raw_questions.len()
+        ));
+    }
+    let mut questions = Vec::with_capacity(raw_questions.len());
+    for (index, raw) in raw_questions.iter().enumerate() {
+        let object = raw
+            .as_object()
+            .ok_or_else(|| format!("`{tool}` parameter `questions[{index}]` must be an object"))?;
+        let question = object
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "`{tool}` parameter `questions[{index}].question` must be a non-empty string"
+                )
+            })?
+            .to_owned();
+        let allow_free_text = match object.get("allow_free_text") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(format!(
+                    "`{tool}` parameter `questions[{index}].allow_free_text` must be a boolean"
+                ))
+            }
+        };
+        let mut options = Vec::new();
+        if let Some(raw_options) = object.get("options") {
+            let array = raw_options.as_array().ok_or_else(|| {
+                format!("`{tool}` parameter `questions[{index}].options` must be an array")
+            })?;
+            if array.len() > 4 {
+                return Err(format!(
+                    "`{tool}` parameter `questions[{index}].options` accepts at most 4 options"
+                ));
+            }
+            for (option_index, raw_option) in array.iter().enumerate() {
+                let option = raw_option.as_object().ok_or_else(|| {
+                    format!(
+                        "`{tool}` parameter `questions[{index}].options[{option_index}]` must be an object"
+                    )
+                })?;
+                let label = option
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "`{tool}` parameter `questions[{index}].options[{option_index}].label` must be a non-empty string"
+                        )
+                    })?
+                    .to_owned();
+                let description = match option.get("description") {
+                    None | Some(Value::Null) => String::new(),
+                    Some(Value::String(text)) => text.clone(),
+                    Some(_) => {
+                        return Err(format!(
+                            "`{tool}` parameter `questions[{index}].options[{option_index}].description` must be a string"
+                        ))
+                    }
+                };
+                options.push(QuestionOption { label, description });
+            }
+        }
+        if !allow_free_text && options.len() < 2 {
+            return Err(format!(
+                "`{tool}` question {index} cannot be answered: provide 2-4 options or allow free text"
+            ));
+        }
+        questions.push(AgentQuestion {
+            question,
+            options,
+            allow_free_text,
+        });
+    }
+    Ok(QuestionCard { questions })
+}
+
 fn parse_workflow(args: &Map<String, Value>, tool: &str) -> Result<WorkflowPlan, String> {
     let name = req_str(args, tool, "name")?;
     let name = name.trim();
@@ -1113,6 +1449,10 @@ mod tests {
                 "todo_write",
                 // Phase 9e: the background completion wait.
                 "wait",
+                // §19.3/§19.4: subagent spawning, steering and escalation.
+                "spawn_subagent",
+                "send_message",
+                "ask_user_question",
                 "manage_todo",
             ],
             "§17.1's closed set plus manifest v2/v3's additive tools"
@@ -1199,6 +1539,81 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(required, ["name", "script", "commands"]);
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_builds_a_question_card_with_options_and_free_text() {
+        let root = temp_root("route-question");
+        let call = call(
+            "ask_user_question",
+            &serde_json::json!({
+                "questions": [{
+                    "question": "Which file?",
+                    "options": [
+                        {"label": "src/a.rs", "description": "left"},
+                        {"label": "src/b.rs", "description": "right"}
+                    ],
+                    "allow_free_text": false
+                }]
+            })
+            .to_string(),
+        );
+        match execute_tool(&ctx(&root), call).await {
+            ToolOutcome::NeedsApproval(ApprovalCard::Question(card)) => {
+                assert_eq!(card.questions.len(), 1);
+                assert_eq!(card.questions[0].options.len(), 2);
+                assert!(!card.questions[0].allow_free_text);
+            }
+            other => panic!("expected a question card, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unanswerable_question_is_a_model_visible_error_not_a_card() {
+        let root = temp_root("route-question-error");
+        let call = call(
+            "ask_user_question",
+            &serde_json::json!({
+                "questions": [{
+                    "question": "Pick",
+                    "options": [],
+                    "allow_free_text": false
+                }]
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            execute_tool(&ctx(&root), call).await,
+            ToolOutcome::Ready(result) if !result.ok && result.content.contains("cannot be answered")
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_without_a_runtime_is_a_visible_error() {
+        let root = temp_root("route-spawn");
+        let call = call(
+            "spawn_subagent",
+            &serde_json::json!({"policy": "read-only", "mission": "review"}).to_string(),
+        );
+        assert!(matches!(
+            execute_tool(&ctx(&root), call).await,
+            ToolOutcome::Ready(result) if !result.ok && result.content.contains("not available")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_policy_rejects_writes_on_both_router_paths() {
+        let root = temp_root("route-policy");
+        let ctx = ctx(&root).with_policy(crate::agent::SubagentPolicy::ReadOnly);
+        let write = call("write_file", r#"{"path":"a.rs","content":"x"}"#);
+        assert!(matches!(
+            execute_tool(&ctx, write.clone()).await,
+            ToolOutcome::Ready(result) if !result.ok && result.content.contains("disabled")
+        ));
+        let approved = execute_approved(&ctx, write).await;
+        assert!(!approved.ok);
+        assert!(approved.content.contains("disabled"));
+        assert!(!root.join("a.rs").exists(), "the write never reached disk");
     }
 
     #[tokio::test]

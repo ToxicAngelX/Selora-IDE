@@ -95,6 +95,8 @@ struct WorkflowRunHistory {
     steps: Vec<selora_protocol::WorkflowStepDto>,
     reports: Vec<selora_protocol::WorkflowReportDto>,
     artifacts: Vec<selora_protocol::WorkflowArtifactDto>,
+    /// Per-phase receipt usage, in phase order. See [`workflow_run_history`].
+    phase_usage: Vec<selora_protocol::WorkflowPhaseUsageDto>,
     tokens: u64,
     cost_usd: f64,
     error: Option<String>,
@@ -111,7 +113,10 @@ struct WorkflowRunHistory {
 /// * `engine_report_item` Ã¢â‚¬â€ every `report(item, artifactId)` that reached the
 ///   host, with its run-wide ordinal so `report-N` ids never shift;
 /// * `engine_artifact` Ã¢â‚¬â€ every artifact with its full markdown/file content,
-///   independent of the terminal report or a `null` step value.
+///   independent of the terminal report or a `null` step value;
+/// * `engine_phase_usage` — one additive per-phase usage delta per billed
+///   step; a journal written before those records falls back to the step
+///   records grouped by phase.
 ///
 /// A journal written before those records existed still loads: steps come
 /// from the step records (with an unknown phase), reports from the successful
@@ -132,6 +137,11 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
     let mut seen_artifacts = std::collections::HashSet::new();
     let mut has_report_records = false;
     let mut has_artifact_records = false;
+    // Explicit per-phase deltas, summed in first-seen phase order.
+    let mut phase_usage: Vec<selora_protocol::WorkflowPhaseUsageDto> = Vec::new();
+    // A step whose delta is explicit must never also be counted from its
+    // step record: that would double count a resumed journal.
+    let mut explicit_steps: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut dropped = false;
 
     for entry in &journal.entries {
@@ -188,6 +198,22 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
                     Err(_) => dropped = true,
                 }
             }
+            "engine_phase_usage" => {
+                match serde_json::from_value::<selora_workflow::PhaseUsageRecord>(
+                    entry.payload.clone(),
+                ) {
+                    Ok(record) if !record.phase.trim().is_empty() => {
+                        explicit_steps.insert(record.step_id);
+                        add_phase_usage(
+                            &mut phase_usage,
+                            &record.phase,
+                            record.tokens,
+                            record.cost_usd,
+                        );
+                    }
+                    _ => dropped = true,
+                }
+            }
             "engine_run_finished" => {
                 match serde_json::from_value::<selora_workflow::WorkflowReport>(
                     entry.payload.clone(),
@@ -232,6 +258,17 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
             {
                 history.phases.push(phase.clone());
             }
+            // Fallback for a step record with no explicit delta (a journal written
+            // before `engine_phase_usage`, or a mixed older prefix): group the
+            // step's own receipt delta by its phase. An explicit delta for the
+            // same step wins, so no attempt is counted twice.
+            if !explicit_steps.contains(index) {
+                if let Some(finish) = finish {
+                    if (finish.tokens > 0 || finish.cost_usd > 0.0) && !phase.trim().is_empty() {
+                        add_phase_usage(&mut phase_usage, &phase, finish.tokens, finish.cost_usd);
+                    }
+                }
+            }
             let (status, error) = match finish {
                 Some(finish) => (
                     workflow_step_status(finish.step.status),
@@ -254,6 +291,33 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
         }
         history.cost_usd = spent_usd;
         history.tokens = tokens;
+    }
+
+    // Phase summary: phase order first, with explicit zeros for a phase that
+    // had no billed step, then any phase that only the usage records named.
+    // No usage evidence means no rows at all — the panel then renders no
+    // per-phase numbers instead of a fabricated $0 for real spend.
+    if !phase_usage.is_empty() {
+        let mut ordered = Vec::with_capacity(history.phases.len() + phase_usage.len());
+        for name in &history.phases {
+            ordered.push(
+                phase_usage
+                    .iter()
+                    .find(|usage| &usage.phase == name)
+                    .cloned()
+                    .unwrap_or_else(|| selora_protocol::WorkflowPhaseUsageDto {
+                        phase: name.clone(),
+                        tokens: 0,
+                        cost_usd: 0.0,
+                    }),
+            );
+        }
+        for usage in phase_usage {
+            if !ordered.iter().any(|known| known.phase == usage.phase) {
+                ordered.push(usage);
+            }
+        }
+        history.phase_usage = ordered;
     }
 
     // Reports: the explicit ordinal is the live `report-N` id.
@@ -358,6 +422,32 @@ fn workflow_run_history(journal: &selora_workflow::journal::LoadedJournal) -> Wo
         );
     }
     history
+}
+
+/// Add one usage delta to a per-phase accumulator (first-seen phase order).
+///
+/// A blank phase is unphased usage and never becomes a row: the run total
+/// still owns it, and the phase summary must not attribute it to a made-up
+/// phase. Saturating token addition mirrors [`selora_workflow::Budget`].
+fn add_phase_usage(
+    usage: &mut Vec<selora_protocol::WorkflowPhaseUsageDto>,
+    phase: &str,
+    tokens: u64,
+    cost_usd: f64,
+) {
+    if phase.trim().is_empty() || !cost_usd.is_finite() || cost_usd < 0.0 {
+        return;
+    }
+    if let Some(existing) = usage.iter_mut().find(|entry| entry.phase == phase) {
+        existing.tokens = existing.tokens.saturating_add(tokens);
+        existing.cost_usd += cost_usd;
+        return;
+    }
+    usage.push(selora_protocol::WorkflowPhaseUsageDto {
+        phase: phase.to_owned(),
+        tokens,
+        cost_usd,
+    });
 }
 
 /// Read a journal's terminal status, preferring the raw
@@ -519,6 +609,7 @@ fn persisted_workflow_runs(
             steps: history.steps,
             reports: history.reports,
             artifacts: history.artifacts,
+            phase_usage: history.phase_usage,
             tokens: history.tokens,
             cost_usd: history.cost_usd,
         });
@@ -1216,6 +1307,9 @@ impl<R: tauri::Runtime> WorkflowStream<R> {
             // Phase 9b plan cards belong to a chat session, not a workflow
             // subagent; an unexpected one is never rendered as a write.
             selora_ai::ApprovalCard::Plan { .. } => return,
+            // §19.4 question cards are a chat-session park, never a
+            // workflow grant.
+            selora_ai::ApprovalCard::Question(_) => return,
         };
         self.record(FrontendEvent::WorkflowApprovalNeeded(
             WorkflowApprovalNeededDto {
@@ -1520,6 +1614,12 @@ fn workflow_partial_effects_message(partial: selora_workflow::PartialEffects) ->
         reasons.push(format!(
             "{} tool call(s) started without a recorded finish",
             partial.unfinished_effects
+        ));
+    }
+    if partial.failed_effects > 0 {
+        reasons.push(format!(
+            "{} tool call(s) reported an error and may have applied part of the effect",
+            partial.failed_effects
         ));
     }
     if partial.unfinished_ask_effects > 0 {
@@ -6783,7 +6883,7 @@ mod tests {
         // the process died before its finish line.
         let ledger = selora_workflow::ToolEffectLedger::open_for_run(dir.path(), &run_id).unwrap();
         ledger
-            .record_started(
+            .begin_effect(
                 Some(&selora_workflow::ToolEffectStep {
                     step_id: "1".into(),
                     agent: Some("reviewer".into()),
@@ -7122,6 +7222,177 @@ mod tests {
         assert_eq!(saved.artifacts[0].phase.as_deref(), Some("scan"));
         assert_eq!(saved.tokens, summary.tokens);
         assert_eq!(saved.cost_usd, summary.cost_usd);
+        assert!(
+            saved.phase_usage.is_empty(),
+            "a run that billed no step must not invent per-phase spend: {:?}",
+            saved.phase_usage
+        );
+    }
+
+    #[test]
+    fn p8_workflow_phase_usage_sums_reported_spend_and_zeroes_quiet_phases() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let _dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_cost_per_call(0.5),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-phase-usage",
+                        r#"
+                            phase("scan");
+                            agent("reviewer").ask("inspect");
+                            phase("apply");
+                            agent("reviewer").ask("patch");
+                            phase("verify");
+                            report("done");
+                        "#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(summary.status, WorkflowStatus::Completed);
+
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("the completed run reloads as history");
+        let phase_usage: Vec<(&str, u64, f64)> = saved
+            .phase_usage
+            .iter()
+            .map(|usage| (usage.phase.as_str(), usage.tokens, usage.cost_usd))
+            .collect();
+        assert_eq!(
+            phase_usage,
+            vec![("scan", 0, 0.5), ("apply", 0, 0.5), ("verify", 0, 0.0)],
+            "each ask's delta lands in its phase; the quiet phase is an explicit 0"
+        );
+        let phase_total: f64 = saved.phase_usage.iter().map(|usage| usage.cost_usd).sum();
+        assert!(
+            (phase_total - saved.cost_usd).abs() < 1e-9,
+            "phase totals must equal the run total, never a second estimate: {phase_total} vs {}",
+            saved.cost_usd
+        );
+        assert!((saved.cost_usd - summary.cost_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p8_workflow_old_journal_without_phase_usage_falls_back_to_step_deltas() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = open_workspace(&state, &app);
+        state.install_workflow_host_factory(fake_workflow_factory(Arc::new(
+            FakeWorkflowHost::with_cost_per_call(0.5),
+        )));
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    workflow_run(
+                        "wf-phase-usage-fallback",
+                        r#"
+                            phase("scan");
+                            agent("reviewer").ask("inspect");
+                            phase("apply");
+                            agent("reviewer").ask("patch");
+                        "#,
+                        vec![],
+                    ),
+                ),
+            )
+            .unwrap();
+        let events = wait_for_finished_runs(&state, 1);
+        wait_for_no_active_runs(&state);
+        let summary = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                FrontendEvent::WorkflowFinished(summary) => Some(summary),
+                _ => None,
+            })
+            .unwrap();
+        let id = selora_workflow::RunId::from(summary.run_id.as_str());
+        let path = selora_workflow::journal::journal_path(dir.path(), &id);
+        // Keep only the explicit deltas whose step passes `keep`, then renumber
+        // the sequence so the file is what the older writer would have emitted.
+        fn rewrite(path: &std::path::Path, keep: impl Fn(u64) -> bool) {
+            let text = std::fs::read_to_string(path).unwrap();
+            let mut kept = Vec::new();
+            for line in text.lines() {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["kind"] == "engine_phase_usage" {
+                    if let Some(step_id) = value["payload"]["step_id"].as_u64() {
+                        if !keep(step_id) {
+                            continue;
+                        }
+                    }
+                }
+                value["seq"] = serde_json::json!(kept.len() as u64 + 1);
+                kept.push(value.to_string());
+            }
+            std::fs::write(path, format!("{}\n", kept.join("\n"))).unwrap();
+        }
+
+        fn phase_costs(saved: &selora_protocol::WorkflowPersistedRunDto) -> Vec<(String, f64)> {
+            saved
+                .phase_usage
+                .iter()
+                .map(|usage| (usage.phase.clone(), usage.cost_usd))
+                .collect()
+        }
+
+        // Mixed journal: the first ask keeps its explicit delta, the second
+        // ask's is gone. The kept step must not also be counted from its step
+        // record, and the missing one must still be attributed.
+        rewrite(&path, |step_id| step_id == 2);
+        let mixed = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("a mixed journal still loads");
+        assert_eq!(
+            phase_costs(&mixed),
+            vec![("scan".to_owned(), 0.5), ("apply".to_owned(), 0.5)],
+            "explicit and fallback deltas never overlap"
+        );
+
+        // A journal with no explicit phase usage at all falls back entirely to
+        // the step records' own deltas.
+        rewrite(&path, |_| false);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("engine_phase_usage"));
+        let saved = state
+            .bootstrap()
+            .workflows
+            .into_iter()
+            .find(|run| run.run_id == summary.run_id)
+            .expect("an old journal still loads");
+        assert_eq!(
+            phase_costs(&saved),
+            vec![("scan".to_owned(), 0.5), ("apply".to_owned(), 0.5)],
+            "the fallback groups the step records' own deltas by phase"
+        );
+        let phase_total: f64 = saved.phase_usage.iter().map(|usage| usage.cost_usd).sum();
+        assert!((phase_total - saved.cost_usd).abs() < 1e-9);
     }
 
     #[test]
@@ -7214,7 +7485,7 @@ mod tests {
             let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
             if matches!(
                 value["kind"].as_str(),
-                Some("engine_report_item" | "engine_artifact")
+                Some("engine_report_item" | "engine_artifact" | "engine_phase_usage")
             ) {
                 continue;
             }
@@ -7255,6 +7526,11 @@ mod tests {
         assert_eq!(saved.artifacts.len(), 1, "artifacts come from the terminal");
         assert_eq!(saved.artifacts[0].title, "T");
         assert_eq!(saved.artifacts[0].body, "Body");
+        assert!(
+            saved.phase_usage.is_empty(),
+            "no phase fields means no phase-attributed usage: {:?}",
+            saved.phase_usage
+        );
         assert!(saved.detail.is_none(), "{:?}", saved.detail);
     }
 

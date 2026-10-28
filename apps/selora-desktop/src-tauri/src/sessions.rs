@@ -44,19 +44,19 @@ use std::sync::{Arc, Mutex};
 use selora_ai::{
     AgentSessionMode, AgentSessionState, AgentSessionStore, AgentSummary, AgentTurnState,
     ApprovalCard, ChatEvent, ChatMessage, ChatReceipt, ChatRequest, CompactionConfig,
-    CompactionError, Model, ParkedCard, RouterToolRunner, ToolContext, ToolSpec, TranscriptEntry,
-    TurnCaps, TurnInput,
+    CompactionError, Model, ParkedCard, RouterToolRunner, ToolContext, ToolRunner, ToolSpec,
+    TranscriptEntry, TurnCaps, TurnInput,
 };
 use selora_core::SeloraError;
 use selora_protocol::{
     validate_and_consume_approval, AgentCompactionFailedDto, AgentModeDto, AgentParkSummaryDto,
     AgentPhase, AgentSessionSummaryDto, AgentStateDto, AgentTurnDoneDto, ApprovalDto, ApprovalId,
     ApprovalNeededDto, ChatCompletedDto, ChatDeltaDto, ChatFailedDto, ChatRequestDto, ChatStateDto,
-    ConnectionStatus, DecisionDto, FrontendEvent, MessageDto, MessageId, MessageRole, ModelDto,
-    ModelsDto, PlanApprovalDto, PlanPhaseDto, PlanStateDto, ProtocolErrorDto, RequestId,
-    SeloraStatusDto, SessionDto, SessionId, SubagentArtifactDto, SubagentCompletedDto,
-    SubagentPolicyDto, TodoDto, TodoStatusDto, TodosDto, ToolCallStartedDto, ToolResultDto, TurnId,
-    WorkflowApprovalDto,
+    ConnectionStatus, DecisionDto, DecisionPromptDto, FrontendEvent, MessageDto, MessageId,
+    MessageRole, ModelDto, ModelsDto, PlanApprovalDto, PlanPhaseDto, PlanStateDto,
+    ProtocolErrorDto, QuestionPromptOptionDto, RequestId, SeloraStatusDto, SessionDto, SessionId,
+    SubagentArtifactDto, SubagentCompletedDto, SubagentPolicyDto, TodoDto, TodoStatusDto, TodosDto,
+    ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -287,6 +287,16 @@ impl ChatSession {
     }
 }
 
+/// §19.3: one child card's routing facts. The runtime owns the single-use
+/// decision slot; this record lets the engine refuse a stale session or the
+/// wrong card type before forwarding.
+#[derive(Clone)]
+struct SubagentCardRoute {
+    request_id: RequestId,
+    session_id: SessionId,
+    is_question: bool,
+}
+
 struct EngineInner {
     base_url: String,
     active_model: Option<String>,
@@ -312,6 +322,14 @@ pub(crate) struct SessionEngine {
     /// while the user edits in another. The `wait` tool reads it through
     /// `ToolContext`.
     subagents: selora_ai::SubagentRuntime,
+    /// §19.3: the one relay receiver for the runtime's completion and card
+    /// events. Taken by the first agent turn; the relay then lives for the
+    /// engine's lifetime so a child may finish while the user edits.
+    subagent_events: Mutex<Option<mpsc::UnboundedReceiver<selora_ai::SubagentEvent>>>,
+    /// Child cards waiting on the parent's decision rail. The runtime owns the
+    /// single-use decision slot; this map only validates request/session/card
+    /// type before forwarding.
+    subagent_cards: Mutex<BTreeMap<ApprovalId, SubagentCardRoute>>,
     /// The agent tools' root. The Z3 shell has no folder picker (that lands
     /// in Z4 with the workbench), so `SELORA_WORKSPACE_ROOT` is the one way
     /// to point the tools at a real tree today; without it `SendAgent`
@@ -343,6 +361,9 @@ impl SessionEngine {
             .or_else(|| initial_models.first().map(|m| m.id.clone()))
             .or_else(|| config.active_model.clone());
 
+        let runtime = selora_ai::SubagentRuntime::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime.set_event_sink(tx);
         Self {
             inner: Mutex::new(EngineInner {
                 base_url: config.base_url.clone(),
@@ -356,7 +377,9 @@ impl SessionEngine {
             }),
             config,
             workspace_root: Mutex::new(None),
-            subagents: selora_ai::SubagentRuntime::new(),
+            subagents: runtime,
+            subagent_events: Mutex::new(Some(rx)),
+            subagent_cards: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -722,6 +745,7 @@ impl SessionEngine {
                             summary: park.summary(),
                             can_approve_all_this_turn: false,
                             plan: approval_plan(card),
+                            decision_prompt: approval_prompt(card),
                         });
                         session.pending_card = Some(card.clone());
                         session.pending_tool_name = Some(tool_name.clone());
@@ -736,6 +760,24 @@ impl SessionEngine {
 
     pub(crate) fn base_url(&self) -> String {
         self.inner.lock().expect("engine lock").base_url.clone()
+    }
+
+    /// The live agent request/turn for a session, when one is running. Child
+    /// cards group under it; a background child may outlive the turn, in
+    /// which case the relay mints its own ids.
+    fn active_request_for_session(&self, session_id: &SessionId) -> Option<(RequestId, TurnId)> {
+        let inner = self.inner.lock().expect("engine lock");
+        inner
+            .active
+            .iter()
+            .find_map(|(request_id, active)| match active {
+                ActiveRequest::Agent {
+                    session_id: owner,
+                    turn_id,
+                    ..
+                } if owner == session_id => Some((request_id.clone(), turn_id.clone())),
+                _ => None,
+            })
     }
 
     pub(crate) fn set_base_url(&self, base_url: String) {
@@ -1172,7 +1214,7 @@ impl SessionEngine {
             ..TurnCaps::spec_defaults(model.context_window)
         };
         let mut input = TurnInput::new(model.clone(), conversation)
-            .with_caps(caps)
+            .with_caps(caps.clone())
             .with_manifest(manifest_for(payload.mode))
             .with_auto_approve_writes(auto_approve)
             .with_compaction(CompactionConfig::default())
@@ -1184,10 +1226,24 @@ impl SessionEngine {
             input = input.with_reasoning_effort(effort.clone());
         }
         let tool_settings = agent_tool_settings(&self.config.agent, self.brave_key());
+        // §19.3: a child never inherits the parent's command allowlist or
+        // session auto-approve grant: `full` means writes and bash still card
+        // in the parent session.
+        let child_settings = selora_ai::AgentToolSettings {
+            auto_approve_commands: Vec::new(),
+            ..tool_settings.clone()
+        };
+        let backend: Arc<dyn selora_ai::SubagentBackend> = Arc::new(DesktopSubagentBackend {
+            root: root.clone(),
+            settings: child_settings,
+            base_url: self.base_url(),
+            api_key: api_key.clone(),
+        });
         let tools = RouterToolRunner::new(
             ToolContext::new(root, tool_settings)
                 .with_plan(plan_store)
-                .with_subagents(self.subagents.clone(), payload.session_id.as_str()),
+                .with_subagents(self.subagents.clone(), payload.session_id.as_str())
+                .with_subagent_backend(backend, model.clone(), caps.clone()),
         );
         let chat = selora_ai::ClientChatStream::new(selora_ai::SeloraClient::new(
             &self.base_url(),
@@ -1211,6 +1267,7 @@ impl SessionEngine {
             );
         }
 
+        self.ensure_subagent_relay(Arc::clone(&log), app.clone());
         tauri::async_runtime::spawn(agent_relay(AgentRelayCtx {
             log,
             engine: Arc::clone(self),
@@ -1223,6 +1280,29 @@ impl SessionEngine {
             join,
         }));
         Ok(())
+    }
+
+    /// Take the runtime's one event receiver and start the session relay.
+    /// Called by the first agent turn; later turns reuse the running relay.
+    fn ensure_subagent_relay<R: tauri::Runtime>(
+        self: &Arc<Self>,
+        log: Arc<EventLog>,
+        app: tauri::AppHandle<R>,
+    ) {
+        let receiver = self
+            .subagent_events
+            .lock()
+            .expect("subagent events lock")
+            .take();
+        let Some(events_rx) = receiver else {
+            return;
+        };
+        tauri::async_runtime::spawn(subagent_relay(SubagentRelayCtx {
+            log,
+            engine: Arc::clone(self),
+            app,
+            events_rx,
+        }));
     }
 
     /// Phase 9e: start one background child and emit its single typed
@@ -1372,6 +1452,55 @@ impl SessionEngine {
             return self.stop_chat(request_id, envelope_session);
         }
 
+        // §19.3: a child card lives on its own rail. Validate the request,
+        // session and card type, then let the runtime consume the single-use
+        // id before forwarding to the child's turn.
+        if let Some(route) = self
+            .subagent_cards
+            .lock()
+            .expect("subagent card lock")
+            .get(approval_id)
+            .cloned()
+        {
+            if &route.request_id != request_id
+                || envelope_session
+                    .as_ref()
+                    .is_some_and(|session| session != &route.session_id)
+            {
+                return Err(stale_session());
+            }
+            let is_answer = decision == DecisionDto::Answer;
+            if route.is_question != is_answer {
+                return Err(ProtocolErrorDto {
+                    code: "approval_card_mismatch".into(),
+                    message: if route.is_question {
+                        "This subagent card needs a question answer, not an approval decision."
+                            .into()
+                    } else {
+                        "A question answer cannot approve this subagent card.".into()
+                    },
+                    retryable: false,
+                });
+            }
+            self.subagent_cards
+                .lock()
+                .expect("subagent card lock")
+                .remove(approval_id);
+            let loop_id = Uuid::parse_str(approval_id.as_str()).map_err(|_| ProtocolErrorDto {
+                code: "approval_mismatch".into(),
+                message: "The approval id does not name a pending approval.".into(),
+                retryable: false,
+            })?;
+            return self
+                .subagents
+                .decide(loop_id, (loop_id, map_decision(decision, answer)))
+                .map_err(|error| ProtocolErrorDto {
+                    code: "approval_not_pending".into(),
+                    message: error.to_string(),
+                    retryable: false,
+                });
+        }
+
         let mut inner = self.inner.lock().expect("engine lock");
         // The session whose parked card belongs to this request.
         let Some((session_id, session)) = inner
@@ -1402,6 +1531,26 @@ impl SessionEngine {
             .is_some_and(|owner| owner != &session_id)
         {
             return Err(stale_session());
+        }
+        // §19.4: a question card is answered, never approved; an approval
+        // card is never answered. Refuse the wrong card type before the
+        // single-use gate consumes the id.
+        let pending_is_question = session
+            .pending_approval
+            .as_ref()
+            .expect("found by pending approval")
+            .decision_prompt
+            .is_some();
+        if pending_is_question != (decision == DecisionDto::Answer) {
+            return Err(ProtocolErrorDto {
+                code: "approval_card_mismatch".into(),
+                message: if pending_is_question {
+                    "This card needs a question answer, not an approval decision.".into()
+                } else {
+                    "A question answer cannot approve this card.".into()
+                },
+                retryable: false,
+            });
         }
         if decision == DecisionDto::ApproveAllThisTurn
             && session
@@ -2138,6 +2287,7 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                     .unwrap_or_else(|| fallback_tool_name(&card));
                 let (path_or_command, diff_or_input, workflow) = approval_body(&card);
                 let plan = approval_plan(&card);
+                let prompt = approval_prompt(&card);
                 // Park before announcing: the single-use slot exists before
                 // the frontend can possibly answer.
                 engine.set_pending_approval(
@@ -2151,9 +2301,12 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         summary: format!("{tool_name} {path_or_command}"),
                         can_approve_all_this_turn: !matches!(
                             &card,
-                            ApprovalCard::Plan { .. } | ApprovalCard::Workflow { .. }
+                            ApprovalCard::Plan { .. }
+                                | ApprovalCard::Workflow { .. }
+                                | ApprovalCard::Question(_)
                         ),
                         plan,
+                        decision_prompt: prompt.clone(),
                     },
                     card.clone(),
                     tool_name.clone(),
@@ -2171,6 +2324,8 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
                         diff_or_input,
                         workflow,
                         plan: approval_plan(&card),
+                        prompt,
+                        subagent_id: None,
                     }),
                     Some(request_id.clone()),
                     session_id.clone(),
@@ -2319,6 +2474,120 @@ async fn agent_relay<R: tauri::Runtime>(ctx: AgentRelayCtx<R>) {
             Some(request_id),
             session_id,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The subagent relay (completions + child cards)
+// ---------------------------------------------------------------------------
+
+struct SubagentRelayCtx<R: tauri::Runtime> {
+    log: Arc<EventLog>,
+    engine: Arc<SessionEngine>,
+    app: tauri::AppHandle<R>,
+    events_rx: mpsc::UnboundedReceiver<selora_ai::SubagentEvent>,
+}
+
+/// Map the shared runtime's events onto the normal session stream. A
+/// completion lands in the roster once (the frontend dedupes by child id) and
+/// a child card parks on the same approval rail as the parent's own cards.
+async fn subagent_relay<R: tauri::Runtime>(ctx: SubagentRelayCtx<R>) {
+    let SubagentRelayCtx {
+        log,
+        engine,
+        app,
+        mut events_rx,
+    } = ctx;
+    while let Some(event) = events_rx.recv().await {
+        match event {
+            selora_ai::SubagentEvent::Completed(completion) => {
+                let Ok(parent) = SessionId::new(completion.parent_session.clone()) else {
+                    continue;
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::SubagentCompleted(subagent_completed_dto(completion)),
+                    None,
+                    parent,
+                );
+            }
+            selora_ai::SubagentEvent::ApprovalNeeded(child_card) => {
+                let Ok(session_id) = SessionId::new(child_card.parent_session.clone()) else {
+                    continue;
+                };
+                let approval_id = ApprovalId::new(child_card.approval_id.to_string())
+                    .expect("uuid string is a valid id");
+                let child_id = child_card.child_id.clone();
+                let card = child_card.card;
+                let tool_name = fallback_tool_name(&card);
+                let (path_or_command, diff_or_input, workflow) = approval_body(&card);
+                let plan = approval_plan(&card);
+                let prompt = approval_prompt(&card);
+                let is_question = matches!(&card, ApprovalCard::Question(_));
+                let (request_id, turn_id) = engine
+                    .active_request_for_session(&session_id)
+                    .unwrap_or_else(|| {
+                        (
+                            RequestId::new(format!("subagent-{child_id}"))
+                                .expect("minted request id"),
+                            TurnId::new(format!("turn-{child_id}")).expect("minted turn id"),
+                        )
+                    });
+                engine
+                    .subagent_cards
+                    .lock()
+                    .expect("subagent card lock")
+                    .insert(
+                        approval_id.clone(),
+                        SubagentCardRoute {
+                            request_id: request_id.clone(),
+                            session_id: session_id.clone(),
+                            is_question,
+                        },
+                    );
+                log.record_session(
+                    &app,
+                    FrontendEvent::ApprovalNeeded(ApprovalNeededDto {
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        turn_id,
+                        approval_id,
+                        tool_name,
+                        path_or_command,
+                        diff_or_input,
+                        workflow,
+                        plan,
+                        prompt,
+                        subagent_id: Some(child_id),
+                    }),
+                    Some(request_id),
+                    session_id,
+                );
+            }
+        }
+    }
+}
+
+/// The desktop subagent backend: one fresh chat stream and one policy-scoped
+/// router per child turn. It deliberately carries no session approval grant.
+struct DesktopSubagentBackend {
+    root: PathBuf,
+    settings: selora_ai::AgentToolSettings,
+    base_url: String,
+    api_key: String,
+}
+
+impl selora_ai::SubagentBackend for DesktopSubagentBackend {
+    fn chat(&self) -> Result<Box<dyn selora_ai::ChatStream>, String> {
+        Ok(Box::new(selora_ai::ClientChatStream::new(
+            selora_ai::SeloraClient::new(&self.base_url, &self.api_key),
+        )))
+    }
+
+    fn tools(&self, policy: selora_ai::SubagentPolicy) -> Result<Box<dyn ToolRunner>, String> {
+        let context =
+            ToolContext::new(self.root.clone(), self.settings.clone()).with_policy(policy);
+        Ok(Box::new(RouterToolRunner::new(context)))
     }
 }
 
@@ -2812,6 +3081,15 @@ fn approval_body(card: &ApprovalCard) -> (String, Option<String>, Option<Workflo
             None,
             None,
         ),
+        ApprovalCard::Question(question_card) => (
+            question_card
+                .questions
+                .first()
+                .map(|question| question.question.clone())
+                .unwrap_or_else(|| "question".to_owned()),
+            None,
+            None,
+        ),
     }
 }
 
@@ -2825,6 +3103,31 @@ fn approval_plan(card: &ApprovalCard) -> Option<PlanApprovalDto> {
         }),
         _ => None,
     }
+}
+
+/// §19.4: one question card maps onto the single decision prompt the UI
+/// renders (`prompt` on the event, `decision_prompt` on the parked approval).
+/// The option id is the label: that is the value the answer echoes back.
+fn approval_prompt(card: &ApprovalCard) -> Option<DecisionPromptDto> {
+    let ApprovalCard::Question(question_card) = card else {
+        return None;
+    };
+    let question = question_card.questions.first()?;
+    Some(DecisionPromptDto::Question {
+        header: None,
+        question: question.question.clone(),
+        options: question
+            .options
+            .iter()
+            .map(|option| QuestionPromptOptionDto {
+                id: option.label.clone(),
+                label: option.label.clone(),
+                description: (!option.description.is_empty()).then(|| option.description.clone()),
+            })
+            .collect(),
+        allow_free_text: question.allow_free_text,
+        free_text_placeholder: None,
+    })
 }
 
 fn plan_phase_dto(phase: selora_ai::PlanPhase) -> PlanPhaseDto {
@@ -2867,6 +3170,7 @@ fn fallback_tool_name(card: &ApprovalCard) -> String {
         ApprovalCard::Command { .. } => "bash".into(),
         ApprovalCard::Workflow { .. } => "run_workflow".into(),
         ApprovalCard::Plan { .. } => "exit_plan_mode".into(),
+        ApprovalCard::Question(_) => "ask_user_question".into(),
     }
 }
 

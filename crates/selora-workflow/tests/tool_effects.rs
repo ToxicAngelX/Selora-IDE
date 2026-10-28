@@ -13,10 +13,28 @@ use std::sync::{Arc, Mutex};
 use selora_workflow::journal::{journal_path, run_dir, Journal};
 use selora_workflow::{
     partial_effects, prepare, redacted_tool_arguments, run_workflow_persisted, tool_effects_path,
-    CommandOutput, EventSink, GitCommit, GrepMatch, Host, HostError, RunId, RunOptions,
-    ToolEffectLedger, WorkflowError, WorkflowEvent, WorkflowOutcome, WorkflowSpec,
+    CommandOutput, EffectBegin, EventSink, GitCommit, GrepMatch, Host, HostError, RunId,
+    RunOptions, ToolEffectLedger, ToolEffectPhase, WorkflowError, WorkflowEvent, WorkflowOutcome,
+    WorkflowSpec,
 };
 use serde_json::{json, Value};
+
+/// Run one `begin_effect` that must produce a fresh attempt.
+fn execute_effect(
+    ledger: &ToolEffectLedger,
+    step: Option<&selora_workflow::ToolEffectStep>,
+    call_id: &str,
+    tool: &str,
+    args: Value,
+) -> (String, u32) {
+    match ledger
+        .begin_effect(step, call_id, tool, args)
+        .expect("a fresh effect")
+    {
+        EffectBegin::Execute { effect_id, attempt } => (effect_id, attempt),
+        other => panic!("expected Execute, got {other:?}"),
+    }
+}
 
 struct Workspace(PathBuf);
 
@@ -26,15 +44,11 @@ fn an_early_opened_ledger_rereads_sequence_before_its_first_write() {
     let id = RunId::from("reread-sequence");
     let first = ToolEffectLedger::open_for_run(root.path(), &id).unwrap();
     let stale = ToolEffectLedger::open_for_run(root.path(), &id).unwrap();
-    let effect = first
-        .record_started(None, "one", "write_file", json!({}))
-        .unwrap();
+    let (effect, attempt) = execute_effect(&first, None, "one", "write_file", json!({}));
     first
-        .record_finished(&effect, "one", "write_file", true)
+        .record_finished(&effect, attempt, "one", "write_file", true)
         .unwrap();
-    stale
-        .record_started(None, "two", "bash", json!({}))
-        .unwrap();
+    execute_effect(&stale, None, "two", "bash", json!({}));
     let records = selora_workflow::load_tool_effects(root.path(), &id).unwrap();
     assert_eq!(
         records.iter().map(|record| record.seq).collect::<Vec<_>>(),
@@ -128,15 +142,19 @@ impl Host for EffectHost {
                 json!({"path": "notes.txt", "content_bytes": 12})
             };
             let tool = if secret { "write_file" } else { "edit_file" };
-            let effect = ledger
-                .record_started(step.as_ref(), &format!("call-{count}"), tool, args)
-                .unwrap();
+            let (effect, attempt) = match ledger
+                .begin_effect(step.as_ref(), &format!("call-{count}"), tool, args)
+                .unwrap()
+            {
+                EffectBegin::Execute { effect_id, attempt } => (effect_id, attempt),
+                other => panic!("a fresh ask must execute, got {other:?}"),
+            };
             if count == self.panic_after_start {
                 panic!("simulated process interruption after the effect started");
             }
             if self.complete_effects.contains(&count) {
                 ledger
-                    .record_finished(&effect, &format!("call-{count}"), tool, true)
+                    .record_finished(&effect, attempt, &format!("call-{count}"), tool, true)
                     .unwrap();
             }
         } else if count == self.panic_after_start {
@@ -208,7 +226,7 @@ fn execute(
     workspace: &Workspace,
     id: &RunId,
     spec: &WorkflowSpec,
-    host: Arc<EffectHost>,
+    host: Arc<dyn Host>,
     resume: bool,
     allow_incomplete_asks: bool,
     acknowledge_partial_effects: bool,
@@ -318,7 +336,7 @@ fn partial_effects_refuse_before_any_host_call_or_journal_append() {
         &workspace,
         &id,
         &spec,
-        Arc::clone(&host),
+        Arc::clone(&host) as Arc<dyn Host>,
         true,
         false,
         false,
@@ -354,7 +372,15 @@ fn explicit_acknowledgement_starts_exactly_once() {
     let host = Arc::new(EffectHost::default());
     // Acknowledgement alone also covers the unfinished-ask re-dispatch: it
     // names the same effects.
-    let (result, _) = execute(&workspace, &id, &spec, Arc::clone(&host), true, false, true);
+    let (result, _) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host) as Arc<dyn Host>,
+        true,
+        false,
+        true,
+    );
     let outcome = result.unwrap();
     assert_eq!(outcome.report.status, selora_workflow::RunStatus::Completed);
     assert_eq!(
@@ -391,7 +417,15 @@ fn read_only_unfinished_ask_still_resumes_normally() {
     assert!(partial.is_empty(), "read-only asks write no ledger records");
 
     let host = Arc::new(EffectHost::default());
-    let (result, _) = execute(&workspace, &id, &spec, Arc::clone(&host), true, true, false);
+    let (result, _) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host) as Arc<dyn Host>,
+        true,
+        true,
+        false,
+    );
     result.unwrap();
     assert_eq!(host.asks.load(Ordering::SeqCst), 1);
 }
@@ -421,7 +455,15 @@ fn completed_effects_do_not_block_resume() {
         "a completed ask's paired effects are not partial: {partial:?}"
     );
     let host = Arc::new(EffectHost::default());
-    let (result, _) = execute(&workspace, &id, &spec, Arc::clone(&host), true, true, false);
+    let (result, _) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host) as Arc<dyn Host>,
+        true,
+        true,
+        false,
+    );
     result.unwrap();
     assert_eq!(host.asks.load(Ordering::SeqCst), 1);
 }
@@ -448,7 +490,7 @@ fn corrupt_ledger_is_a_typed_refusal_even_with_acknowledgement() {
             &workspace,
             &id,
             &spec,
-            Arc::clone(&host),
+            Arc::clone(&host) as Arc<dyn Host>,
             true,
             false,
             acknowledge,
@@ -478,4 +520,557 @@ fn ledger_never_records_a_secret_or_full_file_body() {
         "the redacted summary keeps only sizes: {ledger}"
     );
     assert!(run_dir(workspace.path(), &id).join("spec.json").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// Stable identity, replay, retries and acknowledgement evidence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stable_effect_id_depends_only_on_durable_identity() {
+    let step = selora_workflow::ToolEffectStep {
+        step_id: "2".into(),
+        agent: Some("fixer".into()),
+    };
+    let base = selora_workflow::stable_effect_id("run-1", Some(&step), "call-1", "write_file");
+    assert_eq!(
+        base,
+        selora_workflow::stable_effect_id("run-1", Some(&step), "call-1", "write_file"),
+        "the same durable identity must hash to the same effect id"
+    );
+    for other in [
+        selora_workflow::stable_effect_id("run-2", Some(&step), "call-1", "write_file"),
+        selora_workflow::stable_effect_id("run-1", None, "call-1", "write_file"),
+        selora_workflow::stable_effect_id("run-1", Some(&step), "call-2", "write_file"),
+        selora_workflow::stable_effect_id("run-1", Some(&step), "call-1", "edit_file"),
+    ] {
+        assert_ne!(base, other, "every durable identity field must matter");
+    }
+    assert!(base.starts_with("fx-"));
+}
+
+#[test]
+fn a_completed_effect_is_replayed_not_executed_again() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let step = selora_workflow::ToolEffectStep {
+        step_id: "1".into(),
+        agent: Some("writer".into()),
+    };
+    let args = json!({"path": "notes.txt", "content_bytes": 4});
+    let (effect, attempt) =
+        execute_effect(&ledger, Some(&step), "call-1", "write_file", args.clone());
+    ledger
+        .record_finished(&effect, attempt, "call-1", "write_file", true)
+        .unwrap();
+
+    let replay = ledger
+        .begin_effect(Some(&step), "call-1", "write_file", args.clone())
+        .unwrap();
+    assert_eq!(
+        replay,
+        EffectBegin::AlreadyCompleted {
+            effect_id: effect.clone(),
+            attempt,
+        }
+    );
+    // A second replay must not append a second `replayed` record.
+    ledger
+        .begin_effect(Some(&step), "call-1", "write_file", args)
+        .unwrap();
+
+    let records = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.phase == ToolEffectPhase::Started)
+            .count(),
+        1,
+        "a completed effect never starts a second attempt"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.phase == ToolEffectPhase::Replayed)
+            .count(),
+        1,
+        "replay evidence is durable and idempotent"
+    );
+}
+
+#[test]
+fn an_unfinished_effect_refuses_a_retry_until_acknowledged() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let step = selora_workflow::ToolEffectStep {
+        step_id: "2".into(),
+        agent: Some("fixer".into()),
+    };
+    let args = json!({"path": "notes.txt", "content_bytes": 4});
+    let (effect, attempt) =
+        execute_effect(&ledger, Some(&step), "call-2", "write_file", args.clone());
+
+    let refused = ledger
+        .begin_effect(Some(&step), "call-2", "write_file", args.clone())
+        .unwrap_err();
+    assert!(
+        matches!(refused, WorkflowError::ToolEffectLedger { .. }),
+        "an unmatched attempt is a typed refusal: {refused:?}"
+    );
+
+    let mut ids = std::collections::BTreeSet::new();
+    ids.insert(effect.clone());
+    assert_eq!(
+        ledger
+            .acknowledge_effects(&ids, "owner", "accepted the risk")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        ledger
+            .acknowledge_effects(&ids, "owner", "accepted the risk")
+            .unwrap(),
+        0,
+        "acknowledgement evidence is idempotent"
+    );
+    let records = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap();
+    let ack = records
+        .iter()
+        .find(|record| record.phase == ToolEffectPhase::Acknowledged)
+        .expect("durable acknowledgement evidence");
+    assert_eq!(ack.effect_id, effect);
+    assert_eq!(ack.attempt, attempt);
+    assert_eq!(ack.step.as_ref(), Some(&step), "the ask is named");
+    assert_eq!(ack.acknowledged_by.as_deref(), Some("owner"));
+    assert_eq!(
+        ack.acknowledged_reason.as_deref(),
+        Some("accepted the risk")
+    );
+
+    let retry = ledger
+        .begin_effect(Some(&step), "call-2", "write_file", args)
+        .unwrap();
+    assert_eq!(
+        retry,
+        EffectBegin::Execute {
+            effect_id: effect,
+            attempt: attempt + 1,
+        }
+    );
+}
+
+#[test]
+fn a_failed_effect_refuses_a_retry_until_acknowledged() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let args = json!({"path": "notes.txt", "content_bytes": 4});
+    let (effect, attempt) = execute_effect(&ledger, None, "call-3", "write_file", args.clone());
+    ledger
+        .record_finished(&effect, attempt, "call-3", "write_file", false)
+        .unwrap();
+
+    assert!(ledger
+        .begin_effect(None, "call-3", "write_file", args.clone())
+        .is_err());
+    let mut ids = std::collections::BTreeSet::new();
+    ids.insert(effect);
+    ledger
+        .acknowledge_effects(&ids, "owner", "accepted a partial write")
+        .unwrap();
+    let retry = ledger
+        .begin_effect(None, "call-3", "write_file", args)
+        .unwrap();
+    assert_eq!(retry.attempt(), 2);
+}
+
+#[test]
+fn one_call_id_cannot_be_reinterpreted_with_different_arguments() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    execute_effect(
+        &ledger,
+        None,
+        "call-4",
+        "write_file",
+        json!({"path": "a.txt"}),
+    );
+    let error = ledger
+        .begin_effect(None, "call-4", "write_file", json!({"path": "b.txt"}))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("different call arguments"),
+        "a re-used id with different arguments fails closed: {error}"
+    );
+}
+
+#[test]
+fn concurrent_append_handles_keep_the_sequence_contiguous() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let ledger = Arc::new(ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap());
+    let mut threads = Vec::new();
+    for writer in 0..4 {
+        let ledger = Arc::clone(&ledger);
+        threads.push(std::thread::spawn(move || {
+            for call in 0..5 {
+                let call_id = format!("call-{writer}-{call}");
+                let (effect, attempt) =
+                    execute_effect(&ledger, None, &call_id, "bash", json!({"command_bytes": 3}));
+                ledger
+                    .record_finished(&effect, attempt, &call_id, "bash", true)
+                    .unwrap();
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let records = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap();
+    assert_eq!(records.len(), 40);
+    assert_eq!(
+        records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+        (1..=40).collect::<Vec<_>>(),
+        "the per-run lock serializes read/append/sync"
+    );
+}
+
+/// A host that records each ask'"'"'s tool effect with a stable call id and
+/// counts real executions. The second ask crashes after its effect is durable
+/// but before the journal records the ask result, which is the crash window
+/// replay must cover.
+struct ReplayHost {
+    asks: AtomicU64,
+    executions: AtomicU64,
+    crash_once: AtomicBool,
+    step: Mutex<Option<selora_workflow::ToolEffectStep>>,
+    ledger: Mutex<ToolEffectLedger>,
+}
+
+impl ReplayHost {
+    fn new(ledger: ToolEffectLedger) -> Self {
+        Self {
+            asks: AtomicU64::new(0),
+            executions: AtomicU64::new(0),
+            crash_once: AtomicBool::new(true),
+            step: Mutex::new(None),
+            ledger: Mutex::new(ledger),
+        }
+    }
+}
+
+impl Host for ReplayHost {
+    fn note_step_started(&self, step: &selora_workflow::WorkflowStep) {
+        *self
+            .step
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(selora_workflow::ToolEffectStep {
+            step_id: step.index.to_string(),
+            agent: step.agent.clone(),
+        });
+    }
+
+    fn ask(&self, agent: &str, _: Option<&str>, instructions: &str) -> Result<Value, HostError> {
+        self.asks.fetch_add(1, Ordering::SeqCst);
+        let step = self
+            .step
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .expect("the engine reports the owning step before an ask");
+        let call_id = format!("call-{}", step.step_id);
+        {
+            let ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let args = json!({"path": format!("f{}.txt", step.step_id), "content_bytes": 4});
+            match ledger
+                .begin_effect(Some(&step), &call_id, "write_file", args)
+                .unwrap()
+            {
+                EffectBegin::Execute { effect_id, attempt } => {
+                    self.executions.fetch_add(1, Ordering::SeqCst);
+                    ledger
+                        .record_finished(&effect_id, attempt, &call_id, "write_file", true)
+                        .unwrap();
+                }
+                EffectBegin::AlreadyCompleted { .. } => {}
+            }
+        }
+        if step.step_id == "2" && self.crash_once.swap(false, Ordering::SeqCst) {
+            panic!("simulated crash after a completed effect, before the journal result");
+        }
+        Ok(json!({"agent": agent, "instructions": instructions}))
+    }
+
+    fn world_run(&self, _: &str, _: &[String], _: Option<u64>) -> Result<CommandOutput, HostError> {
+        Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    fn files_glob(&self, _: &str) -> Result<Vec<String>, HostError> {
+        Ok(vec![])
+    }
+
+    fn files_grep(&self, _: &str, _: Option<&str>) -> Result<Vec<GrepMatch>, HostError> {
+        Ok(vec![])
+    }
+
+    fn files_read(&self, _: &str) -> Result<String, HostError> {
+        Ok(String::new())
+    }
+
+    fn git_changed_files(&self, _: Option<&str>) -> Result<Vec<String>, HostError> {
+        Ok(vec![])
+    }
+
+    fn git_diff(&self, _: Option<&str>, _: Option<&str>) -> Result<String, HostError> {
+        Ok(String::new())
+    }
+
+    fn git_status(&self) -> Result<String, HostError> {
+        Ok(String::new())
+    }
+
+    fn git_log(&self, _: Option<usize>) -> Result<Vec<GitCommit>, HostError> {
+        Ok(vec![])
+    }
+
+    fn report(&self, _: &Value, _: Option<&str>) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn artifact_markdown(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn artifact_file(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn log(&self, _: &str) {}
+
+    fn cost_usd(&self) -> f64 {
+        self.asks.load(Ordering::SeqCst) as f64
+    }
+
+    fn tokens(&self) -> u64 {
+        self.asks.load(Ordering::SeqCst) * 100
+    }
+}
+
+#[test]
+fn a_crashed_ask_replays_its_completed_effect_instead_of_running_it_twice() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = two_ask_spec();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let host = Arc::new(ReplayHost::new(ledger));
+
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute(
+            &workspace,
+            &id,
+            &spec,
+            Arc::clone(&host) as Arc<dyn Host>,
+            false,
+            false,
+            false,
+        )
+    }));
+    assert!(crashed.is_err(), "the second ask must crash");
+    assert_eq!(
+        host.executions.load(Ordering::SeqCst),
+        2,
+        "each ask ran its tool exactly once before the crash"
+    );
+
+    let partial = partial_effects(workspace.path(), &id).unwrap();
+    assert_eq!(partial.unfinished_ask_effects, 1);
+    assert!(!partial.is_empty());
+
+    // Ordinary resume refuses: the ask that would be dispatched again owns a
+    // durable effect.
+    let (refused, _) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::new(EffectHost::default()),
+        true,
+        true,
+        false,
+    );
+    assert!(matches!(
+        refused,
+        Err(WorkflowError::PartialEffects { effects: 1 })
+    ));
+
+    assert_eq!(
+        selora_workflow::acknowledge_partial_effects(
+            workspace.path(),
+            &id,
+            "test-owner",
+            "accept the effect risk",
+        )
+        .unwrap(),
+        1
+    );
+    let partial = partial_effects(workspace.path(), &id).unwrap();
+    assert!(partial.is_empty(), "durable acceptance clears the risk");
+    assert_eq!(partial.acknowledged_effects, 1);
+
+    let (result, _) = execute(
+        &workspace,
+        &id,
+        &spec,
+        Arc::clone(&host) as Arc<dyn Host>,
+        true,
+        true,
+        false,
+    );
+    result.unwrap();
+    assert_eq!(
+        host.executions.load(Ordering::SeqCst),
+        2,
+        "the completed effect was replayed, never executed a second time"
+    );
+
+    let records = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.phase == ToolEffectPhase::Started)
+            .count(),
+        2,
+        "one started record per real execution"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.phase == ToolEffectPhase::Replayed)
+            .count(),
+        1,
+        "the replay is durable evidence"
+    );
+}
+
+#[test]
+fn an_acknowledging_resume_writes_per_ask_evidence_before_starting() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = crash_after_started(&workspace, &id, false);
+
+    let host = Arc::new(EffectHost::default());
+    let (result, _) = execute(&workspace, &id, &spec, host, true, false, true);
+    result.unwrap();
+
+    let records = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap();
+    let ack = records
+        .iter()
+        .find(|record| record.phase == ToolEffectPhase::Acknowledged)
+        .expect("the acknowledgement is durable evidence");
+    assert_eq!(
+        ack.step.as_ref().map(|step| step.step_id.as_str()),
+        Some("2")
+    );
+    assert_eq!(
+        ack.step.as_ref().and_then(|step| step.agent.as_deref()),
+        Some("fixer")
+    );
+    assert_eq!(ack.acknowledged_by.as_deref(), Some("workflow resume"));
+    assert!(ack
+        .acknowledged_reason
+        .as_deref()
+        .is_some_and(|reason| !reason.is_empty()));
+}
+
+#[test]
+fn a_failed_effect_counts_as_partial_evidence() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let spec = two_ask_spec();
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let host = Arc::new(EffectHost {
+        ledger: Some(Arc::new(Mutex::new(ledger))),
+        complete_effects: vec![1],
+        panic_before_effect: 2,
+        ..EffectHost::default()
+    });
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute(&workspace, &id, &spec, host, false, false, false)
+    }));
+    assert!(crashed.is_err());
+
+    // A second tool call of the completed ask reported an error: its effect
+    // may be partial, so it is durable risk even though the ask succeeded.
+    let ledger = ToolEffectLedger::open_for_run(workspace.path(), &id).unwrap();
+    let step = selora_workflow::ToolEffectStep {
+        step_id: "1".into(),
+        agent: Some("writer".into()),
+    };
+    let (failed, failed_attempt) = execute_effect(
+        &ledger,
+        Some(&step),
+        "call-9",
+        "write_file",
+        json!({"path": "other.txt", "content_bytes": 3}),
+    );
+    ledger
+        .record_finished(&failed, failed_attempt, "call-9", "write_file", false)
+        .unwrap();
+
+    let partial = partial_effects(workspace.path(), &id).unwrap();
+    assert_eq!(partial.failed_effects, 1);
+    assert!(partial.risk_count() >= 1);
+}
+
+#[test]
+fn inconsistent_attempt_evidence_is_typed_corruption() {
+    let workspace = Workspace::new();
+    let id = RunId::new();
+    let path = workspace.effects(&id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = |seq: u64, phase: &str, attempt: u32, ok: Option<bool>| {
+        let mut value = json!({
+            "seq": seq,
+            "run_id": id.as_str(),
+            "effect_id": "fx-test",
+            "call_id": "call-1",
+            "tool": "write_file",
+            "phase": phase,
+            "attempt": attempt,
+        });
+        if let Some(ok) = ok {
+            value["ok"] = json!(ok);
+        }
+        value.to_string()
+    };
+    let cases = [
+        vec![record(1, "started", 1, None), record(2, "started", 1, None)],
+        vec![record(1, "finished", 1, Some(true))],
+        vec![
+            record(1, "started", 1, None),
+            record(2, "replayed", 1, None),
+        ],
+        vec![
+            record(1, "started", 1, None),
+            record(2, "finished", 1, Some(true)),
+            record(3, "started", 2, None),
+        ],
+    ];
+    for lines in cases {
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let error = selora_workflow::load_tool_effects(workspace.path(), &id).unwrap_err();
+        assert!(
+            matches!(error, WorkflowError::ToolEffectLedger { .. }),
+            "inconsistent evidence is typed corruption: {error:?}"
+        );
+    }
 }

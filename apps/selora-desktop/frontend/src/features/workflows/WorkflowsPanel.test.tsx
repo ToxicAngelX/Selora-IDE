@@ -510,6 +510,44 @@ describe('WorkflowsPanel', () => {
     expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull();
   });
 
+  it('shows per-phase usage and zeroes a phase with no billed ask', () => {
+    act(() => workflowsStore.hydratePersisted([{
+      run_id: 'run_phase_usage',
+      name: 'Usage review',
+      status: 'completed',
+      resumable: false,
+      phases: ['scan', 'fix', 'verify'],
+      phase_usage: [
+        { phase: 'scan', tokens: 1200, cost_usd: 0.12 },
+        { phase: 'fix', tokens: 800, cost_usd: 0.08 },
+        { phase: 'verify', tokens: 0, cost_usd: 0 },
+      ],
+      tokens: 2000,
+      cost_usd: 0.2,
+    }]));
+    render(<WorkflowsPanel />);
+
+    const run = workflowsStore.getSnapshot().runs[0];
+    expect(run?.phase_usage).toEqual([
+      { phase: 'scan', tokens: 1200, cost_usd: 0.12 },
+      { phase: 'fix', tokens: 800, cost_usd: 0.08 },
+      { phase: 'verify', tokens: 0, cost_usd: 0 },
+    ]);
+    expect(screen.getByTestId('wf-phase-usage-scan').textContent).toContain('1,200 tokens');
+    expect(screen.getByTestId('wf-phase-usage-scan').textContent).toContain('$0.12');
+    expect(screen.getByTestId('wf-phase-usage-verify').textContent).toContain('0 tokens');
+    expect(screen.getByTestId('wf-phase-usage-verify').textContent).toContain('$0.00');
+  });
+
+  it('renders no per-phase numbers when the journal reported none', () => {
+    apply(started);
+    render(<WorkflowsPanel />);
+
+    expect(workflowsStore.getSnapshot().runs[0]?.phase_usage).toEqual([]);
+    expect(screen.queryByTestId('wf-phase-usage-Scan')).toBeNull();
+    expect(screen.queryByTestId('wf-phase-usage-Review')).toBeNull();
+  });
+
   it('never offers resume for an ambiguous durable run', () => {
     workflowsStore.setResumeHandler(() => undefined);
     act(() => workflowsStore.hydratePersisted([{
