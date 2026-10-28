@@ -451,6 +451,11 @@ pub struct SettingsPatchDto {
     pub keybind_save: Option<String>,
 }
 
+/// Default history page size for `GitLog` when the caller omits `limit`.
+fn default_git_log_limit() -> u32 {
+    50
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendCommand {
@@ -597,6 +602,71 @@ pub enum FrontendCommand {
     OpenGitDiff {
         path: WorkspacePath,
     },
+    // Daily git (typed commands for the branch / history / stash / merge and
+    // network surface). Every path is a `WorkspacePath`, so the protocol
+    // already rejects traversal and absolute paths at the parse boundary; the
+    // backend re-checks containment against the real work tree.
+    // Payload field names match `apps/selora-desktop/frontend/src/bridge/
+    // bridge.ts` exactly (`checkout`, `count`, `sha`, `message`, `resolution`);
+    // the reply shapes live in [`GitCommandReplyDto`].
+    GitBranches,
+    GitCreateBranch {
+        name: String,
+        #[serde(default)]
+        checkout: bool,
+    },
+    GitSwitchBranch {
+        name: String,
+    },
+    GitDeleteBranch {
+        name: String,
+    },
+    GitLog {
+        #[serde(default = "default_git_log_limit")]
+        count: u32,
+        #[serde(default)]
+        path: Option<WorkspacePath>,
+    },
+    GitShowCommit {
+        sha: String,
+    },
+    /// Discard every local change to one path: the working-tree edit and any
+    /// staged entry. An untracked (or newly staged) file is deleted.
+    GitDiscard {
+        path: WorkspacePath,
+    },
+    GitStageAll,
+    GitUnstageAll,
+    GitStashSave {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    GitStashList,
+    GitStashApply {
+        #[serde(default)]
+        index: u32,
+    },
+    GitStashPop {
+        #[serde(default)]
+        index: u32,
+    },
+    GitStashDrop {
+        index: u32,
+    },
+    GitMerge {
+        branch: String,
+    },
+    #[serde(rename = "git_conflict_resolve")]
+    GitResolveConflict {
+        path: WorkspacePath,
+        resolution: GitConflictSideDto,
+    },
+    // The bridge sends no payload for the network commands: the backend uses
+    // the branch's configured remote and the checked-out branch. Unit
+    // variants keep that wire shape exact.
+    GitFetch,
+    GitPull,
+    GitPush,
     ToggleSurface {
         surface: SurfaceId,
     },
@@ -1129,6 +1199,11 @@ pub struct GitStatusDto {
     /// fall back to `changed_paths` / `staged_paths`.
     #[serde(default)]
     pub files: Vec<GitFileDto>,
+    /// Additive: conflicted paths from the current merge/rebase, sorted. A
+    /// conflicted path is *not* in `changed_paths` (its two status slots are
+    /// unmodified); the panel renders it in the conflict banner instead.
+    #[serde(default)]
+    pub conflicts: Vec<WorkspacePath>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticDto {
@@ -1272,6 +1347,11 @@ pub struct BootstrapState {
 pub enum CommandResultDto {
     Snapshot(Box<BootstrapState>),
     Ack(CommandAckDto),
+    /// A read-only daily git command's typed data (`git_branches`,
+    /// `git_log`, `git_show_commit`, `git_stash_list`). Serialized as one
+    /// object whose key names the list (`branches` / `commits` / `stashes`) or
+    /// the commit fields directly — both shapes `GitPanelView` validates.
+    Git(GitCommandReplyDto),
 }
 
 /// A mutation acknowledgement: the core identity, the log position after the
@@ -1799,6 +1879,77 @@ pub struct GitDiffDto {
     pub path: WorkspacePath,
     pub unified_diff: String,
 }
+// ---------------------------------------------------------------------------
+// Daily git reply DTOs (branches, history, stash).
+//
+// Field names match the shapes `GitPanelView.tsx` validates (`name`/`current`,
+// `sha`/`summary`/`author`/`timestamp`, `index`/`message`). `CommandResultDto::
+// Git` carries one of these; the authoritative file state still arrives as a
+// `GitStatusChanged` event, and failures are `ProtocolErrorDto`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitConflictSideDto {
+    Ours,
+    Theirs,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitBranchDto {
+    pub name: String,
+    /// Whether this is the checked-out branch (the panel's `current` field).
+    pub current: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitBranchesReplyDto {
+    pub branches: Vec<GitBranchDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitLogEntryDto {
+    /// Full hex object id.
+    pub sha: String,
+    /// First line of the message.
+    pub summary: String,
+    pub author: String,
+    /// Author time, seconds since the Unix epoch.
+    pub timestamp: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitLogReplyDto {
+    pub commits: Vec<GitLogEntryDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitReplyDto {
+    pub sha: String,
+    pub summary: String,
+    pub author: String,
+    /// Author time, seconds since the Unix epoch.
+    pub timestamp: i64,
+    /// Full commit message (never empty: `git_commit` refuses an empty one).
+    pub message: String,
+    /// Unified patch, bounded by `selora-git`'s `MAX_PATCH_BYTES`.
+    pub unified_diff: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStashEntryDto {
+    pub index: u32,
+    pub message: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStashesReplyDto {
+    pub stashes: Vec<GitStashEntryDto>,
+}
+/// The typed data reply of a read-only git command. The union is untagged
+/// because each variant has a distinct required key; `GitPanelView` accepts
+/// both this named-key shape and a bare array.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GitCommandReplyDto {
+    Branches(GitBranchesReplyDto),
+    Log(GitLogReplyDto),
+    Commit(Box<GitCommitReplyDto>),
+    Stashes(GitStashesReplyDto),
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelsDto {
     pub models: Vec<ModelDto>,
@@ -2189,6 +2340,7 @@ mod tests {
                 changed_paths: vec![],
                 staged_paths: vec![],
                 files: vec![],
+                conflicts: vec![],
             },
             diagnostics: vec![],
             lsp_servers: vec![],
@@ -3052,6 +3204,7 @@ mod tests {
                     worktree: true,
                 },
             ],
+            conflicts: vec![git_path("src/conflict.rs")],
         };
         let json = serde_json::to_string(&status).unwrap();
         // The new field really rides the wire, carrying both slots per file.
@@ -3075,6 +3228,231 @@ mod tests {
         assert_eq!(status.changed_paths.len(), 1);
         assert!(status.staged_paths.is_empty());
         assert!(status.files.is_empty());
+    }
+    #[test]
+    fn daily_git_commands_accept_the_bridge_payloads_exactly() {
+        // Every payload below is verbatim what `bridge.ts` sends (including
+        // the no-payload shape of the network commands and a null stash
+        // message). A mismatch here is a dead command in the panel.
+        let parse = |json: &str| serde_json::from_str::<FrontendCommand>(json).unwrap();
+
+        assert_eq!(
+            parse(r#"{"type":"git_branches"}"#),
+            FrontendCommand::GitBranches
+        );
+        assert_eq!(
+            parse(
+                r#"{"type":"git_create_branch","payload":{"name":"feature/git","checkout":true}}"#
+            ),
+            FrontendCommand::GitCreateBranch {
+                name: "feature/git".into(),
+                checkout: true,
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_switch_branch","payload":{"name":"main"}}"#),
+            FrontendCommand::GitSwitchBranch {
+                name: "main".into()
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_delete_branch","payload":{"name":"old"}}"#),
+            FrontendCommand::GitDeleteBranch { name: "old".into() }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_log","payload":{"count":50}}"#),
+            FrontendCommand::GitLog {
+                count: 50,
+                path: None,
+            }
+        );
+        // An omitted count is the default page, not zero entries.
+        assert_eq!(
+            parse(r#"{"type":"git_log","payload":{}}"#),
+            FrontendCommand::GitLog {
+                count: 50,
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_show_commit","payload":{"sha":"abc1234"}}"#),
+            FrontendCommand::GitShowCommit {
+                sha: "abc1234".into()
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_discard","payload":{"path":"src/a.rs"}}"#),
+            FrontendCommand::GitDiscard {
+                path: git_path("src/a.rs")
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_save","payload":{"message":null}}"#),
+            FrontendCommand::GitStashSave { message: None }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_save","payload":{"message":"park it"}}"#),
+            FrontendCommand::GitStashSave {
+                message: Some("park it".into())
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_list"}"#),
+            FrontendCommand::GitStashList
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_apply","payload":{"index":1}}"#),
+            FrontendCommand::GitStashApply { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_pop","payload":{"index":1}}"#),
+            FrontendCommand::GitStashPop { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_drop","payload":{"index":1}}"#),
+            FrontendCommand::GitStashDrop { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_merge","payload":{"branch":"topic"}}"#),
+            FrontendCommand::GitMerge {
+                branch: "topic".into()
+            }
+        );
+        assert_eq!(
+            parse(
+                r#"{"type":"git_conflict_resolve","payload":{"path":"src/a.rs","resolution":"theirs"}}"#
+            ),
+            FrontendCommand::GitResolveConflict {
+                path: git_path("src/a.rs"),
+                resolution: GitConflictSideDto::Theirs,
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stage_all"}"#),
+            FrontendCommand::GitStageAll
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_unstage_all"}"#),
+            FrontendCommand::GitUnstageAll
+        );
+        assert_eq!(parse(r#"{"type":"git_push"}"#), FrontendCommand::GitPush);
+        assert_eq!(parse(r#"{"type":"git_pull"}"#), FrontendCommand::GitPull);
+        assert_eq!(parse(r#"{"type":"git_fetch"}"#), FrontendCommand::GitFetch);
+
+        // Serialization keeps the same wire names and payload keys.
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitStageAll).unwrap(),
+            r#"{"type":"git_stage_all"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitStashPop { index: 1 }).unwrap(),
+            r#"{"type":"git_stash_pop","payload":{"index":1}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitPush).unwrap(),
+            r#"{"type":"git_push"}"#
+        );
+
+        // WorkspacePath rejects traversal at the wire boundary.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"git_discard","payload":{"path":"../escape.txt"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn daily_git_replies_match_the_panel_contract_and_status_carries_conflicts() {
+        let branches = GitCommandReplyDto::Branches(GitBranchesReplyDto {
+            branches: vec![GitBranchDto {
+                name: "main".into(),
+                current: true,
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(branches.clone())).unwrap(),
+            serde_json::json!({"branches": [{"name": "main", "current": true}]})
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandResultDto>(
+                serde_json::json!({"branches": [{"name": "main", "current": true}]})
+            )
+            .unwrap(),
+            CommandResultDto::Git(branches)
+        );
+
+        let log = GitCommandReplyDto::Log(GitLogReplyDto {
+            commits: vec![GitLogEntryDto {
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                summary: "work".into(),
+                author: "Test".into(),
+                timestamp: 1_700_000_000,
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(log)).unwrap(),
+            serde_json::json!({"commits": [{
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "summary": "work",
+                "author": "Test",
+                "timestamp": 1_700_000_000i64,
+            }]})
+        );
+
+        let detail = GitCommandReplyDto::Commit(Box::new(GitCommitReplyDto {
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            summary: "work".into(),
+            author: "Test".into(),
+            timestamp: 1_700_000_000,
+            message: "work\n".into(),
+            unified_diff: "--- a/a\n+++ b/a\n+line\n".into(),
+        }));
+        let json = serde_json::to_value(CommandResultDto::Git(detail)).unwrap();
+        assert_eq!(json["sha"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(json["message"], "work\n");
+        assert_eq!(json["unified_diff"], "--- a/a\n+++ b/a\n+line\n");
+
+        let stashes = GitCommandReplyDto::Stashes(GitStashesReplyDto {
+            stashes: vec![GitStashEntryDto {
+                index: 0,
+                message: "WIP on main".into(),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(stashes)).unwrap(),
+            serde_json::json!({"stashes": [{"index": 0, "message": "WIP on main"}]})
+        );
+
+        // The untagged union still parses an ack (the added variant is last).
+        let ack = CommandAckDto {
+            protocol_version: 1,
+            core_instance_id: CoreInstanceId::new("core_1").unwrap(),
+            snapshot_sequence: 7,
+            acknowledged: true,
+            session_id: None,
+        };
+        assert_eq!(
+            serde_json::from_value::<CommandResultDto>(serde_json::to_value(&ack).unwrap())
+                .unwrap(),
+            CommandResultDto::Ack(ack)
+        );
+
+        // `conflicts` is additive: absent payloads default to empty and a
+        // present list round-trips as workspace paths.
+        let without: GitStatusDto = serde_json::from_str(
+            r#"{"branch":"main","changed_paths":[],"staged_paths":[],"files":[]}"#,
+        )
+        .unwrap();
+        assert!(without.conflicts.is_empty());
+        let with = GitStatusDto {
+            branch: Some("main".into()),
+            changed_paths: vec![],
+            staged_paths: vec![],
+            files: vec![],
+            conflicts: vec![git_path("src/a.rs")],
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""conflicts":["src/a.rs"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<GitStatusDto>(&json).unwrap(), with);
     }
     #[test]
     fn approval_is_bound_and_consumed_once() {

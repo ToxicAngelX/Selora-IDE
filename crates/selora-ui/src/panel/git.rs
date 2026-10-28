@@ -511,6 +511,7 @@ mod tests {
                 file("src/ui/theme.rs", Slot::Unmodified, Slot::Modified),
                 file("notes.md", Slot::Unmodified, Slot::New),
             ],
+            conflicts: Vec::new(),
         }
     }
 
@@ -518,6 +519,7 @@ mod tests {
         GitStatus {
             branch: Some("main".to_owned()),
             entries: vec![file("src/editor/mod.rs", Slot::Modified, Slot::Unmodified)],
+            conflicts: Vec::new(),
         }
     }
 

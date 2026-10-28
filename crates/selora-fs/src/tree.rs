@@ -511,6 +511,13 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let dir = std::env::temp_dir().join(unique);
+        // A previous process can have had the same pid (pid reuse on Windows
+        // is common) and left its fixture behind; the tests expect a fresh
+        // root, so start from a clean directory instead of failing on a stale
+        // `PathExists`.
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).expect("clear stale fixture root");
+        }
         std::fs::create_dir_all(&dir).expect("create fixture root");
         dir
     }

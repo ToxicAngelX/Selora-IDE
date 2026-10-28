@@ -1,12 +1,12 @@
 use selora_protocol::{
     clamp_region_size, ApprovalId, BootstrapState, BufferSnapshotDto, CommandAckDto,
     CommandResultDto, CoreInstanceId, DecisionDto, EventEnvelope, FileTreeDto, FrontendCommand,
-    FrontendEvent, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto, RegionId, RequestEnvelope,
-    RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId, ToastDto, ToastSeverity,
-    WorkflowApprovalNeededDto, WorkflowArtifactDto, WorkflowArtifactEventDto, WorkflowFinishedDto,
-    WorkflowPhaseDto, WorkflowPhaseEventDto, WorkflowReportDto, WorkflowReportEventDto,
-    WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus, WorkflowStepDto, WorkflowStepEventDto,
-    WorkspaceId, PROTOCOL_VERSION,
+    FrontendEvent, GitCommandReplyDto, LayoutConstraintsDto, LayoutDto, ProtocolErrorDto, RegionId,
+    RequestEnvelope, RequestId, SessionId, SettingsPatchDto, SettingsViewDto, SurfaceId, ToastDto,
+    ToastSeverity, WorkflowApprovalNeededDto, WorkflowArtifactDto, WorkflowArtifactEventDto,
+    WorkflowFinishedDto, WorkflowPhaseDto, WorkflowPhaseEventDto, WorkflowReportDto,
+    WorkflowReportEventDto, WorkflowSpecDto, WorkflowStartedDto, WorkflowStatus, WorkflowStepDto,
+    WorkflowStepEventDto, WorkspaceId, PROTOCOL_VERSION,
 };
 use selora_settings::LayoutSettings;
 use std::{
@@ -2318,6 +2318,7 @@ impl DesktopState {
                     // additive P2 field stays empty (readers fall back to the
                     // legacy paths, which are empty too).
                     files: Vec::new(),
+                    conflicts: Vec::new(),
                 });
                 (
                     selora_protocol::WorkspaceDto {
@@ -2347,6 +2348,7 @@ impl DesktopState {
                     changed_paths: Vec::new(),
                     staged_paths: Vec::new(),
                     files: Vec::new(),
+                    conflicts: Vec::new(),
                 },
             ),
         };
@@ -2932,6 +2934,171 @@ impl DesktopState {
                 self.record_event(app, FrontendEvent::GitDiffReady(diff), Some(request_id));
                 Ok(CommandResultDto::Ack(self.command_ack()))
             }
+            // Daily git. Read commands answer typed data (the panel parses the
+            // reply); mutations answer an ack and publish the authoritative
+            // `GitStatusChanged`, exactly like stage/unstage/commit above.
+            FrontendCommand::GitBranches => {
+                let branches = self.with_workspace(|workspace| workspace.git_branches())?;
+                Ok(CommandResultDto::Git(GitCommandReplyDto::Branches(
+                    branches,
+                )))
+            }
+            FrontendCommand::GitCreateBranch { name, checkout } => {
+                let status =
+                    self.with_workspace(|workspace| workspace.git_create_branch(&name, checkout))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitSwitchBranch { name } => {
+                let status = self.with_workspace(|workspace| workspace.git_switch_branch(&name))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitDeleteBranch { name } => {
+                let status = self.with_workspace(|workspace| workspace.git_delete_branch(&name))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitLog { count, path } => {
+                let path = path.map(|path| path.as_str().to_owned());
+                let log =
+                    self.with_workspace(|workspace| workspace.git_log(count, path.as_deref()))?;
+                Ok(CommandResultDto::Git(GitCommandReplyDto::Log(log)))
+            }
+            FrontendCommand::GitShowCommit { sha } => {
+                let detail = self.with_workspace(|workspace| workspace.git_show_commit(&sha))?;
+                Ok(CommandResultDto::Git(GitCommandReplyDto::Commit(Box::new(
+                    detail,
+                ))))
+            }
+            FrontendCommand::GitDiscard { path } => {
+                let status =
+                    self.with_workspace(|workspace| workspace.git_discard(path.as_str()))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitStageAll => {
+                let status = self.with_workspace(|workspace| workspace.git_stage_all())?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitUnstageAll => {
+                let status = self.with_workspace(|workspace| workspace.git_unstage_all())?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitStashSave { message } => {
+                let status =
+                    self.with_workspace(|workspace| workspace.git_stash_save(message.as_deref()))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitStashList => {
+                let stashes = self.with_workspace(|workspace| workspace.git_stash_list())?;
+                Ok(CommandResultDto::Git(GitCommandReplyDto::Stashes(stashes)))
+            }
+            FrontendCommand::GitStashApply { index } => {
+                let status = self.with_workspace(|workspace| workspace.git_stash_apply(index))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitStashPop { index } => {
+                let status = self.with_workspace(|workspace| workspace.git_stash_pop(index))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitStashDrop { index } => {
+                let status = self.with_workspace(|workspace| workspace.git_stash_drop(index))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitMerge { branch } => {
+                let status = self.with_workspace(|workspace| workspace.git_merge(&branch))?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitResolveConflict { path, resolution } => {
+                let status = self.with_workspace(|workspace| {
+                    workspace.git_resolve_conflict(path.as_str(), resolution)
+                })?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitFetch => {
+                let status = self.with_workspace(|workspace| workspace.git_fetch())?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitPull => {
+                let status = self.with_workspace(|workspace| workspace.git_pull())?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::GitPush => {
+                let status = self.with_workspace(|workspace| workspace.git_push())?;
+                self.record_event(
+                    app,
+                    FrontendEvent::GitStatusChanged(status),
+                    Some(request_id),
+                );
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
             FrontendCommand::SettingsUpdate { patch } => {
                 // The settings mutation emits its own full bootstrap snapshot;
                 // the command reply is only an ack.
@@ -3074,7 +3241,9 @@ impl DesktopState {
     ) -> Result<BootstrapState, ProtocolErrorDto> {
         match self.dispatch_result(app, envelope)? {
             CommandResultDto::Snapshot(snapshot) => Ok(*snapshot),
-            CommandResultDto::Ack(_) => Ok(self.bootstrap()),
+            // A typed git reply is data for the IPC caller; the in-process
+            // helper still materializes the state the same way an ack does.
+            CommandResultDto::Ack(_) | CommandResultDto::Git(_) => Ok(self.bootstrap()),
         }
     }
 
@@ -4597,6 +4766,218 @@ mod tests {
         dir
     }
 
+    // ------------------------------------------------------------------
+    // Daily Git: every bridge command must reach the workspace and answer
+    // the shape `GitPanelView` validates. The backend's own behavior is
+    // covered in `workspace.rs`; this test locks the IPC seam so a merge
+    // cannot leave a variant dispatched to `unsupported_phase_slice` or a
+    // read reply behind the `Ack` arm.
+    // ------------------------------------------------------------------
+
+    /// A one-commit repository so `git_log` / `git_show_commit` have data.
+    fn git_workspace_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# Project\n").expect("seed");
+        let repo = git2::Repository::init(dir.path()).expect("init repo");
+        {
+            let mut config = repo.config().expect("config");
+            config
+                .set_str("user.name", "Selora Test")
+                .expect("user.name");
+            config
+                .set_str("user.email", "test@selora.invalid")
+                .expect("user.email");
+        }
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("add");
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature = repo.signature().expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .expect("commit");
+        dir
+    }
+
+    #[test]
+    fn every_bridge_git_command_dispatches_and_answers_the_panel_shapes() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let dir = git_workspace_with_commit();
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFolderAt {
+                        root: dir.path().to_string_lossy().to_string(),
+                    },
+                ),
+            )
+            .expect("open git workspace");
+
+        let readme = WorkspacePath::new("README.md").expect("path");
+        let dispatch = |command: FrontendCommand| {
+            state
+                .dispatch_result(&app, envelope(&state, command))
+                .expect("dispatch")
+        };
+        let ack = |command: FrontendCommand| match dispatch(command) {
+            CommandResultDto::Ack(ack) => assert!(ack.acknowledged),
+            other => panic!("expected an ack, got {other:?}"),
+        };
+        let status_event = |state: &DesktopState| match last_event(state).payload {
+            FrontendEvent::GitStatusChanged(status) => status,
+            other => panic!("expected git_status_changed, got {other:?}"),
+        };
+
+        // Read commands answer the named-key objects the React panel parses.
+        let main = match dispatch(FrontendCommand::GitBranches) {
+            CommandResultDto::Git(GitCommandReplyDto::Branches(reply)) => {
+                assert_eq!(reply.branches.len(), 1);
+                assert!(reply.branches[0].current);
+                reply.branches[0].name.clone()
+            }
+            other => panic!("git_branches must answer typed data, got {other:?}"),
+        };
+        let commits = match dispatch(FrontendCommand::GitLog {
+            count: 10,
+            path: None,
+        }) {
+            CommandResultDto::Git(GitCommandReplyDto::Log(reply)) => reply.commits,
+            other => panic!("git_log must answer typed data, got {other:?}"),
+        };
+        assert_eq!(commits.len(), 1);
+        let sha = commits[0].sha.clone();
+        match dispatch(FrontendCommand::GitShowCommit { sha: sha.clone() }) {
+            CommandResultDto::Git(GitCommandReplyDto::Commit(reply)) => {
+                assert_eq!(reply.sha, sha);
+                assert!(!reply.message.is_empty());
+                assert!(reply.unified_diff.contains("README.md"));
+            }
+            other => panic!("git_show_commit must answer typed data, got {other:?}"),
+        }
+
+        // Stage / unstage / commit and the diff each publish the authoritative
+        // status (or diff) event after its ack.
+        std::fs::write(dir.path().join("README.md"), "# Project\nchanged\n").expect("edit");
+        ack(FrontendCommand::GitStage {
+            path: readme.clone(),
+        });
+        let staged = status_event(&state);
+        assert!(staged
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "README.md" && file.staged));
+        ack(FrontendCommand::GitUnstage {
+            path: readme.clone(),
+        });
+        assert!(status_event(&state).staged_paths.is_empty());
+        ack(FrontendCommand::GitStage {
+            path: readme.clone(),
+        });
+        ack(FrontendCommand::OpenGitDiff {
+            path: readme.clone(),
+        });
+        match last_event(&state).payload {
+            FrontendEvent::GitDiffReady(diff) => assert_eq!(diff.path.as_str(), "README.md"),
+            other => panic!("expected git_diff_ready, got {other:?}"),
+        }
+        ack(FrontendCommand::GitCommit {
+            message: "bridge commit".into(),
+        });
+        assert!(status_event(&state).files.is_empty());
+
+        // Branch create / switch / delete and merge all dispatch.
+        ack(FrontendCommand::GitCreateBranch {
+            name: "topic".into(),
+            checkout: true,
+        });
+        assert_eq!(status_event(&state).branch.as_deref(), Some("topic"));
+        ack(FrontendCommand::GitSwitchBranch { name: main.clone() });
+        assert_eq!(status_event(&state).branch.as_deref(), Some(main.as_str()));
+        ack(FrontendCommand::GitMerge {
+            branch: "topic".into(),
+        });
+        assert_eq!(status_event(&state).branch.as_deref(), Some(main.as_str()));
+        ack(FrontendCommand::GitDeleteBranch {
+            name: "topic".into(),
+        });
+
+        // Discard / stage-all / unstage-all.
+        std::fs::write(dir.path().join("README.md"), "# Project\ndiscard me\n").expect("edit");
+        ack(FrontendCommand::GitDiscard {
+            path: readme.clone(),
+        });
+        assert!(status_event(&state).files.is_empty());
+        std::fs::write(dir.path().join("README.md"), "# Project\nstage all\n").expect("edit");
+        ack(FrontendCommand::GitStageAll);
+        assert!(!status_event(&state).staged_paths.is_empty());
+        ack(FrontendCommand::GitUnstageAll);
+        assert!(status_event(&state).staged_paths.is_empty());
+
+        // Stash save / list / apply / pop / drop.
+        std::fs::write(dir.path().join("README.md"), "# Project\nstash me\n").expect("edit");
+        ack(FrontendCommand::GitStashSave {
+            message: Some("bridge stash".into()),
+        });
+        assert!(status_event(&state).files.is_empty());
+        match dispatch(FrontendCommand::GitStashList) {
+            CommandResultDto::Git(GitCommandReplyDto::Stashes(reply)) => {
+                assert_eq!(reply.stashes.len(), 1);
+                assert_eq!(reply.stashes[0].index, 0);
+            }
+            other => panic!("git_stash_list must answer typed data, got {other:?}"),
+        }
+        ack(FrontendCommand::GitStashApply { index: 0 });
+        assert!(!status_event(&state).files.is_empty());
+        ack(FrontendCommand::GitStashDrop { index: 0 });
+        ack(FrontendCommand::GitDiscard {
+            path: readme.clone(),
+        });
+
+        std::fs::write(dir.path().join("README.md"), "# Project\npop me\n").expect("edit");
+        ack(FrontendCommand::GitStashSave { message: None });
+        ack(FrontendCommand::GitStashPop { index: 0 });
+        assert!(status_event(&state)
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "README.md"));
+        ack(FrontendCommand::GitDiscard {
+            path: readme.clone(),
+        });
+
+        // Conflict resolution and the network commands are routed too; with
+        // no conflict and no remote they fail with a typed protocol error,
+        // never an "unsupported" reply the panel would misread as empty data.
+        let conflict = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::GitResolveConflict {
+                        path: readme.clone(),
+                        resolution: selora_protocol::GitConflictSideDto::Ours,
+                    },
+                ),
+            )
+            .expect_err("no conflict is in progress");
+        assert_eq!(conflict.code, "git_error", "{conflict:?}");
+        for command in [
+            FrontendCommand::GitFetch,
+            FrontendCommand::GitPull,
+            FrontendCommand::GitPush,
+        ] {
+            let error = state
+                .dispatch_result(&app, envelope(&state, command))
+                .expect_err("no remote is configured");
+            assert_eq!(error.code, "git_error", "{error:?}");
+            assert!(error.message.contains("remote"), "{error:?}");
+        }
+    }
+
     #[test]
     fn bootstrap_prefers_the_users_active_buffer_over_path_order() {
         let app = mock_app_handle();
@@ -4946,6 +5327,7 @@ mod tests {
                 assert_eq!(ack.snapshot_sequence, state.bootstrap().snapshot_sequence);
             }
             CommandResultDto::Snapshot(_) => panic!("a toggle answers the small ack"),
+            CommandResultDto::Git(_) => panic!("a toggle answers no git data"),
         }
 
         // The read path still answers the full bootstrap shape unchanged.
@@ -4990,6 +5372,7 @@ mod tests {
         match edit {
             CommandResultDto::Ack(ack) => assert!(ack.acknowledged),
             CommandResultDto::Snapshot(_) => panic!("an edit answers the small ack"),
+            CommandResultDto::Git(_) => panic!("an edit answers no git data"),
         }
 
         let selection = state

@@ -1,16 +1,20 @@
 //! Selora Git — git integration via `git2` (PLAN.md §4.6, §5).
 //!
-//! The Lite surface (ARCHITECTURE.md §10.5): open the repository a folder
-//! belongs to, snapshot its status, stage / unstage single paths, commit
-//! the index, and diff one file on either side of the row — index →
-//! working tree ([`GitRepo::diff_workdir`], unstaged) or HEAD → index
-//! ([`GitRepo::diff_index`], staged). `push` / `pull` / `fetch` /
-//! remotes / branch management / rebase / stash do not exist here
-//! (PLAN.md §2 non-goals).
+//! The full daily surface (ARCHITECTURE.md §10.5 and the daily-git slice):
+//! open the repository a folder belongs to, snapshot status, stage / unstage
+//! (single path or everything), commit, discard working-tree / index changes,
+//! diff, browse and inspect history, manage local branches, stash, and merge
+//! with explicit conflict entries and ours/theirs resolution.
 //!
-//! Everything is synchronous and cheap enough to run inside a
-//! `spawn_blocking` worker — that is how the app shell invokes it (never
-//! on the frame path). No shelling out to the `git` CLI.
+//! Network operations (`fetch` / `pull` / `push`) are the one exception to
+//! "no CLI": they run the real `git` executable with a fixed argv so the OS
+//! credential helper works unchanged. There is no shell string, no force
+//! push, and output is redacted and bounded before it reaches an error or an
+//! event.
+//!
+//! Everything else is synchronous and cheap enough to run inside a
+//! `spawn_blocking` worker — that is how the app shell invokes it (never on
+//! the frame path).
 //!
 //! `selora-git` depends on no other workspace crate (PLAN.md §5
 //! inter-crate rules); its [`GitError`] is mapped to
@@ -18,14 +22,29 @@
 
 #![forbid(unsafe_code)]
 
+mod branch;
+mod commit;
 mod diff;
+mod discard;
 mod error;
+mod index;
+mod merge;
+mod net;
+mod path;
+mod stash;
 mod status;
 
+pub use branch::BranchInfo;
+pub use commit::{ChangeKind, CommitDetail, CommitFileChange, CommitInfo};
 pub use diff::{DiffLine, FileDiff, Hunk};
+pub use discard::DiscardTarget;
 pub use error::GitError;
+pub use merge::{ConflictEntry, ConflictSide, MergeOutcome, MergeStatus};
+pub use net::{sanitize_remote_text, RemoteOperation, RemoteOutcome};
+pub use stash::StashEntry;
 pub use status::{FileStatus, GitStatus, Slot};
 
+use path::checked_relative;
 use std::path::{Path, PathBuf};
 
 /// An open git repository plus its (normalized) work directory.
@@ -57,7 +76,7 @@ impl GitRepo {
         })?;
         let workdir = repo
             .workdir()
-            .map(normalize)
+            .map(path::normalize)
             .ok_or_else(|| {
                 GitError::Other(
                     "bare repositories are not supported by the Lite git panel".to_owned(),
@@ -87,6 +106,11 @@ impl GitRepo {
         let mut entries = Vec::new();
         for entry in statuses.iter() {
             let flags = entry.status();
+            // A conflicted entry has no stage-0 index entry, so neither slot
+            // maps to a change; it is reported through `conflicts` instead.
+            if flags.contains(git2::Status::CONFLICTED) {
+                continue;
+            }
             let staged = Slot::from_index(flags);
             let worktree = Slot::from_worktree(flags);
             if staged == Slot::Unmodified && worktree == Slot::Unmodified {
@@ -104,7 +128,16 @@ impl GitRepo {
             });
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(GitStatus { branch, entries })
+        let conflicts = self
+            .merge_conflicts()?
+            .into_iter()
+            .map(|conflict| self.workdir.join(conflict.path))
+            .collect();
+        Ok(GitStatus {
+            branch,
+            entries,
+            conflicts,
+        })
     }
 
     /// Stage `path` (working tree → index). Accepts an absolute path (the
@@ -112,9 +145,7 @@ impl GitRepo {
     /// Staging a file that no longer exists on disk records the deletion,
     /// exactly like `git add` does.
     pub fn stage(&self, path: &Path) -> Result<(), GitError> {
-        let rel = self.repo_relative(path).ok_or_else(|| {
-            GitError::Other(format!("`{}` is outside the repository", path.display()))
-        })?;
+        let rel = checked_relative(&self.workdir, path)?;
         let mut index = self.repo.index()?;
         if self.workdir.join(&rel).exists() {
             index.add_path(&rel)?;
@@ -130,9 +161,7 @@ impl GitRepo {
     /// HEAD does not have it (a staged new file becomes untracked again —
     /// including on an unborn HEAD, where there is no HEAD at all).
     pub fn unstage(&self, path: &Path) -> Result<(), GitError> {
-        let rel = self.repo_relative(path).ok_or_else(|| {
-            GitError::Other(format!("`{}` is outside the repository", path.display()))
-        })?;
+        let rel = checked_relative(&self.workdir, path)?;
         let target = self.repo.revparse_single("HEAD").ok();
         self.repo
             .reset_default(target.as_ref(), [rel.to_string_lossy().into_owned()])?;
@@ -144,6 +173,11 @@ impl GitRepo {
     /// identity is surfaced with the fix, not papered over with a fake
     /// author. Refuses an empty message and an empty commit — the panel
     /// disables the button for both, this is the backstop.
+    ///
+    /// When a merge is in progress (`MERGE_HEAD` exists), the merge head is
+    /// added as the second parent and an unchanged tree is allowed: that is
+    /// the merge commit itself. A successful merge commit clears the merge
+    /// state, so the next commit is an ordinary one.
     pub fn commit(&self, message: &str) -> Result<git2::Oid, GitError> {
         let message = message.trim();
         if message.is_empty() {
@@ -152,19 +186,35 @@ impl GitRepo {
         let mut index = self.repo.index()?;
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let parent = self
+
+        let merge_heads = self.merge_head_ids();
+        let mut parent_commits: Vec<git2::Commit<'_>> = Vec::new();
+        if let Some(head) = self
             .repo
             .head()
             .ok()
-            .and_then(|head| head.peel_to_commit().ok());
-        let nothing_staged = match &parent {
+            .and_then(|head| head.peel_to_commit().ok())
+        {
+            parent_commits.push(head);
+        }
+        for oid in &merge_heads {
+            if parent_commits.iter().any(|commit| commit.id() == *oid) {
+                continue;
+            }
+            if let Ok(commit) = self.repo.find_commit(*oid) {
+                parent_commits.push(commit);
+            }
+        }
+
+        let nothing_staged = match parent_commits.first() {
             Some(commit) => commit
                 .tree()
                 .is_ok_and(|head_tree| head_tree.id() == tree_id),
             // Unborn HEAD: an empty tree would produce an empty root commit.
             None => tree.is_empty(),
         };
-        if nothing_staged {
+        // A merge commit may legitimately keep the same tree as one parent.
+        if nothing_staged && parent_commits.len() <= 1 {
             return Err(GitError::Other("nothing staged to commit".to_owned()));
         }
         let signature = self.repo.signature().map_err(|err| {
@@ -172,7 +222,7 @@ impl GitRepo {
                 "{err} — set user.name and user.email in your git config"
             ))
         })?;
-        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        let parents: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
         let oid = self.repo.commit(
             Some("HEAD"),
             &signature,
@@ -181,6 +231,9 @@ impl GitRepo {
             &tree,
             &parents,
         )?;
+        if !merge_heads.is_empty() {
+            self.repo.cleanup_state()?;
+        }
         Ok(oid)
     }
 
@@ -194,9 +247,7 @@ impl GitRepo {
     /// [`Self::diff_index`] for the staged side (its docs explain how to
     /// choose per row).
     pub fn diff_workdir(&self, path: &Path) -> Result<FileDiff, GitError> {
-        let rel = self.repo_relative(path).ok_or_else(|| {
-            GitError::Other(format!("`{}` is outside the repository", path.display()))
-        })?;
+        let rel = checked_relative(&self.workdir, path)?;
         let index = self.repo.index()?;
         let mut options = git2::DiffOptions::new();
         options
@@ -231,9 +282,7 @@ impl GitRepo {
     /// An unborn HEAD (no commits yet) diffs against an empty tree, so a
     /// staged new file appears as all additions rather than erroring.
     pub fn diff_index(&self, path: &Path) -> Result<FileDiff, GitError> {
-        let rel = self.repo_relative(path).ok_or_else(|| {
-            GitError::Other(format!("`{}` is outside the repository", path.display()))
-        })?;
+        let rel = checked_relative(&self.workdir, path)?;
         let index = self.repo.index()?;
         // `None` is libgit2's empty tree, which is exactly the unborn-HEAD
         // case: every index entry is an addition. Any other HEAD failure
@@ -253,39 +302,11 @@ impl GitRepo {
 
     /// Map a path onto a repo-relative path with `/` separators (the form
     /// libgit2 expects). Absolute paths must live under the workdir; a
-    /// relative path is taken as already repo-relative.
+    /// relative path is taken as already repo-relative. Escaping paths (and
+    /// `.git` components) are `None`.
+    #[cfg(test)]
     fn repo_relative(&self, path: &Path) -> Option<PathBuf> {
-        let path = normalize(path);
-        if path.is_absolute() {
-            if let Ok(rel) = path.strip_prefix(&self.workdir) {
-                return Some(forward_slashes(rel));
-            }
-            // Windows is case-insensitive and git reports the workdir with
-            // forward slashes while callers arrive with backslashes: fold
-            // case *and* separators, ignoring the workdir's trailing
-            // separator, and guard against a sibling whose name merely
-            // starts with the workdir's ("repo" vs "repository").
-            let folded = path
-                .as_os_str()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_lowercase();
-            let workdir_folded = self
-                .workdir
-                .as_os_str()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .trim_end_matches('/')
-                .to_lowercase();
-            if let Some(rest) = folded.strip_prefix(&workdir_folded) {
-                if rest.is_empty() || rest.starts_with('/') {
-                    let rel = rest.trim_start_matches('/');
-                    return Some(PathBuf::from(rel.to_owned()));
-                }
-            }
-            return None;
-        }
-        Some(forward_slashes(&path))
+        path::repo_relative(&self.workdir, path)
     }
 }
 
@@ -331,7 +352,7 @@ fn collect_file_diff(diff: &git2::Diff<'_>, path: PathBuf) -> Result<FileDiff, G
 
 /// The checked-out branch, the short id for a detached HEAD, or the
 /// unborn branch name read from HEAD's symbolic target.
-fn branch_name(repo: &git2::Repository) -> Option<String> {
+pub(crate) fn branch_name(repo: &git2::Repository) -> Option<String> {
     match repo.head() {
         Ok(head) => {
             if head.is_branch() {
@@ -355,20 +376,6 @@ fn branch_name(repo: &git2::Repository) -> Option<String> {
 /// The first 7 hex digits of `oid` (git's default short id length).
 fn short_id(oid: git2::Oid) -> String {
     oid.to_string().chars().take(7).collect()
-}
-
-/// Strip the `\\?\` extended-length prefix Windows APIs can produce, so
-/// user-visible paths and git's workdir compare equal.
-fn normalize(path: &Path) -> PathBuf {
-    let text = path.as_os_str().to_string_lossy();
-    let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
-    PathBuf::from(stripped)
-}
-
-/// Repo-relative path with `/` separators (libgit2's path form; a no-op on
-/// Unix).
-fn forward_slashes(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().replace('\\', "/"))
 }
 
 // -----------------------------------------------------------------------------
@@ -855,5 +862,528 @@ mod tests {
         // Outside the repo: None.
         let elsewhere = tempfile::tempdir().expect("tempdir");
         assert_eq!(repo.repo_relative(&elsewhere.path().join("a.txt")), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Daily git surface: branches, history, discard, stash, merge, paths,
+    // network.
+    // -------------------------------------------------------------------------
+
+    fn read(dir: &tempfile::TempDir, rel: &str) -> String {
+        // Git for Windows may apply core.autocrlf on checkout; compare text.
+        fs::read_to_string(dir.path().join(rel))
+            .expect("read")
+            .replace("\r\n", "\n")
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn branches_create_switch_list_and_delete() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+
+        let created = repo.create_branch("feature/git", None).expect("create");
+        assert_eq!(created.name, "feature/git");
+        let branches = repo.branches().expect("branches");
+        assert_eq!(
+            branches.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["feature/git", "main"]
+        );
+        let main = branches.iter().find(|b| b.name == "main").unwrap();
+        let feature = branches.iter().find(|b| b.name == "feature/git").unwrap();
+        assert!(main.is_current);
+        assert!(!feature.is_current);
+        assert_eq!(feature.tip, main.tip);
+
+        repo.switch_branch("feature/git").expect("switch");
+        assert_eq!(
+            repo.status().expect("status").branch.as_deref(),
+            Some("feature/git")
+        );
+        write(&dir, "b.txt", "feature\n");
+        commit_all(&repo, "on feature");
+
+        repo.switch_branch("main").expect("switch back");
+        assert!(!dir.path().join("b.txt").exists());
+        assert_eq!(
+            repo.status().expect("status").branch.as_deref(),
+            Some("main")
+        );
+
+        // The feature commit is not reachable from main yet → safe delete
+        // refuses instead of orphaning it.
+        let refused = repo.delete_branch("feature/git").expect_err("unmerged");
+        assert!(
+            refused.to_string().contains("not fully merged"),
+            "{refused}"
+        );
+
+        let merged = repo.merge_branch("feature/git").expect("merge");
+        assert_eq!(merged.status, MergeStatus::FastForward);
+        assert!(dir.path().join("b.txt").exists());
+        repo.delete_branch("feature/git").expect("delete merged");
+        assert_eq!(repo.branches().expect("branches").len(), 1);
+
+        // The checked-out branch can never be deleted.
+        assert!(repo.delete_branch("main").is_err());
+        // Invalid names are rejected before touching a ref.
+        assert!(repo.create_branch("../escape", None).is_err());
+        assert!(repo.create_branch("bad name", None).is_err());
+        assert!(repo.switch_branch("../escape").is_err());
+    }
+
+    #[test]
+    fn discard_restores_worktree_and_moves_index_back_to_head() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+
+        // Working-tree discard: tracked file is rebuilt from the index.
+        write(&dir, "a.txt", "dirty\n");
+        let count = repo
+            .discard(&[dir.path().join("a.txt")], DiscardTarget::Worktree)
+            .expect("discard worktree");
+        assert_eq!(count, 1);
+        assert_eq!(read(&dir, "a.txt"), "one\n");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // Untracked discard removes that one file.
+        write(&dir, "fresh.txt", "new\n");
+        repo.discard(&[dir.path().join("fresh.txt")], DiscardTarget::Worktree)
+            .expect("discard untracked");
+        assert!(!dir.path().join("fresh.txt").exists());
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // Index discard: the index returns to HEAD, the working tree stays.
+        write(&dir, "a.txt", "staged\n");
+        repo.stage(&dir.path().join("a.txt")).expect("stage");
+        repo.discard(&[dir.path().join("a.txt")], DiscardTarget::Index)
+            .expect("discard index");
+        let status = repo.status().expect("status");
+        let entry = find_entry(&status, "a.txt");
+        assert!(!entry.is_staged());
+        assert_eq!(entry.worktree, Slot::Modified);
+        assert_eq!(read(&dir, "a.txt"), "staged\n");
+    }
+
+    #[test]
+    fn discard_all_clears_both_sides_and_deletes_untracked_or_new_files() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        write(&dir, "gone.txt", "gone\n");
+        commit_all(&repo, "init");
+
+        // Staged AND further edited: one discard returns to the committed text.
+        write(&dir, "a.txt", "staged\n");
+        repo.stage(&dir.path().join("a.txt")).expect("stage");
+        write(&dir, "a.txt", "dirty again\n");
+        repo.discard_all(&dir.path().join("a.txt"))
+            .expect("discard all");
+        assert_eq!(read(&dir, "a.txt"), "one\n");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // An untracked file is deleted (the path the panel's row carries).
+        write(&dir, "fresh.txt", "new\n");
+        repo.discard_all(&dir.path().join("fresh.txt"))
+            .expect("discard untracked");
+        assert!(!dir.path().join("fresh.txt").exists());
+
+        // A newly staged file is removed from the index and from disk.
+        write(&dir, "added.txt", "added\n");
+        repo.stage(&dir.path().join("added.txt"))
+            .expect("stage add");
+        repo.discard_all(&dir.path().join("added.txt"))
+            .expect("discard added");
+        assert!(!dir.path().join("added.txt").exists());
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // A deleted tracked file comes back from HEAD.
+        fs::remove_file(dir.path().join("gone.txt")).expect("remove");
+        repo.discard_all(&dir.path().join("gone.txt"))
+            .expect("discard deletion");
+        assert_eq!(read(&dir, "gone.txt"), "gone\n");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // A conflicted path is refused: resolve it explicitly instead.
+        repo.create_branch("other", None).expect("create");
+        repo.switch_branch("other").expect("switch");
+        write(&dir, "a.txt", "theirs\n");
+        commit_all(&repo, "theirs");
+        repo.switch_branch("main").expect("switch");
+        write(&dir, "a.txt", "ours\n");
+        commit_all(&repo, "ours");
+        repo.merge_branch("other").expect("merge");
+        let refused = repo
+            .discard_all(&dir.path().join("a.txt"))
+            .expect_err("conflict refused");
+        assert!(refused.to_string().contains("merge conflict"), "{refused}");
+    }
+
+    #[test]
+    fn log_limits_filters_by_path_and_show_commit_carries_metadata_and_patch() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "one");
+        write(&dir, "b.txt", "bee\n");
+        commit_all(&repo, "two");
+        write(&dir, "a.txt", "one\ntwo\n");
+        commit_all(&repo, "three");
+
+        let recent = repo.log(2, None).expect("log");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].summary, "three");
+        assert_eq!(recent[1].summary, "two");
+        assert_eq!(recent[0].short_id.len(), 7);
+        assert_eq!(recent[0].author_name, "Selora Test");
+        assert_eq!(recent[0].parents.len(), 1);
+
+        // Path filter: only the commits that touched a.txt, still newest first.
+        let only_a = repo.log(10, Some(Path::new("a.txt"))).expect("log path");
+        assert_eq!(
+            only_a
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three", "one"]
+        );
+        assert!(repo.log(0, None).expect("zero").is_empty());
+        assert!(repo
+            .log(10, Some(Path::new("missing.txt")))
+            .expect("missing path")
+            .is_empty());
+
+        let head = repo.log(1, None).expect("head").remove(0);
+        let detail = repo.show_commit("HEAD").expect("show");
+        assert_eq!(detail.info.id, head.id);
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].path, PathBuf::from("a.txt"));
+        assert_eq!(detail.files[0].kind, ChangeKind::Modified);
+        assert!(detail.files[0].additions >= 1);
+        assert!(!detail.patch_truncated);
+        assert!(detail.patch.contains("+two"), "{}", detail.patch);
+
+        // The root commit diffs against the empty tree, not an error.
+        let root = repo.log(10, None).expect("log").pop().expect("root");
+        let root_detail = repo.show_commit(&root.id).expect("show root");
+        assert_eq!(root_detail.info.parents.len(), 0);
+        assert_eq!(root_detail.files.len(), 1);
+        assert!(root_detail.patch.contains("+one"));
+        assert!(repo.show_commit("not-a-rev").is_err());
+    }
+
+    #[test]
+    fn stage_all_and_unstage_all_cover_edits_adds_and_deletions() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+
+        write(&dir, "a.txt", "two\n");
+        write(&dir, "new.txt", "new\n");
+        assert_eq!(repo.stage_all().expect("stage all"), 2);
+        assert_eq!(repo.status().expect("status").staged_count(), 2);
+
+        assert_eq!(repo.unstage_all().expect("unstage all"), 2);
+        let status = repo.status().expect("status");
+        assert_eq!(status.staged_count(), 0);
+        assert_eq!(find_entry(&status, "a.txt").worktree, Slot::Modified);
+        assert!(find_entry(&status, "new.txt").is_untracked());
+
+        // A deletion travels the same path.
+        fs::remove_file(dir.path().join("a.txt")).expect("remove");
+        repo.stage_all().expect("stage deletion");
+        assert_eq!(
+            find_entry(&repo.status().expect("status"), "a.txt").staged,
+            Slot::Deleted
+        );
+        repo.unstage_all().expect("unstage deletion");
+        assert_eq!(
+            find_entry(&repo.status().expect("status"), "a.txt").worktree,
+            Slot::Deleted
+        );
+    }
+
+    #[test]
+    fn stash_push_list_pop_and_drop_round_trip() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        write(&dir, "a.txt", "two\n");
+
+        let entry = repo.stash_push(Some("park work")).expect("stash push");
+        assert_eq!(entry.index, 0);
+        assert!(entry.message.contains("park work"), "{}", entry.message);
+        assert_eq!(entry.oid.len(), 40);
+        assert!(repo.status().expect("status").entries.is_empty());
+        let list = repo.stash_list().expect("stash list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].index, 0);
+
+        repo.stash_pop(0).expect("stash pop");
+        assert_eq!(read(&dir, "a.txt"), "two\n");
+        assert!(repo.stash_list().expect("stash list").is_empty());
+        assert_eq!(
+            find_entry(&repo.status().expect("status"), "a.txt").worktree,
+            Slot::Modified
+        );
+
+        // Drop leaves the already-cleaned working tree alone (stash push
+        // parked the edit; dropping does not re-apply it).
+        repo.stash_push(None).expect("second stash");
+        assert_eq!(repo.stash_list().expect("list").len(), 1);
+        repo.stash_drop(0).expect("drop");
+        assert!(repo.stash_list().expect("list").is_empty());
+        assert_eq!(read(&dir, "a.txt"), "one\n");
+
+        // Empty stash is a precondition failure, not libgit2 noise.
+        let (empty_dir, empty) = init_repo();
+        write(&empty_dir, "a.txt", "clean\n");
+        commit_all(&empty, "init");
+        assert!(empty
+            .stash_push(None)
+            .unwrap_err()
+            .to_string()
+            .contains("nothing to stash"));
+        assert!(empty.stash_pop(0).is_err());
+        assert!(empty.stash_drop(0).is_err());
+    }
+
+    #[test]
+    fn merge_conflict_entries_resolve_ours_and_theirs_then_commit_merge() {
+        let (dir, repo) = init_repo();
+        write(&dir, "conflict.txt", "base\n");
+        commit_all(&repo, "base");
+
+        repo.create_branch("other", None).expect("create other");
+        repo.switch_branch("other").expect("switch other");
+        write(&dir, "conflict.txt", "theirs\n");
+        commit_all(&repo, "theirs");
+
+        repo.switch_branch("main").expect("switch main");
+        write(&dir, "conflict.txt", "ours\n");
+        commit_all(&repo, "ours");
+
+        let outcome = repo.merge_branch("other").expect("merge");
+        assert_eq!(outcome.status, MergeStatus::Conflicts);
+        assert_eq!(outcome.conflicts.len(), 1);
+        let conflict = &outcome.conflicts[0];
+        assert_eq!(conflict.path, PathBuf::from("conflict.txt"));
+        assert!(conflict.ours && conflict.theirs && conflict.ancestor);
+
+        // The status snapshot reports the conflict as its own list: a stage-0
+        // free path is not a normal `entries` row, so the panel needs it here.
+        let conflicted = repo.status().expect("status");
+        assert_eq!(conflicted.conflicts, vec![dir.path().join("conflict.txt")]);
+        assert!(conflicted.entries.is_empty());
+        assert!(conflicted.is_dirty());
+        assert_eq!(conflicted.changed_count(), 1);
+
+        // Abort restores HEAD and clears the merge state.
+        repo.merge_abort().expect("abort");
+        assert!(repo.merge_conflicts().expect("conflicts").is_empty());
+        assert_eq!(read(&dir, "conflict.txt"), "ours\n");
+
+        // Resolve theirs, then finish with a real two-parent merge commit.
+        let outcome = repo.merge_branch("other").expect("merge again");
+        assert_eq!(outcome.status, MergeStatus::Conflicts);
+        let remaining = repo
+            .resolve_conflict(Path::new("conflict.txt"), ConflictSide::Theirs)
+            .expect("resolve theirs");
+        assert!(remaining.is_empty());
+        assert_eq!(read(&dir, "conflict.txt"), "theirs\n");
+        assert!(repo.merge_conflicts().expect("conflicts").is_empty());
+
+        let oid = repo.commit("merge other").expect("merge commit");
+        let raw = git2::Repository::open(dir.path()).expect("raw");
+        let commit = raw.find_commit(oid).expect("commit");
+        assert_eq!(commit.parent_count(), 2, "merge commit needs two parents");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // There is no merge in progress after the commit: abort refuses instead
+        // of hard-resetting the working tree.
+        assert!(repo.merge_abort().is_err());
+        assert!(repo.merge_conflicts().expect("conflicts").is_empty());
+        assert!(repo
+            .resolve_conflict(Path::new("../escape.txt"), ConflictSide::Ours)
+            .is_err());
+
+        // The other branch is now an ancestor: nothing left to merge.
+        let outcome = repo.merge_branch("other").expect("already merged");
+        assert_eq!(outcome.status, MergeStatus::UpToDate);
+    }
+
+    #[test]
+    fn conflicting_merge_resolves_ours_in_a_fresh_repo() {
+        let (dir, repo) = init_repo();
+        write(&dir, "conflict.txt", "base\n");
+        commit_all(&repo, "base");
+        repo.create_branch("other", None).expect("create");
+        repo.switch_branch("other").expect("switch");
+        write(&dir, "conflict.txt", "theirs\n");
+        commit_all(&repo, "theirs");
+        repo.switch_branch("main").expect("switch");
+        write(&dir, "conflict.txt", "ours\n");
+        commit_all(&repo, "ours");
+
+        let outcome = repo.merge_branch("other").expect("merge");
+        assert_eq!(outcome.status, MergeStatus::Conflicts);
+        repo.resolve_conflict(Path::new("conflict.txt"), ConflictSide::Ours)
+            .expect("resolve ours");
+        assert_eq!(read(&dir, "conflict.txt"), "ours\n");
+        repo.commit("merge ours").expect("merge commit");
+        assert!(repo.status().expect("status").entries.is_empty());
+    }
+
+    #[test]
+    fn path_escape_is_rejected_before_any_git_write() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("secret.txt"), "outside").expect("write outside");
+
+        for path in [
+            outside.path().join("secret.txt"),
+            PathBuf::from("../escape.txt"),
+            PathBuf::from("nested/../../escape.txt"),
+            PathBuf::from(".git/config"),
+        ] {
+            let err = repo.stage(&path).expect_err("stage escape");
+            assert_eq!(err.code(), "path_escape", "{path:?}: {err}");
+            assert!(err.to_string().contains("outside the repository"), "{err}");
+        }
+        assert!(repo
+            .discard(&[PathBuf::from("../escape.txt")], DiscardTarget::Worktree)
+            .is_err());
+        assert!(repo.log(5, Some(Path::new("../escape.txt"))).is_err());
+        assert!(repo
+            .resolve_conflict(Path::new("../escape.txt"), ConflictSide::Ours)
+            .is_err());
+        // The outside file is untouched.
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.txt")).expect("read"),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn network_errors_are_typed_and_redact_credentials() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        git2::Repository::open(dir.path())
+            .expect("raw")
+            .remote("origin", "http://alice:supersecret@127.0.0.1:1/repo.git")
+            .expect("remote");
+
+        let error = repo.fetch(None).expect_err("fetch must fail");
+        assert_eq!(error.code(), "network", "{error}");
+        let text = error.to_string();
+        assert!(!text.contains("supersecret"), "{text}");
+        assert!(!text.contains("alice:"), "{text}");
+
+        // A remote name that looks like an option never reaches the CLI.
+        let injected = repo.fetch(Some("-oProxyCommand=calc")).expect_err("inject");
+        assert_eq!(injected.code(), "invalid_name", "{injected}");
+        // Unknown but well-formed remote names are refused too.
+        let missing = repo.fetch(Some("upstream")).expect_err("missing");
+        assert_eq!(missing.code(), "invalid_name", "{missing}");
+    }
+
+    #[test]
+    fn network_requires_a_configured_remote() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        let error = repo.push(None, None).expect_err("no remote");
+        assert!(error.to_string().contains("no git remote"), "{error}");
+        assert!(repo.remotes().expect("remotes").is_empty());
+    }
+
+    #[test]
+    fn fetch_and_push_work_against_a_local_bare_remote() {
+        if !git_available() {
+            return; // the network half needs the OS git; skip on a bare runner
+        }
+        let bare_dir = tempfile::tempdir().expect("bare dir");
+        git2::Repository::init_bare(bare_dir.path()).expect("init bare");
+
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        git2::Repository::open(dir.path())
+            .expect("raw")
+            .remote("origin", bare_dir.path().to_string_lossy().as_ref())
+            .expect("remote");
+
+        let fetched = repo.fetch(None).expect("fetch local");
+        assert_eq!(fetched.operation, RemoteOperation::Fetch);
+        assert_eq!(fetched.remote, "origin");
+        assert!(fetched.conflicts.is_empty());
+
+        let pushed = repo.push(None, None).expect("push local");
+        assert_eq!(pushed.operation, RemoteOperation::Push);
+        assert!(!pushed.summary.is_empty());
+
+        let bare = git2::Repository::open(bare_dir.path()).expect("open bare");
+        assert!(
+            bare.find_branch("main", git2::BranchType::Local).is_ok(),
+            "main must exist in the bare remote"
+        );
+    }
+
+    #[test]
+    fn pull_fast_forwards_a_clone_from_a_local_bare_remote() {
+        if !git_available() {
+            return; // the network half needs the OS git; skip on a bare runner
+        }
+        let bare_dir = tempfile::tempdir().expect("bare dir");
+        let bare = git2::Repository::init_bare(bare_dir.path()).expect("init bare");
+        bare.set_head("refs/heads/main").expect("bare HEAD main");
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        git2::Repository::open(dir.path())
+            .expect("raw")
+            .remote("origin", bare_dir.path().to_string_lossy().as_ref())
+            .expect("remote");
+        repo.push(None, None).expect("seed push");
+        assert!(bare.find_branch("main", git2::BranchType::Local).is_ok());
+
+        // A second working copy of the same remote.
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        let clone_path = clone_parent.path().join("clone");
+        git2::Repository::clone(bare_dir.path().to_string_lossy().as_ref(), &clone_path)
+            .expect("clone");
+        let clone = GitRepo::open(&clone_path).expect("open clone");
+
+        // The origin advances after the clone was made.
+        write(&dir, "a.txt", "one\ntwo\n");
+        commit_all(&repo, "second");
+        repo.push(None, None).expect("second push");
+
+        let pulled = clone.pull(None, None).expect("pull");
+        assert_eq!(pulled.operation, RemoteOperation::Pull);
+        assert_eq!(pulled.remote, "origin");
+        assert!(pulled.conflicts.is_empty(), "{:?}", pulled.conflicts);
+        assert_eq!(
+            read_text(&clone_path.join("a.txt")),
+            "one\ntwo\n",
+            "pull must update the working tree"
+        );
+        assert!(clone.status().expect("status").entries.is_empty());
+    }
+
+    fn read_text(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("read")
+            .replace("\r\n", "\n")
     }
 }

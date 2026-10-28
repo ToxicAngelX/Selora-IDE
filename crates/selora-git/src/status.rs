@@ -128,13 +128,18 @@ pub struct GitStatus {
     pub branch: Option<String>,
     /// Every file with any change, sorted by path.
     pub entries: Vec<FileStatus>,
+    /// Unresolved merge/rebase conflicts, sorted by path, as absolute paths under
+    /// the work directory (the `entries` key form). A conflicted path has no
+    /// `entries` row (its index slots are stages 1/2/3, not 0/1), so this is
+    /// the only place the panel learns about it.
+    pub conflicts: Vec<PathBuf>,
 }
 
 impl GitStatus {
     /// How many files have any change (staged or not) — the header's
     /// "N changed" count.
     pub fn changed_count(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.conflicts.len()
     }
 
     /// How many files have staged changes — the commit gate.
@@ -147,6 +152,6 @@ impl GitStatus {
 
     /// Whether anything at all is dirty.
     pub fn is_dirty(&self) -> bool {
-        !self.entries.is_empty()
+        !self.entries.is_empty() || !self.conflicts.is_empty()
     }
 }

@@ -377,6 +377,40 @@ describe('GitPanelView', () => {
     );
   });
 
+  it('renders the named-key replies the desktop backend sends', async () => {
+    harness.gitBranches.mockResolvedValue({
+      branches: [
+        { name: 'main', current: true },
+        { name: 'topic', current: false },
+      ],
+    });
+    harness.gitLog.mockResolvedValue({
+      commits: [
+        {
+          sha: 'abcdef1234567890',
+          summary: 'feat: backend shape',
+          author: 'Ada',
+          timestamp: 1700000000,
+        },
+      ],
+    });
+    harness.gitStashList.mockResolvedValue({
+      stashes: [{ index: 0, message: 'wip: backend shape' }],
+    });
+    render(<GitPanelView bootstrap={readyState().bootstrap} />);
+
+    const menu = await openBranchMenu();
+    expect(
+      await within(menu).findByRole('button', { name: 'Switch to topic' }),
+    ).toBeTruthy();
+
+    await openHistory();
+    expect(await screen.findByRole('button', { name: 'Show commit abcdef1' })).toBeTruthy();
+
+    const stash = await openStashMenu();
+    expect(await within(stash).findByRole('button', { name: 'Apply stash 0' })).toBeTruthy();
+  });
+
   it('shows a branch-list error and no invented rows when the backend is absent', async () => {
     harness.gitBranches.mockRejectedValue(new Error('git_branches is not supported'));
     render(<GitPanelView bootstrap={readyState().bootstrap} />);
