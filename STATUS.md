@@ -1,94 +1,89 @@
-# Status - 2026-10-27 (0.1.0 alpha)
+# Status - 2026-10-28 (0.1.0 alpha.2)
 
-## Last completed
+## Release
 
-Phase 8 plus Phase 9 workbench preview merged and gated on branch
-`release/0.1.0-alpha`.
+Branch: `release/0.1.0-alpha.2`
+Tag: `v0.1.0-alpha.2`
+Code base: `825d312` + `ac5a1e9` + docs commit.
 
-- Phase 8: workflow engine, approvals, durable journal/resume, effect ledger,
-  Job Object containment, budget preflight, history, buffer conflicts, LSP
-  reload sync, receipt cost/tokens.
-- Phase 9 preview: Agent Workbench, plan mode/todos, durable sessions, resume,
-  compaction, session-scoped auto-approve, background children and `wait`.
-- Settings: editor font/tabs/wrap, keybinds, theme/light theme.
-- Sessions/retries/todos are backend-authoritative; event order, active buffer,
-  per-session transcripts and parks are reconciled.
+This alpha adds the missing daily-driver building blocks on top of
+`v0.1.0-alpha.1`:
 
-Not included in this alpha:
+- integrated ConPTY terminal with xterm.js
+- full Git backend and panel: branches, history, stash, discard, merge
+  conflicts, fetch/pull/push
+- structured agent questions and `spawn_subagent`/`send_message`/`wait`
+- per-phase workflow cost
+- durable effect acknowledgement/replay hardening
+- broker-launch refusal and Job Object membership audit
+- DeleteSession
+- performance merge: no full bootstrap per keystroke
+- Agent Workbench, plan mode, todos, sessions, resume, compaction, background
 
-- **Structured question flow from `selora-p3-subagent` is not merged.**
-  Phase 9 acceptance reports `questions.structured: PENDING`; the branch commit
-  is `bb28da8`, not an ancestor of the release branch.
-- Integrated Terminal.
-- Git branch/history/push/merge UI.
-- Per-phase workflow cost.
-- Exactly-once subagent side effects.
-
-## Gate (final release tree)
+## Gate
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | clean |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
-| `cargo test --workspace --locked --no-fail-fast` | **1292 passed, 0 failed, 4 ignored**, 35 suites |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean, fresh target |
+| `cargo test --workspace --locked --no-fail-fast` | **1373 passed, 0 failed, 7 ignored**, 36 suites |
 | `npm run typecheck` | clean |
-| `npm test` | **556 passed, 0 failed**, 55 files |
+| `npm test` | **616 passed, 0 failed**, 57 files |
 | `npm run build` | clean |
 | `cargo deny check` | advisories/bans/licenses/sources ok |
-| `scripts/phase8-acceptance.ps1` | **46 passed, 0 failed, 3 pending, 1 skipped**, exit 0 |
-| `scripts/phase9-acceptance.ps1` | **19 passed, 0 failed, 2 pending**, exit 0; Phase 9 not accepted |
+| `scripts/phase8-acceptance.ps1` | **46 passed, 0 failed, 3 pending, 1 skipped** |
+| `scripts/phase9-acceptance.ps1` | **20 passed, 0 failed, 1 pending**, 9 roadmap PASS |
 
-Phase 8 PENDING evidence:
+Phase 8 PENDING:
 
-1. exactly-once unfinished asks are not claimed
-2. broker processes created outside the Job Object can escape; known launch
-   forms are refused and membership is audited, but a confirmed interpreter or
-   obfuscated command can still reach a broker
-3. no per-phase USD in the protocol
+- exactly-once unfinished asks
+- Job assignment startup race
+- per-phase cost evidence still reported PENDING by the harness even though the
+  phase-cost feature is merged; re-run the harness after a fresh run with
+  `engine_phase_usage` records.
 
 Phase 9 PENDING:
 
-1. structured questions (9c unmerged)
-2. remaining owner/real-runtime observations
+- `sessions.workspace`: no `.selora/agent-sessions` directory existed at harness
+  time. Runtime session persistence is merged; the probe needs a real session.
 
-All nine Phase 8 and Phase 9 owner rows remain **UNRUN**.
+All owner rows remain **UNRUN**.
 
-## Artifacts (rebuilt from this tree, unsigned)
+## Artifacts (unsigned)
 
-| Artifact | Size | SHA-256 | Signature |
-|---|---:|---|---|
-| `target\release\selora-desktop.exe` | 19,591,168 | `2e9962edf7706b85bdd00fb137fece58d2f2341f2571ef0470b30fad7c0fed28` | NotSigned |
-| `installer\output\Selora-IDE-Setup-0.1.0.exe` | 9,611,230 | `d145b76b8f5c8e9b1a996794f2f04863c32109cfdf51c7e73c7a6220f88d3239` | NotSigned |
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `target\release\selora-desktop.exe` | 20,421,120 | `dae00fa76184311891d3e3fb9e30bf51dc89b645b3b4710f692f9bf07d632ed4` |
+| `installer\output\Selora-IDE-Setup-0.1.0.exe` | 9,894,346 | `2072f473229a2f6d78445a8180093073fcab8470111918b5d1c0e611ab96056c` |
 
-## Branches
+Authenticode: `NotSigned`.
 
-- release branch: `release/0.1.0-alpha`
-- code commit: `f4fceec` (documentation commit follows)
-- seven integration merges are ancestors
-- historical backup: `stash@{0}` contains pre-integration working-tree changes
-- `selora-post-perf` is **not merged**; it conflicts with the final ack/session
-  path. Its measured report is in `docs/PERFORMANCE.md`.
-- `selora-p3-subagent` remains unmerged.
+## Alpha limitations
 
-## Known limitations
+- no code signing; SmartScreen warns
+- no clean-VM test
+- no owner real-key acceptance
+- exactly-once side effects still have crash windows
+- broker/obfuscated interpreter escape remains possible
+- merge conflicts: ours/theirs only; no interactive 3-way editor
+- Git has no rebase/cherry-pick/tags/remote management
+- stash excludes untracked files
+- push does not set upstream automatically
+- network calls have no explicit timeout
+- background children are in-memory and die on crash
+- egui shell not updated
+- no macOS/Linux, debugger, marketplace, collaboration
 
-- unsigned installer and EXE; SmartScreen warns
-- no clean-VM install; Windows 11/10-without-WebView2 untested
-- no integrated terminal
-- Git limited to status/stage/unstage/commit/diff
-- no code signing, auto-update release, or published repository yet
-- background children are in-memory; process crash loses in-flight children
-- workflow effect evidence fails closed but cannot prove exactly-once side
-  effects across every crash window
-- legacy egui shell is not updated with Phase 9 features
-- frontend lazy-chunk tests are timing-sensitive under heavy parallel load;
-  final full run passed
+## Main checkout
+
+`main` is being edited by another active session and was not used for this
+release. Its changes are preserved in stash entries. The release branch is the
+source of truth for this alpha.
 
 ## Next
 
-1. Publish alpha pre-release from `release/0.1.0-alpha`.
-2. Owner acceptance with a real key/workspace.
-3. Clean-VM install.
-4. Merge 9c structured questions and finish owner acceptance.
-5. Terminal + full Git.
-6. Signing and published auto-update release.
+1. Publish this branch/tag as a pre-release.
+2. Run owner acceptance with a real key.
+3. Clean Windows 11 / Windows 10-without-WebView2 install.
+4. Sign artifacts.
+5. Merge the other session's `main` work only after it commits and gates.

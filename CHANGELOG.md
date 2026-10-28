@@ -3,6 +3,21 @@
 All notable changes to Selora IDE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) (RELEASE.md §6).
 
+## [0.1.0-alpha.2] - 2026-10-28
+
+- Integrated ConPTY terminal, xterm UI, tabs, resize, themes, env allowlist,
+  8-session cap, process-tree kill.
+- Full Git backend/UI: branches, log/show, discard, stash, merge conflicts,
+  stage/unstage all, fetch/pull/push.
+- Structured agent questions, `spawn_subagent`, `send_message`, `wait`.
+- DeleteSession (open and disk-only durable sessions).
+- Per-phase workflow tokens/USD and durable effect acknowledgement/replay.
+- Broker-launch refusal and Job Object audit for `world.run`.
+- Performance fixes: ack-only editor mutations, no double document stringify.
+- Agent Workbench plan/todos/sessions/resume/compaction/background.
+
+Rust 1373 passed; frontend 616 passed. Unsigned alpha.
+
 ## [0.1.0-alpha.1] - 2026-10-27
 
 First public alpha: Windows Tauri shell, editor, LSP, Git basics, AI chat,
