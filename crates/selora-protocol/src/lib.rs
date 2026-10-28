@@ -413,6 +413,11 @@ pub struct SettingsPatchDto {
     pub keybind_save: Option<String>,
 }
 
+/// Default history page size for `GitLog` when the caller omits `limit`.
+fn default_git_log_limit() -> u32 {
+    50
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendCommand {
@@ -553,6 +558,74 @@ pub enum FrontendCommand {
     },
     OpenGitDiff {
         path: WorkspacePath,
+    },
+    // Daily git (typed commands for the branch / history / stash / merge and
+    // network surface). Every path is a `WorkspacePath`, so the protocol
+    // already rejects traversal and absolute paths at the parse boundary; the
+    // backend re-checks containment against the real work tree.
+    GitBranches,
+    GitCreateBranch {
+        name: String,
+        #[serde(default)]
+        start_point: Option<String>,
+    },
+    GitSwitchBranch {
+        name: String,
+    },
+    GitDeleteBranch {
+        name: String,
+    },
+    GitLog {
+        #[serde(default = "default_git_log_limit")]
+        limit: u32,
+        #[serde(default)]
+        path: Option<WorkspacePath>,
+    },
+    GitShowCommit {
+        commit: String,
+    },
+    GitDiscardWorktree {
+        paths: Vec<WorkspacePath>,
+    },
+    GitDiscardIndex {
+        paths: Vec<WorkspacePath>,
+    },
+    GitStageAll,
+    GitUnstageAll,
+    GitStashPush {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    GitStashList,
+    GitStashPop {
+        #[serde(default)]
+        index: u32,
+    },
+    GitStashDrop {
+        index: u32,
+    },
+    GitMerge {
+        branch: String,
+    },
+    GitResolveConflict {
+        path: WorkspacePath,
+        side: GitConflictSideDto,
+    },
+    GitFetch {
+        #[serde(default)]
+        remote: Option<String>,
+    },
+    GitPull {
+        #[serde(default)]
+        remote: Option<String>,
+        #[serde(default)]
+        branch: Option<String>,
+    },
+    GitPush {
+        #[serde(default)]
+        remote: Option<String>,
+        #[serde(default)]
+        branch: Option<String>,
     },
     ToggleSurface {
         surface: SurfaceId,
@@ -1697,6 +1770,123 @@ pub struct GitDiffDto {
     pub path: WorkspacePath,
     pub unified_diff: String,
 }
+// ---------------------------------------------------------------------------
+// Daily git DTOs (branches, history, stash, merge, network).
+//
+// These mirror `selora-git`'s typed values without making the protocol crate
+// depend on it. Paths are `WorkspacePath`, so traversal is rejected at the
+// wire boundary; errors and remote summaries arrive already redacted.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitConflictSideDto {
+    Ours,
+    Theirs,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitMergeStatusDto {
+    UpToDate,
+    FastForward,
+    Merged,
+    Conflicts,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRemoteOperationDto {
+    Fetch,
+    Pull,
+    Push,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitBranchDto {
+    pub name: String,
+    pub is_current: bool,
+    /// Configured upstream (`origin/main`), when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Full hex tip, or `None` for an unborn branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitBranchesDto {
+    pub branches: Vec<GitBranchDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitDto {
+    pub id: String,
+    pub short_id: String,
+    pub summary: String,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub time_unix: i64,
+    pub time_offset_minutes: i32,
+    pub parents: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitLogDto {
+    /// The filter the page was requested with; `None` = whole history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<WorkspacePath>,
+    pub commits: Vec<GitCommitDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitFileDto {
+    pub path: WorkspacePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<WorkspacePath>,
+    /// `added` / `modified` / `deleted` / `renamed` / `copied` /
+    /// `typechange` / `other`.
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitDetailDto {
+    pub commit: GitCommitDto,
+    pub files: Vec<GitCommitFileDto>,
+    pub patch: String,
+    pub patch_truncated: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStashEntryDto {
+    pub index: u32,
+    pub message: String,
+    pub oid: String,
+    pub time_unix: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStashesDto {
+    pub entries: Vec<GitStashEntryDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitConflictDto {
+    pub path: WorkspacePath,
+    pub ours: bool,
+    pub theirs: bool,
+    pub ancestor: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitMergeStateDto {
+    /// Branch being merged, when the event names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub status: GitMergeStatusDto,
+    pub conflicts: Vec<GitConflictDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitRemoteOutcomeDto {
+    pub operation: GitRemoteOperationDto,
+    pub remote: String,
+    /// Redacted, bounded CLI summary.
+    pub summary: String,
+    /// Pull conflicts, if any; empty for fetch/push.
+    #[serde(default)]
+    pub conflicts: Vec<GitConflictDto>,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelsDto {
     pub models: Vec<ModelDto>,
@@ -1783,6 +1973,13 @@ pub enum FrontendEvent {
     SearchResults(SearchResultsDto),
     GitStatusChanged(GitStatusDto),
     GitDiffReady(GitDiffDto),
+    // Daily git events — each is the typed answer to its command.
+    GitBranchesChanged(GitBranchesDto),
+    GitLogReady(GitLogDto),
+    GitCommitShown(Box<GitCommitDetailDto>),
+    GitStashesChanged(GitStashesDto),
+    GitMergeStateChanged(GitMergeStateDto),
+    GitRemoteFinished(GitRemoteOutcomeDto),
     ModelsChanged(ModelsDto),
     SeloraStatusChanged(SeloraStatusDto),
     WorkspaceLayoutChanged(LayoutDto),
@@ -2921,6 +3118,137 @@ mod tests {
         assert_eq!(status.changed_paths.len(), 1);
         assert!(status.staged_paths.is_empty());
         assert!(status.files.is_empty());
+    }
+
+    #[test]
+    fn daily_git_commands_round_trip_and_default_a_log_page() {
+        let log: FrontendCommand = serde_json::from_str(
+            r#"{"type":"git_log","payload":{"limit":20,"path":"src/lib.rs"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            log,
+            FrontendCommand::GitLog {
+                limit: 20,
+                path: Some(git_path("src/lib.rs")),
+            }
+        );
+        let json = serde_json::to_string(&log).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendCommand>(&json).unwrap(), log);
+
+        // An omitted limit means the default page (not zero entries).
+        let defaulted: FrontendCommand =
+            serde_json::from_str(r#"{"type":"git_log","payload":{}}"#).unwrap();
+        assert_eq!(
+            defaulted,
+            FrontendCommand::GitLog {
+                limit: 50,
+                path: None,
+            }
+        );
+
+        let resolve: FrontendCommand = serde_json::from_str(
+            r#"{"type":"git_resolve_conflict","payload":{"path":"src/a.rs","side":"theirs"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve,
+            FrontendCommand::GitResolveConflict {
+                path: git_path("src/a.rs"),
+                side: GitConflictSideDto::Theirs,
+            }
+        );
+
+        let push: FrontendCommand =
+            serde_json::from_str(r#"{"type":"git_push","payload":{}}"#).unwrap();
+        assert_eq!(
+            push,
+            FrontendCommand::GitPush {
+                remote: None,
+                branch: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitStageAll).unwrap(),
+            r#"{"type":"git_stage_all"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitStashPop { index: 1 }).unwrap(),
+            r#"{"type":"git_stash_pop","payload":{"index":1}}"#
+        );
+
+        // WorkspacePath rejects traversal at the wire boundary.
+        assert!(serde_json::from_str::<FrontendCommand>(
+            r#"{"type":"git_discard_worktree","payload":{"paths":["../escape.txt"]}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn daily_git_events_round_trip_with_conflicts_and_redacted_summary() {
+        let conflict = GitConflictDto {
+            path: git_path("src/a.rs"),
+            ours: true,
+            theirs: true,
+            ancestor: true,
+        };
+        let merge = GitMergeStateDto {
+            branch: Some("feature/git".into()),
+            status: GitMergeStatusDto::Conflicts,
+            conflicts: vec![conflict.clone()],
+        };
+        let event = FrontendEvent::GitMergeStateChanged(merge);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"git_merge_state_changed""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
+
+        let remote = FrontendEvent::GitRemoteFinished(GitRemoteOutcomeDto {
+            operation: GitRemoteOperationDto::Pull,
+            remote: "origin".into(),
+            summary: "pull origin ok".into(),
+            conflicts: vec![conflict],
+        });
+        let json = serde_json::to_string(&remote).unwrap();
+        assert!(json.contains(r#""operation":"pull""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), remote);
+
+        let branches = FrontendEvent::GitBranchesChanged(GitBranchesDto {
+            branches: vec![GitBranchDto {
+                name: "main".into(),
+                is_current: true,
+                upstream: Some("origin/main".into()),
+                tip: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            }],
+        });
+        let json = serde_json::to_string(&branches).unwrap();
+        assert!(json.contains(r#""upstream":"origin/main""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), branches);
+
+        let commit = FrontendEvent::GitCommitShown(Box::new(GitCommitDetailDto {
+            commit: GitCommitDto {
+                id: "0123456789abcdef0123456789abcdef01234567".into(),
+                short_id: "0123456".into(),
+                summary: "commit".into(),
+                message: "commit\n".into(),
+                author_name: "Test".into(),
+                author_email: "test@example.com".into(),
+                time_unix: 1_700_000_000,
+                time_offset_minutes: 0,
+                parents: vec![],
+            },
+            files: vec![GitCommitFileDto {
+                path: git_path("src/a.rs"),
+                old_path: None,
+                status: "modified".into(),
+                additions: 2,
+                deletions: 1,
+            }],
+            patch: "--- a/src/a.rs\n+++ b/src/a.rs\n".into(),
+            patch_truncated: false,
+        }));
+        let json = serde_json::to_string(&commit).unwrap();
+        assert!(json.contains(r#""type":"git_commit_shown""#), "{json}");
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), commit);
     }
     #[test]
     fn approval_is_bound_and_consumed_once() {

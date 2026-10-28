@@ -37,7 +37,10 @@ use selora_core::{Buffer, Position, SeloraError, Workspace};
 use selora_editor::Editor;
 use selora_fs::search::{SearchError, SearchHit, SearchId, SearchQuery};
 use selora_fs::tree::FileTreeNode;
-use selora_git::GitStatus;
+use selora_git::{
+    BranchInfo, CommitDetail, CommitInfo, ConflictEntry, GitStatus, MergeStatus, RemoteOperation,
+    StashEntry,
+};
 use selora_settings::Settings;
 use selora_ui::editor::split::EditorArea;
 use selora_ui::palette::command::CommandPalette;
@@ -50,6 +53,16 @@ use selora_ui::toasts::{Severity, Toast};
 use uuid::Uuid;
 
 use crate::persistence::WorkspaceState;
+
+/// The latest merge result the git panel paints (status plus conflicts).
+///
+/// The backend reports conflicts as values, not errors; this is the state the
+/// panel uses to offer "keep ours" / "keep theirs" per path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitMergeView {
+    pub status: MergeStatus,
+    pub conflicts: Vec<ConflictEntry>,
+}
 
 /// Everything the dispatcher needs to start one agent turn (§17.3):
 /// the resolved model, the panel's conversation, and the `agent.*`
@@ -325,6 +338,32 @@ pub enum AppMessage {
         path: PathBuf,
         diff: String,
     },
+    // Daily git (branch / history / stash / merge / network). These events are
+    // the typed answers to the `git.*` commands in `selora-protocol`; the
+    // backend values are small enough to own directly. The producers land with
+    // the panel slice, so the reduction is exercised by tests until then.
+    #[allow(dead_code)]
+    GitBranchesChanged(Vec<BranchInfo>),
+    #[allow(dead_code)]
+    GitLogReady {
+        path: Option<PathBuf>,
+        commits: Vec<CommitInfo>,
+    },
+    #[allow(dead_code)]
+    GitCommitShown(Box<CommitDetail>),
+    #[allow(dead_code)]
+    GitStashesChanged(Vec<StashEntry>),
+    #[allow(dead_code)]
+    GitMergeStateChanged {
+        status: MergeStatus,
+        conflicts: Vec<ConflictEntry>,
+    },
+    #[allow(dead_code)]
+    GitRemoteFinished {
+        operation: RemoteOperation,
+        remote: String,
+        summary: String,
+    },
 
     // Search (Phase 3c)
     /// The results of search `id` — `Ok` installs them in the panel
@@ -441,6 +480,22 @@ pub struct AppState {
     /// Phase 3b). Data comes from `git_status`; actions go out as
     /// `Effect`s via the shell.
     pub git_panel: GitPanel,
+    /// Local branches, newest snapshot from [`AppMessage::GitBranchesChanged`].
+    pub git_branches: Vec<BranchInfo>,
+    /// The latest history page ([`AppMessage::GitLogReady`]).
+    pub git_log: Vec<CommitInfo>,
+    /// The path filter the latest history page was requested with (`None` =
+    /// whole history); stale replies are matched against it.
+    pub git_log_path: Option<PathBuf>,
+    /// The commit opened in the history detail view
+    /// ([`AppMessage::GitCommitShown`]).
+    pub git_commit_detail: Option<CommitDetail>,
+    /// Stash entries, newest first ([`AppMessage::GitStashesChanged`]).
+    pub git_stashes: Vec<StashEntry>,
+    /// The latest merge result and its unresolved conflicts.
+    pub git_merge: Option<GitMergeView>,
+    /// The last network operation's redacted summary (for the panel footer).
+    pub git_remote_summary: Option<String>,
     /// The search panel's view state (query, toggles, collapsed groups;
     /// Phase 3c). Results arrive via [`AppMessage::SearchResults`];
     /// searches go out as [`Effect::Search`] via the shell.
@@ -497,6 +552,13 @@ impl Default for AppState {
             git_status: None,
             in_git_repo: false,
             git_panel: GitPanel::new(),
+            git_branches: Vec::new(),
+            git_log: Vec::new(),
+            git_log_path: None,
+            git_commit_detail: None,
+            git_stashes: Vec::new(),
+            git_merge: None,
+            git_remote_summary: None,
             search: SearchPanel::new(),
             lsp: LspViewState::default(),
             pending_definition: None,
@@ -744,6 +806,7 @@ impl AppState {
                 self.in_git_repo = false;
                 self.git_status = None;
                 self.file_tree.set_git_status(None);
+                self.clear_git_daily();
             }
             AppMessage::GitCommitted(short_id) => {
                 self.toast(format!("committed {short_id}"), Severity::Info);
@@ -751,9 +814,45 @@ impl AppState {
             AppMessage::GitError(error) => {
                 self.toast(format!("git: {error}"), Severity::Error);
             }
-            // The diff view's payload — the shell observes it in the
+            // The diff view's payload - the shell observes it in the
             // drain loop (Phase R6b); the state reduction is a no-op.
             AppMessage::GitDiffReady { .. } => {}
+            AppMessage::GitBranchesChanged(branches) => {
+                self.git_branches = branches;
+            }
+            AppMessage::GitLogReady { path, commits } => {
+                self.git_log = commits;
+                self.git_log_path = path;
+            }
+            AppMessage::GitCommitShown(detail) => {
+                self.git_commit_detail = Some(*detail);
+            }
+            AppMessage::GitStashesChanged(entries) => {
+                self.git_stashes = entries;
+            }
+            AppMessage::GitMergeStateChanged { status, conflicts } => {
+                let count = conflicts.len();
+                self.git_merge = Some(GitMergeView { status, conflicts });
+                if count > 0 {
+                    self.toast(
+                        format!("merge has {count} conflicted file(s)"),
+                        Severity::Error,
+                    );
+                } else if status == MergeStatus::Merged {
+                    self.toast("merge staged - commit to finish", Severity::Info);
+                }
+            }
+            AppMessage::GitRemoteFinished {
+                operation,
+                remote,
+                summary,
+            } => {
+                self.git_remote_summary = Some(summary.clone());
+                self.toast(
+                    format!("git {} {remote}: {summary}", operation.as_str()),
+                    Severity::Info,
+                );
+            }
 
             // -- Search (Phase 3c) ----------------------------------------------
             AppMessage::SearchResults { id, results } => match results {
@@ -956,6 +1055,18 @@ impl AppState {
         false
     }
 
+    /// Drop the daily-git snapshots (branches, history, detail, stash, merge,
+    /// last network summary). Status is cleared by the same callers.
+    fn clear_git_daily(&mut self) {
+        self.git_branches.clear();
+        self.git_log.clear();
+        self.git_log_path = None;
+        self.git_commit_detail = None;
+        self.git_stashes.clear();
+        self.git_merge = None;
+        self.git_remote_summary = None;
+    }
+
     /// A new folder was picked: close the old session's tabs and buffers,
     /// reset the tree, and re-root the workspace. The tree itself arrives
     /// later as `FileTreeUpdated`.
@@ -969,6 +1080,7 @@ impl AppState {
         self.fuzzy_source.clear();
         self.git_status = None;
         self.in_git_repo = false;
+        self.clear_git_daily();
         self.search = SearchPanel::new();
         self.lsp.hover = None;
         self.lsp.completion = None;
@@ -1718,6 +1830,97 @@ mod tests {
         state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
         assert!(!state.in_git_repo);
         assert!(state.git_status.is_none());
+    }
+
+    #[test]
+    fn daily_git_messages_populate_state_and_switch_folder_clears_them() {
+        let mut state = AppState::default();
+        state.apply(AppMessage::FolderOpened(path("/repo")));
+
+        state.apply(AppMessage::GitBranchesChanged(vec![BranchInfo {
+            name: "main".into(),
+            is_current: true,
+            upstream: Some("origin/main".into()),
+            tip: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        }]));
+        assert_eq!(state.git_branches.len(), 1);
+        assert!(state.git_branches[0].is_current);
+
+        let commit = CommitInfo {
+            id: "0123456789abcdef0123456789abcdef01234567".into(),
+            short_id: "0123456".into(),
+            summary: "work".into(),
+            message: "work\n".into(),
+            author_name: "Test".into(),
+            author_email: "test@example.com".into(),
+            time_unix: 1_700_000_000,
+            time_offset_minutes: 0,
+            parents: vec![],
+        };
+        state.apply(AppMessage::GitLogReady {
+            path: Some(path("src/a.rs")),
+            commits: vec![commit.clone()],
+        });
+        assert_eq!(state.git_log.len(), 1);
+        assert_eq!(state.git_log_path.as_deref(), Some(Path::new("src/a.rs")));
+
+        state.apply(AppMessage::GitCommitShown(Box::new(CommitDetail {
+            info: commit,
+            files: vec![],
+            patch: String::new(),
+            patch_truncated: false,
+        })));
+        assert!(state.git_commit_detail.is_some());
+
+        state.apply(AppMessage::GitStashesChanged(vec![StashEntry {
+            index: 0,
+            message: "WIP on main".into(),
+            oid: "0123456789abcdef0123456789abcdef01234567".into(),
+            time_unix: 1_700_000_000,
+        }]));
+        assert_eq!(state.git_stashes.len(), 1);
+
+        state.apply(AppMessage::GitMergeStateChanged {
+            status: MergeStatus::Conflicts,
+            conflicts: vec![ConflictEntry {
+                path: path("src/a.rs"),
+                ours: true,
+                theirs: true,
+                ancestor: true,
+            }],
+        });
+        let merge = state.git_merge.as_ref().expect("merge view");
+        assert_eq!(merge.status, MergeStatus::Conflicts);
+        assert_eq!(merge.conflicts.len(), 1);
+        assert_eq!(state.toasts.last().unwrap().severity, Severity::Error);
+
+        state.apply(AppMessage::GitRemoteFinished {
+            operation: RemoteOperation::Fetch,
+            remote: "origin".into(),
+            summary: "From origin".into(),
+        });
+        assert_eq!(state.git_remote_summary.as_deref(), Some("From origin"));
+        assert!(state.toasts.last().unwrap().text.contains("fetch origin"));
+
+        // A folder switch drops every daily-git snapshot.
+        state.apply(AppMessage::DialogFolderPicked(Some(path("/new"))));
+        assert!(state.git_branches.is_empty());
+        assert!(state.git_log.is_empty());
+        assert!(state.git_log_path.is_none());
+        assert!(state.git_commit_detail.is_none());
+        assert!(state.git_stashes.is_empty());
+        assert!(state.git_merge.is_none());
+        assert!(state.git_remote_summary.is_none());
+
+        // So does losing the repository.
+        state.apply(AppMessage::GitBranchesChanged(vec![BranchInfo {
+            name: "main".into(),
+            is_current: true,
+            upstream: None,
+            tip: None,
+        }]));
+        state.apply(AppMessage::GitNoRepo);
+        assert!(state.git_branches.is_empty());
     }
 
     // --- search (Phase 3c wiring) ----------------------------------------------
