@@ -7,6 +7,7 @@ mod lsp_bridge;
 mod security;
 mod sessions;
 mod state;
+mod terminal;
 mod workflow_broker;
 mod workflow_command;
 mod workflows_host;
@@ -120,6 +121,10 @@ fn main() {
                     state::CloseOutcome::Close { .. } => {
                         // Best effort: the layout must never block a close.
                         let _ = app_state.persist_layout();
+                        // The app is going away: stop every ConPTY session and
+                        // its process tree now rather than leaving them to the
+                        // OS handle close.
+                        app_state.shutdown_terminals();
                     }
                     state::CloseOutcome::Stay => api.prevent_close(),
                     state::CloseOutcome::SaveFailed { saved, message } => {

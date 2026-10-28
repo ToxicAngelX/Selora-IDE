@@ -38,6 +38,7 @@ export type IconName =
   | 'severity-warning'
   | 'severity-info'
   | 'terminal'
+  | 'paste'
   | 'play';
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
@@ -137,6 +138,14 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     <>
       <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
       <path d="M3.5 10.5h-1a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v1" />
+    </>
+  ),
+  // Clipboard with a page: paste.
+  paste: (
+    <>
+      <path d="M5.5 2.5h5v2h-5z" />
+      <path d="M4.5 3.5h-1a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-1" />
+      <path d="M5.5 7.5h5M5.5 10h5" />
     </>
   ),
   lock: (

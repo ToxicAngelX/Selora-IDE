@@ -1640,6 +1640,9 @@ pub struct DesktopState {
     /// The host constructor. A `Mutex` so the hermetic tests can swap in a
     /// fake host; production never replaces it.
     workflow_hosts: Arc<Mutex<WorkflowHostFactory>>,
+    /// Phase 10: the live ConPTY sessions. A workspace switch/close and the
+    /// app exit call `close_all`, which kills every session's process tree.
+    terminals: crate::terminal::TerminalManager,
 }
 
 /// How [`DesktopState::launch_workflow`] should open the durable run.
@@ -1759,6 +1762,7 @@ impl DesktopState {
             workflow_hosts: Arc::new(Mutex::new(
                 Arc::new(production_workflow_host) as WorkflowHostFactory
             )),
+            terminals: crate::terminal::TerminalManager::new(),
         }
     }
 
@@ -1778,6 +1782,10 @@ impl DesktopState {
     /// one thing for the whole app.
     fn attach_workspace(&self, root: PathBuf) -> Result<(), WorkspaceError> {
         let workspace = Workspace::open(root)?;
+        // A terminal is rooted at the workspace it was opened in; switching
+        // roots kills every session (and its process tree) before the new
+        // workspace becomes visible.
+        self.terminals.close_all();
         // The old root's servers must die before the new workspace becomes
         // visible; `reset_lsp` also invalidates any event still in flight.
         self.reset_lsp();
@@ -1797,6 +1805,7 @@ impl DesktopState {
     /// Close the open folder: no buffers, no language servers, no
     /// diagnostics. The bootstrap then reports the no-workspace state.
     fn detach_workspace(&self) {
+        self.terminals.close_all();
         self.reset_lsp();
         self.sessions().set_workspace_root(None);
         *self
@@ -2500,6 +2509,44 @@ impl DesktopState {
                     message: format!("Failed to save the layout: {error}"),
                     retryable: true,
                 })?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            // Phase 10 — the embedded terminal. Create needs an open
+            // workspace (the shell's cwd) and emits TerminalCreated through
+            // the same event log every other stream uses. Input/resize/close
+            // name a live session; an unknown id is a typed error rather than
+            // a silent no-op.
+            FrontendCommand::TerminalCreate {
+                request_id: _request_id,
+                cols,
+                rows,
+            } => {
+                let root = self.workspace_root_path().ok_or_else(|| ProtocolErrorDto {
+                    code: "no_workspace".into(),
+                    message: "Open a folder first.".into(),
+                    retryable: false,
+                })?;
+                let log = Arc::clone(&self.log);
+                let handle = app.clone();
+                let emit: crate::terminal::Emit =
+                    Arc::new(move |event| log.record(&handle, event, None));
+                self.terminals.create(&emit, &root, cols, rows)?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::TerminalInput { terminal_id, data } => {
+                self.terminals.input(&terminal_id, &data)?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::TerminalResize {
+                terminal_id,
+                cols,
+                rows,
+            } => {
+                self.terminals.resize(&terminal_id, cols, rows)?;
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::TerminalClose { terminal_id } => {
+                self.terminals.close(&terminal_id)?;
                 Ok(CommandResultDto::Ack(self.command_ack()))
             }
             FrontendCommand::OpenExternal { url } => {
@@ -3326,6 +3373,13 @@ impl DesktopState {
         let layout = self.layout.lock().expect("layout lock").clone();
         let mut settings = self.layout_store.load_settings()?;
         self.layout_store.persist_layout(&mut settings, &layout)
+    }
+
+    /// Stop every live ConPTY session and its process tree. Called when the
+    /// window is allowed to close; a workspace switch calls the same manager
+    /// path from `attach_workspace`/`detach_workspace`.
+    pub fn shutdown_terminals(&self) -> usize {
+        self.terminals.close_all()
     }
 
     /// Every open buffer with unsaved edits, path-sorted. The close prompt
@@ -8147,5 +8201,173 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("disabled"));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 10 — the embedded terminal through the real dispatch path.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn terminal_commands_are_workspace_scoped_and_die_on_a_switch() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+
+        // No open workspace: create answers the typed `no_workspace`.
+        let error = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::TerminalCreate {
+                        request_id: RequestId::new("terminal-request").expect("valid id"),
+                        cols: 80,
+                        rows: 24,
+                    },
+                ),
+            )
+            .expect_err("terminal needs a workspace");
+        assert_eq!(error.code, "no_workspace");
+        assert!(!error.retryable);
+
+        let first = tempfile::tempdir().expect("first workspace");
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFolderAt {
+                        root: first.path().to_string_lossy().to_string(),
+                    },
+                ),
+            )
+            .expect("workspace opens");
+        state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::TerminalCreate {
+                        request_id: RequestId::new("terminal-request").expect("valid id"),
+                        cols: 100,
+                        rows: 30,
+                    },
+                ),
+            )
+            .expect("terminal starts");
+
+        // The event stream carries the created session, rooted at the
+        // workspace (not the process cwd).
+        let created = state
+            .events_after(0)
+            .into_iter()
+            .find_map(|event| match event.payload {
+                FrontendEvent::TerminalCreated(created) => Some(created),
+                _ => None,
+            })
+            .expect("terminal_created was emitted");
+        assert_eq!(
+            std::path::PathBuf::from(&created.cwd),
+            std::fs::canonicalize(first.path()).expect("canonical workspace")
+        );
+        assert!(created.shell == "pwsh" || created.shell == "powershell");
+
+        // Resize and input name the live session; an unknown id is typed.
+        state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::TerminalResize {
+                        terminal_id: created.terminal_id.clone(),
+                        cols: 120,
+                        rows: 40,
+                    },
+                ),
+            )
+            .expect("resize accepted");
+        let error = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::TerminalResize {
+                        terminal_id: "not-a-terminal".into(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                ),
+            )
+            .expect_err("unknown terminal");
+        assert_eq!(error.code, "terminal_not_found");
+
+        // Switching folders closes every session: the old id is gone.
+        let second = tempfile::tempdir().expect("second workspace");
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFolderAt {
+                        root: second.path().to_string_lossy().to_string(),
+                    },
+                ),
+            )
+            .expect("workspace switch");
+        let error = state
+            .dispatch_result(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::TerminalClose {
+                        terminal_id: created.terminal_id,
+                    },
+                ),
+            )
+            .expect_err("the switch killed the session");
+        assert_eq!(error.code, "terminal_not_found");
+        assert_eq!(state.shutdown_terminals(), 0);
+    }
+
+    #[test]
+    fn terminal_create_payload_with_a_smuggled_cwd_still_roots_at_the_workspace() {
+        let app = mock_app_handle();
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let workspace = tempfile::tempdir().expect("workspace");
+        state
+            .dispatch(
+                &app,
+                envelope(
+                    &state,
+                    FrontendCommand::OpenFolderAt {
+                        root: workspace.path().to_string_lossy().to_string(),
+                    },
+                ),
+            )
+            .expect("workspace opens");
+
+        // The hostile JSON names C:\Windows and cmd.exe. Neither field exists
+        // on the wire, so the backend ignores both.
+        let command: FrontendCommand = serde_json::from_str(
+            r#"{"type":"terminal_create","payload":{"request_id":"smuggled","cols":80,"rows":24,"cwd":"C:\\Windows","shell":"cmd.exe"}}"#,
+        )
+        .expect("payload parses");
+        state
+            .dispatch_result(&app, envelope(&state, command))
+            .expect("terminal starts at the workspace");
+
+        let created = state
+            .events_after(0)
+            .into_iter()
+            .find_map(|event| match event.payload {
+                FrontendEvent::TerminalCreated(created) => Some(created),
+                _ => None,
+            })
+            .expect("terminal_created was emitted");
+        assert_eq!(
+            std::path::PathBuf::from(&created.cwd),
+            std::fs::canonicalize(workspace.path()).expect("canonical workspace")
+        );
+        assert_ne!(created.shell, "cmd.exe");
+        state.shutdown_terminals();
     }
 }

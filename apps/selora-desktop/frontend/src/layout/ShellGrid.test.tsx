@@ -146,8 +146,8 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
     expect(queryAllByRole('button', { name: 'Find a bug in the selection' })).toHaveLength(0);
   });
 
-  it('the bottom dock renders its three views — terminal is the clearly-labeled placeholder', async () => {
-    const { container, findByText, findByRole, queryByText } = renderShell(
+  it('the bottom dock renders its three views — terminal is a real xterm surface with a truthful no-workspace state', async () => {
+    const { container, findByTestId, findByText, findByRole, queryByText } = renderShell(
       makeLayout({ bottom_dock_open: true, bottom_view: 'terminal_placeholder' }),
     );
     // Lazy dock region: the landmark exists before the chunk resolves.
@@ -156,8 +156,13 @@ describe('ShellGrid (DESIGN §1 — the seven regions)', () => {
       container.querySelector('.bottom-dock-loading')?.getAttribute('aria-busy'),
     ).toBe('true');
     expect((await findByRole('tab', { name: 'Terminal' })).classList.contains('is-active')).toBe(true);
-    expect(await findByText('No terminal session is running')).toBeTruthy();
-    expect(await findByText('The integrated shell arrives with the terminal slice.')).toBeTruthy();
+    // The panel asks the live envelope context for a shell. This smoke test
+    // renders ShellGrid without a bootstrap, so the truthful failure is the
+    // no-workspace gate — never a simulated prompt.
+    expect(
+      (await findByTestId('terminal-error')).textContent,
+    ).toContain('Open a folder before starting a terminal.');
+    expect(container.querySelector('.terminal-xterm')).toBeNull();
     // Output's honest placeholder is not shown while the terminal view is active.
     expect(queryByText('No output yet — tasks land with the terminal slice.')).toBeNull();
 

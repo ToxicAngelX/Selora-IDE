@@ -52,6 +52,22 @@ describe('BottomDock', () => {
     expect(getByTestId('terminal-panel')).toBeTruthy();
   });
 
+  it('keeps the terminal mounted while another dock view is active', () => {
+    const { getByRole, getByTestId } = render(<BottomDock />);
+
+    fireEvent.click(getByRole('tab', { name: 'Terminal' }));
+    showView('terminal_placeholder');
+    const host = getByTestId('terminal-panel').closest('.terminal-host');
+
+    fireEvent.click(getByRole('tab', { name: 'Output' }));
+    showView('output');
+
+    expect(getByTestId('output-panel')).toBeTruthy();
+    expect(host?.hasAttribute('hidden')).toBe(true);
+    // The panel is hidden, not unmounted: its xterm buffer survives the switch.
+    expect(getByTestId('terminal-panel')).toBeTruthy();
+  });
+
   it('triggers toggle when close button is clicked', () => {
     const toggleSpy = vi.spyOn(layoutStore, 'toggle');
     const { getByRole } = render(<BottomDock />);
