@@ -27,6 +27,7 @@ nav:
   - Settings: settings.md
   - Keyboard shortcuts: keybinds.md
   - Walkthrough and checklist: WALKTHROUGH.md
+  - Performance: PERFORMANCE.md
   - Troubleshooting: troubleshooting.md
 
 markdown_extensions:

@@ -108,6 +108,15 @@ pub async fn update_settings(
     offload(move || state.apply_settings_update(&app, patch, None)).await
 }
 
+/// Boot-trace marker: the frontend calls this once its bootstrap + replay flow
+/// reaches `ready`. It writes one line to `%TEMP%\selora_boot.log`, so support
+/// logs and `scripts/perf.ps1` can separate process/window creation from the
+/// first usable shell without changing app state.
+#[tauri::command]
+pub fn frontend_ready() {
+    crate::log_boot("frontend bootstrap ready");
+}
+
 /// §3.4's replay command — the only Tauri command Z2 adds. Backed by the
 /// recorded event log and its 1024-event retention cap; the gate (seeded
 /// `null`) lives on the frontend.
