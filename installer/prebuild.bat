@@ -31,4 +31,4 @@ if not exist "%ISCC%" (
 
 "%ISCC%" /DMyAppVersion=%VERSION% installer\selora-ide.iss
 if errorlevel 1 exit /b 1
-echo prebuild: wrote installer\output\Selora-IDE-Setup-%VERSION%.exe
+echo prebuild: wrote installer\output\selora-installer-v1.exe
