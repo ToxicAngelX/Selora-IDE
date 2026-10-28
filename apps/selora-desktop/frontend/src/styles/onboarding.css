@@ -8,7 +8,8 @@
    ========================================================================== */
 
 .onboarding-backdrop,
-.about-backdrop {
+.about-backdrop,
+.update-backdrop {
   position: fixed;
   inset: 0;
   display: flex;
@@ -457,6 +458,82 @@
   margin-top: auto;
 }
 
+/* --- Startup update prompt ------------------------------------------------ */
+
+.update-backdrop {
+  /* Above the onboarding wizard: an update prompt must not hide behind it. */
+  z-index: 1300;
+  animation: onboarding-fade var(--dur-base) var(--ease-fade);
+}
+
+.update-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(calc(var(--space-6) * 11), 92vw);
+  padding: var(--space-5);
+  text-align: center;
+  background: var(--ink-mid);
+  border: var(--border-hairline);
+  border-radius: var(--radius-2);
+  animation: onboarding-rise var(--dur-base) var(--ease-precise);
+}
+
+.update-eyebrow {
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.update-title {
+  margin-top: var(--space-2);
+  font-size: var(--type-xl);
+  line-height: var(--type-xl-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-default);
+}
+
+.update-body {
+  margin-top: var(--space-3);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  color: var(--fg-muted);
+}
+
+.update-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: calc(var(--space-6) * 1.1);
+  margin-top: var(--space-2);
+}
+
+.update-progress,
+.update-error {
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.update-progress {
+  color: var(--fg-muted);
+}
+
+.update-error {
+  color: var(--err);
+}
+
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
 /* --- Motion --------------------------------------------------------------- */
 
 @keyframes onboarding-fade {
@@ -478,7 +555,9 @@
   .onboarding-backdrop,
   .onboarding-dialog,
   .about-backdrop,
-  .about-dialog {
+  .about-dialog,
+  .update-backdrop,
+  .update-dialog {
     animation: none;
   }
 
@@ -498,6 +577,8 @@
 :root[data-reduced-motion="true"] .onboarding-dialog,
 :root[data-reduced-motion="true"] .about-backdrop,
 :root[data-reduced-motion="true"] .about-dialog,
+:root[data-reduced-motion="true"] .update-backdrop,
+:root[data-reduced-motion="true"] .update-dialog,
 :root[data-reduced-motion="true"] .onboarding-brand-satellite {
   animation: none;
 }

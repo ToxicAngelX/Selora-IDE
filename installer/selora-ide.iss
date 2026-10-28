@@ -59,6 +59,11 @@ DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 WizardStyle=modern
+; In-app updates run this setup with /SILENT /CLOSEAPPLICATIONS while Selora
+; IDE may still be writing its settings. Close the running instance before
+; replacing files; the updater reopens the app itself, so Setup must not.
+CloseApplications=yes
+RestartApplications=no
 WizardImageFile={#SourcePath}..\assets\icons\wizard_large.bmp
 WizardSmallImageFile={#SourcePath}..\assets\icons\wizard_small.bmp
 ; Hand-run default. {#SourcePath} ends with a backslash and is the script's

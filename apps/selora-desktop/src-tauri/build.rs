@@ -38,6 +38,8 @@ fn main() {
                 "pick_folder",
                 "open_external",
                 "update_settings",
+                "check_for_update",
+                "install_update",
             ])),
     )
     .expect("Tauri configuration and capability manifest must be valid");

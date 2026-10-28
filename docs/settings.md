@@ -9,7 +9,7 @@ close).
 |---|---|
 | General | (placeholder) |
 | Editor | font size, tab width, ghost text on/off |
-| UI | reduce-motion, tree width, theme (`selora-dark` / `dark` / `space-black` / `light`) |
+| UI | reduce-motion, tree width, theme (`selora-dark` / `dark` / `space-black` / `light`), automatic update check (`ui.check_for_updates`, default on) |
 | Selora | connection (Connect/Disconnect), base URL, active model |
 | LSP | rust-analyzer / typescript-language-server paths (auto-detect) |
 | Git | (placeholder) |

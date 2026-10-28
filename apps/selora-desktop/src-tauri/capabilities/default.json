@@ -16,6 +16,8 @@
     "allow-pick-folder",
     "allow-open-external",
     "allow-update-settings",
+    "allow-check-for-update",
+    "allow-install-update",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-minimize",

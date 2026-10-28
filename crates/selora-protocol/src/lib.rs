@@ -449,6 +449,10 @@ pub struct SettingsPatchDto {
     pub keybind_toggle_chat: Option<String>,
     #[serde(default)]
     pub keybind_save: Option<String>,
+    /// Startup update check (UI_SPEC §11). `None` leaves the stored value
+    /// untouched; the About dialog's manual check ignores this flag.
+    #[serde(default)]
+    pub check_for_updates: Option<bool>,
 }
 
 /// Default history page size for `GitLog` when the caller omits `limit`.
@@ -1004,6 +1008,9 @@ fn default_editor_tab_size() -> u32 {
 fn default_editor_word_wrap() -> bool {
     false
 }
+fn default_check_for_updates() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingsViewDto {
@@ -1028,6 +1035,10 @@ pub struct SettingsViewDto {
     pub editor_tab_size: u32,
     #[serde(default = "default_editor_word_wrap")]
     pub editor_word_wrap: bool,
+    /// Whether the shell checks for a newer release once per launch. The
+    /// manual check in the About dialog is unaffected.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
 }
 /// Phase Z2 serde defaults (§5.1 / §4.2): every field is defaulted so a
 /// partial or pre-Z2 `LayoutDto` JSON deserializes — the values are §1.1's
@@ -2319,6 +2330,7 @@ mod tests {
                 editor_font_size: 14,
                 editor_tab_size: 4,
                 editor_word_wrap: false,
+                check_for_updates: true,
             },
             // §1.1: the Z1 stub values (280/220, agent dock open) were
             // diagnostic placeholders — Z2's fixture carries the table's

@@ -79,6 +79,8 @@ export type SettingsView = {
   editor_font_size: number;
   editor_tab_size: number;
   editor_word_wrap: boolean;
+  /** Check for a newer release once per launch (update prompt). */
+  check_for_updates?: boolean;
 };
 
 /** The backend-supported writable subset of `SettingsView` (SettingsPatchDto). */
@@ -92,6 +94,7 @@ export type SettingsPatch = {
   keybind_fuzzy_find?: string;
   keybind_toggle_chat?: string;
   keybind_save?: string;
+  check_for_updates?: boolean;
 };
 
 // --- DTOs referenced by the full FrontendEvent union ------------------------
@@ -1266,6 +1269,42 @@ export const getApiKeyStatus = (): Promise<ApiKeyStatus> =>
 
 export const fetchModels = (): Promise<Model[]> =>
   invoke<Model[]>('fetch_models');
+
+// --- In-app updates (UI_SPEC §11) -------------------------------------------
+
+/** What `check_for_update` answers. `newer` false means "already latest". */
+export type UpdateCheck = {
+  current_version: string;
+  latest_tag: string;
+  newer: boolean;
+  release_url: string;
+  /** Both the setup and its published SHA256 are attached to the release. */
+  installer_available: boolean;
+};
+
+export type UpdateProgress = {
+  downloaded: number;
+  /** 0 when the server did not report a content length. */
+  total: number;
+};
+
+/** One GitHub API GET; nothing is downloaded. */
+export const checkForUpdate = (): Promise<UpdateCheck> =>
+  invoke<UpdateCheck>('check_for_update');
+
+/**
+ * Download, verify and launch the latest installer. Resolves when the shell
+ * is exiting; progress arrives on {@link listenUpdateProgress}.
+ */
+export const installUpdate = (): Promise<void> =>
+  invoke<void>('install_update');
+
+export const UPDATE_PROGRESS_EVENT = 'selora:update-progress';
+
+export const listenUpdateProgress = (
+  handler: (progress: UpdateProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<UpdateProgress>(UPDATE_PROGRESS_EVENT, (event) => handler(event.payload));
 
 // --- Event validation (unchanged from Z1; ARCHITECTURE §3.4) -----------------
 

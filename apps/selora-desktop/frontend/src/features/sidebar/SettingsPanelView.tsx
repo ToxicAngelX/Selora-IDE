@@ -540,6 +540,26 @@ const restartServer = (language: string): void => {
                 <option value="">—</option>
               </select>
             </div>
+
+            <div className="settings-row">
+              <span className="settings-label" id="settings-check-updates-label">
+                Automatic Updates
+              </span>
+              <label
+                className="settings-switch"
+                title="Check GitHub Releases once per launch and offer the newer installer in a centered prompt. The About dialog's manual check always works."
+              >
+                <input
+                  type="checkbox"
+                  checked={settings.check_for_updates ?? true}
+                  disabled={saving}
+                  aria-busy={saving}
+                  aria-labelledby="settings-check-updates-label"
+                  onChange={(e) => persist({ check_for_updates: e.target.checked })}
+                />
+                <span className="switch-slider" />
+              </label>
+            </div>
           </div>
         </div>
       )}

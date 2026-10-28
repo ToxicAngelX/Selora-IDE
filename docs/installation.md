@@ -55,6 +55,18 @@ Settings, workspace state, and chat sessions live in
 writes a best-effort plaintext copy to `%APPDATA%\selora-ide\.api_key`, so
 the key is not keyring-only.
 
+## Updates
+
+Selora IDE checks GitHub Releases on launch and offers a newer version in a
+centered prompt. Choosing **Yes, update** downloads the release's installer,
+verifies it against the published SHA256, and runs it silently; the installer
+upgrades the current install in place, so there is nothing to uninstall and
+your settings, workspace, and sessions stay. **No, later** closes the prompt
+until the next launch.
+
+Turn the automatic check off under **Settings -> Theme -> Automatic Updates**.
+The manual check in **Help -> About** keeps working either way.
+
 ## Uninstall
 
 Settings -> Apps -> Selora IDE -> Uninstall. The uninstaller removes the

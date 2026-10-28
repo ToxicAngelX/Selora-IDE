@@ -61,6 +61,7 @@ export function makeBootstrap(overrides: Partial<BootstrapState> = {}): Bootstra
       editor_font_size: 14,
       editor_tab_size: 4,
       editor_word_wrap: false,
+      check_for_updates: true,
     },
     layout: FIXTURE_LAYOUT,
     layout_constraints: FIXTURE_CONSTRAINTS,

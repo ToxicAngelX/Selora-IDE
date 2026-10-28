@@ -678,6 +678,7 @@ fn settings_view(settings: &selora_settings::Settings) -> SettingsViewDto {
         editor_font_size: settings.editor.font_size,
         editor_tab_size: settings.editor.tab_size,
         editor_word_wrap: settings.editor.word_wrap,
+        check_for_updates: settings.ui.check_for_updates,
     }
 }
 
@@ -2164,6 +2165,7 @@ impl DesktopState {
             && patch.keybind_fuzzy_find.is_none()
             && patch.keybind_toggle_chat.is_none()
             && patch.keybind_save.is_none()
+            && patch.check_for_updates.is_none()
         {
             return Err(ProtocolErrorDto {
                 code: "invalid_settings_patch".into(),
@@ -2262,6 +2264,9 @@ impl DesktopState {
         }
         if let Some(binding) = save {
             settings.keybinds.save = binding;
+        }
+        if let Some(check) = patch.check_for_updates {
+            settings.ui.check_for_updates = check;
         }
         self.layout_store
             .save_settings(&settings)

@@ -413,6 +413,37 @@ them deliberately. Steps, in order:
 
 The draft step is critical. We do not auto-publish releases. The owner always smoke-tests first.
 
+### 4.4 In-app updates
+
+The published installer is also the update path: its `AppId`
+(`{{7A3E9C41-5D2B-4E8F-B6A1-9C0D2E4F6A8B}`) never changes, so running a newer
+`Selora-IDE-Setup-X.Y.Z.exe` upgrades the existing per-user install in place.
+No uninstall step, and `settings.json` / `workspace.json` / `sessions.json`
+survive because they live under `%APPDATA%\selora-ide`, not `{app}`.
+
+The shell automates that:
+
+1. On launch, the UpdateDialog calls `check_for_update` (one GET against
+   `releases/latest`) unless **Settings → Theme → Automatic Updates** is off.
+2. If the latest tag is a strictly newer numeric triple, a centered box asks
+   **Yes, update** / **No, later**. "No" is per-launch only: the prompt returns
+   on the next start while the build stays older.
+3. "Yes" calls `install_update`, which downloads the release's
+   `Selora-IDE-Setup-X.Y.Z.exe`, verifies it against the published
+   `.exe.sha256`, runs it with `/SILENT /CLOSEAPPLICATIONS /NORESTART`, and
+   exits. The command chain reopens Selora IDE after Setup finishes.
+
+Consequences for a release:
+
+- Both assets must be attached to the **published** release. A draft is
+  invisible to `releases/latest`, so the prompt stays silent until the owner
+  publishes. The workflow already uploads both names.
+- An unsigned installer still triggers SmartScreen on the first in-app update.
+  Enable `SIGNING_CERT_BASE64` before treating in-app updates as a normal
+  channel.
+- The SHA256 check proves the transfer, not the author. Code signing is the
+  only authenticity control; see §3.
+
 ---
 
 ## 5. Versioning

@@ -23,6 +23,7 @@ import { ShellGrid } from '../layout/ShellGrid';
 import { CommandPalette } from '../components/CommandPalette';
 import { CheatSheet, useCheatSheetTrigger } from '../components/CheatSheet';
 import { AboutDialog, useAboutTrigger } from '../components/AboutDialog';
+import { UpdatePrompt } from '../components/UpdatePrompt';
 import { ToastViewport } from '../components/ToastViewport';
 import { OnboardingOverlay } from '../features/onboarding/OnboardingOverlay';
 import { useShortcuts } from '../features/keymap/use-shortcuts';
@@ -170,6 +171,7 @@ function AppInner() {
       <CommandPalette open={paletteOpen} commands={commands} onRun={onCommand} onClose={onClosePalette} />
       <CheatSheet open={cheatSheetOpen} commands={commands} onClose={() => setCheatSheetOpen(false)} />
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <UpdatePrompt autoCheck={app.bootstrap.settings.check_for_updates ?? true} />
       <OnboardingOverlay />
       {connectModalOpen ? (
         <Suspense fallback={null}>

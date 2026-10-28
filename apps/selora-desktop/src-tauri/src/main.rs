@@ -8,6 +8,7 @@ mod security;
 mod sessions;
 mod state;
 mod terminal;
+mod updates;
 mod workflow_broker;
 mod workflow_command;
 mod workflows_host;
@@ -205,7 +206,9 @@ fn main() {
             commands::disconnect_api_key,
             commands::get_api_key_status,
             commands::fetch_models,
-            commands::pick_folder
+            commands::pick_folder,
+            updates::check_for_update,
+            updates::install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running Selora desktop shell");

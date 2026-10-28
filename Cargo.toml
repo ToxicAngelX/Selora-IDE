@@ -38,6 +38,11 @@ selora-protocol = { path = "crates/selora-protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
+# Installer download verification (selora-ai::updates): the published
+# `Selora-IDE-Setup-<version>.exe.sha256` is checked before the updater
+# hands the file to the OS. A pure-Rust digest keeps the Windows build
+# free of native crypto dependencies.
+sha2 = "0.10"
 # LSP client types (selora-lsp): PLAN.md §4.5 — thin client, no tower-lsp.
 lsp-types = "0.97"
 # Git bindings (selora-git): PLAN.md §4.6 — vendored libgit2 so Windows

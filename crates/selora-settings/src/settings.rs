@@ -180,6 +180,16 @@ pub struct UiSettings {
     /// static under reduced motion (`fade`/`bloom` stay). Default off.
     #[serde(default)]
     pub reduce_motion: bool,
+
+    /// Check GitHub Releases once per launch and offer the newer installer
+    /// in-app. Default on; turning it off only stops the automatic check -
+    /// the About dialog's manual check keeps working.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
+}
+
+fn default_check_for_updates() -> bool {
+    true
 }
 
 /// `lsp.*` (ARCHITECTURE.md §8.1) — `None` means "resolve from PATH".
@@ -505,6 +515,7 @@ impl Default for UiSettings {
             sidebar_width: default_sidebar_width(),
             chat_sidebar_width: default_chat_sidebar_width(),
             reduce_motion: false,
+            check_for_updates: default_check_for_updates(),
         }
     }
 }
