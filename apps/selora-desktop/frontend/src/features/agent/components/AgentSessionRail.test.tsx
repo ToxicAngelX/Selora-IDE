@@ -76,6 +76,27 @@ fireEvent.click(otherRow!);
     newSpy.mockRestore();
   });
 
+  it('asks for confirmation before dispatching a session delete', () => {
+    const onDelete = vi.fn();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const { getByRole } = render(
+      <AgentSessionRail
+        sessions={sessions}
+        activeSessionId="sess-active"
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Delete session Older session' }));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(onDelete).not.toHaveBeenCalled();
+
+    confirmSpy.mockReturnValue(true);
+    fireEvent.click(getByRole('button', { name: 'Delete session Older session' }));
+    expect(onDelete).toHaveBeenCalledWith('sess-older');
+    confirmSpy.mockRestore();
+  });
+
   it('shows the empty session state without fabricating a row', () => {
     const { getByText, queryByRole } = render(
       <AgentSessionRail sessions={[]} activeSessionId="" />

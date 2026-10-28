@@ -180,6 +180,8 @@ export type BootstrapState = {
     changed_paths: string[];
     staged_paths: string[];
     files?: { path: string; staged: boolean; worktree: boolean }[];
+    /** Additive: conflicted paths from the current merge/rebase. */
+    conflicts?: string[];
   };
   diagnostics: Diagnostic[];
   /** P1: live language-server state (empty until the first file of a
@@ -524,6 +526,7 @@ export type FrontendCommand =
   | { type: 'agent_decision'; payload: { request_id: Id; approval_id: Id; decision: Decision; resolution?: AgentDecisionResolution } }
   | { type: 'retry_message'; payload: { session_id: Id; message_id: Id } }
   | { type: 'switch_session'; payload: { session_id: Id } }
+  | { type: 'delete_session'; payload: { session_id: Id } }
   | { type: 'new_session' }
   | { type: 'set_active_buffer'; payload: { buffer_id: Id } }
   | { type: 'list_agent_sessions' }
@@ -548,6 +551,28 @@ export type FrontendCommand =
   | { type: 'git_unstage'; payload: { path: string } }
   | { type: 'git_commit'; payload: { message: string } }
   | { type: 'open_git_diff'; payload: { path: string } }
+  // Additive Git panel commands (branch/history/stash/sync/conflicts).
+  // The Lite backend may not implement them; callers surface the rejection
+  // instead of inventing a result.
+  | { type: 'git_branches' }
+  | { type: 'git_create_branch'; payload: { name: string; checkout: boolean } }
+  | { type: 'git_switch_branch'; payload: { name: string } }
+  | { type: 'git_delete_branch'; payload: { name: string } }
+  | { type: 'git_log'; payload: { count: number } }
+  | { type: 'git_show_commit'; payload: { sha: string } }
+  | { type: 'git_discard'; payload: { path: string } }
+  | { type: 'git_stash_list' }
+  | { type: 'git_stash_save'; payload: { message: string | null } }
+  | { type: 'git_stash_apply'; payload: { index: number } }
+  | { type: 'git_stash_pop'; payload: { index: number } }
+  | { type: 'git_stash_drop'; payload: { index: number } }
+  | { type: 'git_merge'; payload: { branch: string } }
+  | { type: 'git_conflict_resolve'; payload: { path: string; resolution: 'ours' | 'theirs' } }
+  | { type: 'git_stage_all' }
+  | { type: 'git_unstage_all' }
+  | { type: 'git_push' }
+  | { type: 'git_pull' }
+  | { type: 'git_fetch' }
   | { type: 'workflow_run'; payload: { request_id: Id; spec: WorkflowSpec } }
   | {
       type: 'workflow_resume';
@@ -605,6 +630,8 @@ export type FrontendEvent =
         changed_paths: string[];
         staged_paths: string[];
         files?: { path: string; staged: boolean; worktree: boolean }[];
+        /** Additive: conflicted paths from the current merge/rebase. */
+        conflicts?: string[];
       };
     }
   | { type: 'git_diff_ready'; payload: { path: string; unified_diff: string } }
@@ -840,6 +867,84 @@ export const gitCommit = (message: string, ctx: EnvelopeContext): Promise<unknow
 export const openGitDiff = (path: string, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'open_git_diff', payload: { path } }, ctx);
 
+// --- Additive Git panel commands -------------------------------------------
+// Results are intentionally unknown: the panel validates the payload shape and
+// renders only entries it can prove, so an absent/older backend can never
+// produce fake branches, commits, or stashes.
+//
+// Expected replies (bare array or the named key; unknown shapes are ignored):
+//   git_branches        [{ name, current }]            | { branches: [...] }
+//   git_log             [{ sha, summary, author, timestamp }] | { commits: [...] }
+//   git_show_commit     { sha, summary?, author, timestamp, message, unified_diff }
+//   git_stash_list      [{ index, message }]           | { stashes: [...] }
+// Every mutation replies with its data (or null); the authoritative file
+// state still arrives through `git_status_changed`.
+
+export const gitBranches = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_branches' }, ctx);
+
+export const gitCreateBranch = (
+  name: string,
+  checkout: boolean,
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_create_branch', payload: { name, checkout } }, ctx);
+
+export const gitSwitchBranch = (name: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_switch_branch', payload: { name } }, ctx);
+
+export const gitDeleteBranch = (name: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_delete_branch', payload: { name } }, ctx);
+
+export const gitLog = (count: number, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_log', payload: { count } }, ctx);
+
+export const gitShowCommit = (sha: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_show_commit', payload: { sha } }, ctx);
+
+export const gitDiscard = (path: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_discard', payload: { path } }, ctx);
+
+export const gitStashList = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stash_list' }, ctx);
+
+export const gitStashSave = (message: string | null, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stash_save', payload: { message } }, ctx);
+
+export const gitStashApply = (index: number, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stash_apply', payload: { index } }, ctx);
+
+export const gitStashPop = (index: number, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stash_pop', payload: { index } }, ctx);
+
+export const gitStashDrop = (index: number, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stash_drop', payload: { index } }, ctx);
+
+export const gitMerge = (branch: string, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_merge', payload: { branch } }, ctx);
+
+export const gitConflictResolve = (
+  path: string,
+  resolution: 'ours' | 'theirs',
+  ctx: EnvelopeContext,
+): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_conflict_resolve', payload: { path, resolution } }, ctx);
+
+export const gitStageAll = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_stage_all' }, ctx);
+
+export const gitUnstageAll = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_unstage_all' }, ctx);
+
+export const gitPush = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_push' }, ctx);
+
+export const gitPull = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_pull' }, ctx);
+
+export const gitFetch = (ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'git_fetch' }, ctx);
+
 export const sendChat = (
   message: string,
   modelId: string | null,
@@ -947,6 +1052,10 @@ export const agentDecision = (
 
 export const switchSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'switch_session', payload: { session_id: sessionId } }, ctx);
+
+/** Delete a session (durable sessions also lose their on-disk store). */
+export const deleteSession = (sessionId: Id, ctx: EnvelopeContext): Promise<unknown> =>
+  dispatchZ2Command({ type: 'delete_session', payload: { session_id: sessionId } }, ctx);
 
 export const newSession = (ctx: EnvelopeContext): Promise<unknown> =>
   dispatchZ2Command({ type: 'new_session' }, ctx);

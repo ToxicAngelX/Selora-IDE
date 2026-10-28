@@ -41,7 +41,9 @@ Not included in this alpha:
 Phase 8 PENDING evidence:
 
 1. exactly-once unfinished asks are not claimed
-2. broker/shell-service processes can escape the Job Object
+2. broker processes created outside the Job Object can escape; known launch
+   forms are refused and membership is audited, but a confirmed interpreter or
+   obfuscated command can still reach a broker
 3. no per-phase USD in the protocol
 
 Phase 9 PENDING:

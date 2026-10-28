@@ -24,6 +24,7 @@ import {
   agentDecision,
   fetchModels,
   newSession as requestNewSessionCommand,
+  deleteSession as deleteSessionCommand,
   listAgentSessions,
   retryMessage as bridgeRetryMessage,
   runWorkflow,
@@ -385,7 +386,10 @@ function decisionErrorMessage(error: unknown): string {
   return message || 'The decision could not be sent. Try again.';
 }
 
-function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unknown): string {
+function sessionCommandError(
+  action: 'create' | 'switch' | 'delete' | 'retry',
+  error: unknown,
+): string {
   const code =
     error && typeof error === 'object' && 'code' in error
       ? String((error as { code: unknown }).code)
@@ -395,14 +399,18 @@ function sessionCommandError(action: 'create' | 'switch' | 'retry', error: unkno
       ? 'Creating agent sessions is not supported by this backend build yet.'
       : action === 'switch'
         ? 'Switching agent sessions is not supported by this backend build yet.'
-        : 'Retrying a turn is not supported by this backend build yet.';
+        : action === 'delete'
+          ? 'Deleting agent sessions is not supported by this backend build yet.'
+          : 'Retrying a turn is not supported by this backend build yet.';
   }
   const prefix =
     action === 'create'
       ? 'Could not create an agent session: '
       : action === 'switch'
         ? 'Could not switch agent sessions: '
-        : 'Could not retry the turn: ';
+        : action === 'delete'
+          ? 'Could not delete the agent session: '
+          : 'Could not retry the turn: ';
   return `${prefix}${decisionErrorMessage(error)}`;
 }
 
@@ -857,7 +865,7 @@ const activeSessionId =
       bootstrap.chat.active_session_id ??
       bootstrap.chat.sessions.find((session) => session.active)?.session_id ??
       sessions[0]?.id ??
-      state.activeSessionId;
+      '';
 
     // Keep each backend session's transcript separate: switching a tab must
     // show that session's messages, not the flattened union of every session.
@@ -1284,6 +1292,52 @@ const activeSessionId =
   },
 
   /**
+   * Delete a session through the backend. A durable session's on-disk store
+   * is removed too, so it cannot be resumed later. The backend refuses while
+   * a turn runs; that message is shown instead of hiding the tab.
+   */
+  async requestDeleteSession(sessionId: string): Promise<boolean> {
+    if (
+      !state.sessions.some((session) => session.id === sessionId) &&
+      !state.resumableSessions.some((session) => session.id === sessionId)
+    ) {
+      state = {
+        ...state,
+        sessionError: 'That session is not in the backend session list.',
+      };
+      notify();
+      return false;
+    }
+    const ctx = context;
+    if (!ctx) {
+      state = {
+        ...state,
+        sessionError: 'Open a workspace before deleting agent sessions.',
+      };
+      notify();
+      return false;
+    }
+    if (state.sessionBusy) return false;
+    state = { ...state, sessionBusy: true, sessionError: null };
+    notify();
+    try {
+      await deleteSessionCommand(sessionId, ctx);
+      this.deleteSession(sessionId);
+      state = { ...state, sessionBusy: false };
+      notify();
+      return true;
+    } catch (error) {
+      state = {
+        ...state,
+        sessionBusy: false,
+        sessionError: sessionCommandError('delete', error),
+      };
+      notify();
+      return false;
+    }
+  },
+
+  /**
    * Apply a `session_todos_changed` event. The list is authoritative and
    * session-scoped: a late event from another session is ignored (the next
    * bootstrap restores that session's own list on switch).
@@ -1380,13 +1434,20 @@ const activeSessionId =
 
   deleteSession(sessionId: string) {
     sessionViews.delete(sessionId);
+    const wasActive = state.activeSessionId === sessionId;
     const remaining = state.sessions.filter((s) => s.id !== sessionId);
-    const nextActive = remaining[0]?.id || '';
+    // Deleting a background tab must not yank the user's selection. When the
+    // active tab goes, the backend's recency order (oldest first) makes the
+    // last remaining row the real replacement.
+    const nextActive = wasActive
+      ? remaining[remaining.length - 1]?.id || ''
+      : state.activeSessionId;
     const { [sessionId]: _removedTranscript, ...transcripts } = state.transcripts;
     const { [sessionId]: _removedTodos, ...todosBySession } = state.todosBySession;
     state = {
       ...state,
       sessions: remaining,
+      resumableSessions: state.resumableSessions.filter((session) => session.id !== sessionId),
       transcripts,
       todosBySession,
       activeSessionId: nextActive,

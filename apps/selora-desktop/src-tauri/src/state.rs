@@ -2324,6 +2324,7 @@ impl DesktopState {
                 | FrontendCommand::AgentDecision { .. }
                 | FrontendCommand::RetryMessage { .. }
                 | FrontendCommand::SwitchSession { .. }
+                | FrontendCommand::DeleteSession { .. }
                 | FrontendCommand::NewSession
                 | FrontendCommand::ListAgentSessions
                 | FrontendCommand::SetAgentAutoApprove { .. }
@@ -2418,6 +2419,11 @@ impl DesktopState {
             }
             FrontendCommand::SwitchSession { session_id } => {
                 self.sessions.switch_session(&session_id)?;
+                self.publish_chat_bootstrap(app, Some(request_id));
+                Ok(CommandResultDto::Ack(self.command_ack()))
+            }
+            FrontendCommand::DeleteSession { session_id } => {
+                self.sessions.delete_session(&session_id)?;
                 self.publish_chat_bootstrap(app, Some(request_id));
                 Ok(CommandResultDto::Ack(self.command_ack()))
             }

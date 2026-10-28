@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
 import { AgentDock } from './AgentDock';
 import { agentStore } from '../features/agent/agent-store';
+import { makeBootstrap } from '../testing/fixtures';
 
 const editorHarness = vi.hoisted(() => {
   let snapshot: unknown = { activeBuffer: null, activeSelection: null };
@@ -37,6 +38,43 @@ describe('AgentDock session truth', () => {
     expect(getByText('No sessions yet')).toBeTruthy();
     expect(queryAllByRole('tab')).toHaveLength(0);
     expect(agentStore.getSnapshot().sessions).toEqual([]);
+  });
+
+  it('refreshes the tab strip after the backend deletes the active session', () => {
+    act(() => {
+      agentStore.hydrate(
+        makeBootstrap({
+          workspace: {
+            id: 'ws-1',
+            core_instance_id: 'core-0001',
+            root: '/repo',
+            display_name: 'repo',
+          },
+          chat: {
+            sessions: [
+              { session_id: 'sess-a', title: 'Agent Session 1', message_ids: [], active: false },
+              { session_id: 'sess-b', title: 'Agent Session 2', message_ids: [], active: false },
+            ],
+            messages: [],
+            active_session_id: 'sess-a',
+            active_request_id: null,
+            active_turn_id: null,
+            pending_approval: null,
+          },
+        }),
+      );
+    });
+
+    const { getByRole, queryByRole } = render(<AgentDock />);
+    expect(getByRole('tab', { name: /Agent Session 1/ })).toBeTruthy();
+
+    act(() => {
+      agentStore.deleteSession('sess-a');
+    });
+
+    expect(queryByRole('tab', { name: /Agent Session 1/ })).toBeNull();
+    const replacement = getByRole('tab', { name: /Agent Session 2/ });
+    expect(replacement.getAttribute('aria-selected')).toBe('true');
   });
 
   it('offers editor and split exits that name the shell mode', () => {
