@@ -145,6 +145,8 @@ export type SubagentInfo = {
   artifacts?: SubagentArtifact[];
   /** True until the user opens the parent session/result. */
   unread?: boolean;
+  /** Child mission/answer/tool transcript grouped under the parent. */
+  messages?: ChatMessage[];
 };
 
 export type ArtifactKind = 'doc' | 'code' | 'diff' | 'diagram';
