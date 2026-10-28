@@ -244,22 +244,35 @@ impl GitRepo {
                 sanitize_remote_text(&format!("cannot start git: {err}"))
             },
         })?;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            stdout = String::from_utf8_lossy(&bytes).into_owned();
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            stderr = String::from_utf8_lossy(&bytes).into_owned();
-        }
+        // Drain both pipes concurrently: reading stdout to EOF first can
+        // deadlock when git fills the stderr pipe buffer (a chatty credential
+        // helper or a remote error).
+        let stdout_pipe = child.stdout.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let stderr_pipe = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        });
         let status = child.wait().map_err(|err| GitError::Network {
             operation: operation.as_str(),
             message: sanitize_remote_text(&format!("cannot wait for git: {err}")),
         })?;
+        let stdout = stdout_pipe
+            .and_then(|handle| handle.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let stderr = stderr_pipe
+            .and_then(|handle| handle.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
 
         if !status.success() {
             // A pull that produced conflicts is a merge state, not an opaque

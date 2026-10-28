@@ -781,6 +781,7 @@ mod tests {
         GitStatus {
             branch: Some("main".to_owned()),
             entries,
+            conflicts: Vec::new(),
         }
     }
 

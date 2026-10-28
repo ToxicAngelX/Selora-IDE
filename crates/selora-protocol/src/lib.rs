@@ -98,8 +98,8 @@ pub enum ProtocolValidationError {
     InvalidExternalUrl,
     InvalidWorkspacePath,
     /// A region size that is not a finite number (Phase Z2, ARCHITECTURE
-    /// §1.1). Unreachable from the wire — JSON has no NaN/±Inf spelling and
-    /// serde_json rejects out-of-range number literals at the parse boundary —
+    /// Â§1.1). Unreachable from the wire â€” JSON has no NaN/Â±Inf spelling and
+    /// serde_json rejects out-of-range number literals at the parse boundary â€”
     /// so the check stands as a Rust-internal invariant for non-wire callers.
     InvalidRegionSize,
 }
@@ -198,7 +198,7 @@ pub struct AgentRequestDto {
     pub prompt: String,
     pub model_id: Option<String>,
     /// Phase Z3: the agent dock's permission mode. `execute` is the default
-    /// (and pre-Z3 wire value) — the full §17.1 manifest with approvals
+    /// (and pre-Z3 wire value) â€” the full Â§17.1 manifest with approvals
     /// gating side effects. `explore` arms the read-only tools only (the
     /// model cannot request a write). Plan-mode UX beyond this rides
     /// Phase 9's plan/apply split.
@@ -231,7 +231,7 @@ pub struct EditorContextDto {
     pub dirty: bool,
 }
 /// The `SendAgent` permission mode (Phase Z3). Serde-rejected spellings
-/// never reach a Rust arm — the boundary is the validator.
+/// never reach a Rust arm â€” the boundary is the validator.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentModeDto {
@@ -303,57 +303,57 @@ pub enum RegionId {
 }
 
 // ---------------------------------------------------------------------------
-// Phase Z2 — shell layout geometry (docs/ui/PHASE_Z2_ARCHITECTURE.md §1.1).
+// Phase Z2 â€” shell layout geometry (docs/ui/PHASE_Z2_ARCHITECTURE.md Â§1.1).
 //
 // These constants are the single source of truth for region bounds and
 // defaults: `bootstrap.layout_constraints` carries the bounds to the frontend
 // (no bound is ever a JS literal) and `selora-settings`' `layout.*` defaults
-// delegate to the same constants (§4.2). tokens.css intentionally carries no
+// delegate to the same constants (Â§4.2). tokens.css intentionally carries no
 // region values for exactly this reason. Sources: bounds 160/480, 240/600 and
-// the 400px editor floor from UI_SPEC §2's region table; defaults 240/360/200
+// the 400px editor floor from UI_SPEC Â§2's region table; defaults 240/360/200
 // and the closed first-run agent/bottom states from the same table.
 // ---------------------------------------------------------------------------
 
-/// Primary sidebar width bounds (UI_SPEC §2).
+/// Primary sidebar width bounds (UI_SPEC Â§2).
 pub const PRIMARY_SIDEBAR_MIN_PX: f32 = 160.0;
 pub const PRIMARY_SIDEBAR_MAX_PX: f32 = 480.0;
-/// Primary sidebar stored default (§1.1's table: 240px, open first-run).
+/// Primary sidebar stored default (Â§1.1's table: 240px, open first-run).
 pub const PRIMARY_SIDEBAR_DEFAULT_PX: f32 = 240.0;
 
-/// Agent dock width bounds (UI_SPEC §2).
+/// Agent dock width bounds (UI_SPEC Â§2).
 pub const AGENT_DOCK_MIN_PX: f32 = 240.0;
 pub const AGENT_DOCK_MAX_PX: f32 = 600.0;
-/// Agent dock stored default (§1.1's table: 360px, closed first-run).
+/// Agent dock stored default (Â§1.1's table: 360px, closed first-run).
 pub const AGENT_DOCK_DEFAULT_PX: f32 = 360.0;
 
-/// Bottom dock height bounds. UI_SPEC §2's "min 0" meant *hidden*, which the
+/// Bottom dock height bounds. UI_SPEC Â§2's "min 0" meant *hidden*, which the
 /// protocol models as `bottom_dock_open: false`; an open dock gets a usable
-/// 120px floor (Z2 decision, §1.1). Rust enforces the static 800px ceiling —
+/// 120px floor (Z2 decision, Â§1.1). Rust enforces the static 800px ceiling â€”
 /// the 50%-of-workbench rule is dynamic and cannot be validated in Rust, so
-/// the frontend additionally clamps to it before dispatching (§1.1, §2.3).
+/// the frontend additionally clamps to it before dispatching (Â§1.1, Â§2.3).
 pub const BOTTOM_DOCK_MIN_PX: f32 = 120.0;
 pub const BOTTOM_DOCK_MAX_PX: f32 = 800.0;
-/// Bottom dock stored default (§1.1's table: 200px, closed first-run).
+/// Bottom dock stored default (Â§1.1's table: 200px, closed first-run).
 pub const BOTTOM_DOCK_DEFAULT_PX: f32 = 200.0;
 
 /// Bottom-dock ceiling as a fraction of the measured workbench height
 /// (frontend-side clamp; Rust does not know the webview's workbench height).
 pub const BOTTOM_DOCK_MAX_WORKBENCH_RATIO: f32 = 0.5;
 
-/// The editor region never goes below this width (UI_SPEC §2 region ②'s min).
-/// A frontend-enforced derived constraint — no protocol validation.
+/// The editor region never goes below this width (UI_SPEC Â§2 region â‘¡'s min).
+/// A frontend-enforced derived constraint â€” no protocol validation.
 pub const EDITOR_MIN_WIDTH_PX: f32 = 400.0;
 
-/// Resize handle hit-zone width (the brief §6's ≥6px rule).
+/// Resize handle hit-zone width (the brief Â§6's â‰¥6px rule).
 pub const RESIZE_HIT_ZONE_MIN_PX: f32 = 6.0;
 
-/// Editor split count bounds (UI_SPEC §3.3).
+/// Editor split count bounds (UI_SPEC Â§3.3).
 pub const EDITOR_SPLITS_MIN: u8 = 1;
 pub const EDITOR_SPLITS_MAX: u8 = 4;
 
-/// The surfaces the primary sidebar can show (§2.2's routing table).
+/// The surfaces the primary sidebar can show (Â§2.2's routing table).
 /// `Problems` is a bottom-dock view in Z2, so it is excluded here
-/// (ARCHITECTURE §4.3 — brief §2's sidebar parenthetical is superseded).
+/// (ARCHITECTURE Â§4.3 â€” brief Â§2's sidebar parenthetical is superseded).
 pub const ACTIVITY_VIEWS: [SurfaceId; 5] = [
     SurfaceId::Files,
     SurfaceId::Search,
@@ -362,19 +362,19 @@ pub const ACTIVITY_VIEWS: [SurfaceId; 5] = [
     SurfaceId::Settings,
 ];
 
-/// The surfaces the bottom dock can show (§2.2's routing table).
+/// The surfaces the bottom dock can show (Â§2.2's routing table).
 pub const BOTTOM_VIEWS: [SurfaceId; 3] = [
     SurfaceId::Output,
     SurfaceId::TerminalPlaceholder,
     SurfaceId::Problems,
 ];
 
-/// Clamp a ResizeRegion value into the region's bounds (§1.1). Finite
+/// Clamp a ResizeRegion value into the region's bounds (Â§1.1). Finite
 /// out-of-range values are clamped, never rejected (drag-end values
 /// routinely land a fraction past a bound). The non-finite check is a
-/// Rust-internal invariant guard: JSON cannot carry NaN/±Inf and serde_json
+/// Rust-internal invariant guard: JSON cannot carry NaN/Â±Inf and serde_json
 /// rejects out-of-range number literals at the parse boundary, so no wire
-/// input can reach it — it exists for future non-wire callers, not as a wire
+/// input can reach it â€” it exists for future non-wire callers, not as a wire
 /// threat model.
 pub fn clamp_region_size(region: RegionId, size_px: f32) -> Result<f32, ProtocolValidationError> {
     if !size_px.is_finite() {
@@ -563,11 +563,14 @@ pub enum FrontendCommand {
     // network surface). Every path is a `WorkspacePath`, so the protocol
     // already rejects traversal and absolute paths at the parse boundary; the
     // backend re-checks containment against the real work tree.
+    // Payload field names match `apps/selora-desktop/frontend/src/bridge/
+    // bridge.ts` exactly (`checkout`, `count`, `sha`, `message`, `resolution`);
+    // the reply shapes live in [`GitCommandReplyDto`].
     GitBranches,
     GitCreateBranch {
         name: String,
         #[serde(default)]
-        start_point: Option<String>,
+        checkout: bool,
     },
     GitSwitchBranch {
         name: String,
@@ -577,26 +580,29 @@ pub enum FrontendCommand {
     },
     GitLog {
         #[serde(default = "default_git_log_limit")]
-        limit: u32,
+        count: u32,
         #[serde(default)]
         path: Option<WorkspacePath>,
     },
     GitShowCommit {
-        commit: String,
+        sha: String,
     },
-    GitDiscardWorktree {
-        paths: Vec<WorkspacePath>,
-    },
-    GitDiscardIndex {
-        paths: Vec<WorkspacePath>,
+    /// Discard every local change to one path: the working-tree edit and any
+    /// staged entry. An untracked (or newly staged) file is deleted.
+    GitDiscard {
+        path: WorkspacePath,
     },
     GitStageAll,
     GitUnstageAll,
-    GitStashPush {
+    GitStashSave {
         #[serde(default)]
         message: Option<String>,
     },
     GitStashList,
+    GitStashApply {
+        #[serde(default)]
+        index: u32,
+    },
     GitStashPop {
         #[serde(default)]
         index: u32,
@@ -607,26 +613,17 @@ pub enum FrontendCommand {
     GitMerge {
         branch: String,
     },
+    #[serde(rename = "git_conflict_resolve")]
     GitResolveConflict {
         path: WorkspacePath,
-        side: GitConflictSideDto,
+        resolution: GitConflictSideDto,
     },
-    GitFetch {
-        #[serde(default)]
-        remote: Option<String>,
-    },
-    GitPull {
-        #[serde(default)]
-        remote: Option<String>,
-        #[serde(default)]
-        branch: Option<String>,
-    },
-    GitPush {
-        #[serde(default)]
-        remote: Option<String>,
-        #[serde(default)]
-        branch: Option<String>,
-    },
+    // The bridge sends no payload for the network commands: the backend uses
+    // the branch's configured remote and the checked-out branch. Unit
+    // variants keep that wire shape exact.
+    GitFetch,
+    GitPull,
+    GitPush,
     ToggleSurface {
         surface: SurfaceId,
     },
@@ -641,7 +638,7 @@ pub enum FrontendCommand {
     SettingsUpdate {
         patch: SettingsPatchDto,
     },
-    // Phase 8 — workflows. `WorkflowRun` is the confirmation card's Approve;
+    // Phase 8 â€” workflows. `WorkflowRun` is the confirmation card's Approve;
     // `WorkflowResume` replays/unpauses a journaled run; `WorkflowStop` kills
     // the run and its in-flight children; `WorkflowDecision` answers a
     // `WorkflowApprovalNeeded` card (single-use, like `AgentDecision`).
@@ -744,7 +741,7 @@ pub struct SessionDto {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 9b — plan mode and live todos (ROADMAP Phase 9b). Additive to
+// Phase 9b â€” plan mode and live todos (ROADMAP Phase 9b). Additive to
 // protocol_version 1; every field has a serde default so pre-9b payloads
 // still load.
 // ---------------------------------------------------------------------------
@@ -786,7 +783,7 @@ pub enum TodoStatusDto {
     Completed,
 }
 
-/// `PlanStateChanged` — the session's phase or proposed/approved plan moved.
+/// `PlanStateChanged` â€” the session's phase or proposed/approved plan moved.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanStateDto {
     pub session_id: SessionId,
@@ -796,7 +793,7 @@ pub struct PlanStateDto {
     pub plan: Option<PlanApprovalDto>,
 }
 
-/// `TodosChanged` — the session's stored list was replaced.
+/// `TodosChanged` â€” the session's stored list was replaced.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TodosDto {
     pub session_id: SessionId,
@@ -856,7 +853,7 @@ pub struct ChatStateDto {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 9d — durable agent sessions (ARCHITECTURE §19.1).
+// Phase 9d â€” durable agent sessions (ARCHITECTURE Â§19.1).
 //
 // The resume picker's data comes from `.selora/agent-sessions/{id}/`. It is a
 // read-only projection: a switch/resume restores the transcript, todos, plan,
@@ -895,7 +892,7 @@ pub struct AgentParkSummaryDto {
 }
 
 /// The typed compaction failure. `partial_summary` is the text streamed before
-/// the summarize round failed — surfaced, never silently dropped.
+/// the summarize round failed â€” surfaced, never silently dropped.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentCompactionFailedDto {
     pub request_id: RequestId,
@@ -915,7 +912,7 @@ pub enum ConnectionStatus {
 /// Mirrors `Keybind::parse`'s default grammar spelling for the rebindable
 /// pair (the same values as selora-settings' `default_command_palette` /
 /// `default_toggle_chat`, settings.rs). String constants, not settings
-/// types — the protocol crate stays settings-free.
+/// types â€” the protocol crate stays settings-free.
 fn default_keybind_command_palette() -> String {
     "Ctrl+Shift+P".into()
 }
@@ -942,7 +939,7 @@ fn default_editor_word_wrap() -> bool {
 pub struct SettingsViewDto {
     pub reduced_motion: bool,
     pub theme: String,
-    /// §7.1's rebindable pair, populated from `settings.keybinds` (§5.1) so a
+    /// Â§7.1's rebindable pair, populated from `settings.keybinds` (Â§5.1) so a
     /// user's egui-side rebind carries into the web shell.
     #[serde(default = "default_keybind_command_palette")]
     pub keybind_command_palette: String,
@@ -962,8 +959,8 @@ pub struct SettingsViewDto {
     #[serde(default = "default_editor_word_wrap")]
     pub editor_word_wrap: bool,
 }
-/// Phase Z2 serde defaults (§5.1 / §4.2): every field is defaulted so a
-/// partial or pre-Z2 `LayoutDto` JSON deserializes — the values are §1.1's
+/// Phase Z2 serde defaults (Â§5.1 / Â§4.2): every field is defaulted so a
+/// partial or pre-Z2 `LayoutDto` JSON deserializes â€” the values are Â§1.1's
 /// table. These functions are also `sanitized()`'s fallbacks, so the wire
 /// defaults and the sanitization floors cannot diverge.
 fn default_primary_sidebar_width_px() -> f32 {
@@ -1010,22 +1007,22 @@ pub struct LayoutDto {
     pub bottom_view: SurfaceId,
     #[serde(default = "default_editor_splits")]
     pub editor_splits: u8,
-    /// The activity bar's active view (§5.1 — brief §6's "active activity
+    /// The activity bar's active view (Â§5.1 â€” brief Â§6's "active activity
     /// view"). `bottom_view` above covers the bottom dock's active view.
     #[serde(default = "default_activity_view")]
     pub activity_view: SurfaceId,
-    /// Rust-owned sidebar open state (§5.1 — a collapsed sidebar must
+    /// Rust-owned sidebar open state (Â§5.1 â€” a collapsed sidebar must
     /// restore; `Ctrl+B` toggling needs it).
     #[serde(default = "default_primary_sidebar_open")]
     pub primary_sidebar_open: bool,
 }
 
 impl LayoutDto {
-    /// §4.3 load-time sanitization: clamp all sizes into the §1.1 bounds
+    /// Â§4.3 load-time sanitization: clamp all sizes into the Â§1.1 bounds
     /// (non-finite persisted values fall to the defaults), clamp
     /// `editor_splits` into `EDITOR_SPLITS_MIN..=EDITOR_SPLITS_MAX`, and
     /// reset `activity_view` / `bottom_view` if they name a surface outside
-    /// the valid sets — a persisted value can never wedge the shell. Runs on
+    /// the valid sets â€” a persisted value can never wedge the shell. Runs on
     /// settings load and after every accepted resize.
     pub fn sanitized(self) -> Self {
         Self {
@@ -1065,14 +1062,14 @@ impl LayoutDto {
 }
 
 /// Clamp a persisted size, falling to the default for non-finite values
-/// (§4.3: "non-finite persisted values to the defaults" — an error, as
+/// (Â§4.3: "non-finite persisted values to the defaults" â€” an error, as
 /// `clamp_region_size` treats it, would have nowhere to go here).
 fn sanitize_region_size(region: RegionId, value: f32, fallback: f32) -> f32 {
     clamp_region_size(region, value).unwrap_or(fallback)
 }
 
-/// Field-for-field mirror of the §1.1 constants, delivered in
-/// `bootstrap.layout_constraints` so no bound is ever a JS literal (§5.1).
+/// Field-for-field mirror of the Â§1.1 constants, delivered in
+/// `bootstrap.layout_constraints` so no bound is ever a JS literal (Â§5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayoutConstraintsDto {
     pub primary_sidebar_min_px: f32,
@@ -1087,8 +1084,8 @@ pub struct LayoutConstraintsDto {
 }
 
 impl LayoutConstraintsDto {
-    /// The only constructor — field-for-field from the §1.1 constants, so the
-    /// DTO and the constants cannot drift (§10's protocol test asserts
+    /// The only constructor â€” field-for-field from the Â§1.1 constants, so the
+    /// DTO and the constants cannot drift (Â§10's protocol test asserts
     /// exactly this).
     pub fn from_constants() -> Self {
         Self {
@@ -1114,9 +1111,9 @@ impl LayoutConstraintsDto {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitFileDto {
     pub path: WorkspacePath,
-    /// Index side — `FileStatus.staged != Slot::Unmodified`.
+    /// Index side â€” `FileStatus.staged != Slot::Unmodified`.
     pub staged: bool,
-    /// Working-tree side — `FileStatus::has_worktree_changes()`; an
+    /// Working-tree side â€” `FileStatus::has_worktree_changes()`; an
     /// untracked file is worktree-only (`staged: false`, `worktree: true`).
     pub worktree: bool,
 }
@@ -1132,6 +1129,11 @@ pub struct GitStatusDto {
     /// fall back to `changed_paths` / `staged_paths`.
     #[serde(default)]
     pub files: Vec<GitFileDto>,
+    /// Additive: conflicted paths from the current merge/rebase, sorted. A
+    /// conflicted path is *not* in `changed_paths` (its two status slots are
+    /// unmodified); the panel renders it in the conflict banner instead.
+    #[serde(default)]
+    pub conflicts: Vec<WorkspacePath>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticDto {
@@ -1141,7 +1143,7 @@ pub struct DiagnosticDto {
     pub severity: DiagnosticSeverity,
     pub message: String,
 }
-/// Phase Z4b — an LSP range in wire coordinates (0-based line, UTF-16
+/// Phase Z4b â€” an LSP range in wire coordinates (0-based line, UTF-16
 /// column).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextRangeDto {
@@ -1238,7 +1240,7 @@ pub struct BootstrapState {
     pub chat: ChatStateDto,
     pub settings: SettingsViewDto,
     pub layout: LayoutDto,
-    /// §5.1: the §1.1 bounds as delivered to the frontend — no bound is ever
+    /// Â§5.1: the Â§1.1 bounds as delivered to the frontend â€” no bound is ever
     /// a JS literal. No serde default: the bootstrap is always generated
     /// whole.
     pub layout_constraints: LayoutConstraintsDto,
@@ -1254,7 +1256,7 @@ pub struct BootstrapState {
     #[serde(default)]
     pub workflows: Vec<WorkflowPersistedRunDto>,
     /// Phase 9d: durable agent sessions found in the open workspace (the
-    /// resume picker). Read-only projection — switching loads the session.
+    /// resume picker). Read-only projection â€” switching loads the session.
     #[serde(default)]
     pub agent_sessions: Vec<AgentSessionSummaryDto>,
 }
@@ -1275,6 +1277,11 @@ pub struct BootstrapState {
 pub enum CommandResultDto {
     Snapshot(Box<BootstrapState>),
     Ack(CommandAckDto),
+    /// A read-only daily git command's typed data (`git_branches`,
+    /// `git_log`, `git_show_commit`, `git_stash_list`). Serialized as one
+    /// object whose key names the list (`branches` / `commits` / `stashes`) or
+    /// the commit fields directly â€” both shapes `GitPanelView` validates.
+    Git(GitCommandReplyDto),
 }
 
 /// A mutation acknowledgement: the core identity, the log position after the
@@ -1343,14 +1350,14 @@ pub struct ChatDeltaDto {
     pub turn_id: TurnId,
     pub message_id: MessageId,
     /// The ordinal of this delta within the streaming message (1-based,
-    /// reset per `message_id`) — an in-request ordering check under the
+    /// reset per `message_id`) â€” an in-request ordering check under the
     /// envelope's global monotonic `sequence`. Phase Z3 pins the
     /// semantics: before Z3 no producer existed.
     pub sequence: u64,
     pub text: String,
 }
 /// Phase Z3 serde defaults: a pre-Z3 `ChatCompletedDto` JSON (the four
-/// id-and-text fields) deserializes with zeroed metering — the cost footer
+/// id-and-text fields) deserializes with zeroed metering â€” the cost footer
 /// reads 0 tokens / $0 rather than failing to load.
 fn default_tokens() -> u64 {
     0
@@ -1366,7 +1373,7 @@ pub struct ChatCompletedDto {
     pub message_id: MessageId,
     pub text: String,
     /// Phase Z3: the completion's metering (the receipt's token total and
-    /// cost — gateway-reported when present, else the chars/4 estimate the
+    /// cost â€” gateway-reported when present, else the chars/4 estimate the
     /// client applies) so the frontend's cost footer needs no second event.
     #[serde(default = "default_tokens")]
     pub total_tokens: u64,
@@ -1381,7 +1388,7 @@ pub struct ChatFailedDto {
     pub error: ProtocolErrorDto,
 }
 // ---------------------------------------------------------------------------
-// Phase Z3 — the agent dock's event payloads (docs/ui/PHASE_Z_MIGRATION.md).
+// Phase Z3 â€” the agent dock's event payloads (docs/ui/PHASE_Z_MIGRATION.md).
 //
 // Every DTO carries the routing triple (request_id, session_id, turn_id) the
 // same way `ChatDeltaDto` does, so the frontend's stale-request dropping is
@@ -1390,7 +1397,7 @@ pub struct ChatFailedDto {
 // generates it, Rust only relays it.
 // ---------------------------------------------------------------------------
 
-/// The loop started one tool call — the tool card header.
+/// The loop started one tool call â€” the tool card header.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallStartedDto {
     pub request_id: RequestId,
@@ -1401,8 +1408,8 @@ pub struct ToolCallStartedDto {
     /// The call's `arguments` JSON, verbatim as the model produced it.
     pub args_json: String,
 }
-/// One tool finished (executed, denied, or errored) — the tool card body.
-/// `result_summary` carries the tool's full output (reads ≤4MB, bash/fetch
+/// One tool finished (executed, denied, or errored) â€” the tool card body.
+/// `result_summary` carries the tool's full output (reads â‰¤4MB, bash/fetch
 /// capped at 256KB by the router); "summary" is the Z3 brief's wire name.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultDto {
@@ -1413,7 +1420,7 @@ pub struct ToolResultDto {
     pub result_summary: String,
     pub is_err: bool,
 }
-/// The loop parked on an approval card (§17.4) — the approval card.
+/// The loop parked on an approval card (Â§17.4) â€” the approval card.
 /// `approval_id` is single-use: Rust validates and consumes it before the
 /// decision reaches the turn. `PartialEq` only (no `Eq`): the Phase 8
 /// `workflow` payload carries an f64 cost cap.
@@ -1427,17 +1434,17 @@ pub struct ApprovalNeededDto {
     /// The card's target: a workspace-relative path for write/edit/delete,
     /// the full command line for bash.
     pub path_or_command: String,
-    /// The unified diff for write/edit cards (`None` for delete/bash — a
+    /// The unified diff for write/edit cards (`None` for delete/bash â€” a
     /// bash card has no diff and a delete needs none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_or_input: Option<String>,
-    /// Phase 8 (§18.1): the `run_workflow` confirmation payload — the script
+    /// Phase 8 (Â§18.1): the `run_workflow` confirmation payload â€” the script
     /// body, the confirmed command set and the run's cost cap. Additive and
     /// defaulted, so a pre-8 `approval_needed` JSON still loads (with the
     /// field absent) and every non-workflow card omits the key entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowApprovalDto>,
-    /// Phase 9b: the `exit_plan_mode` plan card — steps plus optional
+    /// Phase 9b: the `exit_plan_mode` plan card â€” steps plus optional
     /// summary. Additive/defaulted like `workflow`; absent elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanApprovalDto>,
@@ -1461,12 +1468,12 @@ pub struct AgentStateDto {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub state: AgentPhase,
-    /// The running tool's name — present only in `running_tool`.
+    /// The running tool's name â€” present only in `running_tool`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
 }
 /// The turn's summary footer: token/cost totals, tool counts, and how it
-/// ended (`completed: false` follows a partial answer — cap, failure, or
+/// ended (`completed: false` follows a partial answer â€” cap, failure, or
 /// the Stop button; `end_message` is the toast-ready reason).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurnDoneDto {
@@ -1531,7 +1538,7 @@ pub struct SubagentCompletedDto {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8 — workflow wire contract (ROADMAP Phase 8, ARCHITECTURE §18).
+// Phase 8 â€” workflow wire contract (ROADMAP Phase 8, ARCHITECTURE Â§18).
 //
 // Additive to protocol_version 1: the four commands and seven progress events
 // are new arms on the existing tagged enums, so a pre-8 payload keeps loading.
@@ -1541,7 +1548,7 @@ pub struct SubagentCompletedDto {
 // common), not a stable-id type.
 // ---------------------------------------------------------------------------
 
-/// The run's lifecycle — also the per-phase and per-step state.
+/// The run's lifecycle â€” also the per-phase and per-step state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStatus {
@@ -1611,12 +1618,12 @@ pub struct WorkflowArtifactDto {
     pub phase: Option<String>,
 }
 
-/// The ARCHITECTURE §18.1 workflow-level cost cap default ($5).
+/// The ARCHITECTURE Â§18.1 workflow-level cost cap default ($5).
 fn default_workflow_max_cost_usd() -> f64 {
     5.0
 }
 
-/// A full run snapshot — the panel's starting state and resume answer.
+/// A full run snapshot â€” the panel's starting state and resume answer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowRunDto {
     pub run_id: String,
@@ -1658,7 +1665,7 @@ pub struct WorkflowSpecDto {
 /// the `WorkflowSpecDto` the panel's Approve sends, but carried on the tool
 /// card so the chat renders the grant where the model requested it. Every
 /// field is defaulted: a partial payload still renders (an absent cap falls to
-/// the §18.1 default rather than inventing zero).
+/// the Â§18.1 default rather than inventing zero).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowApprovalDto {
     #[serde(default)]
@@ -1671,7 +1678,7 @@ pub struct WorkflowApprovalDto {
     pub max_cost_usd: f64,
 }
 
-/// `WorkflowStarted` — the run was accepted; the panel can open its graph.
+/// `WorkflowStarted` â€” the run was accepted; the panel can open its graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowStartedDto {
     pub run_id: String,
@@ -1684,36 +1691,36 @@ pub struct WorkflowStartedDto {
     pub max_cost_usd: f64,
 }
 
-/// `WorkflowPhase` — a graph node appeared or changed state.
+/// `WorkflowPhase` â€” a graph node appeared or changed state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowPhaseEventDto {
     pub run_id: String,
     pub phase: WorkflowPhaseDto,
 }
 
-/// `WorkflowStep` — a live step's status/label/detail changed.
+/// `WorkflowStep` â€” a live step's status/label/detail changed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowStepEventDto {
     pub run_id: String,
     pub step: WorkflowStepDto,
 }
 
-/// `WorkflowReport` — one confirmed finding landed in the run log.
+/// `WorkflowReport` â€” one confirmed finding landed in the run log.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowReportEventDto {
     pub run_id: String,
     pub report: WorkflowReportDto,
 }
 
-/// `WorkflowArtifact` — a markdown/file artifact became available.
+/// `WorkflowArtifact` â€” a markdown/file artifact became available.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowArtifactEventDto {
     pub run_id: String,
     pub artifact: WorkflowArtifactDto,
 }
 
-/// `WorkflowApprovalNeeded` — a subagent's write/bash parked on the same card
-/// shape as chat (§17.4 semantics unchanged). `WorkflowDecision` answers it.
+/// `WorkflowApprovalNeeded` â€” a subagent's write/bash parked on the same card
+/// shape as chat (Â§17.4 semantics unchanged). `WorkflowDecision` answers it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowApprovalNeededDto {
     pub run_id: String,
@@ -1729,7 +1736,7 @@ pub struct WorkflowApprovalNeededDto {
     pub can_approve_all_this_turn: bool,
 }
 
-/// `WorkflowFinished` — the terminal summary (completed, failed or stopped).
+/// `WorkflowFinished` â€” the terminal summary (completed, failed or stopped).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowFinishedDto {
     pub run_id: String,
@@ -1771,11 +1778,12 @@ pub struct GitDiffDto {
     pub unified_diff: String,
 }
 // ---------------------------------------------------------------------------
-// Daily git DTOs (branches, history, stash, merge, network).
+// Daily git reply DTOs (branches, history, stash).
 //
-// These mirror `selora-git`'s typed values without making the protocol crate
-// depend on it. Paths are `WorkspacePath`, so traversal is rejected at the
-// wire boundary; errors and remote summaries arrive already redacted.
+// Field names match the shapes `GitPanelView.tsx` validates (`name`/`current`,
+// `sha`/`summary`/`author`/`timestamp`, `index`/`message`). `CommandResultDto::
+// Git` carries one of these; the authoritative file state still arrives as a
+// `GitStatusChanged` event, and failures are `ProtocolErrorDto`.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1784,108 +1792,61 @@ pub enum GitConflictSideDto {
     Ours,
     Theirs,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitMergeStatusDto {
-    UpToDate,
-    FastForward,
-    Merged,
-    Conflicts,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitRemoteOperationDto {
-    Fetch,
-    Pull,
-    Push,
-}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitBranchDto {
     pub name: String,
-    pub is_current: bool,
-    /// Configured upstream (`origin/main`), when one exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<String>,
-    /// Full hex tip, or `None` for an unborn branch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tip: Option<String>,
+    /// Whether this is the checked-out branch (the panel's `current` field).
+    pub current: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitBranchesDto {
+pub struct GitBranchesReplyDto {
     pub branches: Vec<GitBranchDto>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitCommitDto {
-    pub id: String,
-    pub short_id: String,
+pub struct GitLogEntryDto {
+    /// Full hex object id.
+    pub sha: String,
+    /// First line of the message.
     pub summary: String,
+    pub author: String,
+    /// Author time, seconds since the Unix epoch.
+    pub timestamp: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitLogReplyDto {
+    pub commits: Vec<GitLogEntryDto>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitReplyDto {
+    pub sha: String,
+    pub summary: String,
+    pub author: String,
+    /// Author time, seconds since the Unix epoch.
+    pub timestamp: i64,
+    /// Full commit message (never empty: `git_commit` refuses an empty one).
     pub message: String,
-    pub author_name: String,
-    pub author_email: String,
-    pub time_unix: i64,
-    pub time_offset_minutes: i32,
-    pub parents: Vec<String>,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitLogDto {
-    /// The filter the page was requested with; `None` = whole history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<WorkspacePath>,
-    pub commits: Vec<GitCommitDto>,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitCommitFileDto {
-    pub path: WorkspacePath,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_path: Option<WorkspacePath>,
-    /// `added` / `modified` / `deleted` / `renamed` / `copied` /
-    /// `typechange` / `other`.
-    pub status: String,
-    pub additions: u32,
-    pub deletions: u32,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitCommitDetailDto {
-    pub commit: GitCommitDto,
-    pub files: Vec<GitCommitFileDto>,
-    pub patch: String,
-    pub patch_truncated: bool,
+    /// Unified patch, bounded by `selora-git`'s `MAX_PATCH_BYTES`.
+    pub unified_diff: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitStashEntryDto {
     pub index: u32,
     pub message: String,
-    pub oid: String,
-    pub time_unix: i64,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitStashesDto {
-    pub entries: Vec<GitStashEntryDto>,
+pub struct GitStashesReplyDto {
+    pub stashes: Vec<GitStashEntryDto>,
 }
+/// The typed data reply of a read-only git command. The union is untagged
+/// because each variant has a distinct required key; `GitPanelView` accepts
+/// both this named-key shape and a bare array.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitConflictDto {
-    pub path: WorkspacePath,
-    pub ours: bool,
-    pub theirs: bool,
-    pub ancestor: bool,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitMergeStateDto {
-    /// Branch being merged, when the event names one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    pub status: GitMergeStatusDto,
-    pub conflicts: Vec<GitConflictDto>,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GitRemoteOutcomeDto {
-    pub operation: GitRemoteOperationDto,
-    pub remote: String,
-    /// Redacted, bounded CLI summary.
-    pub summary: String,
-    /// Pull conflicts, if any; empty for fetch/push.
-    #[serde(default)]
-    pub conflicts: Vec<GitConflictDto>,
+#[serde(untagged)]
+pub enum GitCommandReplyDto {
+    Branches(GitBranchesReplyDto),
+    Log(GitLogReplyDto),
+    Commit(Box<GitCommitReplyDto>),
+    Stashes(GitStashesReplyDto),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelsDto {
@@ -1940,9 +1901,9 @@ pub enum FrontendEvent {
     ChatCompleted(ChatCompletedDto),
     ChatFailed(ChatFailedDto),
     AgentEvent(AgentEventDto),
-    // Phase Z3 — the agent dock's stream. `AgentEvent` above is the Z1-era
+    // Phase Z3 â€” the agent dock's stream. `AgentEvent` above is the Z1-era
     // generic carrier; it never had a producer and is superseded by the
-    // typed payloads below (kept additively — protocol_version stays 1).
+    // typed payloads below (kept additively â€” protocol_version stays 1).
     ToolCallStarted(ToolCallStartedDto),
     ToolResult(ToolResultDto),
     ApprovalNeeded(ApprovalNeededDto),
@@ -1958,7 +1919,7 @@ pub enum FrontendEvent {
     /// P1: one language server changed lifecycle (starting/ready/failed).
     /// `failed` carries a truthful, typed reason for the UI.
     LspServerStateChanged(LspServerStateDto),
-    // Phase Z4b — the LSP request answers (each echoes the buffer so the
+    // Phase Z4b â€” the LSP request answers (each echoes the buffer so the
     // editor can drop a result for a tab that closed mid-flight).
     HoverResult(HoverResultDto),
     CompletionResult(CompletionResultDto),
@@ -1973,18 +1934,11 @@ pub enum FrontendEvent {
     SearchResults(SearchResultsDto),
     GitStatusChanged(GitStatusDto),
     GitDiffReady(GitDiffDto),
-    // Daily git events — each is the typed answer to its command.
-    GitBranchesChanged(GitBranchesDto),
-    GitLogReady(GitLogDto),
-    GitCommitShown(Box<GitCommitDetailDto>),
-    GitStashesChanged(GitStashesDto),
-    GitMergeStateChanged(GitMergeStateDto),
-    GitRemoteFinished(GitRemoteOutcomeDto),
     ModelsChanged(ModelsDto),
     SeloraStatusChanged(SeloraStatusDto),
     WorkspaceLayoutChanged(LayoutDto),
     Toast(ToastDto),
-    // Phase 8 — the workflow engine's progress stream (§18.4). Each payload
+    // Phase 8 â€” the workflow engine's progress stream (Â§18.4). Each payload
     // carries `run_id`; the three command-scoped ones also echo `request_id`.
     WorkflowStarted(WorkflowStartedDto),
     WorkflowPhase(WorkflowPhaseEventDto),
@@ -1993,7 +1947,7 @@ pub enum FrontendEvent {
     WorkflowArtifact(WorkflowArtifactEventDto),
     WorkflowApprovalNeeded(WorkflowApprovalNeededDto),
     WorkflowFinished(WorkflowFinishedDto),
-    // Phase 9b — plan mode and live todos. Additive; a pre-9b consumer
+    // Phase 9b â€” plan mode and live todos. Additive; a pre-9b consumer
     // ignores the arms it does not know.
     PlanStateChanged(PlanStateDto),
     TodosChanged(TodosDto),
@@ -2225,8 +2179,8 @@ mod tests {
                 editor_tab_size: 4,
                 editor_word_wrap: false,
             },
-            // §1.1: the Z1 stub values (280/220, agent dock open) were
-            // diagnostic placeholders — Z2's fixture carries the table's
+            // Â§1.1: the Z1 stub values (280/220, agent dock open) were
+            // diagnostic placeholders â€” Z2's fixture carries the table's
             // values (240 / 360-closed / 200-closed).
             layout: LayoutDto {
                 primary_sidebar_width_px: PRIMARY_SIDEBAR_DEFAULT_PX,
@@ -2245,6 +2199,7 @@ mod tests {
                 changed_paths: vec![],
                 staged_paths: vec![],
                 files: vec![],
+                conflicts: vec![],
             },
             diagnostics: vec![],
             lsp_servers: vec![],
@@ -2464,7 +2419,7 @@ mod tests {
 
     #[test]
     fn z2_command_wire_shapes_are_stable() {
-        // §2.1's exact spellings, verified against the serde envelope.
+        // Â§2.1's exact spellings, verified against the serde envelope.
         assert_eq!(
             serde_json::to_string(&FrontendCommand::ToggleSurface {
                 surface: SurfaceId::Agent
@@ -2514,8 +2469,8 @@ mod tests {
     }
     #[test]
     fn z2_command_serde_boundary_rejects_malformed_payloads() {
-        // Unknown surface/region spellings fail enum deserialization (§2.3
-        // item 4) — the rejection happens at the serde boundary, before any
+        // Unknown surface/region spellings fail enum deserialization (Â§2.3
+        // item 4) â€” the rejection happens at the serde boundary, before any
         // Rust arm runs.
         assert!(serde_json::from_str::<FrontendCommand>(
             r#"{"type":"toggle_surface","payload":{"surface":"nonexistent"}}"#
@@ -2553,7 +2508,7 @@ mod tests {
     #[test]
     fn pre_z2_and_partial_layout_json_load_with_defaults() {
         // A pre-Z2 persisted layout (the seven old fields) deserializes with
-        // the §4.2 defaults for the two new fields.
+        // the Â§4.2 defaults for the two new fields.
         let pre_z2 = serde_json::from_str::<LayoutDto>(
             r#"{"primary_sidebar_width_px":240.0,"agent_dock_width_px":360.0,"agent_dock_open":false,"bottom_dock_height_px":200.0,"bottom_dock_open":false,"bottom_view":"output","editor_splits":1}"#,
         )
@@ -2561,7 +2516,7 @@ mod tests {
         assert_eq!(pre_z2.activity_view, SurfaceId::Files);
         assert!(pre_z2.primary_sidebar_open);
         // A partial (or empty) layout JSON fills every missing field with the
-        // §4.2 defaults (§5.1: "every existing LayoutDto field gains a serde
+        // Â§4.2 defaults (Â§5.1: "every existing LayoutDto field gains a serde
         // default").
         let partial =
             serde_json::from_str::<LayoutDto>(r#"{"primary_sidebar_width_px":300.0}"#).unwrap();
@@ -2580,7 +2535,7 @@ mod tests {
     #[test]
     fn clamp_region_size_bounds_table_and_non_finite() {
         use RegionId::*;
-        // (region, input, expected) — finite out-of-range values are clamped,
+        // (region, input, expected) â€” finite out-of-range values are clamped,
         // never rejected; in-range values pass through exactly.
         for (region, input, expected) in [
             (PrimarySidebar, 100.0, PRIMARY_SIDEBAR_MIN_PX),
@@ -2620,13 +2575,13 @@ mod tests {
             primary_sidebar_open: true,
         };
         let sanitized = wedged.clone().sanitized();
-        assert_eq!(sanitized.primary_sidebar_width_px, 240.0, "NaN → default");
+        assert_eq!(sanitized.primary_sidebar_width_px, 240.0, "NaN â†’ default");
         assert_eq!(sanitized.agent_dock_width_px, 600.0, "clamped to max");
         assert_eq!(sanitized.bottom_dock_height_px, 120.0, "clamped to min");
         assert_eq!(sanitized.bottom_view, SurfaceId::Output, "reset into set");
         assert_eq!(sanitized.editor_splits, EDITOR_SPLITS_MIN);
         assert_eq!(sanitized.activity_view, SurfaceId::Files, "reset into set");
-        // Open flags are semantics, not sizes — untouched.
+        // Open flags are semantics, not sizes â€” untouched.
         assert!(sanitized.agent_dock_open);
         assert!(sanitized.bottom_dock_open);
         // A clean layout is a fixed point.
@@ -2656,7 +2611,7 @@ mod tests {
     }
     #[test]
     fn protocol_constants_are_the_documented_table() {
-        // §1.1's table, verbatim — the single source of truth everything else
+        // Â§1.1's table, verbatim â€” the single source of truth everything else
         // (settings defaults, the Z2 state bootstrap) delegates to.
         assert_eq!(PRIMARY_SIDEBAR_MIN_PX, 160.0);
         assert_eq!(PRIMARY_SIDEBAR_MAX_PX, 480.0);
@@ -2672,7 +2627,7 @@ mod tests {
         assert_eq!(RESIZE_HIT_ZONE_MIN_PX, 6.0);
         assert_eq!(EDITOR_SPLITS_MIN, 1);
         assert_eq!(EDITOR_SPLITS_MAX, 4);
-        // §4.3's valid sets.
+        // Â§4.3's valid sets.
         assert!(ACTIVITY_VIEWS.contains(&SurfaceId::Files));
         assert!(ACTIVITY_VIEWS.contains(&SurfaceId::Workflows));
         assert!(!ACTIVITY_VIEWS.contains(&SurfaceId::Problems));
@@ -2680,7 +2635,7 @@ mod tests {
         assert!(!BOTTOM_VIEWS.contains(&SurfaceId::Files));
     }
 
-    /// The §1.1-table default layout (§4.2's "wire shape of a full section").
+    /// The Â§1.1-table default layout (Â§4.2's "wire shape of a full section").
     fn default_layout() -> LayoutDto {
         LayoutDto {
             primary_sidebar_width_px: 240.0,
@@ -2827,8 +2782,8 @@ mod tests {
             .unwrap(),
             r#"{"type":"approval_needed","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","approval_id":"approval-1","tool_name":"bash","path_or_command":"cargo test"}}"#
         );
-        // Phase 8: a `run_workflow` card carries the confirmation payload —
-        // script, confirmed command set and cap — additively (`tool_name`
+        // Phase 8: a `run_workflow` card carries the confirmation payload â€”
+        // script, confirmed command set and cap â€” additively (`tool_name`
         // stays `run_workflow` so the card routes to the WorkflowCard).
         let workflow_card = ApprovalNeededDto {
             request_id: rid("request-1"),
@@ -2866,7 +2821,7 @@ mod tests {
             FrontendEvent::ApprovalNeeded(dto) => assert!(dto.workflow.is_none()),
             other => panic!("expected a legacy approval card, got {other:?}"),
         }
-        // A partial payload fills the §18.1 cap default and an empty command set.
+        // A partial payload fills the Â§18.1 cap default and an empty command set.
         let partial: WorkflowApprovalDto =
             serde_json::from_str(r#"{"name":"repo-audit","script":"report({})"}"#).unwrap();
         assert!(partial.commands.is_empty());
@@ -3095,6 +3050,7 @@ mod tests {
                     worktree: true,
                 },
             ],
+            conflicts: vec![git_path("src/conflict.rs")],
         };
         let json = serde_json::to_string(&status).unwrap();
         // The new field really rides the wire, carrying both slots per file.
@@ -3119,55 +3075,117 @@ mod tests {
         assert!(status.staged_paths.is_empty());
         assert!(status.files.is_empty());
     }
-
     #[test]
-    fn daily_git_commands_round_trip_and_default_a_log_page() {
-        let log: FrontendCommand = serde_json::from_str(
-            r#"{"type":"git_log","payload":{"limit":20,"path":"src/lib.rs"}}"#,
-        )
-        .unwrap();
+    fn daily_git_commands_accept_the_bridge_payloads_exactly() {
+        // Every payload below is verbatim what `bridge.ts` sends (including
+        // the no-payload shape of the network commands and a null stash
+        // message). A mismatch here is a dead command in the panel.
+        let parse = |json: &str| serde_json::from_str::<FrontendCommand>(json).unwrap();
+
         assert_eq!(
-            log,
-            FrontendCommand::GitLog {
-                limit: 20,
-                path: Some(git_path("src/lib.rs")),
+            parse(r#"{"type":"git_branches"}"#),
+            FrontendCommand::GitBranches
+        );
+        assert_eq!(
+            parse(
+                r#"{"type":"git_create_branch","payload":{"name":"feature/git","checkout":true}}"#
+            ),
+            FrontendCommand::GitCreateBranch {
+                name: "feature/git".into(),
+                checkout: true,
             }
         );
-        let json = serde_json::to_string(&log).unwrap();
-        assert_eq!(serde_json::from_str::<FrontendCommand>(&json).unwrap(), log);
-
-        // An omitted limit means the default page (not zero entries).
-        let defaulted: FrontendCommand =
-            serde_json::from_str(r#"{"type":"git_log","payload":{}}"#).unwrap();
         assert_eq!(
-            defaulted,
+            parse(r#"{"type":"git_switch_branch","payload":{"name":"main"}}"#),
+            FrontendCommand::GitSwitchBranch {
+                name: "main".into()
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_delete_branch","payload":{"name":"old"}}"#),
+            FrontendCommand::GitDeleteBranch { name: "old".into() }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_log","payload":{"count":50}}"#),
             FrontendCommand::GitLog {
-                limit: 50,
+                count: 50,
                 path: None,
             }
         );
-
-        let resolve: FrontendCommand = serde_json::from_str(
-            r#"{"type":"git_resolve_conflict","payload":{"path":"src/a.rs","side":"theirs"}}"#,
-        )
-        .unwrap();
+        // An omitted count is the default page, not zero entries.
         assert_eq!(
-            resolve,
+            parse(r#"{"type":"git_log","payload":{}}"#),
+            FrontendCommand::GitLog {
+                count: 50,
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_show_commit","payload":{"sha":"abc1234"}}"#),
+            FrontendCommand::GitShowCommit {
+                sha: "abc1234".into()
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_discard","payload":{"path":"src/a.rs"}}"#),
+            FrontendCommand::GitDiscard {
+                path: git_path("src/a.rs")
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_save","payload":{"message":null}}"#),
+            FrontendCommand::GitStashSave { message: None }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_save","payload":{"message":"park it"}}"#),
+            FrontendCommand::GitStashSave {
+                message: Some("park it".into())
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_list"}"#),
+            FrontendCommand::GitStashList
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_apply","payload":{"index":1}}"#),
+            FrontendCommand::GitStashApply { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_pop","payload":{"index":1}}"#),
+            FrontendCommand::GitStashPop { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_stash_drop","payload":{"index":1}}"#),
+            FrontendCommand::GitStashDrop { index: 1 }
+        );
+        assert_eq!(
+            parse(r#"{"type":"git_merge","payload":{"branch":"topic"}}"#),
+            FrontendCommand::GitMerge {
+                branch: "topic".into()
+            }
+        );
+        assert_eq!(
+            parse(
+                r#"{"type":"git_conflict_resolve","payload":{"path":"src/a.rs","resolution":"theirs"}}"#
+            ),
             FrontendCommand::GitResolveConflict {
                 path: git_path("src/a.rs"),
-                side: GitConflictSideDto::Theirs,
+                resolution: GitConflictSideDto::Theirs,
             }
         );
-
-        let push: FrontendCommand =
-            serde_json::from_str(r#"{"type":"git_push","payload":{}}"#).unwrap();
         assert_eq!(
-            push,
-            FrontendCommand::GitPush {
-                remote: None,
-                branch: None,
-            }
+            parse(r#"{"type":"git_stage_all"}"#),
+            FrontendCommand::GitStageAll
         );
+        assert_eq!(
+            parse(r#"{"type":"git_unstage_all"}"#),
+            FrontendCommand::GitUnstageAll
+        );
+        assert_eq!(parse(r#"{"type":"git_push"}"#), FrontendCommand::GitPush);
+        assert_eq!(parse(r#"{"type":"git_pull"}"#), FrontendCommand::GitPull);
+        assert_eq!(parse(r#"{"type":"git_fetch"}"#), FrontendCommand::GitFetch);
+
+        // Serialization keeps the same wire names and payload keys.
         assert_eq!(
             serde_json::to_string(&FrontendCommand::GitStageAll).unwrap(),
             r#"{"type":"git_stage_all"}"#
@@ -3176,79 +3194,111 @@ mod tests {
             serde_json::to_string(&FrontendCommand::GitStashPop { index: 1 }).unwrap(),
             r#"{"type":"git_stash_pop","payload":{"index":1}}"#
         );
+        assert_eq!(
+            serde_json::to_string(&FrontendCommand::GitPush).unwrap(),
+            r#"{"type":"git_push"}"#
+        );
 
         // WorkspacePath rejects traversal at the wire boundary.
         assert!(serde_json::from_str::<FrontendCommand>(
-            r#"{"type":"git_discard_worktree","payload":{"paths":["../escape.txt"]}}"#
+            r#"{"type":"git_discard","payload":{"path":"../escape.txt"}}"#
         )
         .is_err());
     }
 
     #[test]
-    fn daily_git_events_round_trip_with_conflicts_and_redacted_summary() {
-        let conflict = GitConflictDto {
-            path: git_path("src/a.rs"),
-            ours: true,
-            theirs: true,
-            ancestor: true,
-        };
-        let merge = GitMergeStateDto {
-            branch: Some("feature/git".into()),
-            status: GitMergeStatusDto::Conflicts,
-            conflicts: vec![conflict.clone()],
-        };
-        let event = FrontendEvent::GitMergeStateChanged(merge);
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""type":"git_merge_state_changed""#), "{json}");
-        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
-
-        let remote = FrontendEvent::GitRemoteFinished(GitRemoteOutcomeDto {
-            operation: GitRemoteOperationDto::Pull,
-            remote: "origin".into(),
-            summary: "pull origin ok".into(),
-            conflicts: vec![conflict],
-        });
-        let json = serde_json::to_string(&remote).unwrap();
-        assert!(json.contains(r#""operation":"pull""#), "{json}");
-        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), remote);
-
-        let branches = FrontendEvent::GitBranchesChanged(GitBranchesDto {
+    fn daily_git_replies_match_the_panel_contract_and_status_carries_conflicts() {
+        let branches = GitCommandReplyDto::Branches(GitBranchesReplyDto {
             branches: vec![GitBranchDto {
                 name: "main".into(),
-                is_current: true,
-                upstream: Some("origin/main".into()),
-                tip: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                current: true,
             }],
         });
-        let json = serde_json::to_string(&branches).unwrap();
-        assert!(json.contains(r#""upstream":"origin/main""#), "{json}");
-        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), branches);
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(branches.clone())).unwrap(),
+            serde_json::json!({"branches": [{"name": "main", "current": true}]})
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandResultDto>(
+                serde_json::json!({"branches": [{"name": "main", "current": true}]})
+            )
+            .unwrap(),
+            CommandResultDto::Git(branches)
+        );
 
-        let commit = FrontendEvent::GitCommitShown(Box::new(GitCommitDetailDto {
-            commit: GitCommitDto {
-                id: "0123456789abcdef0123456789abcdef01234567".into(),
-                short_id: "0123456".into(),
-                summary: "commit".into(),
-                message: "commit\n".into(),
-                author_name: "Test".into(),
-                author_email: "test@example.com".into(),
-                time_unix: 1_700_000_000,
-                time_offset_minutes: 0,
-                parents: vec![],
-            },
-            files: vec![GitCommitFileDto {
-                path: git_path("src/a.rs"),
-                old_path: None,
-                status: "modified".into(),
-                additions: 2,
-                deletions: 1,
+        let log = GitCommandReplyDto::Log(GitLogReplyDto {
+            commits: vec![GitLogEntryDto {
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                summary: "work".into(),
+                author: "Test".into(),
+                timestamp: 1_700_000_000,
             }],
-            patch: "--- a/src/a.rs\n+++ b/src/a.rs\n".into(),
-            patch_truncated: false,
+        });
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(log)).unwrap(),
+            serde_json::json!({"commits": [{
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "summary": "work",
+                "author": "Test",
+                "timestamp": 1_700_000_000i64,
+            }]})
+        );
+
+        let detail = GitCommandReplyDto::Commit(Box::new(GitCommitReplyDto {
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            summary: "work".into(),
+            author: "Test".into(),
+            timestamp: 1_700_000_000,
+            message: "work\n".into(),
+            unified_diff: "--- a/a\n+++ b/a\n+line\n".into(),
         }));
-        let json = serde_json::to_string(&commit).unwrap();
-        assert!(json.contains(r#""type":"git_commit_shown""#), "{json}");
-        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), commit);
+        let json = serde_json::to_value(CommandResultDto::Git(detail)).unwrap();
+        assert_eq!(json["sha"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(json["message"], "work\n");
+        assert_eq!(json["unified_diff"], "--- a/a\n+++ b/a\n+line\n");
+
+        let stashes = GitCommandReplyDto::Stashes(GitStashesReplyDto {
+            stashes: vec![GitStashEntryDto {
+                index: 0,
+                message: "WIP on main".into(),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(CommandResultDto::Git(stashes)).unwrap(),
+            serde_json::json!({"stashes": [{"index": 0, "message": "WIP on main"}]})
+        );
+
+        // The untagged union still parses an ack (the added variant is last).
+        let ack = CommandAckDto {
+            protocol_version: 1,
+            core_instance_id: CoreInstanceId::new("core_1").unwrap(),
+            snapshot_sequence: 7,
+            acknowledged: true,
+            session_id: None,
+        };
+        assert_eq!(
+            serde_json::from_value::<CommandResultDto>(serde_json::to_value(&ack).unwrap())
+                .unwrap(),
+            CommandResultDto::Ack(ack)
+        );
+
+        // `conflicts` is additive: absent payloads default to empty and a
+        // present list round-trips as workspace paths.
+        let without: GitStatusDto = serde_json::from_str(
+            r#"{"branch":"main","changed_paths":[],"staged_paths":[],"files":[]}"#,
+        )
+        .unwrap();
+        assert!(without.conflicts.is_empty());
+        let with = GitStatusDto {
+            branch: Some("main".into()),
+            changed_paths: vec![],
+            staged_paths: vec![],
+            files: vec![],
+            conflicts: vec![git_path("src/a.rs")],
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""conflicts":["src/a.rs"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<GitStatusDto>(&json).unwrap(), with);
     }
     #[test]
     fn approval_is_bound_and_consumed_once() {
@@ -3287,7 +3337,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 8 — workflows.
+    // Phase 8 â€” workflows.
     // -----------------------------------------------------------------------
 
     fn workflow_spec() -> WorkflowSpecDto {

@@ -106,6 +106,11 @@ impl GitRepo {
         let mut entries = Vec::new();
         for entry in statuses.iter() {
             let flags = entry.status();
+            // A conflicted entry has no stage-0 index entry, so neither slot
+            // maps to a change; it is reported through `conflicts` instead.
+            if flags.contains(git2::Status::CONFLICTED) {
+                continue;
+            }
             let staged = Slot::from_index(flags);
             let worktree = Slot::from_worktree(flags);
             if staged == Slot::Unmodified && worktree == Slot::Unmodified {
@@ -123,7 +128,16 @@ impl GitRepo {
             });
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(GitStatus { branch, entries })
+        let conflicts = self
+            .merge_conflicts()?
+            .into_iter()
+            .map(|conflict| self.workdir.join(conflict.path))
+            .collect();
+        Ok(GitStatus {
+            branch,
+            entries,
+            conflicts,
+        })
     }
 
     /// Stage `path` (working tree → index). Accepts an absolute path (the
@@ -961,6 +975,59 @@ mod tests {
     }
 
     #[test]
+    fn discard_all_clears_both_sides_and_deletes_untracked_or_new_files() {
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        write(&dir, "gone.txt", "gone\n");
+        commit_all(&repo, "init");
+
+        // Staged AND further edited: one discard returns to the committed text.
+        write(&dir, "a.txt", "staged\n");
+        repo.stage(&dir.path().join("a.txt")).expect("stage");
+        write(&dir, "a.txt", "dirty again\n");
+        repo.discard_all(&dir.path().join("a.txt"))
+            .expect("discard all");
+        assert_eq!(read(&dir, "a.txt"), "one\n");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // An untracked file is deleted (the path the panel's row carries).
+        write(&dir, "fresh.txt", "new\n");
+        repo.discard_all(&dir.path().join("fresh.txt"))
+            .expect("discard untracked");
+        assert!(!dir.path().join("fresh.txt").exists());
+
+        // A newly staged file is removed from the index and from disk.
+        write(&dir, "added.txt", "added\n");
+        repo.stage(&dir.path().join("added.txt"))
+            .expect("stage add");
+        repo.discard_all(&dir.path().join("added.txt"))
+            .expect("discard added");
+        assert!(!dir.path().join("added.txt").exists());
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // A deleted tracked file comes back from HEAD.
+        fs::remove_file(dir.path().join("gone.txt")).expect("remove");
+        repo.discard_all(&dir.path().join("gone.txt"))
+            .expect("discard deletion");
+        assert_eq!(read(&dir, "gone.txt"), "gone\n");
+        assert!(repo.status().expect("status").entries.is_empty());
+
+        // A conflicted path is refused: resolve it explicitly instead.
+        repo.create_branch("other", None).expect("create");
+        repo.switch_branch("other").expect("switch");
+        write(&dir, "a.txt", "theirs\n");
+        commit_all(&repo, "theirs");
+        repo.switch_branch("main").expect("switch");
+        write(&dir, "a.txt", "ours\n");
+        commit_all(&repo, "ours");
+        repo.merge_branch("other").expect("merge");
+        let refused = repo
+            .discard_all(&dir.path().join("a.txt"))
+            .expect_err("conflict refused");
+        assert!(refused.to_string().contains("merge conflict"), "{refused}");
+    }
+
+    #[test]
     fn log_limits_filters_by_path_and_show_commit_carries_metadata_and_patch() {
         let (dir, repo) = init_repo();
         write(&dir, "a.txt", "one\n");
@@ -1109,6 +1176,14 @@ mod tests {
         let conflict = &outcome.conflicts[0];
         assert_eq!(conflict.path, PathBuf::from("conflict.txt"));
         assert!(conflict.ours && conflict.theirs && conflict.ancestor);
+
+        // The status snapshot reports the conflict as its own list: a stage-0
+        // free path is not a normal `entries` row, so the panel needs it here.
+        let conflicted = repo.status().expect("status");
+        assert_eq!(conflicted.conflicts, vec![dir.path().join("conflict.txt")]);
+        assert!(conflicted.entries.is_empty());
+        assert!(conflicted.is_dirty());
+        assert_eq!(conflicted.changed_count(), 1);
 
         // Abort restores HEAD and clears the merge state.
         repo.merge_abort().expect("abort");
@@ -1262,5 +1337,53 @@ mod tests {
             bare.find_branch("main", git2::BranchType::Local).is_ok(),
             "main must exist in the bare remote"
         );
+    }
+
+    #[test]
+    fn pull_fast_forwards_a_clone_from_a_local_bare_remote() {
+        if !git_available() {
+            return; // the network half needs the OS git; skip on a bare runner
+        }
+        let bare_dir = tempfile::tempdir().expect("bare dir");
+        let bare = git2::Repository::init_bare(bare_dir.path()).expect("init bare");
+        bare.set_head("refs/heads/main").expect("bare HEAD main");
+        let (dir, repo) = init_repo();
+        write(&dir, "a.txt", "one\n");
+        commit_all(&repo, "init");
+        git2::Repository::open(dir.path())
+            .expect("raw")
+            .remote("origin", bare_dir.path().to_string_lossy().as_ref())
+            .expect("remote");
+        repo.push(None, None).expect("seed push");
+        assert!(bare.find_branch("main", git2::BranchType::Local).is_ok());
+
+        // A second working copy of the same remote.
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        let clone_path = clone_parent.path().join("clone");
+        git2::Repository::clone(bare_dir.path().to_string_lossy().as_ref(), &clone_path)
+            .expect("clone");
+        let clone = GitRepo::open(&clone_path).expect("open clone");
+
+        // The origin advances after the clone was made.
+        write(&dir, "a.txt", "one\ntwo\n");
+        commit_all(&repo, "second");
+        repo.push(None, None).expect("second push");
+
+        let pulled = clone.pull(None, None).expect("pull");
+        assert_eq!(pulled.operation, RemoteOperation::Pull);
+        assert_eq!(pulled.remote, "origin");
+        assert!(pulled.conflicts.is_empty(), "{:?}", pulled.conflicts);
+        assert_eq!(
+            read_text(&clone_path.join("a.txt")),
+            "one\ntwo\n",
+            "pull must update the working tree"
+        );
+        assert!(clone.status().expect("status").entries.is_empty());
+    }
+
+    fn read_text(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("read")
+            .replace("\r\n", "\n")
     }
 }

@@ -18,9 +18,10 @@ use std::{
 
 use selora_protocol::{
     BufferChangedDto, BufferConflictClearedDto, BufferConflictDto, BufferId, BufferSnapshotDto,
-    FileTreeDto, FileTreeNodeDto, FileTreeNodeKind, GitDiffDto, GitFileDto, GitStatusDto,
-    SearchHitDto, SearchQueryDto, SearchResultsDto, Selection, TextChange, TextPosition,
-    WorkspacePath,
+    FileTreeDto, FileTreeNodeDto, FileTreeNodeKind, GitBranchDto, GitBranchesReplyDto,
+    GitCommitReplyDto, GitConflictSideDto, GitDiffDto, GitFileDto, GitLogEntryDto, GitLogReplyDto,
+    GitStashEntryDto, GitStashesReplyDto, GitStatusDto, SearchHitDto, SearchQueryDto,
+    SearchResultsDto, Selection, TextChange, TextPosition, WorkspacePath,
 };
 
 /// Maximum size of a file that may be opened in the text editor.
@@ -741,6 +742,7 @@ impl Workspace {
                 changed_paths: Vec::new(),
                 staged_paths: Vec::new(),
                 files: Vec::new(),
+                conflicts: Vec::new(),
             }),
         }
     }
@@ -817,6 +819,253 @@ impl Workspace {
 
         let path = WorkspacePath::new(&rel).map_err(invalid_path_error)?;
         Ok(GitDiffDto { path, unified_diff })
+    }
+
+    /// Every local branch, with the checked-out one marked `current`.
+    pub fn git_branches(&self) -> WsResult<GitBranchesReplyDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        let branches = repo.branches().map_err(git_error)?;
+        Ok(GitBranchesReplyDto {
+            branches: branches
+                .into_iter()
+                .map(|branch| GitBranchDto {
+                    name: branch.name,
+                    current: branch.is_current,
+                })
+                .collect(),
+        })
+    }
+
+    /// Create a local branch at HEAD, optionally switching to it. If the
+    /// switch fails the new branch is removed again, so the repository never
+    /// keeps a branch the user did not get to use.
+    pub fn git_create_branch(&self, name: &str, checkout: bool) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.create_branch(name, None).map_err(git_error)?;
+        if checkout {
+            if let Err(err) = repo.switch_branch(name) {
+                let _ = repo.delete_branch(name);
+                return Err(git_error(err));
+            }
+        }
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Check out a local branch (safe: local edits that would be overwritten
+    /// abort the switch) and return fresh status.
+    pub fn git_switch_branch(&self, name: &str) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.switch_branch(name).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Delete a local branch. The checked-out branch and an unmerged branch
+    /// are refused, so the command can never orphan commits.
+    pub fn git_delete_branch(&self, name: &str) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.delete_branch(name).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// The newest `count` commits reachable from HEAD, newest first. With
+    /// `rel`, only commits that touched that workspace-relative path.
+    pub fn git_log(&self, count: u32, rel: Option<&str>) -> WsResult<GitLogReplyDto> {
+        let path = match rel {
+            Some(rel) => {
+                let rel = Self::normalize_relative(rel)?;
+                Some(self.resolve_relative(&rel, true)?)
+            }
+            None => None,
+        };
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        let commits = repo
+            .log(count as usize, path.as_deref())
+            .map_err(git_error)?;
+        Ok(GitLogReplyDto {
+            commits: commits
+                .into_iter()
+                .map(|commit| GitLogEntryDto {
+                    sha: commit.id,
+                    summary: commit.summary,
+                    author: commit.author_name,
+                    timestamp: commit.time_unix,
+                })
+                .collect(),
+        })
+    }
+
+    /// One commit's metadata, message, and bounded unified patch.
+    pub fn git_show_commit(&self, sha: &str) -> WsResult<GitCommitReplyDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        let detail = repo.show_commit(sha).map_err(git_error)?;
+        let info = detail.info;
+        // The panel needs a non-empty message to render the detail; a commit
+        // with an empty message falls back to its summary, then its short id.
+        let message = if !info.message.is_empty() {
+            info.message
+        } else if !info.summary.is_empty() {
+            info.summary.clone()
+        } else {
+            info.short_id.clone()
+        };
+        Ok(GitCommitReplyDto {
+            sha: info.id,
+            summary: info.summary,
+            author: info.author_name,
+            timestamp: info.time_unix,
+            message,
+            unified_diff: detail.patch,
+        })
+    }
+
+    /// Discard every local change to one path (working tree and index). An
+    /// untracked or newly staged file is deleted; a conflicted path is refused.
+    pub fn git_discard(&self, rel: &str) -> WsResult<GitStatusDto> {
+        let rel = Self::normalize_relative(rel)?;
+        let abs_path = self.resolve_relative(&rel, true)?;
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.discard_all(&abs_path).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Stage every working-tree change (adds, edits, deletions; never a
+    /// conflicted entry, which needs an explicit resolution).
+    pub fn git_stage_all(&self) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.stage_all().map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Reset the whole index to HEAD.
+    pub fn git_unstage_all(&self) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.unstage_all().map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Park the working tree + index in a new stash.
+    pub fn git_stash_save(&self, message: Option<&str>) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.stash_push(message).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Every stash entry, newest first.
+    pub fn git_stash_list(&self) -> WsResult<GitStashesReplyDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        let stashes = repo.stash_list().map_err(git_error)?;
+        Ok(GitStashesReplyDto {
+            stashes: stashes
+                .into_iter()
+                .map(|entry| GitStashEntryDto {
+                    index: u32::try_from(entry.index).unwrap_or(u32::MAX),
+                    message: entry.message,
+                })
+                .collect(),
+        })
+    }
+
+    /// Apply `stash@{index}` and keep the entry.
+    pub fn git_stash_apply(&self, index: u32) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.stash_apply(index as usize).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Apply `stash@{index}` and drop it.
+    pub fn git_stash_pop(&self, index: u32) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.stash_pop(index as usize).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Drop `stash@{index}` without applying it.
+    pub fn git_stash_drop(&self, index: u32) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.stash_drop(index as usize).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Merge one local branch into the current HEAD. A fast-forward moves the
+    /// branch; a true merge leaves the index staged (and reports conflicts in
+    /// the returned status) for a later `git_commit`.
+    pub fn git_merge(&self, branch: &str) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.merge_branch(branch).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Keep one side of a conflicted path and stage it as resolved.
+    pub fn git_resolve_conflict(
+        &self,
+        rel: &str,
+        side: GitConflictSideDto,
+    ) -> WsResult<GitStatusDto> {
+        let rel = Self::normalize_relative(rel)?;
+        let abs_path = self.resolve_relative(&rel, true)?;
+        let side = match side {
+            GitConflictSideDto::Ours => selora_git::ConflictSide::Ours,
+            GitConflictSideDto::Theirs => selora_git::ConflictSide::Theirs,
+        };
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.resolve_conflict(&abs_path, side).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Fetch from the branch's remote (or `origin`); output is redacted.
+    pub fn git_fetch(&self) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.fetch(None).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Pull the checked-out branch from its remote. A conflicted pull leaves
+    /// the index and merge state in place for explicit resolution.
+    pub fn git_pull(&self) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.pull(None, None).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
+    }
+
+    /// Push the checked-out branch to its remote, never forced.
+    pub fn git_push(&self) -> WsResult<GitStatusDto> {
+        let git = self.git_lock();
+        let repo = git.as_ref().ok_or_else(not_a_git_repo)?;
+        repo.push(None, None).map_err(git_error)?;
+        let status = repo.status().map_err(git_error)?;
+        Ok(self.git_status_to_dto(status))
     }
 
     fn buffers_lock(&self) -> MutexGuard<'_, BTreeMap<String, BufferState>> {
@@ -1041,11 +1290,20 @@ impl Workspace {
                 worktree,
             });
         }
+        let conflicts = status
+            .conflicts
+            .iter()
+            .filter_map(|path| {
+                self.workspace_relative(path)
+                    .and_then(|rel| WorkspacePath::new(rel).ok())
+            })
+            .collect();
         GitStatusDto {
             branch: status.branch,
             changed_paths,
             staged_paths,
             files,
+            conflicts,
         }
     }
 }
@@ -1785,6 +2043,15 @@ mod tests {
     fn init_repo_with_fixture_commit(root: &Path) {
         let repo = git2::Repository::init(root).expect("init repo");
         {
+            let mut config = repo.config().expect("config");
+            config
+                .set_str("user.name", "Selora Test")
+                .expect("user.name");
+            config
+                .set_str("user.email", "test@selora.invalid")
+                .expect("user.email");
+        }
+        {
             let mut index = repo.index().expect("index");
             for path in ["README.md", "src/main.rs", "src/nested/note.txt"] {
                 index.add_path(Path::new(path)).expect("add fixture file");
@@ -1901,6 +2168,187 @@ mod tests {
             .changed_paths
             .iter()
             .any(|path| path.as_str() == "src/untracked.rs"));
+    }
+
+    #[test]
+    fn daily_git_workspace_surface_covers_the_panel_commands() {
+        let fixture = Fixture::new();
+        init_repo_with_fixture_commit(&fixture.root);
+        let workspace = fixture.workspace();
+        let main = workspace
+            .git_status()
+            .expect("status")
+            .branch
+            .expect("checked-out branch");
+
+        // Branches: list, create + checkout, log, show.
+        let branches = workspace.git_branches().expect("branches");
+        assert_eq!(branches.branches.len(), 1);
+        assert_eq!(branches.branches[0].name, main);
+        assert!(branches.branches[0].current);
+
+        let created = workspace
+            .git_create_branch("feature/git", true)
+            .expect("create branch");
+        assert_eq!(created.branch.as_deref(), Some("feature/git"));
+        let branches = workspace.git_branches().expect("branches");
+        assert_eq!(
+            branches
+                .branches
+                .iter()
+                .map(|branch| (branch.name.as_str(), branch.current))
+                .collect::<Vec<_>>(),
+            vec![("feature/git", true), (main.as_str(), false)]
+        );
+
+        let log = workspace.git_log(10, None).expect("log");
+        assert_eq!(log.commits.len(), 1);
+        assert_eq!(log.commits[0].summary, "init");
+        assert_eq!(log.commits[0].sha.len(), 40);
+        let detail = workspace
+            .git_show_commit(&log.commits[0].sha)
+            .expect("show commit");
+        assert_eq!(detail.sha, log.commits[0].sha);
+        assert_eq!(detail.message.trim(), "init");
+        assert!(
+            detail.unified_diff.contains("README.md"),
+            "{}",
+            detail.unified_diff
+        );
+        assert!(
+            workspace
+                .git_log(10, Some("README.md"))
+                .expect("log path")
+                .commits
+                .len()
+                == 1
+        );
+
+        // Discard one path (both sides) and delete an untracked file.
+        fs::write(fixture.root.join("README.md"), "# Project\nedited\n").expect("edit");
+        workspace.git_stage("README.md").expect("stage");
+        fs::write(fixture.root.join("README.md"), "# Project\nedited again\n").expect("edit");
+        let discarded = workspace.git_discard("README.md").expect("discard");
+        assert!(discarded.files.is_empty(), "{:?}", discarded.files);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("README.md"))
+                .expect("read")
+                .replace("\r\n", "\n"),
+            "# Project\n"
+        );
+        fs::write(fixture.root.join("untracked.txt"), "temporary\n").expect("untracked");
+        assert!(workspace
+            .git_stage_all()
+            .expect("stage all")
+            .staged_paths
+            .iter()
+            .any(|path| path.as_str() == "untracked.txt"));
+        assert!(workspace
+            .git_unstage_all()
+            .expect("unstage all")
+            .staged_paths
+            .is_empty());
+        workspace
+            .git_discard("untracked.txt")
+            .expect("discard untracked");
+        assert!(!fixture.root.join("untracked.txt").exists());
+
+        // Stash: save, list, apply (keeps the entry), drop.
+        fs::write(fixture.root.join("README.md"), "# Project\nparked\n").expect("parked edit");
+        let stashed = workspace
+            .git_stash_save(Some("park it"))
+            .expect("stash save");
+        assert!(stashed.files.is_empty(), "{:?}", stashed.files);
+        let stashes = workspace.git_stash_list().expect("stash list");
+        assert_eq!(stashes.stashes.len(), 1);
+        assert_eq!(stashes.stashes[0].index, 0);
+        assert!(stashes.stashes[0].message.contains("park it"));
+        let applied = workspace.git_stash_apply(0).expect("stash apply");
+        assert!(applied
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "README.md" && file.worktree));
+        assert_eq!(workspace.git_stash_list().expect("list").stashes.len(), 1);
+        workspace.git_stash_drop(0).expect("stash drop");
+        assert!(workspace.git_stash_list().expect("list").stashes.is_empty());
+        workspace
+            .git_discard("README.md")
+            .expect("clean after stash");
+
+        // Commit on the feature branch.
+        fs::write(fixture.root.join("README.md"), "# Project\nfeature\n").expect("feature edit");
+        workspace.git_stage("README.md").expect("stage feature");
+        workspace
+            .git_commit("feature edit")
+            .expect("feature commit");
+
+        // Diverge on the main branch.
+        let switched = workspace.git_switch_branch(&main).expect("switch main");
+        assert_eq!(
+            switched.branch.as_deref(),
+            Some(main.as_str()),
+            "switch must move HEAD to main"
+        );
+        fs::write(fixture.root.join("README.md"), "# Project\nmain\n").expect("main edit");
+        workspace.git_stage("README.md").expect("stage main");
+        workspace.git_commit("main edit").expect("main commit");
+        assert_eq!(
+            workspace.git_status().expect("status").branch.as_deref(),
+            Some(main.as_str())
+        );
+        let feature_status = workspace.git_status().expect("status");
+        assert!(
+            feature_status.files.is_empty(),
+            "the main edit must be committed clean: {:?}",
+            feature_status.files
+        );
+        assert_eq!(
+            workspace.git_log(10, None).expect("log").commits.len(),
+            2,
+            "main sees init + the main edit; the feature commit stays off-branch"
+        );
+
+        // Merge reports the conflict as data, not an opaque error.
+        let merged = workspace.git_merge("feature/git").expect("merge");
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["README.md"]
+        );
+        assert!(merged.files.is_empty(), "{:?}", merged.files);
+
+        let resolved = workspace
+            .git_resolve_conflict("README.md", GitConflictSideDto::Ours)
+            .expect("resolve ours");
+        assert!(resolved.conflicts.is_empty());
+        // Keeping our side leaves the tree identical to HEAD, so no row is
+        // staged — but the merge state is still committed below.
+        assert!(resolved.files.is_empty(), "{:?}", resolved.files);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("README.md"))
+                .expect("read")
+                .replace("\r\n", "\n"),
+            "# Project\nmain\n"
+        );
+        workspace
+            .git_commit("merge feature/git")
+            .expect("merge commit");
+        let clean = workspace.git_status().expect("status");
+        assert!(clean.conflicts.is_empty());
+        assert!(clean.files.is_empty(), "{:?}", clean.files);
+
+        // The feature branch is merged now, so the safe delete succeeds.
+        workspace
+            .git_delete_branch("feature/git")
+            .expect("delete merged branch");
+
+        // Network commands fail with a typed, readable error and no remote.
+        let push = workspace.git_push().expect_err("no remote");
+        assert_eq!(push.code, "git_error", "{push:?}");
+        assert!(push.message.contains("no git remote"), "{push:?}");
     }
 
     #[test]

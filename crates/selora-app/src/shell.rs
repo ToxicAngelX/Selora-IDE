@@ -2599,6 +2599,7 @@ mod tests {
                     staged: selora_git::Slot::Unmodified,
                     worktree: selora_git::Slot::Modified,
                 }],
+                conflicts: Vec::new(),
             }));
         frame(&mut app);
         assert!(app.state.git_status.is_some());
@@ -3360,6 +3361,7 @@ mod tests {
                     staged: selora_git::Slot::Unmodified,
                     worktree: selora_git::Slot::Modified,
                 }],
+                conflicts: Vec::new(),
             }));
         assert!(app.git_diff.is_none());
 

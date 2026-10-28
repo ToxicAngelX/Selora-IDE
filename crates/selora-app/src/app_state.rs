@@ -1782,6 +1782,7 @@ mod tests {
                 staged: selora_git::Slot::Unmodified,
                 worktree: selora_git::Slot::Modified,
             }],
+            conflicts: Vec::new(),
         };
         state.apply(AppMessage::GitStatusChanged(status));
         assert!(state.in_git_repo);
@@ -1824,6 +1825,7 @@ mod tests {
         state.apply(AppMessage::GitStatusChanged(selora_git::GitStatus {
             branch: Some("main".into()),
             entries: vec![],
+            conflicts: Vec::new(),
         }));
         assert!(state.in_git_repo);
 
