@@ -381,6 +381,11 @@ case 'plan_state_changed':
       });
       return;
     }
+    case 'subagent_activity':
+      // Child activity writes only its own child ledger; it is safe even when
+      // another parent session is selected.
+      agentStore.handleSubagentActivity(payload.payload);
+      return;
     case 'subagent_completed': {
       // Phase 9e: the toast/badge is emitted only for the first accepted
       // delivery of this child id. A failed child is a warning, never a
@@ -397,6 +402,11 @@ case 'plan_state_changed':
       });
       return;
     }
+    case 'subagent_cancelled':
+      // Cancellation is terminal but not success: preserve the streamed
+      // transcript, close its parked approvals, and ignore a later completion.
+      agentStore.handleSubagentCancelled(payload.payload);
+      return;
     case 'agent_event':
       agentStore.handleAgentEvent(payload.payload);
       return;

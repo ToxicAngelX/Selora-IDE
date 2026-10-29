@@ -1,0 +1,133 @@
+/* Selora IDE — Active conversation feed polish (presentation only).
+   Every rule is scoped to an .agent-feed-* class; nothing here redefines a
+   generic .agent-* rule from src/styles/agent.css. Colors, spacing, type,
+   radii and motion all read from src/styles/tokens.css. No gradients,
+   no shadows, no new fonts. */
+
+.agent-feed-root {
+  /* Local reading metrics, all derived from the token set. */
+  --agent-feed-measure: 72ch;
+  --agent-feed-turn-gap: var(--space-4);
+  --agent-feed-role-gap: var(--space-2);
+}
+
+/* --- List: turn rhythm, scroll anchoring, stable bottom padding -------- */
+
+.agent-feed-list.agent-feed-list {
+  gap: var(--agent-feed-turn-gap);
+  scroll-padding-block-end: var(--space-4);
+  overscroll-behavior: contain;
+  overflow-anchor: auto;
+}
+
+/* --- Turn rows -------------------------------------------------------- */
+
+.agent-feed-turn {
+  scroll-margin-block-start: var(--space-3);
+  min-width: 0;
+}
+
+.agent-feed-turn--user {
+  justify-content: flex-end;
+}
+
+.agent-feed-turn--assistant {
+  justify-content: flex-start;
+}
+
+/* --- Role label + avatar alignment ------------------------------------ */
+
+.agent-feed-meta {
+  min-height: var(--type-xs-lh);
+  gap: var(--agent-feed-role-gap);
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+
+.agent-feed-meta .agent-feed-role-label {
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+/* --- Assistant turn: reading measure + rhythm ------------------------- */
+
+.agent-feed-assistant.agent-feed-assistant {
+  max-width: var(--agent-feed-measure);
+  padding: var(--space-1) 0 var(--space-2);
+}
+
+.agent-feed-prose {
+  max-width: var(--agent-feed-measure);
+}
+
+.agent-feed-prose > * + * {
+  margin-top: var(--space-2);
+}
+
+/* --- User turn -------------------------------------------------------- */
+
+.agent-feed-user-bubble.agent-feed-user-bubble {
+  border-radius: var(--radius-2);
+  border-bottom-right-radius: var(--radius-1);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  font-weight: var(--weight-regular);
+}
+
+.agent-feed-user-bubble .message-paragraph {
+  margin: 0;
+}
+
+/* --- Streaming cue: fixed box so the turn never jumps ----------------- */
+
+.agent-feed-stream-cue {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: var(--type-md-lh);
+  padding: var(--space-1) 0;
+}
+
+/* --- Status line ------------------------------------------------------ */
+
+.agent-feed-status-left {
+  min-width: 0;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* --- Empty feed state ------------------------------------------------- */
+
+.agent-feed-empty-hero {
+  max-width: 560px;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-4);
+}
+
+.agent-feed-empty-heading {
+  letter-spacing: var(--tracking-tight);
+}
+
+.agent-feed-empty-subline {
+  max-width: 44ch;
+  line-height: var(--type-md-lh);
+}
+
+/* --- Reduced motion --------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-feed-turn,
+  .agent-feed-stream-cue {
+    scroll-behavior: auto;
+  }
+}
+
+:root[data-reduced-motion='true'] .agent-feed-turn,
+:root[data-reduced-motion='true'] .agent-feed-stream-cue {
+  scroll-behavior: auto;
+}

@@ -34,13 +34,16 @@ import {
   Key,
   DirectSend,
   Search,
+  Paperclip,
+  FileText,
 } from '../../../components/icons';
 import { BorderBeam } from '../presence/BorderBeam';
 import { VoiceBeam } from '../presence/VoiceBeam';
-import type { Model } from '../../../bridge/bridge';
+import type { FileTreeNode, Model } from '../../../bridge/bridge';
 import type { PermissionMode, ReasoningEffort } from '../types';
 import { agentStore, getComposerGate, resolveModelId } from '../agent-store';
-import { activeEditorContext } from '../../editor/editor-store';
+import { activeEditorContext, editorStore } from '../../editor/editor-store';
+import './agent-attachments.css';
 
 export type AgentComposerProps = {
   inFlight: boolean;
@@ -136,6 +139,35 @@ function composerModeId(mode: PermissionMode): 'ask' | 'agent' | 'plan' {
   return 'agent';
 }
 
+/**
+ * Attachments are workspace-relative paths, not uploaded bytes. The backend
+ * contract is explicit: `editor_context` never carries file contents and the
+ * agent reads files itself with `read_file` (selora-protocol lib.rs). So the
+ * prompt names the files and the agent reads the same bytes its tools see.
+ */
+const MAX_ATTACHMENTS = 8;
+const ATTACHMENT_HEADER = 'Attached workspace files (read them with read_file before answering):';
+
+function flattenFileTree(node: FileTreeNode | null, out: string[] = []): string[] {
+  if (!node || out.length >= 5000) return out;
+  if (node.kind === 'file') out.push(node.path);
+  for (const child of node.children ?? []) flattenFileTree(child, out);
+  return out;
+}
+
+const ATTACHMENTS_ONLY_PROMPT = 'Please review the attached workspace files.';
+
+function composePrompt(text: string, attachments: readonly string[]): string {
+  if (attachments.length === 0) return text;
+  const intro = text.trim() ? text : ATTACHMENTS_ONLY_PROMPT;
+  return `${intro}\n\n${ATTACHMENT_HEADER}\n${attachments.map((path) => `- ${path}`).join('\n')}`;
+}
+
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 /** Provider label derived from the real backend model id (no fake metadata). */
 function describeModel(model: Model): ModelItem {
   const idLower = `${model.id} ${model.display_name}`.toLowerCase();
@@ -211,6 +243,43 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
   const [activeMenu, setActiveMenu] = useState<MenuType>(null);
   const [modelSearch, setModelSearch] = useState('');
   const [modelError, setModelError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<string[]>([]);
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachQuery, setAttachQuery] = useState('');
+
+  const editor = useSyncExternalStore(editorStore.subscribe, editorStore.getSnapshot);
+
+  const workspaceFiles = useMemo(() => {
+    const seen = new Set<string>();
+    const options: Array<{ path: string; name: string; open: boolean }> = [];
+    for (const tab of editor.tabs ?? []) {
+      if (!tab.path || seen.has(tab.path)) continue;
+      seen.add(tab.path);
+      options.push({ path: tab.path, name: tab.filename, open: true });
+    }
+    for (const path of flattenFileTree(editor.fileTree ?? null)) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      options.push({ path, name: baseName(path), open: false });
+    }
+    return options;
+  }, [editor.tabs, editor.fileTree]);
+
+  const filteredFiles = useMemo(() => {
+    const query = attachQuery.trim().toLowerCase();
+    const matches = query
+      ? workspaceFiles.filter((file) => file.path.toLowerCase().includes(query))
+      : workspaceFiles;
+    return matches.slice(0, 80);
+  }, [workspaceFiles, attachQuery]);
+
+  const toggleAttachment = useCallback((path: string) => {
+    setAttachments((current) => {
+      if (current.includes(path)) return current.filter((entry) => entry !== path);
+      if (current.length >= MAX_ATTACHMENTS) return current;
+      return [...current, path];
+    });
+  }, []);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -247,6 +316,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
         !containerRef.current.contains(e.target as Node)
       ) {
         setActiveMenu(null);
+        setAttachOpen(false);
       }
     };
     document.addEventListener('pointerdown', handleClickOutside);
@@ -285,30 +355,34 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
   const handleQueue = useCallback(() => {
     if (!gate.ready) return;
     const trimmed = text.trim();
-    if (!trimmed) return;
-    agentStore.queuePrompt(trimmed, permissionMode);
+    if (!trimmed && attachments.length === 0) return;
+    agentStore.queuePrompt(composePrompt(trimmed, attachments), permissionMode);
     setText('');
     setHistoryIndex(-1);
     setSavedDraft('');
     setActiveMenu(null);
-  }, [gate.ready, text, permissionMode]);
+    setAttachOpen(false);
+    setAttachments([]);
+  }, [gate.ready, text, permissionMode, attachments]);
 
   const handleSteer = useCallback(() => {
     if (!gate.ready) return;
     const trimmed = text.trim();
-    if (!trimmed) return;
-    agentStore.steerActiveTurn(trimmed);
+    if (!trimmed && attachments.length === 0) return;
+    agentStore.steerActiveTurn(composePrompt(trimmed, attachments));
     setText('');
     setHistoryIndex(-1);
     setSavedDraft('');
     setActiveMenu(null);
-  }, [gate.ready, text]);
+    setAttachOpen(false);
+    setAttachments([]);
+  }, [gate.ready, text, attachments]);
 
   const handleSubmit = useCallback(() => {
     if (inFlight) {
       if (!gate.ready) return;
       const trimmed = text.trim();
-      if (trimmed) {
+      if (trimmed || attachments.length > 0) {
         handleQueue();
       } else {
         agentStore.stopActiveTurn();
@@ -317,15 +391,18 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
     }
     if (!gate.ready) return;
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed && attachments.length === 0) return;
+    const prompt = composePrompt(trimmed, attachments);
     const context = activeEditorContext();
-    if (context) agentStore.sendUserMessage(trimmed, false, context);
-    else agentStore.sendUserMessage(trimmed);
+    if (context) agentStore.sendUserMessage(prompt, false, context);
+    else agentStore.sendUserMessage(prompt);
     setText('');
     setHistoryIndex(-1);
     setSavedDraft('');
     setActiveMenu(null);
-  }, [inFlight, gate.ready, text, handleQueue]);
+    setAttachOpen(false);
+    setAttachments([]);
+  }, [inFlight, gate.ready, text, attachments, handleQueue]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter') {
@@ -343,7 +420,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
       }
       if (inFlight) {
         if (!gate.ready) return;
-        if (text.trim()) {
+        if (text.trim() || attachments.length > 0) {
           handleQueue();
         } else {
           agentStore.stopActiveTurn();
@@ -459,6 +536,26 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
           );
         })}
       </div>
+
+      {/* 2b. Attached workspace files. Paths only: the agent reads them. */}
+      {attachments.length > 0 && (
+        <div className="agent-attach-chips" role="list" aria-label="Attached files">
+          {attachments.map((path) => (
+            <span className="agent-attach-chip" role="listitem" key={path} title={path}>
+              <FileText size={11} aria-hidden="true" />
+              <span className="agent-attach-chip-name">{baseName(path)}</span>
+              <button
+                type="button"
+                className="agent-attach-chip-remove"
+                aria-label={`Remove attachment ${baseName(path)}`}
+                onClick={() => toggleAttachment(path)}
+              >
+                <X size={10} aria-hidden="true" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* 3. Smooth Auto-Expanding Text Input Area */}
       <div className="composer-input-row" style={{ position: 'relative' }}>
@@ -709,9 +806,91 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
         </div>
       )}
 
+      {/* 4b. Workspace file picker. Only real tree entries and open tabs. */}
+      {attachOpen && (
+        <div
+          className="agent-attach-menu"
+          role="dialog"
+          aria-label="Attach workspace files"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              event.stopPropagation();
+              setAttachOpen(false);
+            }
+          }}
+        >
+          <div className="agent-attach-menu-head">
+            <span className="agent-attach-menu-title">Attach workspace files</span>
+            <span className="agent-attach-menu-count">
+              {attachments.length}/{MAX_ATTACHMENTS}
+            </span>
+          </div>
+          <input
+            className="agent-attach-search"
+            value={attachQuery}
+            onChange={(event) => setAttachQuery(event.target.value)}
+            placeholder="Search workspace files…"
+            aria-label="Search workspace files"
+            autoFocus
+          />
+          <div className="agent-attach-list" role="listbox" aria-label="Workspace files" aria-multiselectable="true">
+            {workspaceFiles.length === 0 ? (
+              <p className="agent-attach-empty">Open a folder to attach workspace files.</p>
+            ) : filteredFiles.length === 0 ? (
+              <p className="agent-attach-empty">No files match “{attachQuery.trim()}”.</p>
+            ) : (
+              filteredFiles.map((file) => {
+                const selected = attachments.includes(file.path);
+                const atLimit = !selected && attachments.length >= MAX_ATTACHMENTS;
+                return (
+                  <button
+                    key={file.path}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    className={`agent-attach-file${selected ? ' is-selected' : ''}`}
+                    title={file.path}
+                    disabled={atLimit}
+                    onClick={() => toggleAttachment(file.path)}
+                  >
+                    <FileText size={12} className="agent-attach-file-icon" aria-hidden="true" />
+                    <span className="agent-attach-file-name">{file.name}</span>
+                    <span className="agent-attach-file-path">{file.path}</span>
+                    {file.open && <span className="agent-attach-file-open">open</span>}
+                    {selected && <Check size={12} className="agent-attach-file-check" aria-hidden="true" />}
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+
       {/* 5. Bottom Toolbar */}
       <div className="composer-toolbar">
         <div className="toolbar-left">
+          {/* Attach workspace files. Paths only, read by the agent's tools. */}
+          <button
+            type="button"
+            className={`composer-pill attach-pill${attachOpen ? ' is-open' : ''}`}
+            onClick={() => setAttachOpen((open) => !open)}
+            disabled={workspaceFiles.length === 0}
+            title={
+              workspaceFiles.length === 0
+                ? 'Open a folder to attach workspace files'
+                : 'Attach workspace files for this prompt'
+            }
+            aria-label="Attach workspace files"
+            aria-haspopup="dialog"
+            aria-expanded={attachOpen}
+          >
+            <Paperclip size={13} />
+            <span className="pill-text">Attach</span>
+            {attachments.length > 0 && (
+              <span className="agent-attach-count">{attachments.length}</span>
+            )}
+          </button>
+
           {/* Permission Mode pill (ZCode V4ComposerModeControls) */}
           <button
             type="button"
@@ -793,7 +972,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
           </button>
 
           {/* In-Flight Actions vs Send/Stop Button */}
-          {inFlight && text.trim() ? (
+          {inFlight && (text.trim() || attachments.length > 0) ? (
             <div className="composer-inflight-actions-group">
               {/* Steer button (Ctrl+Enter) */}
               <button
@@ -837,7 +1016,7 @@ export const AgentComposer: React.FC<AgentComposerProps> = ({
             <button
               type="button"
               className={`composer-send-btn ${inFlight ? 'is-stop' : ''} ${
-                text.trim() && gate.ready ? 'has-text' : ''
+                (text.trim() || attachments.length > 0) && gate.ready ? 'has-text' : ''
               } ${sendBlocked ? 'is-blocked' : ''}`}
               onClick={handleSubmit}
               disabled={sendBlocked}

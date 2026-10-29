@@ -73,6 +73,8 @@ export type AgentToolCall = {
   argsRaw?: Record<string, unknown>;
   status: ToolCallStatus;
   approvalId?: string;
+  /** A background child's card never inherits the parent's auto-approval. */
+  backgroundChild?: boolean;
   resultSummary?: string;
   diff?: DiffStat;
   exitCode?: number;
@@ -122,7 +124,10 @@ export type AgentTodo = {
   assignedSubagent?: string;
 };
 
-export type SubagentStatus = 'working' | 'idle' | 'done' | 'failed';
+export type SubagentStatus = 'working' | 'idle' | 'done' | 'failed' | 'cancelled';
+
+/** The live child state reported by `subagent_activity.state_changed`. */
+export type SubagentLiveState = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
 
 export type SubagentArtifact = {
   kind: string;
@@ -145,6 +150,16 @@ export type SubagentInfo = {
   artifacts?: SubagentArtifact[];
   /** True until the user opens the parent session/result. */
   unread?: boolean;
+  /** Child mission/answer/tool transcript grouped under the parent. */
+  messages?: ChatMessage[];
+  /** The child's own task prompt (from `subagent_activity.started`). */
+  mission?: string;
+  /** Live run state reported by the backend for a working child. */
+  state?: SubagentLiveState;
+  /** The tool currently running in the child, when any. */
+  activeTool?: string;
+  startedAt?: number;
+  completedAt?: number;
 };
 
 export type ArtifactKind = 'doc' | 'code' | 'diff' | 'diagram';

@@ -1,0 +1,140 @@
+.agent-sessiontabs-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  min-height: var(--space-6);
+  border-bottom: var(--border-hairline);
+  background: var(--ink-low);
+}
+
+.agent-sessiontabs-list {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--hairline) 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink-hi) transparent;
+}
+
+.agent-sessiontabs-empty {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0 var(--space-1);
+  color: var(--fg-faint);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  white-space: nowrap;
+}
+
+.agent-sessiontabs-list .agent-sessiontabs-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: calc(var(--space-6) * 6);
+  height: var(--space-5);
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid transparent;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  cursor: pointer;
+}
+
+.agent-sessiontabs-list .agent-sessiontabs-tab:hover {
+  background: var(--ink-faint);
+  border-color: var(--ink-hi);
+  color: var(--fg-default);
+}
+
+.agent-sessiontabs-list .agent-sessiontabs-tab.is-active {
+  background: var(--ink-mid);
+  border-color: var(--ink-rule);
+  color: var(--fg-bright);
+  font-weight: var(--weight-medium);
+}
+
+.agent-sessiontabs-tab .agent-sessiontabs-dot {
+  width: var(--space-1);
+  height: var(--space-1);
+  flex: none;
+  border-radius: var(--radius-pill);
+  background: var(--fg-faint);
+}
+
+.agent-sessiontabs-tab .agent-sessiontabs-dot.is-running {
+  background: var(--ok);
+}
+
+.agent-sessiontabs-tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-sessiontabs-strip .agent-sessiontabs-add {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  margin-left: auto;
+  height: var(--space-5);
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid transparent;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.agent-sessiontabs-strip .agent-sessiontabs-add:hover:not(:disabled) {
+  background: var(--ink-faint);
+  border-color: var(--ink-hi);
+  color: var(--fg-default);
+}
+
+.agent-sessiontabs-strip .agent-sessiontabs-add:disabled {
+  border-color: var(--ink-hi);
+  background: var(--ink-faint);
+  color: var(--fg-faint);
+  cursor: progress;
+}
+
+.agent-sessiontabs-error {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: var(--space-1) var(--space-1) 0;
+  color: var(--err);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .agent-sessiontabs-strip .agent-sessiontabs-add > span {
+    display: none;
+  }
+
+  .agent-sessiontabs-strip .agent-sessiontabs-add {
+    padding: 0 var(--space-2);
+  }
+
+  .agent-sessiontabs-list .agent-sessiontabs-tab {
+    max-width: calc(var(--space-6) * 4);
+  }
+}

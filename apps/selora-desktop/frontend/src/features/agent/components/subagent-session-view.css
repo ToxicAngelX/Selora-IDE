@@ -1,0 +1,78 @@
+.subagent-session-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.subagent-session-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--ink-hi);
+  font-size: 12px;
+}
+
+.subagent-session-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--ink-hi);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--fg-default);
+  font: inherit;
+  cursor: pointer;
+}
+.subagent-session-back:hover { background: var(--surface-hover); }
+.subagent-session-back:focus-visible { outline: 2px solid var(--fg-default); outline-offset: 1px; }
+
+.subagent-session-identity { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
+.subagent-session-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 28ch; }
+.subagent-session-id { color: var(--fg-muted); font-size: 11px; overflow-wrap: anywhere; }
+.subagent-session-policy {
+  padding: 2px 6px;
+  border: 1px solid var(--ink-hi);
+  border-radius: 5px;
+  font-size: 11px;
+}
+.subagent-session-status { margin-left: auto; font-size: 11px; color: var(--fg-muted); }
+.subagent-session-status.is-live { color: var(--fg-default); }
+.subagent-session-status.is-failed { color: var(--err); }
+.subagent-session-status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: middle;
+}
+
+.subagent-session-active-tool,
+.subagent-session-terminal-note,
+.subagent-session-error,
+.subagent-session-empty {
+  margin: 8px 12px 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.subagent-session-active-tool { color: var(--fg-muted); }
+.subagent-session-error { color: var(--err); white-space: pre-wrap; }
+.subagent-session-terminal-note { color: var(--fg-muted); white-space: pre-wrap; }
+
+.subagent-session-feed { flex: 1; min-height: 0; overflow: hidden; }
+.subagent-session-feed .feed-messages-list { overflow-y: auto; }
+.subagent-session-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.subagent-session-thinking-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }

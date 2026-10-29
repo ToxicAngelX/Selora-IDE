@@ -1617,6 +1617,66 @@ pub struct SubagentArtifactDto {
     pub path: String,
 }
 
+/// Live state of a child conversation, mirrored from its own turn loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRunState {
+    Thinking,
+    RunningTool,
+    AwaitingApproval,
+    Done,
+}
+
+/// One live event from a child conversation. `parent_session_id` scopes the
+/// view; `child_id` is the stable child-session key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentActivityDto {
+    Started {
+        child_id: String,
+        parent_session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        policy: SubagentPolicyDto,
+        mission: String,
+    },
+    Delta {
+        child_id: String,
+        parent_session_id: SessionId,
+        message_id: String,
+        sequence: u64,
+        text: String,
+    },
+    ToolCallStarted {
+        child_id: String,
+        parent_session_id: SessionId,
+        call_id: String,
+        tool_name: String,
+        args_json: String,
+    },
+    ToolResult {
+        child_id: String,
+        parent_session_id: SessionId,
+        call_id: String,
+        result_summary: String,
+        is_err: bool,
+    },
+    StateChanged {
+        child_id: String,
+        parent_session_id: SessionId,
+        state: SubagentRunState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+    },
+}
+
+/// Cancellation is a lifecycle signal, never a successful child result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCancelledDto {
+    pub child_id: String,
+    pub parent_session_id: SessionId,
+}
+
 /// A background subagent's one terminal result.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubagentCompletedDto {
@@ -2061,6 +2121,10 @@ pub enum FrontendEvent {
     /// Phase 9e: one background child reached a terminal result. Keyed by
     /// `child_id`; never emitted for a cancelled child.
     SubagentCompleted(SubagentCompletedDto),
+    /// One live step of a child conversation, keyed by `child_id`.
+    SubagentActivity(SubagentActivityDto),
+    /// One running child was cancelled; closes its UI without a result.
+    SubagentCancelled(SubagentCancelledDto),
     DiagnosticsChanged(Vec<DiagnosticDto>),
     /// P1: one language server changed lifecycle (starting/ready/failed).
     /// `failed` carries a truthful, typed reason for the UI.
@@ -3030,6 +3094,35 @@ mod tests {
             .unwrap(),
             r#"{"type":"agent_turn_done","payload":{"request_id":"request-1","session_id":"session-1","turn_id":"turn-1","total_tokens":12400,"cost_usd":0.041,"num_tools":6,"approved":3,"denied":1,"completed":true,"end_message":"agent turn complete"}}"#
         );
+    }
+    #[test]
+    fn subagent_activity_keeps_child_transcript_separate() {
+        let event = FrontendEvent::SubagentActivity(SubagentActivityDto::ToolCallStarted {
+            child_id: "child-1".into(),
+            parent_session_id: sid("session-1"),
+            call_id: "call-1".into(),
+            tool_name: "read_file".into(),
+            args_json: r#"{"path":"src/lib.rs"}"#.into(),
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"subagent_activity","payload":{"kind":"tool_call_started","child_id":"child-1","parent_session_id":"session-1","call_id":"call-1","tool_name":"read_file","args_json":"{\"path\":\"src/lib.rs\"}"}}"#
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
+    }
+    #[test]
+    fn subagent_cancellation_is_a_lifecycle_event_not_a_result() {
+        let event = FrontendEvent::SubagentCancelled(SubagentCancelledDto {
+            child_id: "child-1".into(),
+            parent_session_id: sid("session-1"),
+        });
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"subagent_cancelled","payload":{"child_id":"child-1","parent_session_id":"session-1"}}"#
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<FrontendEvent>(&json).unwrap(), event);
     }
     #[test]
     fn phase_9e_subagent_completion_wire_shape_is_stable() {

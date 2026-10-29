@@ -146,8 +146,7 @@ pub async fn check_latest_release_at(url: &str, current: &str) -> Result<Release
         .tag_name
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
-    let installer_name = format!("Selora-IDE-Setup-{version}.exe");
-    let checksum_name = format!("{installer_name}.sha256");
+    let legacy_installer_name = format!("Selora-IDE-Setup-{version}.exe");
     let asset = |name: &str| {
         release
             .assets
@@ -155,11 +154,17 @@ pub async fn check_latest_release_at(url: &str, current: &str) -> Result<Release
             .find(|candidate| candidate.name == name)
             .map(|candidate| candidate.clone().into_asset())
     };
+    let installer_name = if asset(&legacy_installer_name).is_some() {
+        legacy_installer_name.as_str()
+    } else {
+        "selora-installer-v1.exe"
+    };
+    let checksum_name = format!("{installer_name}.sha256");
     Ok(ReleaseInfo {
         tag: release.tag_name,
         html_url: release.html_url,
         newer,
-        installer: asset(&installer_name),
+        installer: asset(installer_name),
         checksum: asset(&checksum_name),
     })
 }
@@ -415,6 +420,25 @@ mod tests {
             .expect("checksum asset")
             .name
             .ends_with(".exe.sha256"));
+    }
+
+    #[tokio::test]
+    async fn a_release_exposes_the_fixed_installer_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "v0.2.0",
+                "html_url": "https://github.com/x/y/releases/tag/v0.2.0",
+                "assets": [
+                    { "name": "selora-installer-v1.exe", "browser_download_url": "https://example.invalid/setup.exe", "size": 1234 },
+                    { "name": "selora-installer-v1.exe.sha256", "browser_download_url": "https://example.invalid/setup.sha256", "size": 90 }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let info = check_latest_release_at(&server.uri(), "0.1.0").await.expect("ok");
+        assert_eq!(info.installer.unwrap().name, "selora-installer-v1.exe");
+        assert_eq!(info.checksum.unwrap().name, "selora-installer-v1.exe.sha256");
     }
 
     #[test]

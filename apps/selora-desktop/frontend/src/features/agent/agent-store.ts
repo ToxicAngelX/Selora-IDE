@@ -16,6 +16,8 @@ import type {
   ReasoningEffort,
   ResumableAgentSession,
   SubagentInfo,
+  SubagentLiveState,
+  SubagentStatus,
   ThinkingState,
   TodoStatus,
   AgentMetrics,
@@ -48,6 +50,7 @@ import {
   type PlanApproval,
   type PlanPhase,
   type PlanStateChangedPayload,
+  type SubagentActivityPayload,
   type SubagentCompletedPayload,
   type TodoItem,
   type TodosChangedPayload,
@@ -87,6 +90,8 @@ export type AgentState = {
   unreadSubagentCount: number;
   /** Phase 9e: the child whose result the UI should reveal (click hook). */
   revealedSubagentId: string | null;
+  /** Child transcript open in the dock; valid only under activeSessionId. */
+  activeSubagentId: string | null;
   artifacts: ArtifactItem[];
   inFlight: boolean;
   thinkingState: ThinkingState;
@@ -206,6 +211,7 @@ let state: AgentState = {
   subagents: [],
   unreadSubagentCount: 0,
   revealedSubagentId: null,
+  activeSubagentId: null,
   artifacts: [],
   inFlight: false,
   thinkingState: 'breathing',
@@ -364,14 +370,24 @@ function updateToolCallCard(
   approvalId: string,
   update: Partial<AgentToolCall>,
 ): void {
+  const apply = (messages: ChatMessage[]) => messages.map((message) => ({
+    ...message,
+    toolCalls: message.toolCalls?.map((call) =>
+      call.approvalId === approvalId ? { ...call, ...update } : call,
+    ),
+  }));
+  // A child approval is mirrored in both transcripts: the parent's awareness
+  // card and the child's own card share one decision/status.
   state = {
     ...state,
-    messages: state.messages.map((message) => ({
-      ...message,
-      toolCalls: message.toolCalls?.map((call) =>
-        call.approvalId === approvalId ? { ...call, ...update } : call,
-      ),
-    })),
+    messages: apply(state.messages),
+    subagents: state.subagents.map((child) =>
+      child.messages?.some((message) =>
+        message.toolCalls?.some((call) => call.approvalId === approvalId),
+      )
+        ? { ...child, messages: apply(child.messages) }
+        : child,
+    ),
   };
   notify();
 }
@@ -423,6 +439,261 @@ const completedSubagentIds = new Set<string>();
 
 function countUnreadSubagents(subagents: SubagentInfo[]): number {
   return subagents.reduce((count, subagent) => (subagent.unread ? count + 1 : count), 0);
+}
+
+const SUBAGENT_NAME_MAX = 48;
+
+/**
+ * A child's display name comes from the backend's `started.name`, else the
+ * first non-empty mission line collapsed to one line, else a stable id suffix.
+ */
+export function subagentDisplayName(
+  name: string | null | undefined,
+  mission: string | null | undefined,
+  childId: string,
+): string {
+  const explicit = name?.trim();
+  if (explicit) return explicit;
+  const firstLine = mission
+    ?.split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .find((line) => line.length > 0);
+  if (firstLine) {
+    return firstLine.length > SUBAGENT_NAME_MAX
+      ? `${firstLine.slice(0, SUBAGENT_NAME_MAX - 1).trimEnd()}…`
+      : firstLine;
+  }
+  return `Subagent ${childId.slice(-8)}`;
+}
+
+/** A completion must keep a started name, not downgrade to `<id>`. */
+function meaningfulSubagentName(child: SubagentInfo | undefined): string | null {
+  if (!child) return null;
+  const name = child.name?.trim();
+  if (!name || name === child.id || name === `subagent-${child.id}`) return null;
+  return name;
+}
+
+function isTerminalChildStatus(status: SubagentStatus): boolean {
+  return status === 'done' || status === 'failed' || status === 'cancelled';
+}
+
+function finalizeChildMessages(
+  messages: ChatMessage[] | undefined,
+  status: 'complete' | 'error',
+): ChatMessage[] | undefined {
+  return messages?.map((message) =>
+    message.role === 'assistant' && message.status === 'streaming'
+      ? { ...message, status }
+      : message,
+  );
+}
+
+function subagentFallback(childId: string, parentSessionId: string): SubagentInfo {
+  return {
+    id: childId,
+    name: subagentDisplayName(undefined, undefined, childId),
+    model: 'Auto',
+    status: 'working',
+    parentSessionId,
+    startedAt: Date.now(),
+  };
+}
+
+/** Child activity is kept in its own ledger; the parent transcript is untouched. */
+function updateChildSubagent(
+  childId: string,
+  parentSessionId: string,
+  update: (child: SubagentInfo) => SubagentInfo,
+): void {
+  const knownParent = parentSessionId === state.activeSessionId ||
+    state.sessions.some((session) => session.id === parentSessionId);
+  if (!parentSessionId || !knownParent) return;
+  const existing = state.subagents.find((child) => child.id === childId);
+  const base = existing ?? subagentFallback(childId, parentSessionId);
+  const updated = update({ ...base, parentSessionId });
+  const subagents = existing
+    ? state.subagents.map((child) => (child.id === childId ? updated : child))
+    : [...state.subagents, updated];
+  state = { ...state, subagents, unreadSubagentCount: countUnreadSubagents(subagents) };
+}
+
+function activeChildStillBelongs(
+  childId: string | null,
+  activeSessionId: string,
+  subagents: SubagentInfo[],
+): string | null {
+  if (!childId) return null;
+  const child = subagents.find((entry) => entry.id === childId);
+  return child && child.parentSessionId === activeSessionId ? childId : null;
+}
+
+/** Derive the same compact tool target the parent transcript shows. */
+function summarizeToolArgs(argsJson: string, toolName: string): {
+  argsSummary: string;
+  argsRaw?: Record<string, unknown>;
+} {
+  let argsRaw: Record<string, unknown> | undefined;
+  try {
+    const parsed: unknown = JSON.parse(argsJson);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      argsRaw = parsed as Record<string, unknown>;
+      if ('path' in argsRaw) return { argsSummary: String(argsRaw.path), argsRaw };
+      if ('command' in argsRaw) return { argsSummary: String(argsRaw.command), argsRaw };
+      if ('query' in argsRaw) return { argsSummary: String(argsRaw.query), argsRaw };
+      return { argsSummary: JSON.stringify(argsRaw), argsRaw };
+    }
+  } catch {
+    // Not JSON: the raw argument text is the honest summary.
+  }
+  return { argsSummary: argsJson || toolName, ...(argsRaw ? { argsRaw } : {}) };
+}
+
+type ChildApprovalTarget = { childId: string; toolName: string };
+
+/** HEAD's child approval carries `subagent_id`; older payloads tag the tool. */
+function childApprovalTarget(payload: ApprovalNeededPayload): ChildApprovalTarget | null {
+  if (payload.subagent_id?.trim()) {
+    return {
+      childId: payload.subagent_id.trim(),
+      toolName: payload.tool_name.replace(/^Subagent\s*\[[^\]]+\]\s*:\s*/i, '').trim() || payload.tool_name,
+    };
+  }
+  const match = payload.tool_name.match(/^Subagent\s*\[([^\]]+)\]\s*:\s*(.+)$/i);
+  if (!match || !match[1]?.trim()) return null;
+  return { childId: match[1].trim(), toolName: match[2]!.trim() || payload.tool_name };
+}
+
+/** Append to the child's last assistant message, or open one for this activity. */
+function withChildAssistant(
+  child: SubagentInfo,
+  childId: string,
+  update: (message: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  const messages = [...(child.messages ?? [])];
+  const lastIndex = messages.length - 1;
+  if (lastIndex >= 0 && messages[lastIndex]?.role === 'assistant') {
+    messages[lastIndex] = update(messages[lastIndex]!);
+    return messages;
+  }
+  messages.push(update({
+    id: `subagent-${childId}-assistant`,
+    role: 'assistant',
+    content: '',
+    status: 'streaming',
+    timestamp: Date.now(),
+    toolCalls: [],
+  }));
+  return messages;
+}
+
+/**
+ * A child approval follows the child's `tool_call_started`. Upgrade that live
+ * running card in place so its `call_id` still receives the later result; a
+ * missing live card becomes a new approval card. The parent's awareness card
+ * is appended by `handleApprovalNeeded` independently.
+ */
+function attachChildApprovalCard(
+  payload: ApprovalNeededPayload,
+  target: ChildApprovalTarget,
+): void {
+  childApprovalOwners.set(payload.approval_id, {
+    childId: target.childId,
+    parentSessionId: payload.session_id,
+  });
+  const approvalCall: WorkflowToolCall = {
+    id: `call_appr_${payload.approval_id}`,
+    toolName: target.toolName,
+    argsSummary: payload.plan?.summary || payload.path_or_command,
+    status: 'needs_approval',
+    approvalId: payload.approval_id,
+    backgroundChild: true,
+    workflow: payload.workflow,
+    decisionPrompt: payload.prompt,
+    plan: payload.plan,
+    diff: !payload.workflow && !payload.plan && payload.diff_or_input
+      ? { added: 1, removed: 0, hunks: [payload.diff_or_input] }
+      : undefined,
+    startedAt: Date.now(),
+  };
+  updateChildSubagent(target.childId, payload.session_id, (child) => {
+    const messages = [...(child.messages ?? [])];
+    // A replayed approval updates the existing card, never duplicates it.
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index]!;
+      if (!message.toolCalls?.some((call) => call.approvalId === payload.approval_id)) continue;
+      messages[index] = {
+        ...message,
+        toolCalls: message.toolCalls.map((call) =>
+          call.approvalId === payload.approval_id ? { ...call, ...approvalCall, id: call.id } : call,
+        ),
+      };
+      return {
+        ...child,
+        messages,
+        status: 'working',
+        state: 'awaiting_approval',
+        activeTool: target.toolName,
+        activeStep: `Awaiting approval: ${target.toolName}`,
+      };
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index]!;
+      if (message.role !== 'assistant') continue;
+      const calls = message.toolCalls ?? [];
+      const runningIndex = calls.reduce(
+        (found, call, callIndex) =>
+          call.toolName === target.toolName && call.status === 'running' && !call.approvalId
+            ? callIndex
+            : found,
+        -1,
+      );
+      if (runningIndex < 0) continue;
+      const running = calls[runningIndex]!;
+      messages[index] = {
+        ...message,
+        toolCalls: calls.map((call, callIndex) =>
+          callIndex === runningIndex
+            ? { ...running, ...approvalCall, id: running.id, startedAt: running.startedAt }
+            : call,
+        ),
+      };
+      return {
+        ...child,
+        messages,
+        status: 'working',
+        state: 'awaiting_approval',
+        activeTool: target.toolName,
+        activeStep: `Awaiting approval: ${target.toolName}`,
+      };
+    }
+    const lastIndex = messages.length - 1;
+    if (lastIndex >= 0 && messages[lastIndex]?.role === 'assistant') {
+      const message = messages[lastIndex]!;
+      messages[lastIndex] = {
+        ...message,
+        toolCalls: [...(message.toolCalls ?? []), approvalCall],
+      };
+    } else {
+      messages.push({
+        id: `subagent-${target.childId}-approval`,
+        role: 'assistant',
+        content: '',
+        status: 'streaming',
+        timestamp: Date.now(),
+        toolCalls: [approvalCall],
+      });
+    }
+    return {
+      ...child,
+      messages,
+      status: 'working',
+      state: 'awaiting_approval',
+      activeTool: target.toolName,
+      activeStep: `Awaiting approval: ${target.toolName}`,
+    };
+  });
+  notify();
 }
 
 /**
@@ -530,12 +801,15 @@ type SessionView = Pick<AgentState, 'messages' | 'todos' | 'plan' | 'planPhase' 
 const sessionViews = new Map<string, SessionView>();
 let routingSessionEvent = false;
 
-function selectSessionView(sessionId: string) {
+function selectSessionView(sessionId: string, clearChildSelection = false) {
   const view = sessionViews.get(sessionId);
   activeRequestId = view?.requestId ?? null;
   state = {
     ...state,
     activeSessionId: sessionId,
+    activeSubagentId: clearChildSelection
+      ? activeChildStillBelongs(state.activeSubagentId, sessionId, state.subagents)
+      : state.activeSubagentId,
     messages: view?.messages ?? state.transcripts[sessionId] ?? [],
     todos: view?.todos ?? state.todosBySession[sessionId] ?? [],
     plan: view?.plan ?? null,
@@ -556,6 +830,8 @@ function selectSessionView(sessionId: string) {
  * would silently lose the decision.
  */
 const pendingApprovalRequests = new Map<string, string>();
+/** Which child (and its parent session) owns a parked child approval card. */
+const childApprovalOwners = new Map<string, { childId: string; parentSessionId: string }>();
 
 type WorkflowConfirmation = {
   requestId: string;
@@ -567,6 +843,47 @@ type WorkflowConfirmation = {
 };
 const workflowConfirmations = new Map<string, WorkflowConfirmation>();
 const terminalRequests = new Set<string>();
+
+/**
+ * A finished child can no longer answer its parked cards. Close the child
+ * transcript's cards (and the parent awareness copies) truthfully.
+ */
+function closeChildApprovalCards(childId: string, sessionId: string, reason: string): void {
+  terminalRequests.add(childId);
+  const approvals = new Set([...pendingApprovalRequests]
+    .filter(([, request]) => request === childId).map(([approval]) => approval));
+  for (const [approval, owner] of childApprovalOwners) {
+    if (owner.childId === childId) approvals.add(approval);
+  }
+  for (const approval of approvals) {
+    pendingApprovalRequests.delete(approval);
+    childApprovalOwners.delete(approval);
+  }
+  if (approvals.size === 0) return;
+  const update = (messages: ChatMessage[]) => messages.map((message) => ({
+    ...message,
+    toolCalls: message.toolCalls?.map((call) =>
+      call.approvalId && approvals.has(call.approvalId) && call.status === 'needs_approval'
+        ? { ...call, status: 'denied' as const, decisionSubmitting: false, resultSummary: reason }
+        : call),
+  }));
+  const view = sessionViews.get(sessionId);
+  if (view) sessionViews.set(sessionId, { ...view, messages: update(view.messages) });
+  const subagents = state.subagents.map((child) => {
+    if (child.id !== childId || !child.messages?.some((message) =>
+      message.toolCalls?.some((call) => call.approvalId && approvals.has(call.approvalId)),
+    )) return child;
+    return { ...child, messages: update(child.messages), activeTool: undefined };
+  });
+  state = {
+    ...state,
+    subagents,
+    messages: state.activeSessionId === sessionId ? update(state.messages) : state.messages,
+    transcripts: Object.prototype.hasOwnProperty.call(state.transcripts, sessionId)
+      ? { ...state.transcripts, [sessionId]: update(state.transcripts[sessionId] ?? []) }
+      : state.transcripts,
+  };
+}
 
 function updateWorkflowConfirmationCard(approvalId: string, update: Partial<WorkflowToolCall>) {
   state = {
@@ -730,7 +1047,12 @@ function notify() {
 }
 
 function findApprovalCard(approvalId: string): AgentToolCall | undefined {
-  return state.messages
+  const parent = state.messages
+    .flatMap((message) => message.toolCalls ?? [])
+    .find((call) => call.approvalId === approvalId);
+  if (parent) return parent;
+  return state.subagents
+    .flatMap((child) => child.messages ?? [])
     .flatMap((message) => message.toolCalls ?? [])
     .find((call) => call.approvalId === approvalId);
 }
@@ -817,6 +1139,7 @@ export const agentStore = {
     if (context && (context.workspace_id !== bootstrap.workspace.id || context.core_instance_id !== bootstrap.core_instance_id)) {
       sessionViews.clear();
       pendingApprovalRequests.clear();
+      childApprovalOwners.clear();
       workflowConfirmations.clear();
       completedSubagentIds.clear();
       state = { ...state, transcripts: {}, todosBySession: {}, messages: [], subagents: [], artifacts: [] };
@@ -1027,6 +1350,21 @@ const activeSessionId =
       }
     }
 
+    // A child is only meaningful under a session this snapshot still knows.
+    // Their transcripts stay in `subagents[].messages`; they never merge into
+    // `transcripts`/`messages`.
+    const validParents = new Set(
+      [...sessions.map((session) => session.id), activeSessionId].filter(Boolean),
+    );
+    const subagents = state.subagents.filter(
+      (child) => Boolean(child.parentSessionId) && validParents.has(child.parentSessionId!),
+    );
+    const activeSubagentId = activeChildStillBelongs(
+      state.activeSubagentId,
+      activeSessionId,
+      subagents,
+    );
+
     state = {
       ...state,
       availableModels: models,
@@ -1037,6 +1375,9 @@ const activeSessionId =
       todosBySession,
       messages: transcripts[activeSessionId] ?? [],
       resumableSessions,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+      activeSubagentId,
       activeSessionId,
       permissionMode: activeSessionId === previousSessionId ? state.permissionMode : DEFAULT_PERMISSION_MODE,
       todos: hydratedTodos,
@@ -1078,6 +1419,7 @@ const activeSessionId =
     context = null;
     activeRequestId = null;
     pendingApprovalRequests.clear();
+    childApprovalOwners.clear();
     workflowConfirmations.clear();
     terminalRequests.clear();
     completedSubagentIds.clear();
@@ -1094,6 +1436,7 @@ const activeSessionId =
       subagents: [],
       unreadSubagentCount: 0,
       revealedSubagentId: null,
+      activeSubagentId: null,
       inFlight: false,
       thinkingState: 'breathing',
       permissionMode: DEFAULT_PERMISSION_MODE,
@@ -1179,6 +1522,7 @@ const activeSessionId =
       ...state,
       sessions: [newSession, ...state.sessions],
       activeSessionId: newId,
+      activeSubagentId: null,
       messages: [],
       transcripts: { ...state.transcripts, [newId]: [] },
       todosBySession: { ...state.todosBySession, [newId]: [] },
@@ -1236,7 +1580,7 @@ const activeSessionId =
    */
   selectSessionLocally(sessionId: string) {
     if (state.activeSessionId === sessionId) return;
-    selectSessionView(sessionId);
+    selectSessionView(sessionId, true);
     notify();
   },
 
@@ -1270,7 +1614,7 @@ const activeSessionId =
     notify();
     try {
       await switchSessionCommand(sessionId, ctx);
-      selectSessionView(sessionId);
+      selectSessionView(sessionId, true);
       state = {
         ...state,
         activeSessionId: sessionId,
@@ -1354,6 +1698,169 @@ const activeSessionId =
   },
 
   /**
+   * Live child activity. Every branch writes only the child ledger; the
+   * parent's `messages`/`transcripts` are never touched. Late activity may
+   * arrive before `started`, so the child is upserted onto its named parent.
+   */
+  handleSubagentActivity(payload: SubagentActivityPayload): void {
+    const { child_id, parent_session_id } = payload;
+    if (payload.kind !== 'started' && completedSubagentIds.has(child_id)) return;
+
+    switch (payload.kind) {
+      case 'started': {
+        const existing = state.subagents.find((child) => child.id === child_id);
+        const mission = payload.mission ?? '';
+        const derivedName = subagentDisplayName(payload.name, mission, child_id);
+        const hasFreshName = Boolean(payload.name?.trim() || mission.trim());
+        const name = hasFreshName
+          ? derivedName
+          : meaningfulSubagentName(existing) ?? derivedName;
+        const existingMessages = existing?.messages ?? [];
+        const missionId = `subagent-${child_id}-mission`;
+        const missionMessage: ChatMessage = {
+          id: missionId,
+          role: 'user',
+          content: mission,
+          status: 'complete',
+          timestamp: existing?.startedAt ?? Date.now(),
+        };
+        const messages = mission
+          ? existingMessages.some((message) => message.id === missionId)
+            ? existingMessages.map((message) =>
+                message.id === missionId ? { ...message, content: mission } : message)
+            : [missionMessage, ...existingMessages]
+          : existingMessages;
+        updateChildSubagent(child_id, parent_session_id, (child) => ({
+          ...child,
+          name,
+          mission: mission || child.mission,
+          policy: payload.policy,
+          model: child.model || 'Auto',
+          status: isTerminalChildStatus(child.status) ? child.status : 'working',
+          state: child.state ?? (isTerminalChildStatus(child.status) ? 'done' : 'thinking'),
+          startedAt: child.startedAt ?? Date.now(),
+          unread: isTerminalChildStatus(child.status) ? child.unread : false,
+          messages,
+        }));
+        break;
+      }
+      case 'delta': {
+        updateChildSubagent(child_id, parent_session_id, (child) => {
+          if (isTerminalChildStatus(child.status)) return child;
+          const messages = [...(child.messages ?? [])];
+          const index = messages.findIndex((message) => message.id === payload.message_id);
+          if (index >= 0) {
+            const message = messages[index]!;
+            messages[index] = {
+              ...message,
+              content: message.content + payload.text,
+              // A streamed message stays streamed; completion closes it.
+              status: message.status === 'error' ? 'error' : 'streaming',
+            };
+          } else {
+            messages.push({
+              id: payload.message_id,
+              role: 'assistant',
+              content: payload.text,
+              status: 'streaming',
+              timestamp: Date.now(),
+            });
+          }
+          return {
+            ...child,
+            messages,
+            status: 'working',
+            state: child.state === 'running_tool' ? 'running_tool' : 'thinking',
+            activeStep: 'Responding',
+          };
+        });
+        break;
+      }
+      case 'tool_call_started': {
+        const { argsSummary, argsRaw } = summarizeToolArgs(payload.args_json, payload.tool_name);
+        updateChildSubagent(child_id, parent_session_id, (child) => {
+          if (isTerminalChildStatus(child.status)) return child;
+          const call: AgentToolCall = {
+            id: payload.call_id,
+            toolName: payload.tool_name,
+            argsSummary,
+            ...(argsRaw ? { argsRaw } : {}),
+            status: 'running',
+            startedAt: Date.now(),
+          };
+          const messages = withChildAssistant(child, child_id, (message) => ({
+            ...message,
+            toolCalls: [
+              ...(message.toolCalls ?? []).filter((entry) => entry.id !== payload.call_id),
+              call,
+            ],
+          }));
+          return {
+            ...child,
+            messages,
+            status: 'working',
+            state: 'running_tool',
+            activeTool: payload.tool_name,
+            activeStep: `Running ${payload.tool_name}`,
+          };
+        });
+        break;
+      }
+      case 'tool_result': {
+        updateChildSubagent(child_id, parent_session_id, (child) => {
+          if (isTerminalChildStatus(child.status)) return child;
+          let found = false;
+          const messages = (child.messages ?? []).map((message) => ({
+            ...message,
+            toolCalls: message.toolCalls?.map((call) => {
+              if (call.id !== payload.call_id) return call;
+              found = true;
+              return {
+                ...call,
+                status: (payload.is_err ? 'error' : 'completed') as AgentToolCall['status'],
+                resultSummary: payload.result_summary,
+                exitCode: payload.is_err ? 1 : 0,
+                durationMs: Date.now() - call.startedAt,
+              };
+            }),
+          }));
+          return {
+            ...child,
+            messages,
+            status: 'working',
+            state: 'thinking',
+            activeTool: undefined,
+            activeStep: found ? 'Thinking' : child.activeStep,
+          };
+        });
+        break;
+      }
+      case 'state_changed': {
+        const runState: SubagentLiveState = payload.state;
+        updateChildSubagent(child_id, parent_session_id, (child) => {
+          if (isTerminalChildStatus(child.status)) return child;
+          const activeStep = runState === 'thinking'
+            ? 'Thinking'
+            : runState === 'running_tool'
+              ? payload.tool_name ? `Running ${payload.tool_name}` : 'Running tool'
+              : runState === 'awaiting_approval'
+                ? payload.tool_name ? `Awaiting approval: ${payload.tool_name}` : 'Awaiting approval'
+                : 'Done';
+          return {
+            ...child,
+            status: 'working',
+            state: runState,
+            activeTool: runState === 'done' ? undefined : payload.tool_name,
+            activeStep,
+          };
+        });
+        break;
+      }
+    }
+    notify();
+  },
+
+  /**
    * Phase 9e: one accepted background completion. Returns false when this
    * child id was already handled (dedupe) or when the payload claims success
    * without a result. A failed child stays failed: it is never painted as a
@@ -1362,27 +1869,35 @@ const activeSessionId =
   handleSubagentCompleted(payload: SubagentCompletedPayload): boolean {
     if (completedSubagentIds.has(payload.child_id)) return false;
     completedSubagentIds.add(payload.child_id);
+    closeChildApprovalCards(payload.child_id, payload.parent_session_id, 'This child conversation has ended.');
 
     const existing = state.subagents.find((subagent) => subagent.id === payload.child_id);
     const ok = payload.ok === true;
     const entry: SubagentInfo = {
+      // Live transcript and started metadata survive the terminal event.
+      ...existing,
       id: payload.child_id,
-      name: existing?.name ?? `subagent-${payload.child_id}`,
+      name: meaningfulSubagentName(existing) ??
+        subagentDisplayName(undefined, existing?.mission, payload.child_id),
       model: existing?.model ?? 'Auto',
       status: ok ? 'done' : 'failed',
       parentSessionId: payload.parent_session_id,
       policy: payload.policy,
-      result: ok ? payload.final_message : '',
+      result: payload.final_message,
       error: ok ? undefined : payload.error ?? 'subagent failed without a message',
       artifacts: payload.artifacts ?? [],
       unread: true,
       activeStep: ok
         ? `Completed: ${payload.final_message || 'no output'}`
         : `Failed: ${payload.error ?? 'unknown error'}`,
+      state: 'done',
+      activeTool: undefined,
+      completedAt: Date.now(),
+      messages: finalizeChildMessages(existing?.messages, ok ? 'complete' : 'error'),
     };
     const subagents = existing
       ? state.subagents.map((subagent) =>
-          subagent.id === payload.child_id ? { ...subagent, ...entry } : subagent,
+          subagent.id === payload.child_id ? entry : subagent,
         )
       : [...state.subagents, entry];
     state = {
@@ -1392,6 +1907,34 @@ const activeSessionId =
     };
     notify();
     return true;
+  },
+
+  handleSubagentCancelled(payload: { child_id: string; parent_session_id: string }): void {
+    if (completedSubagentIds.has(payload.child_id)) return;
+    completedSubagentIds.add(payload.child_id);
+    closeChildApprovalCards(payload.child_id, payload.parent_session_id, 'Subagent was cancelled.');
+    const existing = state.subagents.find((child) => child.id === payload.child_id);
+    const entry: SubagentInfo = {
+      ...existing,
+      id: payload.child_id,
+      name: meaningfulSubagentName(existing) ??
+        subagentDisplayName(undefined, existing?.mission, payload.child_id),
+      model: existing?.model ?? 'Auto',
+      parentSessionId: payload.parent_session_id,
+      status: 'cancelled',
+      result: 'Subagent was cancelled.',
+      unread: false,
+      activeStep: 'Cancelled',
+      activeTool: undefined,
+      state: 'done',
+      completedAt: Date.now(),
+      messages: finalizeChildMessages(existing?.messages, 'complete'),
+    };
+    const subagents = existing
+      ? state.subagents.map((child) => (child.id === payload.child_id ? entry : child))
+      : [...state.subagents, entry];
+    state = { ...state, subagents, unreadSubagentCount: countUnreadSubagents(subagents) };
+    notify();
   },
 
   /**
@@ -1411,6 +1954,35 @@ const activeSessionId =
     };
     notify();
     return true;
+  },
+
+  /**
+   * Open a child transcript in the dock. Only a child that belongs to the
+   * active parent session can open; callers (title-bar pet, results row) get
+   * `false` rather than showing a transcript under the wrong parent.
+   */
+  openSubagentSession(childId: string): boolean {
+    const child = state.subagents.find((entry) => entry.id === childId);
+    if (!child || child.parentSessionId !== state.activeSessionId) return false;
+    const subagents = state.subagents.map((entry) =>
+      entry.id === childId ? { ...entry, unread: false } : entry,
+    );
+    state = {
+      ...state,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+      activeSubagentId: childId,
+      revealedSubagentId: state.revealedSubagentId === childId ? null : state.revealedSubagentId,
+    };
+    notify();
+    return true;
+  },
+
+  /** Return from the child transcript to the parent's normal feed. */
+  closeSubagentSession() {
+    if (state.activeSubagentId === null) return;
+    state = { ...state, activeSubagentId: null };
+    notify();
   },
 
   /** Mark one child's result read without changing the selected session. */
@@ -1444,12 +2016,23 @@ const activeSessionId =
       : state.activeSessionId;
     const { [sessionId]: _removedTranscript, ...transcripts } = state.transcripts;
     const { [sessionId]: _removedTodos, ...todosBySession } = state.todosBySession;
+    // Children belong to their parent session: deleting the parent deletes
+    // only their byte-for-byte child ledger, never a parent transcript entry.
+    const subagents = state.subagents.filter((child) => child.parentSessionId !== sessionId);
+    const activeSubagentId = activeChildStillBelongs(
+      state.activeSubagentId,
+      nextActive,
+      subagents,
+    );
     state = {
       ...state,
       sessions: remaining,
       resumableSessions: state.resumableSessions.filter((session) => session.id !== sessionId),
       transcripts,
       todosBySession,
+      subagents,
+      unreadSubagentCount: countUnreadSubagents(subagents),
+      activeSubagentId,
       activeSessionId: nextActive,
       messages: transcripts[nextActive] ?? [],
       todos: todosBySession[nextActive] ?? [],
@@ -1924,8 +2507,10 @@ const activeSessionId =
     approvalId: string,
     decision: 'approve' | 'deny' | 'approve_all' | 'revise',
   ): void | Promise<void> {
-    const target = state.messages.flatMap((message) => message.toolCalls ?? [])
-      .find((call) => call.approvalId === approvalId) as WorkflowToolCall | undefined;
+    const target = findApprovalCard(approvalId) as WorkflowToolCall | undefined;
+    const childOwner = childApprovalOwners.get(approvalId);
+    // A child card never grants this turn's blanket approval.
+    if (childOwner && decision === 'approve_all') return;
     const planCard = Boolean(target?.plan) || target?.toolName === 'exit_plan_mode';
     // A question is never approved or denied generically: it needs text or
     // one of the offered options (the answerQuestion route).
@@ -1941,10 +2526,34 @@ const activeSessionId =
     // happens to be newest globally. Without a resolvable request the card
     // stays parked (flipping it would lie about a decision never sent).
     const requestId = pendingApprovalRequests.get(approvalId) ?? activeRequestId;
-    const sessionContext = requestId ? sessionEnvelopeContext() : null;
+    const sessionContext = requestId
+      ? childOwner && context
+        ? { ...context, session_id: childOwner.parentSessionId }
+        : sessionEnvelopeContext()
+      : null;
     if (!requestId || !sessionContext) return;
 
     const mappedDecision = decision === 'approve_all' ? 'approve_all_this_turn' : decision;
+
+    // A child card stays parked until its decision route actually succeeds:
+// the pet transcript and the parent awareness card both show the truth.
+    if (childOwner) {
+      updateToolCallCard(approvalId, { decisionSubmitting: true, decisionError: undefined });
+      return agentDecision(requestId, approvalId, mappedDecision, sessionContext).then(() => {
+        pendingApprovalRequests.delete(approvalId);
+        childApprovalOwners.delete(approvalId);
+        updateToolCallCard(approvalId, {
+          status: decision === 'deny' || decision === 'revise' ? 'denied' : 'approved',
+          decisionSubmitting: false,
+          decisionError: undefined,
+        });
+      }).catch((error: unknown) => {
+        updateToolCallCard(approvalId, {
+          decisionSubmitting: false,
+          decisionError: decisionErrorMessage(error),
+        });
+      });
+    }
 
     // Phase 8: the agent's `run_workflow` card is the confirmation moment.
     // The workflow-specific route above waits for the exact script/command set
@@ -1959,7 +2568,7 @@ const activeSessionId =
 
     const updatedCalls = lastMsg.toolCalls.map((c) => {
       const isPlan = c.approvalId === approvalId && (Boolean((c as WorkflowToolCall).plan) || c.toolName === 'exit_plan_mode');
-      if (c.approvalId === approvalId || (decision === 'approve_all' && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow && !(c as WorkflowToolCall).plan)) {
+      if (c.approvalId === approvalId || (decision === 'approve_all' && !c.backgroundChild && c.toolName !== 'run_workflow' && !(c as WorkflowToolCall).workflow && !(c as WorkflowToolCall).plan)) {
         return {
           ...c,
           status: (decision === 'deny' || decision === 'revise' ? 'denied' : 'approved') as AgentToolCall['status'],
@@ -2143,13 +2752,22 @@ const activeSessionId =
     this.updateToolResult(payload.call_id, payload.result_summary, payload.is_err);
   },
 
-  handleApprovalNeeded(payload: ApprovalNeededPayload) {
+  handleApprovalNeeded(payload: ApprovalNeededPayload, backgroundChildEvent = false) {
+    const childTarget = childApprovalTarget(payload);
+    // A late card after completion/cancellation must never resurrect the child.
+    if (childTarget && completedSubagentIds.has(childTarget.childId)) return;
+    const parentVisible = !payload.session_id || payload.session_id === state.activeSessionId;
+    // Remember which request owns this approval before any transcript write.
+    if (payload.request_id) {
+      pendingApprovalRequests.set(payload.approval_id, payload.request_id);
+    }
+    // A child card belongs to the child transcript even when another parent
+    // session is on screen. Opening that pet/session later must show the park.
+    if (childTarget) attachChildApprovalCard(payload, childTarget);
+    if (!parentVisible) return;
     // A background child can ask after its parent turn ended. Its card is
     // still bound to the same session and is safe to render there.
-    const backgroundChild =
-      Boolean(payload.subagent_id) &&
-      (!payload.session_id || payload.session_id === state.activeSessionId);
-    if (!isActiveEvent(payload) && !backgroundChild) return;
+    if (!isActiveEvent(payload) && !backgroundChildEvent && !childTarget) return;
     if (payload.tool_name === 'run_workflow' && !state.inFlight && activeRequestId === payload.request_id) return;
     const existingConfirmation = workflowConfirmations.get(payload.approval_id);
     if (existingConfirmation && (
@@ -2190,6 +2808,7 @@ const activeSessionId =
       argsSummary: plan?.summary || payload.path_or_command,
       status: 'needs_approval',
       approvalId: payload.approval_id,
+      backgroundChild: Boolean(childTarget) || backgroundChildEvent,
       workflow,
       decisionPrompt: payload.prompt,
       plan,
@@ -2320,16 +2939,10 @@ const activeSessionId =
     }
 
 // Todos are not rewritten here: the plan stays exactly what the backend
-    // last stored. A turn ending is not a todo status change.
-    const idleSubagents = state.subagents.map((s) => ({
-      ...s,
-      status: 'idle' as const,
-      activeStep: 'Ready',
-    }));
-
+    // last stored. A turn ending is not a todo status change, and a child
+    // that outlives the parent turn keeps its own backend-reported state.
     state = {
       ...state,
-      subagents: idleSubagents,
       inFlight: false,
       thinkingState: 'breathing',
       streamingActivityLevel: 0,

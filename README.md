@@ -9,7 +9,7 @@ Download the newest Windows installer from:
 
 <https://github.com/ToxicAngelX/Selora-IDE/releases/latest>
 
-Run `selora-installer-v1.exe`. The installer is per-user and does not
+Run `Selora-IDE-Setup-0.1.0.exe`. The installer is per-user and does not
 need administrator access. It installs WebView2 when Windows does not have it.
 
 ## Start quickly

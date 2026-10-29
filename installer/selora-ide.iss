@@ -71,7 +71,7 @@ WizardSmallImageFile={#SourcePath}..\assets\icons\wizard_small.bmp
 ; release.yml still pass an absolute /O (see the header) so the artifact path
 ; does not depend on ISCC's current directory or install location.
 OutputDir={#SourcePath}output
-OutputBaseFilename=selora-installer-v1
+OutputBaseFilename=Selora-IDE-Setup-{#MyAppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
 SetupIconFile={#SourcePath}..\assets\icons\selora-ide.ico

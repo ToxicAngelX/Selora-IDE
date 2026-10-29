@@ -423,12 +423,48 @@
   background: var(--ink-mid);
 }
 
+.agent-view-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-view-tab:disabled:hover {
+  color: var(--fg-muted);
+  background: transparent;
+}
+
 .agent-workbench-body {
   flex: 1;
   min-height: 0;
   display: flex;
   overflow: hidden;
   position: relative;
+}
+
+/* Keep the parent feed/composer mounted while a child session overlays it so
+   an in-progress draft and attachments survive a pet visit. */
+.agent-parent-layer {
+  display: contents;
+}
+
+.agent-workbench-body.has-subagent-session .agent-parent-layer {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.subagent-session-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  background: var(--ink-canvas);
+}
+
+.subagent-session-layer > .subagent-session-view {
+  flex: 1;
+  min-width: 0;
 }
 
 /* --- 6. Session Rail & Drawer Overlay ----------------------------------- */

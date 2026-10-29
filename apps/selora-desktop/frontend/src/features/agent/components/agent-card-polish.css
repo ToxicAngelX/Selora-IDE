@@ -1,0 +1,558 @@
+/* Selora IDE — Tool / question card polish.
+   Presentational only: hierarchy for the header telemetry row, the approval
+   action row, and the parked-question options. Every value is a design token
+   from src/styles/tokens.css; no colors, shadows, gradients or fonts are
+   declared here. Selectors are namespaced `.agent-card-*` and always scoped
+   under a card root, so the existing `.agent-*` rules in agent.css keep
+   owning layout. */
+
+/* --- Card shell ---------------------------------------------------------- */
+
+.agent-card-root {
+  border-radius: var(--radius-2);
+  font-family: var(--font-mono);
+}
+
+/* --- Header row ---------------------------------------------------------- */
+
+.agent-card-root .agent-card-header {
+  min-height: var(--space-6);
+  padding: var(--space-1) var(--space-2);
+  gap: var(--space-2);
+  border-bottom: 1px solid transparent;
+}
+
+.agent-card-root .agent-card-header:hover {
+  background: var(--ink-faint);
+}
+
+.agent-card-root.is-expanded > .agent-card-header {
+  border-bottom-color: var(--hairline-faint);
+}
+
+.agent-card-root .agent-card-primary {
+  gap: var(--space-2);
+}
+
+.agent-card-root .agent-card-chevron {
+  color: var(--fg-faint);
+}
+
+.agent-card-root .agent-card-icon {
+  color: var(--fg-muted);
+}
+
+.agent-card-root .agent-card-name {
+  color: var(--fg-default);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-normal);
+}
+
+/* Tool name is the fixed anchor; the target chip takes the remaining width
+   and truncates, so a long path never pushes the status row off screen. */
+.agent-card-root .agent-card-target {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0 var(--space-1);
+  background: transparent;
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-root .agent-card-target.is-command {
+  background: transparent;
+  border-color: var(--ink-rule);
+  color: var(--fg-default);
+}
+
+.agent-card-root .agent-card-target-text {
+  font-family: var(--font-mono);
+}
+
+.agent-card-root .agent-card-copy {
+  color: var(--fg-faint);
+  border-radius: var(--radius-1);
+}
+
+.agent-card-root .agent-card-copy:hover {
+  color: var(--fg-default);
+  background: var(--surface-hover);
+}
+
+.agent-card-root .agent-card-copy:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}
+
+.agent-card-root .agent-card-args {
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+/* --- Telemetry: diff stat, duration, exit code, status ------------------- */
+
+.agent-card-root .agent-card-telemetry {
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+}
+
+.agent-card-root .agent-card-diff {
+  gap: var(--space-1);
+  padding: 0 var(--space-1);
+  background: transparent;
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-card-root .agent-card-diff-add {
+  color: var(--ok);
+  font-weight: var(--weight-medium);
+}
+
+.agent-card-root .agent-card-diff-remove {
+  color: var(--err);
+  font-weight: var(--weight-medium);
+}
+
+.agent-card-root .agent-card-duration {
+  padding: 0 var(--space-1);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-1);
+  color: var(--fg-faint);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-variant-numeric: tabular-nums;
+  animation: none;
+}
+
+.agent-card-root .agent-card-duration.is-running {
+  color: var(--fg-muted);
+  border-color: var(--ink-hi);
+  animation: none;
+}
+
+.agent-card-root .agent-card-duration .duration-icon {
+  color: var(--fg-faint);
+}
+
+.agent-card-root .agent-card-exit {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--ink-hi);
+  border-radius: var(--radius-1);
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.agent-card-root .agent-card-exit.is-ok {
+  color: var(--ok);
+}
+
+.agent-card-root .agent-card-exit.is-error {
+  color: var(--err);
+}
+
+.agent-card-root .agent-card-status {
+  justify-content: flex-end;
+  min-width: var(--space-3);
+}
+
+.agent-card-root .agent-card-spinner {
+  width: var(--space-2);
+  height: var(--space-2);
+  border: var(--hairline) solid var(--ink-rule);
+  border-top-color: var(--fg-default);
+}
+
+.agent-card-root .agent-card-pill {
+  gap: var(--space-1);
+  padding: 0 var(--space-1);
+  background: var(--glow-warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-1);
+  color: var(--warn);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+}
+
+.agent-card-root .agent-card-glyph-ok {
+  color: var(--ok);
+}
+
+.agent-card-root .agent-card-glyph-err {
+  color: var(--err);
+}
+
+/* --- Body ---------------------------------------------------------------- */
+
+.agent-card-root .agent-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--ink-canvas);
+  border-top: 1px solid var(--hairline-faint);
+}
+
+.agent-card-root .agent-card-result {
+  background: var(--ink-low);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  padding: var(--space-2);
+}
+
+.agent-card-root .agent-card-result-pre {
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+/* --- Approval gate ------------------------------------------------------- */
+
+.agent-card-root .agent-card-gate {
+  gap: var(--space-2);
+}
+
+.agent-card-root .agent-card-banner {
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--hairline-faint);
+}
+
+.agent-card-root .agent-card-banner-left {
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.agent-card-root .agent-card-badge {
+  padding: 0 var(--space-1);
+  background: var(--glow-warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-1);
+  color: var(--warn);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  white-space: nowrap;
+}
+
+.agent-card-root .agent-card-desc {
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-card-root .agent-card-toggle-group {
+  background: transparent;
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  padding: 1px;
+  flex-shrink: 0;
+}
+
+.agent-card-root .agent-card-toggle-btn {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-1);
+  color: var(--fg-faint);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-root .agent-card-toggle-btn:hover {
+  color: var(--fg-default);
+}
+
+.agent-card-root .agent-card-toggle-btn.is-active {
+  background: var(--ink-mid);
+  color: var(--fg-bright);
+  font-weight: var(--weight-medium);
+}
+
+.agent-card-root .agent-card-toggle-btn:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}
+
+.agent-card-root .agent-card-diff-viewer {
+  background: var(--ink-low);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-2);
+}
+
+/* --- Approval action row ------------------------------------------------- */
+
+.agent-card-root .agent-card-actions {
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--hairline-faint);
+}
+
+.agent-card-root .agent-card-btn {
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-1);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+  box-shadow: none;
+}
+
+.agent-card-root .agent-card-btn:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}
+
+/* Destructive action sits at the far end, away from the primary decision. */
+.agent-card-root .agent-card-btn-deny {
+  margin-right: auto;
+  background: transparent;
+  border: 1px solid var(--hairline-faint);
+  color: var(--fg-muted);
+}
+
+.agent-card-root .agent-card-btn-deny:hover {
+  background: var(--ink-faint);
+  border-color: var(--ink-rule);
+  color: var(--fg-default);
+}
+
+.agent-card-root .agent-card-btn-all {
+  background: transparent;
+  border: 1px solid var(--ink-hi);
+  color: var(--fg-muted);
+}
+
+.agent-card-root .agent-card-btn-all:hover {
+  background: var(--ink-faint);
+  border-color: var(--ink-rule);
+  color: var(--fg-default);
+}
+
+.agent-card-root .agent-card-btn-accept {
+  background: var(--glow-green-subtle);
+  border: 1px solid var(--ok);
+  color: var(--ok);
+  font-weight: var(--weight-semibold);
+  box-shadow: none;
+  transform: none;
+}
+
+.agent-card-root .agent-card-btn-accept:hover {
+  background: var(--glow-green);
+  color: var(--ok);
+  transform: none;
+}
+
+/* --- Parked question card ------------------------------------------------ */
+
+.agent-card-question {
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-2);
+  background: var(--ink-low);
+}
+
+.agent-card-question .agent-card-question-header {
+  gap: var(--space-2);
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--hairline-faint);
+}
+
+.agent-card-question .agent-card-kind {
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+}
+
+.agent-card-question .agent-card-context {
+  color: var(--fg-faint);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-question .agent-card-question-text {
+  margin: 0;
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+}
+
+.agent-card-question .agent-card-options {
+  gap: var(--space-2);
+}
+
+.agent-card-question .agent-card-legend {
+  margin-bottom: var(--space-1);
+  color: var(--fg-faint);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-question .agent-card-option {
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  transition: border-color var(--dur-instant) var(--ease-precise),
+    background-color var(--dur-instant) var(--ease-precise);
+}
+
+.agent-card-question .agent-card-option:hover {
+  background: var(--ink-faint);
+  border-color: var(--ink-hi);
+}
+
+.agent-card-question .agent-card-option:focus-within {
+  background: var(--ink-faint);
+  border-color: var(--ink-rule);
+}
+
+.agent-card-question .agent-card-option-input {
+  margin-top: 2px;
+  accent-color: var(--fg-default);
+  flex-shrink: 0;
+}
+
+.agent-card-question .agent-card-option-input:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}
+
+.agent-card-question .agent-card-option-body {
+  gap: 1px;
+  min-width: 0;
+}
+
+.agent-card-question .agent-card-option-label {
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+  font-weight: var(--weight-medium);
+}
+
+.agent-card-question .agent-card-option-desc {
+  color: var(--fg-faint);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-question .agent-card-free {
+  gap: var(--space-1);
+}
+
+.agent-card-question .agent-card-free-label {
+  color: var(--fg-muted);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-question .agent-card-textarea {
+  min-height: calc(var(--space-6) * 2);
+  padding: var(--space-2);
+  background: var(--ink-canvas);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+}
+
+.agent-card-question .agent-card-textarea:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}
+
+.agent-card-question .agent-card-textarea:disabled {
+  color: var(--fg-disabled);
+  border-color: var(--ink-hi);
+}
+
+.agent-card-question .agent-card-error {
+  margin: 0;
+  color: var(--err);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+}
+
+.agent-card-question .agent-card-answered {
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--hairline-faint);
+  border-radius: var(--radius-1);
+  background: var(--ink-faint);
+  color: var(--ok);
+  font-size: var(--type-sm);
+  line-height: var(--type-sm-lh);
+}
+
+.agent-card-question .agent-card-actions-row {
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--hairline-faint);
+}
+
+.agent-card-question .agent-card-primary-btn {
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--ok);
+  border-radius: var(--radius-1);
+  background: var(--glow-green-subtle);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  font-weight: var(--weight-medium);
+}
+
+.agent-card-question .agent-card-primary-btn:hover:not(:disabled) {
+  background: var(--glow-green);
+}
+
+.agent-card-question .agent-card-primary-btn:disabled {
+  background: transparent;
+  border-color: var(--ink-hi);
+  color: var(--fg-disabled);
+}
+
+.agent-card-question .agent-card-primary-btn:focus-visible {
+  outline: var(--border-focus);
+  outline-offset: 1px;
+}

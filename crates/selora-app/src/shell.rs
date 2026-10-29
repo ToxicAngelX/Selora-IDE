@@ -4109,6 +4109,8 @@ mod tests {
                 html_url: "https://github.com/ToxicAngelX/Selora-IDE/releases/tag/v9.9.9"
                     .to_owned(),
                 newer: true,
+                installer: None,
+                checksum: None,
             })))
             .expect("send");
         agent_frame(&ctx, &mut app, raw_screen());
@@ -4126,6 +4128,8 @@ mod tests {
                 tag: "v0.1.0".to_owned(),
                 html_url: String::new(),
                 newer: false,
+                installer: None,
+                checksum: None,
             })))
             .expect("send");
         agent_frame(&ctx, &mut app, raw_screen());

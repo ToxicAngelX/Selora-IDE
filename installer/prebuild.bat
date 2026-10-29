@@ -96,14 +96,14 @@ rem relative OutputDir against the script's own directory, so a relative or
 rem absolute invocation both happen to work - but a stray /O in the
 rem environment or a hand-run compile moved the setup out of the repository
 rem during the Phase 8 acceptance run. Pin it here: every prebuild produces
-rem installer\output\selora-installer-v1.exe or fails.
+rem installer\output\Selora-IDE-Setup-<version>.exe or fails.
 set "OUTPUT_DIR=%REPO_ROOT%\installer\output"
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 if errorlevel 1 (
     echo prebuild: could not create "%OUTPUT_DIR%" 1>&2
     exit /b 1
 )
-set "SETUP=%OUTPUT_DIR%\selora-installer-v1.exe"
+set "SETUP=%OUTPUT_DIR%\Selora-IDE-Setup-%VERSION%.exe"
 
 rem Remove a previous artifact for this version first: if ISCC fails, a stale
 rem setup must not survive to look like a fresh build.

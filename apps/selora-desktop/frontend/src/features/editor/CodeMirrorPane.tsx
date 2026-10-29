@@ -82,10 +82,17 @@ export type ScrollGeometry = {
   clientHeight: number;
 };
 
+/** A minimap click or drag: scroll to a line without moving the selection. */
+export type EditorScrollTarget = {
+  line: number;
+  requestId: number;
+};
+
 export type CodeMirrorPaneProps = {
   buffer: BufferSnapshot;
   onScroll?: (geometry: ScrollGeometry) => void;
   revealTarget?: RevealTarget | null;
+  scrollTarget?: EditorScrollTarget | null;
   /** Persisted editor preferences. Omitted in isolated tests = defaults. */
   settings?: EditorPreferences;
 };
@@ -276,6 +283,7 @@ export function CodeMirrorPane({
   buffer,
   onScroll,
   revealTarget = null,
+  scrollTarget = null,
   settings = DEFAULT_EDITOR_PREFERENCES,
 }: CodeMirrorPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -760,6 +768,18 @@ export function CodeMirrorPane({
       configureLanguage(view, buffer);
     }
   }, [buffer.buffer_id, buffer.text, buffer.version, buffer.language, buffer.path]);
+
+  // Minimap navigation scrolls the viewport only. Cursor/selection stays where
+  // the user left it, matching the VS Code minimap contract.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !scrollTarget) return;
+    const lineNumber = Math.min(Math.max(Math.trunc(scrollTarget.line), 1), view.state.doc.lines);
+    const line = view.state.doc.line(lineNumber);
+    view.dispatch({
+      effects: EditorView.scrollIntoView(line.from, { y: 'center' }),
+    });
+  }, [scrollTarget]);
 
   useEffect(() => {
     const view = viewRef.current;

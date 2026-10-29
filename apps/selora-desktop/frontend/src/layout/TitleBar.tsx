@@ -17,6 +17,8 @@ import {
 } from '../features/keymap/commands';
 import type { BootstrapState } from '../bridge/bridge';
 import { getAppSnapshot, subscribeApp } from '../app/app-store';
+import { agentStore } from '../features/agent/agent-store';
+import { SubagentPets } from '../features/agent/components/SubagentPets';
 
 type MenuKind = 'file' | 'edit' | 'view' | 'help';
 
@@ -216,6 +218,11 @@ export function TitleBar({
 }: TitleBarProps) {
   const appState = useSyncExternalStore(subscribeApp, getAppSnapshot);
   const bootstrap = initialBootstrap ?? appState.bootstrap;
+  // The pet strip tracks the agent store directly: children appear as their
+  // started events arrive and stay visible through terminal states.
+  const agentState = useSyncExternalStore(agentStore.subscribe, agentStore.getSnapshot);
+  const activeSubagentId =
+    (agentState as { activeSubagentId?: string | null }).activeSubagentId ?? null;
 
   const workspaceDisplay =
     bootstrap?.workspace?.display_name && bootstrap.workspace.display_name !== 'No workspace open'
@@ -267,6 +274,14 @@ export function TitleBar({
           <GitBranch size={12} className="git-icon" aria-hidden="true" />
           <span className="git-branch-text">{gitBranch}</span>
         </div>
+
+        {/* Subagent pet worlds: one badge per child of the active session */}
+        <SubagentPets
+          subagents={agentState.subagents}
+          activeSessionId={agentState.activeSessionId}
+          activeSubagentId={activeSubagentId}
+          onSelectViewMode={onSelectViewMode}
+        />
 
         {/* Workbench View Mode Switcher */}
         {onSelectViewMode && (

@@ -55,8 +55,9 @@ use selora_protocol::{
     ConnectionStatus, DecisionDto, DecisionPromptDto, FrontendEvent, MessageDto, MessageId,
     MessageRole, ModelDto, ModelsDto, PlanApprovalDto, PlanPhaseDto, PlanStateDto,
     ProtocolErrorDto, QuestionPromptOptionDto, RequestId, SeloraStatusDto, SessionDto, SessionId,
-    SubagentArtifactDto, SubagentCompletedDto, SubagentPolicyDto, TodoDto, TodoStatusDto, TodosDto,
-    ToolCallStartedDto, ToolResultDto, TurnId, WorkflowApprovalDto,
+    SubagentActivityDto, SubagentArtifactDto, SubagentCancelledDto, SubagentCompletedDto,
+    SubagentPolicyDto, SubagentRunState, TodoDto, TodoStatusDto, TodosDto, ToolCallStartedDto,
+    ToolResultDto, TurnId, WorkflowApprovalDto,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -99,6 +100,8 @@ pub(crate) enum ApiKeySource {
     Keyring,
     #[cfg(test)]
     Fixed(Option<String>),
+    #[cfg(test)]
+    Mutable(Arc<Mutex<Result<Option<String>, ProtocolErrorDto>>>),
 }
 
 impl ApiKeySource {
@@ -137,6 +140,8 @@ impl ApiKeySource {
             }
             #[cfg(test)]
             Self::Fixed(key) => Ok(key.clone()),
+            #[cfg(test)]
+            Self::Mutable(key) => key.lock().unwrap().clone(),
         }
     }
 }
@@ -330,6 +335,8 @@ pub(crate) struct SessionEngine {
     /// single-use decision slot; this map only validates request/session/card
     /// type before forwarding.
     subagent_cards: Mutex<BTreeMap<ApprovalId, SubagentCardRoute>>,
+    /// Keys captured by child backends, including keys rotated before activity arrives.
+    subagent_redaction_keys: Mutex<Vec<String>>,
     /// The agent tools' root. The Z3 shell has no folder picker (that lands
     /// in Z4 with the workbench), so `SELORA_WORKSPACE_ROOT` is the one way
     /// to point the tools at a real tree today; without it `SendAgent`
@@ -380,6 +387,7 @@ impl SessionEngine {
             subagents: runtime,
             subagent_events: Mutex::new(Some(rx)),
             subagent_cards: Mutex::new(BTreeMap::new()),
+            subagent_redaction_keys: Mutex::new(Vec::new()),
         }
     }
 
@@ -1233,6 +1241,7 @@ impl SessionEngine {
             auto_approve_commands: Vec::new(),
             ..tool_settings.clone()
         };
+        self.register_subagent_redaction_key(&api_key);
         let backend: Arc<dyn selora_ai::SubagentBackend> = Arc::new(DesktopSubagentBackend {
             root: root.clone(),
             settings: child_settings,
@@ -1924,6 +1933,16 @@ impl SessionEngine {
         })
     }
 
+    fn register_subagent_redaction_key(&self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        let mut keys = self.subagent_redaction_keys.lock().expect("subagent keys lock");
+        if !keys.iter().any(|known| known == key) {
+            keys.push(key.to_owned());
+        }
+    }
+
     pub(crate) fn resolve_model(&self, preferred: Option<&str>) -> Result<Model, ProtocolErrorDto> {
         let id = preferred
             .map(str::to_owned)
@@ -1988,7 +2007,7 @@ impl SessionEngine {
         from_settings.or_else(|| match self.config.key_source {
             ApiKeySource::Keyring => selora_settings::keyring::brave_key_get().ok().flatten(),
             #[cfg(test)]
-            ApiKeySource::Fixed(_) => None,
+            ApiKeySource::Fixed(_) | ApiKeySource::Mutable(_) => None,
         })
     }
 }
@@ -2488,6 +2507,105 @@ struct SubagentRelayCtx<R: tauri::Runtime> {
     events_rx: mpsc::UnboundedReceiver<selora_ai::SubagentEvent>,
 }
 
+#[derive(Default)]
+struct SubagentDeltaBuffer {
+    pending: String,
+    keys: Vec<String>,
+    sequence: u64,
+}
+
+impl SubagentDeltaBuffer {
+    fn push(&mut self, text: &str, key: &str, flush: bool) -> String {
+        if !key.is_empty() && !self.keys.iter().any(|known| known == key) {
+            self.keys.push(key.to_owned());
+        }
+        self.pending.push_str(text);
+        let mut output = String::new();
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            let remaining = &self.pending[consumed..];
+            if !flush && self.keys.iter().any(|key| key.len() > remaining.len() && key.starts_with(remaining)) {
+                break;
+            } else if let Some(key) = self.keys.iter().filter(|key| remaining.starts_with(key.as_str())).max_by_key(|key| key.len()) {
+                consumed += key.len();
+                output.push_str("[REDACTED]");
+            } else {
+                let ch = remaining.chars().next().expect("remaining is not empty");
+                consumed += ch.len_utf8();
+                output.push(ch);
+            }
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+}
+
+type SubagentDeltaBuffers = BTreeMap<(String, String, String), SubagentDeltaBuffer>;
+
+fn redact_with_keys(text: &str, keys: &[String]) -> String {
+    let mut buffer = SubagentDeltaBuffer { keys: keys.iter().filter(|key| !key.is_empty()).cloned().collect(), ..Default::default() };
+    buffer.push(text, "", true)
+}
+
+// Do not expose a possible key prefix across an intervening event. Keep the
+// sequence counter because the same message can resume after that event.
+fn seal_subagent_prefixes<R: tauri::Runtime>(
+    buffers: &mut SubagentDeltaBuffers,
+    log: &EventLog,
+    app: &tauri::AppHandle<R>,
+    except: Option<&(String, String, String)>,
+) {
+    for (identity, buffer) in buffers.iter_mut() {
+        if Some(identity) != except && !buffer.pending.is_empty() {
+            buffer.pending.clear();
+            emit_subagent_delta(log, app, identity, buffer, "[REDACTED]".into());
+        }
+    }
+}
+
+fn emit_subagent_delta<R: tauri::Runtime>(
+    log: &EventLog,
+    app: &tauri::AppHandle<R>,
+    identity: &(String, String, String),
+    buffer: &mut SubagentDeltaBuffer,
+    text: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let Ok(parent) = SessionId::new(identity.0.clone()) else { return };
+    buffer.sequence += 1;
+    log.record_session(
+        app,
+        FrontendEvent::SubagentActivity(SubagentActivityDto::Delta {
+            child_id: identity.1.clone(),
+            parent_session_id: parent.clone(),
+            message_id: redact_with_keys(&identity.2, &buffer.keys),
+            sequence: buffer.sequence,
+            text,
+        }),
+        RequestId::new(identity.1.clone()).ok(),
+        parent,
+    );
+}
+
+fn flush_subagent_deltas<R: tauri::Runtime>(
+    buffers: &mut SubagentDeltaBuffers,
+    log: &EventLog,
+    app: &tauri::AppHandle<R>,
+    child: Option<(&str, &str)>,
+    key: &str,
+) {
+    buffers.retain(|identity, buffer| {
+        if child.is_some_and(|(parent, child)| identity.0 != parent || identity.1 != child) {
+            return true;
+        }
+        let text = buffer.push("", key, true);
+        emit_subagent_delta(log, app, identity, buffer, text);
+        false
+    });
+}
+
 /// Map the shared runtime's events onto the normal session stream. A
 /// completion lands in the roster once (the frontend dedupes by child id) and
 /// a child card parks on the same approval rail as the parent's own cards.
@@ -2498,27 +2616,104 @@ async fn subagent_relay<R: tauri::Runtime>(ctx: SubagentRelayCtx<R>) {
         app,
         mut events_rx,
     } = ctx;
+    let mut delta_buffers = SubagentDeltaBuffers::new();
     while let Some(event) = events_rx.recv().await {
+        // Preserve event order while the keyring is unavailable. No event or
+        // buffered text is emitted until the active key can be read again.
+        let api_key = loop {
+            if let Ok(key) = engine.fetch_api_key() {
+                if !key.is_empty() {
+                    break key;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        engine.register_subagent_redaction_key(&api_key);
+        let keys = engine.subagent_redaction_keys.lock().expect("subagent keys lock").clone();
+        for buffer in delta_buffers.values_mut() {
+            for key in &keys {
+                if !buffer.keys.contains(key) {
+                    buffer.keys.push(key.clone());
+                }
+            }
+        }
         match event {
             selora_ai::SubagentEvent::Completed(completion) => {
+                flush_subagent_deltas(&mut delta_buffers, &log, &app, Some((&completion.parent_session, &completion.child_id)), &api_key);
+                seal_subagent_prefixes(&mut delta_buffers, &log, &app, None);
                 let Ok(parent) = SessionId::new(completion.parent_session.clone()) else {
                     continue;
                 };
+                let mut dto = subagent_completed_dto(completion);
+                dto.error = dto.error.map(|text| redact_with_keys(&text, &keys));
+                dto.final_message = redact_with_keys(&dto.final_message, &keys);
+                for artifact in &mut dto.artifacts {
+                    artifact.kind = redact_with_keys(&artifact.kind, &keys);
+                    artifact.path = redact_with_keys(&artifact.path, &keys);
+                }
                 log.record_session(
                     &app,
-                    FrontendEvent::SubagentCompleted(subagent_completed_dto(completion)),
+                    FrontendEvent::SubagentCompleted(dto),
                     None,
                     parent,
                 );
             }
+            selora_ai::SubagentEvent::Activity(activity) => {
+                if let selora_ai::SubagentActivityKind::Delta { message_id, text, .. } = &activity.kind {
+                    if SessionId::new(activity.parent_session.clone()).is_err() {
+                        continue;
+                    }
+                    let identity = (activity.parent_session.clone(), activity.child_id.clone(), message_id.clone());
+                    seal_subagent_prefixes(&mut delta_buffers, &log, &app, Some(&identity));
+                    let buffer = delta_buffers.entry(identity.clone()).or_default();
+                    buffer.keys = keys.clone();
+                    let text = buffer.push(text, &api_key, false);
+                    emit_subagent_delta(&log, &app, &identity, buffer, text);
+                    continue;
+                }
+                seal_subagent_prefixes(&mut delta_buffers, &log, &app, None);
+                let child_id = activity.child_id.clone();
+                let Ok(parent) = SessionId::new(activity.parent_session.clone()) else {
+                    continue;
+                };
+                let Some(activity) = subagent_activity_dto(activity, &keys) else {
+                    continue;
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::SubagentActivity(activity),
+                    RequestId::new(child_id).ok(),
+                    parent,
+                );
+            }
+            selora_ai::SubagentEvent::Cancelled {
+                child_id,
+                parent_session,
+            } => {
+                flush_subagent_deltas(&mut delta_buffers, &log, &app, Some((&parent_session, &child_id)), &api_key);
+                seal_subagent_prefixes(&mut delta_buffers, &log, &app, None);
+                let Ok(parent) = SessionId::new(parent_session) else {
+                    continue;
+                };
+                log.record_session(
+                    &app,
+                    FrontendEvent::SubagentCancelled(SubagentCancelledDto {
+                        child_id: child_id.clone(),
+                        parent_session_id: parent.clone(),
+                    }),
+                    RequestId::new(child_id).ok(),
+                    parent,
+                );
+            }
             selora_ai::SubagentEvent::ApprovalNeeded(child_card) => {
+                seal_subagent_prefixes(&mut delta_buffers, &log, &app, None);
                 let Ok(session_id) = SessionId::new(child_card.parent_session.clone()) else {
                     continue;
                 };
                 let approval_id = ApprovalId::new(child_card.approval_id.to_string())
                     .expect("uuid string is a valid id");
                 let child_id = child_card.child_id.clone();
-                let card = child_card.card;
+                let card = redact_card_with_keys(child_card.card, &keys);
                 let tool_name = fallback_tool_name(&card);
                 let (path_or_command, diff_or_input, workflow) = approval_body(&card);
                 let plan = approval_plan(&card);
@@ -2564,6 +2759,16 @@ async fn subagent_relay<R: tauri::Runtime>(ctx: SubagentRelayCtx<R>) {
                     session_id,
                 );
             }
+        }
+    }
+    if let Ok(api_key) = engine.fetch_api_key() {
+        if !api_key.is_empty() {
+            engine.register_subagent_redaction_key(&api_key);
+            let keys = engine.subagent_redaction_keys.lock().expect("subagent keys lock").clone();
+            for buffer in delta_buffers.values_mut() {
+                buffer.keys = keys.clone();
+            }
+            flush_subagent_deltas(&mut delta_buffers, &log, &app, None, &api_key);
         }
     }
 }
@@ -2668,14 +2873,16 @@ fn system_prompt(payload: &selora_protocol::AgentRequestDto, root: &Path) -> Str
         "You are Selora, an autonomous coding agent in Selora IDE.\n\
          Operating System: Windows. Shell: PowerShell.\n\
          Workspace Root: {}\n\
-         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
+         Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write, spawn_subagent, wait, send_message, ask_user_question.\n\
          Instructions:\n\
          1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
          2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
          3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
          4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
          5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
-         6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}{}",
+         6. Make clean, accurate edits and verify your work (build, test, or read the result back).\n\
+         7. Use `spawn_subagent` for a bounded independent task. Give each child a short `name`; it labels the child session and its title-bar pet. For fan-out, parallelize, or independent work, call `spawn_subagent` several times with `background: true` in one round, then collect with `wait`. Default policy is read-only; use full only for delegated edits. Children cannot spawn children. Full child writes/bash still require individual approval.\n\
+         {}{}{}",
         root.display(),
         approval_note,
         depth_instructions,
@@ -3181,10 +3388,7 @@ fn subagent_completed_dto(completion: selora_ai::SubagentCompletion) -> Subagent
         child_id: completion.child_id,
         parent_session_id: SessionId::new(completion.parent_session)
             .expect("runtime parent sessions originate from a SessionId"),
-        policy: match completion.policy {
-            selora_ai::SubagentPolicy::ReadOnly => SubagentPolicyDto::ReadOnly,
-            selora_ai::SubagentPolicy::Full => SubagentPolicyDto::Full,
-        },
+        policy: subagent_policy_dto(completion.policy),
         ok: completion.ok,
         error: completion.error,
         final_message: completion.final_message,
@@ -3197,6 +3401,84 @@ fn subagent_completed_dto(completion: selora_ai::SubagentCompletion) -> Subagent
             })
             .collect(),
     }
+}
+
+fn subagent_policy_dto(policy: selora_ai::SubagentPolicy) -> SubagentPolicyDto {
+    match policy {
+        selora_ai::SubagentPolicy::ReadOnly => SubagentPolicyDto::ReadOnly,
+        selora_ai::SubagentPolicy::Full => SubagentPolicyDto::Full,
+    }
+}
+
+/// Map one live runtime activity step onto the protocol. The API key is
+/// scrubbed at this seam, like every other model-visible string.
+fn subagent_activity_dto(
+    activity: selora_ai::SubagentActivity,
+    keys: &[String],
+) -> Option<SubagentActivityDto> {
+    let parent = SessionId::new(activity.parent_session).ok()?;
+    let child_id = activity.child_id;
+    Some(match activity.kind {
+        selora_ai::SubagentActivityKind::Started {
+            name,
+            policy,
+            mission,
+        } => SubagentActivityDto::Started {
+            child_id,
+            parent_session_id: parent,
+            name: Some(redact_with_keys(&name, keys)),
+            policy: subagent_policy_dto(policy),
+            mission: redact_with_keys(&mission, keys),
+        },
+        selora_ai::SubagentActivityKind::Delta {
+            message_id,
+            sequence,
+            text,
+        } => SubagentActivityDto::Delta {
+            child_id,
+            parent_session_id: parent,
+            message_id: redact_with_keys(&message_id, keys),
+            sequence,
+            text: redact_with_keys(&text, keys),
+        },
+        selora_ai::SubagentActivityKind::ToolCallStarted {
+            call_id,
+            tool_name,
+            args_json,
+        } => SubagentActivityDto::ToolCallStarted {
+            child_id,
+            parent_session_id: parent,
+            call_id: redact_with_keys(&call_id, keys),
+            tool_name: redact_with_keys(&tool_name, keys),
+            args_json: redact_with_keys(&args_json, keys),
+        },
+        selora_ai::SubagentActivityKind::ToolResult {
+            call_id,
+            result_summary,
+            is_err,
+        } => SubagentActivityDto::ToolResult {
+            child_id,
+            parent_session_id: parent,
+            call_id: redact_with_keys(&call_id, keys),
+            result_summary: redact_with_keys(&result_summary, keys),
+            is_err,
+        },
+        selora_ai::SubagentActivityKind::StateChanged { state, tool_name } => {
+            SubagentActivityDto::StateChanged {
+                child_id,
+                parent_session_id: parent,
+                state: match state {
+                    selora_ai::SubagentRunState::Thinking => SubagentRunState::Thinking,
+                    selora_ai::SubagentRunState::RunningTool => SubagentRunState::RunningTool,
+                    selora_ai::SubagentRunState::AwaitingApproval => {
+                        SubagentRunState::AwaitingApproval
+                    }
+                    selora_ai::SubagentRunState::Done => SubagentRunState::Done,
+                },
+                tool_name: tool_name.map(|name| redact_with_keys(&name, keys)),
+            }
+        }
+    })
 }
 
 fn map_decision(decision: DecisionDto, answer: Option<String>) -> selora_ai::AgentDecision {
@@ -3246,20 +3528,24 @@ fn redact(text: &str, api_key: &str) -> String {
 
 /// Apply the same approval redaction to plan summaries and every plan step.
 fn redact_card(card: ApprovalCard, api_key: &str) -> ApprovalCard {
-    fn scrub(value: &mut serde_json::Value, key: &str) {
+    redact_card_with_keys(card, &[api_key.to_owned()])
+}
+
+fn redact_card_with_keys(card: ApprovalCard, keys: &[String]) -> ApprovalCard {
+    fn scrub(value: &mut serde_json::Value, keys: &[String]) {
         match value {
-            serde_json::Value::String(text) => *text = redact(text, key),
+            serde_json::Value::String(text) => *text = redact_with_keys(text, keys),
             serde_json::Value::Array(values) => {
-                values.iter_mut().for_each(|value| scrub(value, key))
+                values.iter_mut().for_each(|value| scrub(value, keys))
             }
             serde_json::Value::Object(values) => {
-                values.values_mut().for_each(|value| scrub(value, key))
+                values.values_mut().for_each(|value| scrub(value, keys))
             }
             _ => {}
         }
     }
     let mut value = serde_json::to_value(card).expect("approval card serializes");
-    scrub(&mut value, api_key);
+    scrub(&mut value, keys);
     serde_json::from_value(value).expect("redaction preserves approval schema")
 }
 
@@ -5382,17 +5668,20 @@ mod tests {
             "You are Selora, an autonomous coding agent in Selora IDE.\n\
              Operating System: Windows. Shell: PowerShell.\n\
              Workspace Root: {}\n\
-             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write.\n\
+             Available tools: read_file, list_dir, fuzzy_find, search_files, write_file, edit_file, delete_file, bash, web_search, web_fetch, run_workflow, enter_plan_mode, exit_plan_mode, todo_read, todo_write, spawn_subagent, wait, send_message, ask_user_question.\n\
              Instructions:\n\
              1. You can read and change the project. Use `list_dir`, `fuzzy_find`, `search_files`, and `read_file` to inspect it, then `write_file`, `edit_file`, or `delete_file` to make the change.\n\
              2. Do not stop at describing a change: when the user asks for a code change, perform it with the tools. {}\n\
              3. Always inspect relevant files before modifying them, and re-read after a failed edit rather than guessing.\n\
              4. Break complex work into clear steps and keep the live todo list current with `todo_write` (read it with `todo_read`).\n\
              5. For a non-trivial change, call `enter_plan_mode`, explore read-only, then propose the plan with `exit_plan_mode`; while planning, every write, delete, bash command, and workflow is blocked until the user approves the plan. Approving the plan still leaves each write behind its own diff card.\n\
-             6. Make clean, accurate edits and verify your work (build, test, or read the result back).{}{}",
+             6. Make clean, accurate edits and verify your work (build, test, or read the result back).\n\
+             7. Use `spawn_subagent` for a bounded independent task. Give each child a short `name`; it labels the child session and its title-bar pet. For fan-out, parallelize, or independent work, call `spawn_subagent` several times with `background: true` in one round, then collect with `wait`. Default policy is read-only; use full only for delegated edits. Children cannot spawn children. Full child writes/bash still require individual approval.\n\
+             {}{}{}",
             "C:/repo",
             "Writes, deletes, and non-allowlisted commands pause for the user's approval card; explain what you are doing while the card is pending.",
             "\nReasoning depth: Standard. Balanced reasoning with clear explanations and thorough verification.",
+            "",
             ""
         );
         assert_eq!(prompt, expected);
@@ -6095,5 +6384,320 @@ mod tests {
         );
         assert!(completion.ok);
         assert_eq!(completion.final_message, "review complete");
+    }
+
+    #[test]
+    fn subagent_delta_buffer_redacts_split_keys_and_flushes_prefixes() {
+        let key = "sëcret";
+        for split in key.char_indices().map(|(i, _)| i).chain(std::iter::once(key.len())) {
+            let mut buffer = SubagentDeltaBuffer::default();
+            let mut text = buffer.push(&format!("before {}", &key[..split]), key, false);
+            text.push_str(&buffer.push(&format!("{} after së", &key[split..]), key, false));
+            text.push_str(&buffer.push("", key, true));
+            assert_eq!(text, "before [REDACTED] after së");
+        }
+        let mut buffer = SubagentDeltaBuffer::default();
+        assert_eq!(buffer.push("sësëcret", key, false), "së[REDACTED]");
+        assert_eq!(buffer.push("plain", "", true), "plain");
+        let mut buffer = SubagentDeltaBuffer::default();
+        assert_eq!(buffer.push("", "abc", false), "");
+        assert_eq!(buffer.push("abc", "abcdef", false), "");
+        assert_eq!(buffer.push("def", "abcdef", false), "[REDACTED]");
+        assert_eq!(redact_with_keys("abcdef", &["abc".into(), "abcdef".into()]), "[REDACTED]");
+    }
+
+    #[test]
+    fn subagent_activity_redacts_tool_identifiers_with_all_keys() {
+        let keys = vec!["old-key".into(), "new-key".into()];
+        for kind in [
+            selora_ai::SubagentActivityKind::ToolCallStarted { call_id: "old-key".into(), tool_name: "new-key".into(), args_json: "old-key".into() },
+            selora_ai::SubagentActivityKind::ToolResult { call_id: "old-key".into(), result_summary: "new-key".into(), is_err: false },
+            selora_ai::SubagentActivityKind::StateChanged { state: selora_ai::SubagentRunState::RunningTool, tool_name: Some("new-key".into()) },
+        ] {
+            let dto = subagent_activity_dto(selora_ai::SubagentActivity::new("child", "session-1", kind), &keys).unwrap();
+            let json = serde_json::to_string(&dto).unwrap();
+            assert!(!json.contains("old-key") && !json.contains("new-key"), "{json}");
+            assert!(json.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn subagent_approval_redacts_overlapping_keys_in_one_pass() {
+        let card = ApprovalCard::Plan {
+            summary: Some("abcdef abc".into()),
+            steps: vec!["abcdef".into()],
+        };
+        let card = redact_card_with_keys(card, &["abc".into(), "abcdef".into()]);
+        let ApprovalCard::Plan { summary, steps } = card else { panic!("expected plan") };
+        assert_eq!(summary.as_deref(), Some("[REDACTED] [REDACTED]"));
+        assert_eq!(steps, vec!["[REDACTED]"]);
+    }
+
+    #[test]
+    fn subagent_relay_fails_closed_without_key() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let key = Arc::new(Mutex::new(Ok(None)));
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(), active_model: None,
+            agent: selora_settings::AgentSettings::default(), key_source: ApiKeySource::Mutable(Arc::clone(&key)),
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(selora_ai::SubagentEvent::Activity(selora_ai::SubagentActivity::new(
+            "child", "session-1", selora_ai::SubagentActivityKind::Delta {
+                message_id: "m".into(), sequence: 1, text: "sensitive".into(),
+            },
+        ))).unwrap();
+        drop(tx);
+        let task = tauri::async_runtime::spawn(subagent_relay(SubagentRelayCtx {
+            log: Arc::clone(&log), engine, app: mock_app_handle(), events_rx: rx,
+        }));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(log.events_after(0).is_empty());
+        *key.lock().unwrap() = Ok(Some("sensitive".into()));
+        tauri::async_runtime::block_on(task).unwrap();
+        assert!(matches!(&log.events_after(0)[0].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { text, .. }) if text == "[REDACTED]"));
+    }
+
+    #[test]
+    fn subagent_relay_refreshes_rotated_key_and_recovers_from_keyring_error() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let key = Arc::new(Mutex::new(Ok(Some("old-key".to_string()))));
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(), active_model: None,
+            agent: selora_settings::AgentSettings::default(), key_source: ApiKeySource::Mutable(Arc::clone(&key)),
+        }));
+        engine.register_subagent_redaction_key("original-key");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tauri::async_runtime::spawn(subagent_relay(SubagentRelayCtx {
+            log: Arc::clone(&log), engine, app: mock_app_handle(), events_rx: rx,
+        }));
+        let activity = |text: &str, sequence| selora_ai::SubagentEvent::Activity(selora_ai::SubagentActivity::new(
+            "child", "session-1", selora_ai::SubagentActivityKind::Delta {
+                message_id: "m".into(), sequence, text: text.into(),
+            },
+        ));
+        tx.send(activity("original-key old-key ", 1)).unwrap();
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while log.events_after(0).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(log.events_after(0).len(), 1);
+        assert!(matches!(&log.events_after(0)[0].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { text, .. }) if text == "[REDACTED] [REDACTED] "));
+        *key.lock().unwrap() = Ok(Some("new-key".into()));
+        tx.send(activity("new-key old-key ", 2)).unwrap();
+        while log.events_after(0).len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(log.events_after(0).len(), 2);
+        *key.lock().unwrap() = Err(ProtocolErrorDto { code: "keyring_unavailable".into(), message: "error".into(), retryable: true });
+        tx.send(activity("new-key recovered", 3)).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(log.events_after(0).len(), 2);
+        *key.lock().unwrap() = Ok(Some("new-key".into()));
+        drop(tx);
+        tauri::async_runtime::block_on(task).unwrap();
+        let events = log.events_after(0);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[1].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { text, .. }) if text == "[REDACTED] [REDACTED] "));
+        assert!(matches!(&events[2].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { text, .. }) if text == "[REDACTED] recovered"));
+    }
+
+    #[test]
+    fn subagent_relay_seals_prefix_before_other_activity() {
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(), active_model: None,
+            agent: selora_settings::AgentSettings::default(), key_source: ApiKeySource::Fixed(Some("secret".into())),
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        for kind in [
+            selora_ai::SubagentActivityKind::Delta { message_id: "m".into(), sequence: 1, text: "pre sec".into() },
+            selora_ai::SubagentActivityKind::StateChanged { state: selora_ai::SubagentRunState::Thinking, tool_name: None },
+            selora_ai::SubagentActivityKind::Delta { message_id: "m".into(), sequence: 2, text: "ret post".into() },
+        ] {
+            tx.send(selora_ai::SubagentEvent::Activity(selora_ai::SubagentActivity::new("child", "session-1", kind))).unwrap();
+        }
+        drop(tx);
+        tauri::async_runtime::block_on(subagent_relay(SubagentRelayCtx {
+            log: Arc::clone(&log), engine, app: mock_app_handle(), events_rx: rx,
+        }));
+        let events = log.events_after(0);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[1].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { text, .. }) if text == "[REDACTED]"));
+        assert!(matches!(&events[2].payload, FrontendEvent::SubagentActivity(SubagentActivityDto::StateChanged { .. })));
+    }
+
+    #[test]
+    fn subagent_relay_flushes_split_deltas_on_cancel_and_close() {
+        const KEY: &str = "sk-secret";
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            active_model: None,
+            agent: selora_settings::AgentSettings::default(),
+            key_source: ApiKeySource::Fixed(Some(KEY.into())),
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tauri::async_runtime::spawn(subagent_relay(SubagentRelayCtx {
+            log: Arc::clone(&log), engine, app: mock_app_handle(), events_rx: rx,
+        }));
+        for (child, message, sequence, text) in [
+            ("child-1", "m1", 1, "hello sk-"),
+            ("child-1", "m1", 2, "secret tail sk-"),
+        ] {
+            tx.send(selora_ai::SubagentEvent::Activity(selora_ai::SubagentActivity::new(
+                child, "session-1", selora_ai::SubagentActivityKind::Delta {
+                    message_id: message.into(), sequence, text: text.into(),
+                },
+            ))).unwrap();
+        }
+        tx.send(selora_ai::SubagentEvent::Cancelled {
+            child_id: "child-1".into(), parent_session: "session-1".into(),
+        }).unwrap();
+        tx.send(selora_ai::SubagentEvent::Activity(selora_ai::SubagentActivity::new(
+            "child-2", "session-1", selora_ai::SubagentActivityKind::Delta {
+                message_id: "m2".into(), sequence: 1, text: "sk-".into(),
+            },
+        ))).unwrap();
+        drop(tx);
+        tauri::async_runtime::block_on(task).unwrap();
+        let events = log.events_after(0);
+        let mut children = BTreeMap::<String, String>::new();
+        let mut sequences = BTreeMap::<String, Vec<u64>>::new();
+        for event in &events {
+            if let FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { child_id, text, sequence, .. }) = &event.payload {
+                children.entry(child_id.clone()).or_default().push_str(text);
+                sequences.entry(child_id.clone()).or_default().push(*sequence);
+            }
+        }
+        assert_eq!(children["child-1"], "hello [REDACTED] tail sk-");
+        assert_eq!(children["child-2"], "sk-");
+        assert_eq!(sequences["child-1"], vec![1, 2, 3]);
+        let cancel = events.iter().position(|e| matches!(e.payload, FrontendEvent::SubagentCancelled(_))).unwrap();
+        assert!(events[..cancel].iter().any(|e| matches!(&e.payload, FrontendEvent::SubagentActivity(SubagentActivityDto::Delta { child_id, text, .. }) if child_id == "child-1" && text == "sk-")));
+    }
+
+    #[test]
+    fn subagent_activity_relay_keeps_transcripts_separate_and_redacts() {
+        const KEY: &str = "sk-secret-desktop-key";
+        let state = DesktopState::with_settings(selora_settings::Settings::default());
+        let log = Arc::new(EventLog::new(state.core_instance_id()));
+        let app = mock_app_handle();
+        let engine = Arc::new(SessionEngine::new(EngineConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            active_model: None,
+            agent: selora_settings::AgentSettings::default(),
+            key_source: ApiKeySource::Fixed(Some(KEY.into())),
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(subagent_relay(SubagentRelayCtx {
+            log: Arc::clone(&log),
+            engine: Arc::clone(&engine),
+            app,
+            events_rx: rx,
+        }));
+        tx.send(selora_ai::SubagentEvent::Activity(
+            selora_ai::SubagentActivity::new(
+                "child-1",
+                "session-1",
+                selora_ai::SubagentActivityKind::Started {
+                    name: format!("{KEY} reviewer"),
+                    policy: selora_ai::SubagentPolicy::ReadOnly,
+                    mission: format!("review {KEY}"),
+                },
+            ),
+        ))
+        .unwrap();
+        tx.send(selora_ai::SubagentEvent::Activity(
+            selora_ai::SubagentActivity::new(
+                "child-1",
+                "session-1",
+                selora_ai::SubagentActivityKind::Delta {
+                    message_id: "message-1".into(),
+                    sequence: 1,
+                    text: format!("token {KEY}"),
+                },
+            ),
+        ))
+        .unwrap();
+        tx.send(selora_ai::SubagentEvent::Cancelled {
+            child_id: "child-1".into(),
+            parent_session: "session-1".into(),
+        })
+        .unwrap();
+        tx.send(selora_ai::SubagentEvent::ApprovalNeeded(
+            selora_ai::SubagentCard {
+                child_id: "child-1".into(),
+                parent_session: "session-1".into(),
+                approval_id: uuid::Uuid::new_v4(),
+                card: ApprovalCard::Plan {
+                    summary: None,
+                    steps: vec!["Inspect".into()],
+                },
+            },
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let events = loop {
+            let events = log.events_after(0);
+            if events.len() >= 4 || Instant::now() >= deadline {
+                break events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(events.len(), 4, "{events:#?}");
+        let parent = SessionId::new("session-1").unwrap();
+        let child = RequestId::new("child-1").unwrap();
+        for event in &events {
+            assert_eq!(event.session_id.as_ref(), Some(&parent));
+        }
+        let FrontendEvent::SubagentActivity(SubagentActivityDto::Started {
+            child_id,
+            parent_session_id,
+            name,
+            policy,
+            mission,
+        }) = &events[0].payload
+        else {
+            panic!("first event must be Started: {events:#?}");
+        };
+        assert_eq!(child_id, "child-1");
+        assert_eq!(parent_session_id, &parent);
+        assert_eq!(name.as_deref(), Some("[REDACTED] reviewer"));
+        assert_eq!(*policy, SubagentPolicyDto::ReadOnly);
+        assert_eq!(mission, "review [REDACTED]");
+        assert_eq!(events[0].request_id.as_ref(), Some(&child));
+        let FrontendEvent::SubagentActivity(SubagentActivityDto::Delta {
+            message_id,
+            sequence,
+            text,
+            ..
+        }) = &events[1].payload
+        else {
+            panic!("second event must be Delta: {events:#?}");
+        };
+        assert_eq!(message_id, "message-1");
+        assert_eq!(*sequence, 1);
+        assert_eq!(text, "token [REDACTED]");
+        assert_eq!(events[1].request_id.as_ref(), Some(&child));
+        let FrontendEvent::SubagentCancelled(cancelled) = &events[2].payload else {
+            panic!("third event must be Cancelled: {events:#?}");
+        };
+        assert_eq!(cancelled.child_id, "child-1");
+        assert_eq!(cancelled.parent_session_id, parent);
+        assert_eq!(events[2].request_id.as_ref(), Some(&child));
+        // The existing child approval rail is unchanged: same parent session,
+        // same request routing, and the child id rides `subagent_id`.
+        let FrontendEvent::ApprovalNeeded(card) = &events[3].payload else {
+            panic!("fourth event must be ApprovalNeeded: {events:#?}");
+        };
+        assert_eq!(card.subagent_id.as_deref(), Some("child-1"));
+        assert_eq!(card.session_id, parent);
+        assert_eq!(card.request_id, RequestId::new("subagent-child-1").unwrap());
     }
 }

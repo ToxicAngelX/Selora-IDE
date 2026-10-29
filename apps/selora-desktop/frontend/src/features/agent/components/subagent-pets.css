@@ -1,0 +1,346 @@
+/* Selora IDE — title-bar subagent pet worlds.
+   A pet is a 22px pill inside the 32px title bar: a small circular world
+   badge plus the child's session name. Motion is subtle and only running pets
+   animate. Honors prefers-reduced-motion and :root[data-reduced-motion]. */
+
+.subagent-pets {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  min-width: 0;
+  max-width: 360px;
+  padding: 0 1px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-shrink: 1;
+  scrollbar-width: none;
+  /* Pets are controls: never a window-drag surface. */
+  -webkit-app-region: no-drag;
+}
+
+.subagent-pets::-webkit-scrollbar {
+  display: none;
+}
+
+.subagent-pet {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 22px;
+  max-width: 116px;
+  padding: 0 6px 0 2px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--c-rgba-255-255-255-0p04);
+  color: var(--fg-muted);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color var(--dur-instant) var(--ease-calm),
+    border-color var(--dur-instant) var(--ease-calm),
+    color var(--dur-instant) var(--ease-calm),
+    box-shadow var(--dur-instant) var(--ease-calm),
+    opacity var(--dur-instant) var(--ease-calm);
+}
+
+.subagent-pet:hover {
+  background: var(--glow-accent);
+  border-color: var(--glass-border-hover);
+  color: var(--fg-default);
+}
+
+.subagent-pet:focus-visible {
+  outline: calc(var(--hairline) * 2) solid var(--fg-default);
+  outline-offset: 1px;
+}
+
+.subagent-pet.is-active {
+  color: var(--fg-bright);
+  background: var(--ink-mid);
+  border-color: var(--hairline-active);
+  box-shadow:
+    0 0 0 1px var(--c-rgba-255-255-255-0p18),
+    0 0 10px var(--glow-accent-strong);
+}
+
+.subagent-pet.is-active .subagent-pet-world {
+  box-shadow: 0 0 0 1px var(--moonlight-400);
+}
+
+.subagent-pet.is-done,
+.subagent-pet.is-failed,
+.subagent-pet.is-cancelled {
+  opacity: 0.62;
+}
+
+.subagent-pet.is-done:hover,
+.subagent-pet.is-failed:hover,
+.subagent-pet.is-cancelled:hover {
+  opacity: 1;
+}
+
+.subagent-pet-name {
+  min-width: 0;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- World badge ---------------------------------------------------------- */
+
+.subagent-pet-world {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 28%, var(--world-glow, var(--glow-accent)) 0%, transparent 62%),
+    var(--ink-low);
+  box-shadow: inset 0 0 0 1px var(--hairline-faint);
+}
+
+.subagent-pet-art {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  color: var(--moonlight-400);
+  overflow: visible;
+  transform-origin: center;
+}
+
+.art-sun {
+  color: var(--moonlight-200);
+  --world-glow: color-mix(in srgb, var(--moonlight-200) 24%, transparent);
+}
+
+.art-moon {
+  color: var(--moonlight-400);
+  --world-glow: color-mix(in srgb, var(--moonlight-400) 18%, transparent);
+}
+
+.art-star {
+  color: var(--moonlight-300);
+  --world-glow: color-mix(in srgb, var(--moonlight-300) 20%, transparent);
+}
+
+.art-comet {
+  color: var(--moonlight-600);
+  --world-glow: color-mix(in srgb, var(--moonlight-600) 20%, transparent);
+}
+
+.art-nebula {
+  color: var(--moonlight-700);
+  --world-glow: color-mix(in srgb, var(--moonlight-700) 22%, transparent);
+}
+
+.art-orbit {
+  color: var(--moonlight-500);
+  --world-glow: color-mix(in srgb, var(--moonlight-500) 18%, transparent);
+}
+
+.pet-sun-rays,
+.pet-orbit-ring {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  transform-origin: center;
+}
+
+.pet-orbit-ring {
+  transform: rotate(-24deg);
+}
+
+/* --- Terminal marks ------------------------------------------------------- */
+
+.subagent-pet-mark {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 9px;
+  height: 9px;
+  padding: 1px;
+  border-radius: 50%;
+  background: var(--ink-canvas);
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.subagent-pet-mark.mark-done {
+  stroke: var(--ok);
+}
+
+.subagent-pet-mark.mark-failed {
+  stroke: var(--err);
+}
+
+.subagent-pet-mark.mark-cancelled {
+  stroke: var(--fg-muted);
+}
+
+/* --- Motion: running pets only ------------------------------------------- */
+
+.subagent-pet.is-working .subagent-pet-art {
+  animation: pet-breathe 2.8s var(--ease-calm) infinite;
+}
+
+.subagent-pet.is-working .pet-sun-rays {
+  animation: pet-spin 18s linear infinite;
+}
+
+.subagent-pet.is-working .pet-star {
+  animation: pet-twinkle 2.2s var(--ease-calm) infinite;
+}
+
+.subagent-pet.is-working .pet-comet-tail {
+  animation: pet-drift 2.6s var(--ease-calm) infinite;
+}
+
+.subagent-pet.is-working .pet-nebula {
+  animation: pet-bob 3.4s var(--ease-calm) infinite;
+}
+
+.subagent-pet.is-working .pet-orbit-ring {
+  animation: pet-orbit 6s linear infinite;
+}
+
+.subagent-pet.is-idle .subagent-pet-art {
+  opacity: 0.78;
+}
+
+@keyframes pet-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+
+@keyframes pet-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pet-orbit {
+  from {
+    transform: rotate(-24deg);
+  }
+  to {
+    transform: rotate(336deg);
+  }
+}
+
+@keyframes pet-twinkle {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes pet-drift {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(0.6px, -0.6px);
+  }
+}
+
+@keyframes pet-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-0.7px);
+  }
+}
+
+/* --- Overflow count ------------------------------------------------------- */
+
+.subagent-pets-overflow {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-pill);
+  background: var(--c-rgba-255-255-255-0p06);
+  color: var(--fg-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Narrow widths: keep the icons, drop the labels ---------------------- */
+
+@media (max-width: 1100px) {
+  .subagent-pets {
+    max-width: 220px;
+  }
+
+  .subagent-pet {
+    max-width: 26px;
+    padding: 0 3px;
+  }
+
+  .subagent-pet-name {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .subagent-pets {
+    max-width: 190px;
+  }
+}
+
+@media (max-width: 700px) {
+  .subagent-pets {
+    max-width: 132px;
+  }
+}
+
+/* --- Reduced motion ------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .subagent-pet-art,
+  .subagent-pet.is-working .subagent-pet-art,
+  .subagent-pet.is-working .pet-sun-rays,
+  .subagent-pet.is-working .pet-star,
+  .subagent-pet.is-working .pet-comet-tail,
+  .subagent-pet.is-working .pet-nebula,
+  .subagent-pet.is-working .pet-orbit-ring {
+    animation: none;
+  }
+}
+
+:root[data-reduced-motion='true'] .subagent-pet-art,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .subagent-pet-art,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .pet-sun-rays,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .pet-star,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .pet-comet-tail,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .pet-nebula,
+:root[data-reduced-motion='true'] .subagent-pet.is-working .pet-orbit-ring {
+  animation: none;
+}

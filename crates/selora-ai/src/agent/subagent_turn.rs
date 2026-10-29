@@ -23,12 +23,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::subagent::{
-    ChildOutcome, SpawnError, SpawnRequest, SubagentCard, SubagentHandle, SubagentPolicy,
-    SubagentRuntime,
+    ChildOutcome, SpawnError, SpawnRequest, SubagentActivity, SubagentActivityKind, SubagentCard,
+    SubagentHandle, SubagentPolicy, SubagentRunState, SubagentRuntime,
 };
 use super::turn::{
-    run_agent_turn, AgentEvent, AgentTurnReport, ChatRoundFuture, ToolApprovedFuture,
-    ToolRunFuture, TurnDecision,
+    run_agent_turn, AgentEvent, AgentTurnReport, AgentTurnState, ChatRoundFuture,
+    ToolApprovedFuture, ToolRunFuture, TurnDecision,
 };
 use super::{ChatStream, ToolRunner, TurnCaps, TurnInput};
 use crate::chat_types::{ToolCall, ToolResult};
@@ -230,19 +230,25 @@ pub fn spawn_child_turn(
     let child_id = request.child_id.clone();
     let parent_session = request.parent_session.clone();
     let policy = request.policy;
-    let name = request
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("subagent-{}", short_id(&child_id)));
+    let name = normalize_name(&request);
     let conversation = seed_conversation(&request, &name);
+    let started = SubagentActivity::new(
+        child_id.clone(),
+        parent_session.clone(),
+        SubagentActivityKind::Started {
+            name: name.clone(),
+            policy,
+            mission: request.mission.clone(),
+        },
+    );
     let runtime_for_task = runtime.clone();
     runtime.spawn_background(request, async move {
+        // One Started per spawned child, before the first gateway/tool event.
+        runtime_for_task.emit_activity(started);
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
         runtime_for_task.register_steering(&child_id, steer_tx);
         let mut conversation = conversation;
+        let mut transcript = ChildActivity::default();
         loop {
             let (chat, tools) = match (backend.chat(), backend.tools(policy)) {
                 (Ok(chat), Ok(tools)) => (chat, tools),
@@ -276,6 +282,7 @@ pub fn spawn_child_turn(
                                 &parent_session,
                                 &decision_tx,
                                 event,
+                                &mut transcript,
                             );
                         }
                     }
@@ -288,6 +295,7 @@ pub fn spawn_child_turn(
                     &parent_session,
                     &decision_tx,
                     event,
+                    &mut transcript,
                 );
             }
             runtime_for_task.forget_child_cards(&child_id);
@@ -314,22 +322,126 @@ pub fn spawn_child_turn(
     })
 }
 
+/// Per-child live transcript state. A new `Thinking` round mints a new
+/// assistant message; the delta sequence stays monotonic across turns.
+#[derive(Default)]
+struct ChildActivity {
+    message_id: Option<String>,
+    sequence: u64,
+}
+
 fn relay_event(
     runtime: &SubagentRuntime,
     child_id: &str,
     parent_session: &str,
     decisions: &mpsc::UnboundedSender<TurnDecision>,
     event: AgentEvent,
+    transcript: &mut ChildActivity,
 ) {
-    if let AgentEvent::ApprovalNeeded { approval_id, card } = event {
-        runtime.register_decision(child_id, approval_id, decisions.clone());
-        runtime.emit_child_card(SubagentCard {
-            child_id: child_id.to_owned(),
-            parent_session: parent_session.to_owned(),
-            approval_id,
-            card,
-        });
+    let activity = match event {
+        AgentEvent::State(state) => {
+            if state == AgentTurnState::Thinking {
+                transcript.message_id = None;
+            }
+            let (state, tool_name) = activity_state(&state);
+            SubagentActivityKind::StateChanged { state, tool_name }
+        }
+        AgentEvent::Delta(text) => {
+            transcript.sequence += 1;
+            let message_id = transcript
+                .message_id
+                .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+                .clone();
+            SubagentActivityKind::Delta {
+                message_id,
+                sequence: transcript.sequence,
+                text,
+            }
+        }
+        AgentEvent::ToolCallStarted(call) => SubagentActivityKind::ToolCallStarted {
+            call_id: call.id,
+            tool_name: call.name,
+            args_json: call.arguments,
+        },
+        AgentEvent::ToolResult(result) => SubagentActivityKind::ToolResult {
+            call_id: result.id,
+            result_summary: result.content,
+            is_err: !result.ok,
+        },
+        AgentEvent::ApprovalNeeded { approval_id, card } => {
+            runtime.register_decision(child_id, approval_id, decisions.clone());
+            runtime.emit_child_card(SubagentCard {
+                child_id: child_id.to_owned(),
+                parent_session: parent_session.to_owned(),
+                approval_id,
+                card,
+            });
+            return;
+        }
+        _ => return,
+    };
+    runtime.emit_activity(SubagentActivity::new(
+        child_id.to_owned(),
+        parent_session.to_owned(),
+        activity,
+    ));
+}
+
+fn activity_state(state: &AgentTurnState) -> (SubagentRunState, Option<String>) {
+    match state {
+        AgentTurnState::Thinking => (SubagentRunState::Thinking, None),
+        AgentTurnState::RunningTool(name) => (SubagentRunState::RunningTool, Some(name.clone())),
+        AgentTurnState::AwaitingApproval(_) => (SubagentRunState::AwaitingApproval, None),
+        AgentTurnState::Done => (SubagentRunState::Done, None),
     }
+}
+
+fn normalize_name(request: &SpawnRequest) -> String {
+    if let Some(name) = request.name.as_deref() {
+        let name = plain_line(name);
+        if !name.is_empty() {
+            return truncate_ellipsis(&name, 80);
+        }
+    }
+    if let Some(line) = request.mission.lines().find(|line| !line.trim().is_empty()) {
+        let line = plain_line(line);
+        if !line.is_empty() {
+            return truncate_ellipsis(&line, 48);
+        }
+    }
+    format!("subagent-{}", short_id(&request.child_id))
+}
+
+/// Trim, collapse whitespace, and drop control characters so the name is one
+/// readable line in the child transcript/pet UI.
+fn plain_line(text: &str) -> String {
+    text.split_whitespace()
+        .map(|part| {
+            part.chars()
+                .filter(|ch| {
+                    !ch.is_control()
+                        && !matches!(
+                            *ch,
+                            '\u{200B}'..='\u{200F}'
+                                | '\u{202A}'..='\u{202E}'
+                                | '\u{2060}'..='\u{206F}'
+                                | '\u{FEFF}'
+                        )
+                })
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// The child's initial conversation: policy system prompt, optional persona,
@@ -410,4 +522,357 @@ pub fn format_subagent_completion(completion: &super::subagent::SubagentCompleti
 /// verbatim; the answer is never reinterpreted as an approval.
 pub fn question_answer_result(call: &ToolCall, answer: &str) -> ToolResult {
     ToolResult::success(&call.id, format!("User answer:\n{answer}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::router::ToolOutcome;
+    use selora_ai_types_test_support::receipt;
+
+    struct ScriptedChat {
+        deltas: Vec<&'static str>,
+    }
+
+    impl Default for ScriptedChat {
+        fn default() -> Self {
+            Self {
+                deltas: vec!["hello"],
+            }
+        }
+    }
+
+    impl ChatStream for ScriptedChat {
+        fn stream_round(
+            &mut self,
+            _request: ChatRequest,
+            events: mpsc::UnboundedSender<ChatEvent>,
+        ) -> ChatRoundFuture<'_> {
+            let deltas = self.deltas.clone();
+            Box::pin(async move {
+                for delta in deltas {
+                    let _ = events.send(ChatEvent::Delta(delta.to_owned()));
+                }
+                let receipt = receipt();
+                let _ = events.send(ChatEvent::Done(receipt.clone()));
+                Ok(receipt)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct HangingChat;
+
+    impl ChatStream for HangingChat {
+        fn stream_round(
+            &mut self,
+            _request: ChatRequest,
+            _events: mpsc::UnboundedSender<ChatEvent>,
+        ) -> ChatRoundFuture<'_> {
+            Box::pin(async {
+                std::future::pending::<Result<crate::types::ChatReceipt, selora_core::SeloraError>>(
+                )
+                .await
+            })
+        }
+    }
+
+    struct UnusedTools;
+
+    impl ToolRunner for UnusedTools {
+        fn run(&mut self, call: ToolCall) -> ToolRunFuture {
+            Box::pin(async move {
+                ToolOutcome::Ready(ToolResult {
+                    id: call.id,
+                    ok: false,
+                    content: "unused".into(),
+                })
+            })
+        }
+
+        fn run_approved(&mut self, call: ToolCall) -> ToolApprovedFuture {
+            Box::pin(async move {
+                ToolResult {
+                    id: call.id,
+                    ok: false,
+                    content: "unused".into(),
+                }
+            })
+        }
+
+        fn abort(&mut self) {}
+    }
+
+    struct Backend<C> {
+        chat: std::marker::PhantomData<fn() -> C>,
+    }
+
+    impl<C: ChatStream + Default + 'static> SubagentBackend for Backend<C> {
+        fn chat(&self) -> Result<Box<dyn ChatStream>, String> {
+            Ok(Box::new(C::default()))
+        }
+
+        fn tools(&self, _policy: SubagentPolicy) -> Result<Box<dyn ToolRunner>, String> {
+            Ok(Box::new(UnusedTools))
+        }
+    }
+
+    mod selora_ai_types_test_support {
+        use crate::types::{ChatReceipt, ModelId};
+        use uuid::Uuid;
+
+        pub fn receipt() -> ChatReceipt {
+            ChatReceipt {
+                request_id: Uuid::nil(),
+                model: ModelId::from("test-model"),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cost_usd: 0.0,
+                duration_ms: 1,
+                estimated: false,
+            }
+        }
+    }
+
+    fn model() -> Model {
+        serde_json::from_value(serde_json::json!({
+            "id": "test-model",
+            "supports_tools": true,
+            "context_window": 128000
+        }))
+        .unwrap()
+    }
+
+    fn activities(events: &[super::super::subagent::SubagentEvent]) -> Vec<SubagentActivity> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                super::super::subagent::SubagentEvent::Activity(activity) => Some(activity.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn started_precedes_child_delta_and_completion_with_ids() {
+        let runtime = SubagentRuntime::new();
+        let mut events = runtime.subscribe();
+        spawn_child_turn(
+            &runtime,
+            SpawnRequest::new(
+                "parent-1",
+                "child-1",
+                SubagentPolicy::ReadOnly,
+                "Review parser",
+            ),
+            Arc::new(Backend::<ScriptedChat> {
+                chat: std::marker::PhantomData,
+            }),
+            model(),
+            TurnCaps::spec_defaults(128000),
+        )
+        .unwrap();
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.wait_for_child("child-1"),
+        )
+        .await
+        .expect("completion")
+        .expect("child");
+        assert!(completion.ok, "{completion:?}");
+        let mut seen = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("event")
+                .expect("stream open");
+            let done = matches!(event, super::super::subagent::SubagentEvent::Completed(_));
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        let activities = activities(&seen);
+        assert!(matches!(
+            activities.first().map(|activity| &activity.kind),
+            Some(SubagentActivityKind::Started { name, mission, .. })
+                if name == "Review parser" && mission == "Review parser"
+        ));
+        let delta = activities
+            .iter()
+            .find(|activity| matches!(&activity.kind, SubagentActivityKind::Delta { .. }))
+            .expect("delta activity");
+        let SubagentActivityKind::Delta { text, sequence, .. } = &delta.kind else {
+            unreachable!()
+        };
+        assert_eq!(text, "hello");
+        assert_eq!(*sequence, 1);
+        assert!(activities.iter().all(|activity| {
+            activity.child_id == "child-1" && activity.parent_session == "parent-1"
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_emits_one_lifecycle_event_and_no_completion() {
+        let runtime = SubagentRuntime::new();
+        let mut events = runtime.subscribe();
+        spawn_child_turn(
+            &runtime,
+            SpawnRequest::new(
+                "parent-1",
+                "child-1",
+                SubagentPolicy::ReadOnly,
+                "Wait forever",
+            ),
+            Arc::new(Backend::<HangingChat> {
+                chat: std::marker::PhantomData,
+            }),
+            model(),
+            TurnCaps::spec_defaults(128000),
+        )
+        .unwrap();
+        // Wait for Started so cancellation cannot race task startup.
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("started")
+                .expect("stream open");
+            if matches!(
+                event,
+                super::super::subagent::SubagentEvent::Activity(SubagentActivity {
+                    kind: SubagentActivityKind::Started { .. },
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+        assert!(runtime.cancel_child("child-1"));
+        assert_eq!(
+            runtime.child_state("child-1"),
+            Some(super::super::subagent::ChildState::Cancelled)
+        );
+        let mut cancellations = 0;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(150), events.recv()).await {
+                Ok(Ok(super::super::subagent::SubagentEvent::Cancelled {
+                    child_id,
+                    parent_session,
+                })) => {
+                    assert_eq!(child_id, "child-1");
+                    assert_eq!(parent_session, "parent-1");
+                    cancellations += 1;
+                }
+                Ok(Ok(super::super::subagent::SubagentEvent::Completed(_))) => {
+                    panic!("cancelled child must not complete")
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(cancellations, 1);
+    }
+
+    #[test]
+    fn relay_maps_tool_and_state_activities_with_stable_message_ids() {
+        let runtime = SubagentRuntime::new();
+        let mut events = runtime.subscribe();
+        let (decisions, _decision_rx) = mpsc::unbounded_channel();
+        let mut transcript = ChildActivity::default();
+        for event in [
+            AgentEvent::State(AgentTurnState::Thinking),
+            AgentEvent::Delta("a".into()),
+            AgentEvent::Delta("b".into()),
+            AgentEvent::ToolCallStarted(ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            }),
+            AgentEvent::ToolResult(ToolResult {
+                id: "call-1".into(),
+                ok: false,
+                content: "denied".into(),
+            }),
+            AgentEvent::State(AgentTurnState::RunningTool("read_file".into())),
+            AgentEvent::State(AgentTurnState::Done),
+            AgentEvent::State(AgentTurnState::Thinking),
+            AgentEvent::Delta("c".into()),
+        ] {
+            relay_event(
+                &runtime,
+                "child-1",
+                "parent-1",
+                &decisions,
+                event,
+                &mut transcript,
+            );
+        }
+        let activities = activities(&[
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+            events.try_recv().unwrap(),
+        ]);
+        let deltas: Vec<_> = activities
+            .iter()
+            .filter_map(|activity| match &activity.kind {
+                SubagentActivityKind::Delta {
+                    message_id,
+                    sequence,
+                    ..
+                } => Some((message_id.clone(), *sequence)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas[0].0, deltas[1].0);
+        assert_eq!(deltas[0].1, 1);
+        assert_eq!(deltas[1].1, 2);
+        assert_ne!(deltas[2].0, deltas[0].0, "new Thinking round new message");
+        assert_eq!(deltas[2].1, 3);
+        assert!(activities.iter().any(|activity| matches!(
+            &activity.kind,
+            SubagentActivityKind::ToolCallStarted {
+                call_id,
+                tool_name,
+                args_json,
+            } if call_id == "call-1"
+                && tool_name == "read_file"
+                && args_json.contains("src/lib.rs")
+        )));
+        assert!(activities.iter().any(|activity| matches!(
+            &activity.kind,
+            SubagentActivityKind::ToolResult {
+                call_id,
+                result_summary,
+                is_err: true,
+            } if call_id == "call-1" && result_summary == "denied"
+        )));
+        assert!(activities.iter().any(|activity| matches!(
+            &activity.kind,
+            SubagentActivityKind::StateChanged {
+                state: SubagentRunState::RunningTool,
+                tool_name: Some(name),
+            } if name == "read_file"
+        )));
+        assert!(activities.iter().any(|activity| matches!(
+            &activity.kind,
+            SubagentActivityKind::StateChanged {
+                state: SubagentRunState::Done,
+                tool_name: None,
+            }
+        )));
+    }
+
+    #[test]
+    fn display_name_drops_bidi_formatting_and_controls() {
+        let mut request =
+            SpawnRequest::new("parent-1", "child-1", SubagentPolicy::ReadOnly, "mission");
+        request.name = Some("Safe \u{202E}evil\u{200F} name\u{0007}".into());
+        assert_eq!(normalize_name(&request), "Safe evil name");
+    }
 }

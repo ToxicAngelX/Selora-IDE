@@ -17,8 +17,10 @@ import { AgentTodoSpine } from '../features/agent/components/AgentTodoSpine';
 import { AgentExecutionFeed } from '../features/agent/components/AgentExecutionFeed';
 import { AgentPlanSpine } from '../features/agent/components/AgentPlanSpine';
 import { AgentComposer } from '../features/agent/components/AgentComposer';
+import { SubagentResults } from '../features/agent/components/SubagentResults';
+import { SubagentSessionView } from '../features/agent/components/SubagentSessionView';
 import { ThinkingOrb } from '../features/agent/presence/ThinkingOrb';
-import { EmptyState } from '../components/EmptyState';
+import '../features/agent/components/agent-welcome.css';
 import { activeEditorContext, editorStore } from '../features/editor/editor-store';
 import type { BootstrapState } from '../bridge/bridge';
 
@@ -53,6 +55,13 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
     state.sessions.find((session) => session.id === state.activeSessionId) ?? null;
 
   const hasMessages = state.messages.length > 0;
+  // Only a backend-reported workspace with a real root earns a name line.
+  const workspaceName =
+    state.workspace?.root &&
+    state.workspace.displayName &&
+    state.workspace.displayName !== 'No workspace open'
+      ? state.workspace.displayName
+      : null;
   const gate = getComposerGate(state);
   const autoApplyArmed = state.permissionMode === 'full';
   const activeSessionTabId = activeSession
@@ -72,8 +81,10 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
       );
     }
   };
-  const revealedSubagent = state.revealedSubagentId
-    ? state.subagents.find((subagent) => subagent.id === state.revealedSubagentId)
+  const activeChild = state.activeSubagentId
+    ? state.subagents.find((subagent) =>
+        subagent.id === state.activeSubagentId && subagent.parentSessionId === state.activeSessionId,
+      )
     : undefined;
 
   useEffect(() => {
@@ -133,6 +144,8 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
             className={`agent-view-tab ${activeTab === 'feed' ? 'is-active' : ''}`}
             onClick={() => setActiveTab('feed')}
             aria-pressed={activeTab === 'feed'}
+            disabled={Boolean(activeChild)}
+            title={activeChild ? 'Back to parent to leave the child session' : undefined}
           >
             Chat
           </button>
@@ -141,12 +154,14 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
             className={`agent-view-tab ${activeTab === 'plan' ? 'is-active' : ''}`}
             onClick={() => setActiveTab('plan')}
             aria-pressed={activeTab === 'plan'}
+            disabled={Boolean(activeChild)}
+            title={activeChild ? 'Back to parent to leave the child session' : undefined}
           >
             Plan ({state.todos.filter((t) => t.status === 'completed').length}/
             {state.todos.length})
           </button>
 
-          {activeTab === 'feed' && (
+          {activeTab === 'feed' && !activeChild && (
             <button
               type="button"
               className={`agent-floating-plan-toggle ${showFloatingPlan ? 'is-active' : ''}`}
@@ -217,40 +232,18 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
         onNew={() => void agentStore.requestNewSession()}
         onSelect={(sessionId) => void agentStore.requestSwitchSession(sessionId)}
       />
-      {/* Phase 9e: notification click reveals the child result here, under
-          the selected parent session. */}
-      {revealedSubagent ? (
-        <section className="agent-subagent-result" data-testid="subagent-result" aria-label="Subagent result">
-          <div className="agent-subagent-result-head">
-            <span className="agent-subagent-result-title">
-              {revealedSubagent.name}
-              <span className="agent-subagent-policy">{revealedSubagent.policy ?? 'read_only'}</span>
-            </span>
-            <button
-              type="button"
-              className="agent-subagent-result-close"
-              aria-label="Dismiss subagent result"
-              onClick={() => agentStore.clearSubagentReveal()}
-            >
-              Close
-            </button>
-          </div>
-          <p className="agent-subagent-result-body">
-            {revealedSubagent.status === 'failed'
-              ? revealedSubagent.error ?? 'Subagent failed without a message.'
-              : revealedSubagent.result || 'Subagent finished without a final message.'}
-          </p>
-          {revealedSubagent.artifacts && revealedSubagent.artifacts.length > 0 ? (
-            <ul className="agent-subagent-artifacts">
-              {revealedSubagent.artifacts.map((artifact) => (
-                <li key={`${artifact.kind}:${artifact.path}`}>
-                  <span>{artifact.kind}</span> {artifact.path}
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </section>
-      ) : null}
+      {/* Phase 9e: running and finished children under the selected parent.
+          Opening one swaps the body below for its read-only transcript. */}
+      <SubagentResults
+        sessionId={state.activeSessionId}
+        subagents={state.subagents}
+        revealedChildId={state.revealedSubagentId}
+        onRead={agentStore.markSubagentRead}
+        onClearReveal={agentStore.clearSubagentReveal}
+        onOpenSession={(childId) => {
+          if (agentStore.openSubagentSession(childId)) setActiveTab('feed');
+        }}
+      />
 
       {/* Durable sessions share the same backend switch route as the tabs. */}
       {state.resumableSessions.length > 0 && (
@@ -263,11 +256,12 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
 
       {/* 3. Workbench body */}
       <div
-        className="agent-workbench-body"
+        className={`agent-workbench-body${activeChild ? ' has-subagent-session' : ''}`}
         id="agent-session-panel"
         role="tabpanel"
         aria-labelledby={activeSessionTabId}
       >
+        <div className="agent-parent-layer" aria-hidden={activeChild ? true : undefined}>
         {activeTab === 'feed' ? (
           <div className="agent-feed-column">
             {showFloatingPlan && (
@@ -335,12 +329,14 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
               />
             ) : (
               <div className="agent-body">
-                <EmptyState
-                  heading="Ask anything"
-                  hint={
-                    <em>Ask about the code, or tell Selora what to change.</em>
-                  }
-                >
+                <div className="agent-welcome">
+                  <h2 className="agent-welcome-heading">What are we building today?</h2>
+                  <p className="agent-welcome-sub">Ask about the code, or describe a change.</p>
+                  {workspaceName ? (
+                    <p className="agent-welcome-workspace" title={workspaceName}>
+                      {workspaceName}
+                    </p>
+                  ) : null}
                   <div className="agent-suggestions" role="group" aria-label="Suggested prompts">
                     {suggestions.map((suggestion) => (
                       <button
@@ -359,7 +355,7 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
                       </button>
                     ))}
                   </div>
-                </EmptyState>
+                </div>
               </div>
             )}
 
@@ -386,6 +382,16 @@ export function AgentDock({ bootstrap, onExit }: AgentDockProps = {}) {
               permissionMode={state.permissionMode}
               reasoningEffort={state.reasoningEffort}
               promptHistory={state.promptHistory}
+            />
+          </div>
+        )}
+        </div>
+        {activeChild && (
+          <div className="subagent-session-layer">
+            <SubagentSessionView
+              child={activeChild}
+              parentTitle={activeSession?.title}
+              onBack={() => agentStore.closeSubagentSession()}
             />
           </div>
         )}

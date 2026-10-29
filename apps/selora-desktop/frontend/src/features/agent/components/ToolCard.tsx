@@ -28,6 +28,7 @@ import { agentStore, type WorkflowToolCall } from '../agent-store';
 import { WorkflowCard } from './WorkflowCard';
 import { AgentQuestionCard } from './AgentQuestionCard';
 import { AgentPlanCard } from './AgentPlanCard';
+import './agent-card-polish.css';
 
 export type ToolCardProps = {
   /** A workflow card carries the §18.1 confirmation payload on the call. */
@@ -317,7 +318,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
 
   return (
     <div
-      className={`agent-tool-card tool-${tool.toolName} status-${tool.status} ${
+      className={`agent-tool-card agent-card-root tool-${tool.toolName} status-${tool.status} ${
         expanded ? 'is-expanded' : ''
       } ${isApproval ? 'is-approval-pending' : ''} ${isRunning ? 'is-running-glow' : ''}`}
       tabIndex={isApproval ? 0 : undefined}
@@ -327,11 +328,11 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
       data-testid={`tool-card-${tool.toolName}`}
     >
       {/* Header Row */}
-      <div className="tool-card-header" onClick={() => setExpanded(!expanded)}>
-        <div className="tool-header-primary">
+      <div className="tool-card-header agent-card-header" onClick={() => setExpanded(!expanded)}>
+        <div className="tool-header-primary agent-card-primary">
           <button
             type="button"
-            className="tool-header-toggle"
+            className="tool-header-toggle agent-card-toggle"
             onClick={(event) => {
               event.stopPropagation();
               setExpanded(!expanded);
@@ -340,25 +341,27 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
             aria-label={`Toggle ${tool.toolName} tool details`}
             style={{ display: 'inline-flex', alignItems: 'center', gap: '7px', minWidth: 0 }}
           >
-            <span className="tool-chevron-icon" aria-hidden="true">
+            <span className="tool-chevron-icon agent-card-chevron" aria-hidden="true">
               {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
             </span>
 
-            <span className="tool-icon">{renderToolIcon()}</span>
+            <span className="tool-icon agent-card-icon">{renderToolIcon()}</span>
 
-            <span className="tool-name">{tool.toolName}</span>
+            <span className="tool-name agent-card-name">{tool.toolName}</span>
           </button>
 
           {/* Target Path Chip with Copy Button */}
           {targetInfo && (
             <span
-              className={`tool-target-chip ${targetInfo.isCommand ? 'is-command' : 'is-file'}`}
+              className={`tool-target-chip agent-card-target ${
+                targetInfo.isCommand ? 'is-command' : 'is-file'
+              }`}
               title={targetInfo.path}
             >
-              <span className="target-chip-text">{targetInfo.path}</span>
+              <span className="target-chip-text agent-card-target-text">{targetInfo.path}</span>
               <button
                 type="button"
-                className={`target-chip-copy-btn ${pathCopied ? 'is-copied' : ''}`}
+                className={`target-chip-copy-btn agent-card-copy ${pathCopied ? 'is-copied' : ''}`}
                 onClick={handleCopyPath}
                 title={pathCopied ? 'Copied!' : 'Copy path'}
                 aria-label={pathCopied ? 'Copied path' : 'Copy path'}
@@ -369,23 +372,23 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
           )}
 
           {!targetInfo && tool.argsSummary && (
-            <span className="tool-args-summary">{tool.argsSummary}</span>
+            <span className="tool-args-summary agent-card-args">{tool.argsSummary}</span>
           )}
         </div>
 
-        <div className="tool-header-telemetry">
+        <div className="tool-header-telemetry agent-card-telemetry">
           {/* Diff badge if present (+X -Y) */}
           {tool.diff && (
-            <span className="tool-diff-badge" title={`+${tool.diff.added} / -${tool.diff.removed}`}>
-              <span className="diff-add">+{tool.diff.added}</span>
-              <span className="diff-remove">-{tool.diff.removed}</span>
+            <span className="tool-diff-badge agent-card-diff" title={`+${tool.diff.added} / -${tool.diff.removed}`}>
+              <span className="diff-add agent-card-diff-add">+{tool.diff.added}</span>
+              <span className="diff-remove agent-card-diff-remove">-{tool.diff.removed}</span>
             </span>
           )}
 
           {/* Elapsed Duration Badge */}
           {durationText && (
             <span
-              className={`tool-duration-badge ${isRunning ? 'is-running' : ''}`}
+              className={`tool-duration-badge agent-card-duration ${isRunning ? 'is-running' : ''}`}
               title="Execution duration"
             >
               <Clock size={10} className="duration-icon" />
@@ -393,22 +396,32 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
             </span>
           )}
 
+          {/* Exit code reported by the backend, when it sent one */}
+          {tool.exitCode !== undefined && (
+            <span
+              className={`agent-card-exit ${tool.exitCode === 0 ? 'is-ok' : 'is-error'}`}
+              title="Exit code"
+            >
+              exit {tool.exitCode}
+            </span>
+          )}
+
           {/* Status Indicator */}
-          <span className="tool-status-glyph">
-            {isRunning && <span className="tool-spinner" aria-label="Running" />}
+          <span className="tool-status-glyph agent-card-status">
+            {isRunning && <span className="tool-spinner agent-card-spinner" aria-label="Running" />}
             {isApproval && (
-              <span className="tool-approval-pill">
+              <span className="tool-approval-pill agent-card-pill">
                 <ShieldAlert size={11} style={{ marginRight: 3 }} />
                 Review
               </span>
             )}
             {isSuccess && (
-              <span className="tool-glyph-ok" aria-label="Completed">
+              <span className="tool-glyph-ok agent-card-glyph-ok" aria-label="Completed">
                 <Check size={12} />
               </span>
             )}
             {isError && (
-              <span className="tool-glyph-err" aria-label="Error">
+              <span className="tool-glyph-err agent-card-glyph-err" aria-label="Error">
                 <X size={12} />
               </span>
             )}
@@ -418,17 +431,17 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
 
       {/* Expanded Content Drawer */}
       {expanded && (
-        <div className="tool-card-body">
+        <div className="tool-card-body agent-card-body">
           {/* Output / Result text */}
           {tool.resultSummary && (
-            <div className="tool-result-box">
-              <pre className="tool-result-pre">{tool.resultSummary}</pre>
+            <div className="tool-result-box agent-card-result">
+              <pre className="tool-result-pre agent-card-result-pre">{tool.resultSummary}</pre>
             </div>
           )}
 
           {/* Phase 9a: structured question / plan review on the park channel. */}
           {decisionPrompt?.kind === 'question' && tool.approvalId ? (
-            <div className="tool-decision-prompt" data-testid="tool-question-card">
+            <div className="tool-decision-prompt agent-card-prompt" data-testid="tool-question-card">
               <AgentQuestionCard
                 prompt={decisionPrompt}
                 submitting={tool.decisionSubmitting}
@@ -442,7 +455,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
           ) : null}
 
           {decisionPrompt?.kind === 'plan' && tool.approvalId ? (
-            <div className="tool-decision-prompt" data-testid="tool-plan-card">
+            <div className="tool-decision-prompt agent-card-prompt" data-testid="tool-plan-card">
               <AgentPlanCard
                 prompt={decisionPrompt}
                 submitting={tool.decisionSubmitting}
@@ -463,7 +476,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
               Approve/Deny pair the session routes through the existing
               decision callback. */}
           {showWorkflowGrant && workflow && (
-            <div className="tool-approval-gate" data-testid="tool-workflow-grant">
+            <div className="tool-approval-gate agent-card-gate" data-testid="tool-workflow-grant">
               <WorkflowCard
                 name={workflow.name || tool.argsSummary}
                 script={workflow.script}
@@ -482,21 +495,21 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
 
           {/* Interactive Approval Gate & Diff View */}
           {isApproval && !showWorkflowGrant && !showDecisionPrompt && (
-            <div className="tool-approval-gate">
-              <div className="approval-banner">
-                <div className="approval-banner-left">
-                  <span className="approval-badge">Needs Approval</span>
-                  <span className="approval-desc">
+            <div className="tool-approval-gate agent-card-gate">
+              <div className="approval-banner agent-card-banner">
+                <div className="approval-banner-left agent-card-banner-left">
+                  <span className="approval-badge agent-card-badge">Needs Approval</span>
+                  <span className="approval-desc agent-card-desc">
                     Review proposed file changes before applying to workspace.
                   </span>
                 </div>
 
                 {/* Split vs Unified Diff Toggle */}
                 {parsedDiff && parsedDiff.unified.length > 0 && (
-                  <div className="diff-view-toggle-group">
+                  <div className="diff-view-toggle-group agent-card-toggle-group">
                     <button
                       type="button"
-                      className={`diff-toggle-btn ${diffViewMode === 'unified' ? 'is-active' : ''}`}
+                      className={`diff-toggle-btn agent-card-toggle-btn ${diffViewMode === 'unified' ? 'is-active' : ''}`}
                       onClick={() => setDiffViewMode('unified')}
                       title="Unified Diff View"
                     >
@@ -504,7 +517,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                     </button>
                     <button
                       type="button"
-                      className={`diff-toggle-btn ${diffViewMode === 'split' ? 'is-active' : ''}`}
+                      className={`diff-toggle-btn agent-card-toggle-btn ${diffViewMode === 'split' ? 'is-active' : ''}`}
                       onClick={() => setDiffViewMode('split')}
                       title="Split Diff View"
                     >
@@ -517,7 +530,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
 
               {/* Overhauled Line-by-Line Diff Viewer */}
               {parsedDiff && parsedDiff.unified.length > 0 && (
-                <div className={`approval-diff-viewer mode-${diffViewMode}`}>
+                <div className={`approval-diff-viewer agent-card-diff-viewer mode-${diffViewMode}`}>
                   {diffViewMode === 'unified' ? (
                     /* Unified Diff Mode */
                     <div className="diff-unified-table">
@@ -577,10 +590,10 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
               )}
 
               {/* Action Buttons */}
-              <div className="approval-actions">
+              <div className="approval-actions agent-card-actions">
                 <button
                   type="button"
-                  className="btn-deny"
+                  className="btn-deny agent-card-btn agent-card-btn-deny"
                   onClick={() =>
                     agentStore.handleApprovalDecision(tool.approvalId!, 'deny')
                   }
@@ -591,21 +604,23 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool }) => {
                   <span>Reject (Esc)</span>
                 </button>
 
-                <button
-                  type="button"
-                  className="btn-approve-all"
-                  onClick={() =>
-                    agentStore.handleApprovalDecision(tool.approvalId!, 'approve_all')
-                  }
-                  title="Approve all remaining tools in this turn"
-                  aria-label="Approve All"
-                >
-                  Approve All
-                </button>
+                {!tool.backgroundChild && (
+                  <button
+                    type="button"
+                    className="btn-approve-all agent-card-btn agent-card-btn-all"
+                    onClick={() =>
+                      agentStore.handleApprovalDecision(tool.approvalId!, 'approve_all')
+                    }
+                    title="Approve all remaining tools in this turn"
+                    aria-label="Approve All"
+                  >
+                    Approve All
+                  </button>
+                )}
 
                 <button
                   type="button"
-                  className="btn-approve btn-approve-glow"
+                  className="btn-approve btn-approve-glow agent-card-btn agent-card-btn-accept"
                   onClick={() =>
                     agentStore.handleApprovalDecision(tool.approvalId!, 'approve')
                   }

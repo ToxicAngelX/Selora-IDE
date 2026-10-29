@@ -1,0 +1,66 @@
+/* Selora IDE — agent workbench empty state (Phase 9a polish).
+   Scope: `.agent-welcome-*` plus one descendant rule on the existing
+   `.agent-suggestions` group. Values come only from src/styles/tokens.css;
+   no new colors, gradients, shadows, or fonts (DESIGN_TOKENS.md §12). */
+
+.agent-welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: calc(var(--space-6) * 8); /* 256px: keeps the block optically centered above the composer */
+  gap: var(--space-2);
+  padding: var(--space-5) var(--space-3);
+  text-align: center;
+  color: var(--fg-default);
+}
+
+.agent-welcome-heading {
+  margin: 0;
+  font-size: var(--type-xxl);
+  line-height: var(--type-xxl-lh);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-default);
+  text-wrap: balance;
+}
+
+.agent-welcome-sub {
+  margin: 0;
+  max-width: calc(var(--space-4) * 22); /* 352px: keeps the subline to two lines before it wraps */
+  font-size: var(--type-md);
+  line-height: var(--type-md-lh);
+  color: var(--fg-muted);
+}
+
+/* Only rendered when the backend reports a real workspace. */
+.agent-welcome-workspace {
+  margin: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  line-height: var(--type-xs-lh);
+  color: var(--fg-faint);
+}
+
+.agent-welcome .agent-suggestions {
+  margin-top: var(--space-4);
+}
+
+/* Narrow dock (split view, side rail): step the heading down one size so it
+   never overflows the column. */
+@media (max-width: 380px) {
+  .agent-welcome-heading {
+    font-size: var(--type-xl);
+    line-height: var(--type-xl-lh);
+  }
+
+  .agent-welcome {
+    min-height: calc(var(--space-6) * 6); /* 192px */
+    padding: var(--space-4) var(--space-2);
+  }
+}

@@ -397,6 +397,55 @@ export type SubagentPolicy = 'read_only' | 'full';
 
 export type SubagentArtifact = { kind: string; path: string };
 
+/** Live child run state reported while the child is still working. */
+export type SubagentActivityState = 'thinking' | 'running_tool' | 'awaiting_approval' | 'done';
+
+/**
+ * Phase 9e live child activity. `subagent_activity` is a discriminated union
+ * keyed by `kind`; every variant carries the child and its parent session so a
+ * replay can attach late activity without the `started` metadata.
+ */
+export type SubagentActivityPayload =
+  | {
+      kind: 'started';
+      child_id: string;
+      parent_session_id: Id;
+      name?: string | null;
+      policy: SubagentPolicy;
+      mission: string;
+    }
+  | {
+      kind: 'delta';
+      child_id: string;
+      parent_session_id: Id;
+      message_id: Id;
+      sequence: number;
+      text: string;
+    }
+  | {
+      kind: 'tool_call_started';
+      child_id: string;
+      parent_session_id: Id;
+      call_id: string;
+      tool_name: string;
+      args_json: string;
+    }
+  | {
+      kind: 'tool_result';
+      child_id: string;
+      parent_session_id: Id;
+      call_id: string;
+      result_summary: string;
+      is_err: boolean;
+    }
+  | {
+      kind: 'state_changed';
+      child_id: string;
+      parent_session_id: Id;
+      state: SubagentActivityState;
+      tool_name?: string;
+    };
+
 export type SubagentCompletedPayload = {
   child_id: string;
   parent_session_id: Id;
@@ -651,6 +700,8 @@ export type FrontendEvent =
   | { type: 'agent_turn_done'; payload: AgentTurnDonePayload }
   | { type: 'agent_compaction_failed'; payload: AgentCompactionFailedPayload }
   | { type: 'subagent_completed'; payload: SubagentCompletedPayload }
+  | { type: 'subagent_cancelled'; payload: { child_id: string; parent_session_id: string } }
+  | { type: 'subagent_activity'; payload: SubagentActivityPayload }
   | { type: 'agent_event'; payload: { request_id: Id; session_id: Id; turn_id: Id; approval: Approval | null; message: string } }
   | { type: 'diagnostics_changed'; payload: Diagnostic[] }
   | { type: 'lsp_server_state_changed'; payload: LspServerState }

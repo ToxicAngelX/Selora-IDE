@@ -47,9 +47,10 @@ pub use session::{
 #[allow(unused_imports)]
 pub use subagent::{
     wait_tool_result, wait_tool_spec, ArtifactRef, CancelToken, ChildId, ChildOutcome, ChildState,
-    CompletionDisposition, SpawnError, SpawnRequest, SubagentCard, SubagentCompletion,
-    SubagentControlError, SubagentEvent, SubagentHandle, SubagentPolicy, SubagentRuntime,
-    WaitError, WaitOutcome, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
+    CompletionDisposition, SpawnError, SpawnRequest, SubagentActivity, SubagentActivityKind,
+    SubagentCard, SubagentCompletion, SubagentControlError, SubagentEvent, SubagentHandle,
+    SubagentPolicy, SubagentRunState, SubagentRuntime, WaitError, WaitOutcome,
+    DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT, WAIT_TOOL_NAME,
 };
 pub use subagent_turn::{
     format_subagent_completion, question_answer_result, run_subagent_turn,

@@ -4,7 +4,7 @@
 // of the protocol's open-buffer list. The region owns no mock documents: when
 // no folder is open it offers a live folder picker, and when a workspace is
 // open it points at the Files sidebar with top-level file chips.
-import { lazy, Suspense, useCallback, useMemo, useState, useSyncExternalStore } from 'react';
+import { lazy, Suspense, useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { EmptyState, EmptyStateButton, KeyChip } from '../components/EmptyState';
 import { SeloraMark } from '../components/SeloraMark';
 import { EditorTabBar, type EditorTabView } from '../components/editor/EditorTabBar';
@@ -15,7 +15,7 @@ import type {
   CodeLineData,
   SyntaxTokenType,
 } from '../components/editor/editor-types';
-import type { ScrollGeometry } from '../features/editor/CodeMirrorPane';
+import type { EditorScrollTarget, ScrollGeometry } from '../features/editor/CodeMirrorPane';
 
 // CodeMirror and its language modes are the heaviest dependency in the app.
 // Load the pane as its own chunk so the shell paints first (Z6 bundle split);
@@ -95,14 +95,24 @@ function minimapTokenType(line: string): SyntaxTokenType {
   return 'syn-default';
 }
 
-function minimapLines(text: string): CodeLineData[] {
-  return text
-    .split(/\r?\n/)
-    .slice(0, MINIMAP_MAX_LINES)
-    .map((line, index) => ({
+function minimapLines(text: string): { lines: CodeLineData[]; totalLines: number } {
+  const allLines = text.split(/\r?\n/);
+  const totalLines = Math.max(allLines.length, 1);
+
+  // Sampling keeps the DOM budget bounded while still representing the whole
+  // document; navigation and aria ranges use the real line count.
+  const rowCount = Math.min(totalLines, MINIMAP_MAX_LINES);
+  const step = totalLines / rowCount;
+  const lines: CodeLineData[] = [];
+  for (let row = 0; row < rowCount; row += 1) {
+    const index = totalLines > rowCount ? Math.floor((row + 0.5) * step) : row;
+    const line = allLines[Math.min(index, totalLines - 1)] ?? '';
+    lines.push({
       lineNum: index + 1,
       tokens: [{ text: line.length === 0 ? ' ' : line, type: minimapTokenType(line) }],
-    }));
+    });
+  }
+  return { lines, totalLines };
 }
 
 export function EditorRegion() {
@@ -114,9 +124,16 @@ export function EditorRegion() {
     scrollHeight: 100,
     clientHeight: 100,
   });
+  const minimapRequestRef = useRef(0);
+  const [minimapTarget, setMinimapTarget] = useState<EditorScrollTarget | null>(null);
 
   const handleScroll = useCallback((geometry: ScrollGeometry) => {
     setScrollGeometry(geometry);
+  }, []);
+
+  const handleMinimapNavigate = useCallback((line: number) => {
+    minimapRequestRef.current += 1;
+    setMinimapTarget({ line, requestId: minimapRequestRef.current });
   }, []);
 
   const handleOpenFolder = useCallback(async () => {
@@ -228,7 +245,10 @@ export function EditorRegion() {
     () => (active ? breadcrumbSegments(editor.workspaceRoot, editor.workspaceName, active.path) : []),
     [active, editor.workspaceName, editor.workspaceRoot],
   );
-  const minimap = useMemo(() => (active ? minimapLines(active.text) : []), [active]);
+  const minimap = useMemo(
+    () => (active ? minimapLines(active.text) : { lines: [], totalLines: 0 }),
+    [active],
+  );
   const tabViews = useMemo(
     () =>
       editor.tabs.map((tab) => ({
@@ -361,15 +381,17 @@ export function EditorRegion() {
             buffer={active}
             onScroll={handleScroll}
             revealTarget={editor.revealTarget}
+            scrollTarget={minimapTarget}
             settings={editorSettings}
           />
         </Suspense>
         <EditorMinimap
-          lines={minimap}
+          lines={minimap.lines}
+          totalLines={minimap.totalLines}
           scrollTop={scrollGeometry.scrollTop}
           scrollHeight={scrollGeometry.scrollHeight}
           clientHeight={scrollGeometry.clientHeight}
-          onNavigateLine={(line) => void editorStore.openPathAtLine(active.path, line)}
+          onNavigateLine={handleMinimapNavigate}
         />
       </div>
     </div>

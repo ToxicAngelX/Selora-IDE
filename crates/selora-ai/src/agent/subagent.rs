@@ -226,7 +226,8 @@ impl SubagentCompletion {
 }
 
 /// The typed event stream. Exactly one `Completed` is emitted per accepted
-/// child; cancelled children emit nothing (there is no completion to claim).
+/// child, and exactly one `Cancelled` per running child that is stopped;
+/// `Activity` carries the live transcript mirrored from the child's turn.
 /// `ApprovalNeeded` is the §19.3 child-card rail: a child's write/bash or
 /// question parks here and is answered through [`SubagentRuntime::decide`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -234,6 +235,78 @@ impl SubagentCompletion {
 pub enum SubagentEvent {
     Completed(SubagentCompletion),
     ApprovalNeeded(SubagentCard),
+    Activity(SubagentActivity),
+    Cancelled {
+        child_id: ChildId,
+        parent_session: String,
+    },
+}
+
+/// One live step of a child conversation. The parent session scopes the view;
+/// `child_id` is the stable child session key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentActivity {
+    pub child_id: ChildId,
+    pub parent_session: String,
+    pub kind: SubagentActivityKind,
+}
+
+impl SubagentActivity {
+    pub fn new(
+        child_id: impl Into<ChildId>,
+        parent_session: impl Into<String>,
+        kind: SubagentActivityKind,
+    ) -> Self {
+        Self {
+            child_id: child_id.into(),
+            parent_session: parent_session.into(),
+            kind,
+        }
+    }
+}
+
+/// The live child transcript vocabulary. `Delta` text is incremental and its
+/// `sequence` is monotonic across the child's whole run; `message_id` changes
+/// once per assistant output round.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentActivityKind {
+    Started {
+        name: String,
+        policy: SubagentPolicy,
+        mission: String,
+    },
+    Delta {
+        message_id: String,
+        sequence: u64,
+        text: String,
+    },
+    ToolCallStarted {
+        call_id: String,
+        tool_name: String,
+        args_json: String,
+    },
+    ToolResult {
+        call_id: String,
+        result_summary: String,
+        is_err: bool,
+    },
+    StateChanged {
+        state: SubagentRunState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+    },
+}
+
+/// The child's live status line. `AwaitingApproval` mirrors the turn parking
+/// on a child card; `Done` is the turn-end state, not the terminal result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRunState {
+    Thinking,
+    RunningTool,
+    AwaitingApproval,
+    Done,
 }
 
 /// A child card waiting on the parent session's normal decision rail. The id
@@ -672,6 +745,11 @@ impl SubagentRuntime {
         self.emit(SubagentEvent::ApprovalNeeded(card));
     }
 
+    /// Emit one live child transcript step.
+    pub fn emit_activity(&self, activity: SubagentActivity) {
+        self.emit(SubagentEvent::Activity(activity));
+    }
+
     /// Subscribe to the one-event-per-child stream. Late subscribers do not
     /// receive history; the host also persists the completion itself.
     pub fn subscribe(&self) -> broadcast::Receiver<SubagentEvent> {
@@ -831,6 +909,7 @@ impl SubagentRuntime {
         if record.state.terminal() {
             return false;
         }
+        let parent_session = record.request.parent_session.clone();
         record.state = ChildState::Cancelled;
         record.result = None;
         if let Some(task) = record.task.take() {
@@ -840,6 +919,10 @@ impl SubagentRuntime {
         drop(state);
         self.forget_child_cards(child_id);
         self.forget_steering(child_id);
+        self.emit(SubagentEvent::Cancelled {
+            child_id: child_id.to_owned(),
+            parent_session,
+        });
         true
     }
 
@@ -869,6 +952,10 @@ impl SubagentRuntime {
         for child_id in cancelled_ids {
             self.forget_child_cards(&child_id);
             self.forget_steering(&child_id);
+            self.emit(SubagentEvent::Cancelled {
+                child_id,
+                parent_session: parent_session.to_owned(),
+            });
         }
         cancelled
     }
@@ -1496,6 +1583,15 @@ mod tests {
             CompletionDisposition::Discarded
         );
         assert!(runtime.result("child-1").is_none());
+        let cancelled = match events.recv().await.expect("cancellation event") {
+            SubagentEvent::Cancelled {
+                child_id,
+                parent_session,
+            } => (child_id, parent_session),
+            other => panic!("expected a cancellation, got {other:?}"),
+        };
+        assert_eq!(cancelled.0, "child-1");
+        assert_eq!(cancelled.1, "parent-1");
         assert!(
             tokio::time::timeout(Duration::from_millis(30), events.recv())
                 .await
@@ -1511,18 +1607,32 @@ mod tests {
         runtime.register(request("parent-1", "child-2")).unwrap();
 
         assert!(runtime.cancel_child("child-1"));
+        assert!(
+            !runtime.cancel_child("child-1"),
+            "cancellation is exactly once"
+        );
         assert_eq!(
             runtime.complete_detailed("child-1", ChildOutcome::success("late")),
             CompletionDisposition::Discarded
         );
         assert!(runtime.complete("child-2", ChildOutcome::success("sibling won")));
 
+        let cancelled = match events.recv().await.unwrap() {
+            SubagentEvent::Cancelled {
+                child_id,
+                parent_session,
+            } => (child_id, parent_session),
+            other => panic!("expected a cancellation, got {other:?}"),
+        };
+        assert_eq!(cancelled, ("child-1".into(), "parent-1".into()));
         let completion = match events.recv().await.unwrap() {
             SubagentEvent::Completed(completion) => completion,
             other => panic!("expected a completion, got {other:?}"),
         };
         assert_eq!(completion.child_id, "child-2");
         assert!(completion.ok);
+        // Cancellation is one lifecycle event, never repeated by the late result.
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

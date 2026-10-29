@@ -10,6 +10,7 @@
 import React, { useRef } from 'react';
 import { Plus } from '../../../components/icons';
 import type { AgentSession } from '../types';
+import './agent-session-tabs-polish.css';
 
 export type AgentSessionTabsProps = {
   sessions: AgentSession[];
@@ -40,10 +41,14 @@ export const AgentSessionTabs: React.FC<AgentSessionTabsProps> = ({
   };
 
   return (
-    <div className="agent-session-tabs-strip">
-      <div className="agent-session-tabs" role="tablist" aria-label="Agent sessions">
+    <div className="agent-session-tabs-strip agent-sessiontabs-strip">
+      <div
+        className="agent-session-tabs agent-sessiontabs-list"
+        role="tablist"
+        aria-label="Agent sessions"
+      >
         {sessions.length === 0 ? (
-          <p className="agent-session-tabs-empty">No sessions yet</p>
+          <p className="agent-session-tabs-empty agent-sessiontabs-empty">No sessions yet</p>
         ) : (
           sessions.map((session, index) => {
             const selected = session.id === activeSessionId;
@@ -56,11 +61,11 @@ export const AgentSessionTabs: React.FC<AgentSessionTabsProps> = ({
                 type="button"
                 role="tab"
                 id={`agent-session-tab-${session.id}`}
-                className={`agent-session-tab${selected ? ' is-active' : ''}`}
+                className={`agent-session-tab agent-sessiontabs-tab${selected ? ' is-active' : ''}`}
                 aria-selected={selected}
                 aria-controls="agent-session-panel"
                 tabIndex={selected ? 0 : -1}
-                title={session.id}
+                title={session.title}
                 onClick={() => onSelect(session.id)}
                 onKeyDown={(event) => {
                   if (event.key === 'ArrowRight') {
@@ -79,10 +84,14 @@ export const AgentSessionTabs: React.FC<AgentSessionTabsProps> = ({
                 }}
               >
                 <span
-                  className={`agent-session-tab-dot${session.isRunning ? ' is-running' : ''}`}
+                  className={`agent-session-tab-dot agent-sessiontabs-dot${
+                    session.isRunning ? ' is-running' : ''
+                  }`}
                   aria-hidden="true"
                 />
-                <span className="agent-session-tab-title">{session.title}</span>
+                <span className="agent-session-tab-title agent-sessiontabs-tab-title">
+                  {session.title}
+                </span>
               </button>
             );
           })
@@ -91,7 +100,7 @@ export const AgentSessionTabs: React.FC<AgentSessionTabsProps> = ({
 
       <button
         type="button"
-        className="agent-session-tab-add"
+        className="agent-session-tab-add agent-sessiontabs-add"
         onClick={onNew}
         disabled={busy}
         aria-busy={busy}
@@ -103,7 +112,7 @@ export const AgentSessionTabs: React.FC<AgentSessionTabsProps> = ({
       </button>
 
       {error ? (
-        <p className="agent-session-tabs-error" role="alert">
+        <p className="agent-session-tabs-error agent-sessiontabs-error" role="alert">
           {error}
         </p>
       ) : null}
